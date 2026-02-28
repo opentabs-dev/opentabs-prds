@@ -1,0 +1,49 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two low-severity issues: (1) dev proxy pending array retains timed-out request references causing a minor memory leak during slow restarts, and (2) SVG icon color validation does not recognize modern CSS rgb() space-separated syntax, allowing saturated colors through inactive icon validation.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Clean up timed-out entries from dev-proxy pending array",
+      "description": "As a platform developer, I want timed-out pending requests to be removed from the pending array immediately so that dead req/res references do not accumulate during slow dev restarts.",
+      "acceptanceCriteria": [
+        "When a pending request times out in whenReady(), it is removed from the pending array immediately after the timeout fires",
+        "The drainPending() function does not execute stale (already-settled) callbacks",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/dev-proxy.ts\n\nThe `whenReady` function creates a callback that is pushed into the `pending` array. When a timeout fires (the `onTimeout` path), the callback sets `settled = true` and calls `onTimeout()`, but the callback closure remains in the `pending` array, holding references to the `req`, `res`, or `socket` objects via the `fn` and `onTimeout` closures.\n\nFix: After the timeout fires (in the timeout handler), remove the callback from the `pending` array. The simplest approach is to filter out settled entries:\n\n```ts\n// In the timeout handler, after calling onTimeout():\npending.splice(pending.indexOf(entry), 1);\n```\n\nOr assign a reference to the pushed function so it can be removed by reference. Another approach: change `pending` to use a Set for O(1) deletion.\n\nThe `drainPending` function already handles the `settled` flag correctly (it checks and skips settled entries), but removing timed-out entries eagerly means `drainPending` processes fewer items and the references are freed sooner.\n\nNote: This is dev-only code. The fix is straightforward and low-risk."
+    },
+    {
+      "id": "US-002",
+      "title": "Support modern CSS rgb() syntax in SVG icon color validation",
+      "description": "As a plugin developer, I want the icon validation to correctly parse modern CSS rgb() syntax so that inactive icons with saturated colors in space-separated format are properly flagged and converted to grayscale.",
+      "acceptanceCriteria": [
+        "parseColor correctly parses rgb(255 0 0), rgb(255 0 0 / 0.5), rgba(255 0 0 / 0.5)",
+        "parseColor correctly parses percentage values: rgb(100% 0% 0%), rgb(100% 50% 0% / 0.5)",
+        "isAchromaticColor returns false for saturated colors in modern syntax (e.g., rgb(255 0 0))",
+        "validateInactiveIconColors flags saturated colors written in modern CSS syntax",
+        "generateInactiveIcon converts modern-syntax saturated colors to grayscale",
+        "Existing tests for legacy comma-separated syntax continue to pass",
+        "New unit tests in validate-icon.test.ts cover all modern syntax variants",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/validate-icon.ts\n\nThe `parseColor` function (around line 228) uses a regex to match rgb/rgba values. The current regex only matches the legacy comma-separated syntax: `rgb(R, G, B)` and `rgba(R, G, B, A)`.\n\nModern CSS Color Level 4 syntax allows:\n- Space-separated: `rgb(255 0 0)`, `rgba(255 0 0 / 0.5)`\n- Percentage values: `rgb(100% 0% 0%)`, `rgb(50% 50% 50% / 0.8)`\n- Mixed: technically `rgb(255 0 0 / 50%)` is valid too\n\nFix approach: Extend the rgb/rgba regex to also match space-separated syntax, or add a second regex/parsing path. For percentage values, convert to 0-255 range (multiply by 2.55 and round).\n\nA clean approach is to add a second regex for the modern syntax:\n```ts\n// Modern syntax: rgb(R G B) or rgb(R G B / A)\nconst modernRgbMatch = value.match(/^rgba?\\(\\s*([\\d.]+%?)\\s+([\\d.]+%?)\\s+([\\d.]+%?)(?:\\s*\\/\\s*[\\d.]+%?)?\\s*\\)$/i);\n```\n\nThen parse each component, handling the % suffix by converting to 0-255.\n\nTest file: platform/plugin-tools/src/validate-icon.test.ts"
+    }
+  ]
+}

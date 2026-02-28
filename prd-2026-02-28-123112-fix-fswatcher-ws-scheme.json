@@ -1,0 +1,50 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two medium-severity bugs in the MCP server: (1) FSWatcher instances missing 'error' event handlers that cause process crashes on Linux inotify exhaustion, and (2) WebSocket URL scheme mismatch in the site analyzer that silently prevents frame samples from being attached to WebSocket endpoints.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add error event handlers to all FSWatcher instances in file-watcher.ts",
+      "description": "As a platform developer, I want FSWatcher error events to be handled gracefully so that inotify resource exhaustion on Linux does not crash the MCP server process.",
+      "acceptanceCriteria": [
+        "All FSWatcher instances created by watchPlugin(), watchPendingPlugin(), and startConfigWatching() have an 'error' event handler attached immediately after creation",
+        "The error handler logs a warning with the plugin name (or 'config') and the error message, then closes the watcher",
+        "An FSWatcher error event does NOT cause an uncaught exception or process crash",
+        "Unit test in file-watcher.test.ts verifies that emitting an 'error' event on an FSWatcher does not throw and produces a log warning",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/file-watcher.ts\n\nThree locations need error handlers:\n\n1. watchPlugin() at line 466: `const distWatcher = watch(distDir, ...)` — add `distWatcher.on('error', ...)` after creation, before `watchers.push(distWatcher)`.\n\n2. watchPendingPlugin() at line 421: `const distWatcher = watch(distDir, ...)` — same pattern.\n\n3. startConfigWatching() at line 527: `fw.configWatcher = watch(configDir, ...)` — add `fw.configWatcher.on('error', ...)` after creation.\n\nThe error handler pattern should be:\n```ts\ndistWatcher.on('error', (err) => {\n  log.warn(`File watcher: Error on dist watcher for \"${pluginName}\": ${err instanceof Error ? err.message : String(err)}`);\n  distWatcher.close();\n});\n```\n\nFor the config watcher, use 'config' as the label instead of pluginName.\n\nImport `log` from './logger.js' is already present at line 25.\n\nNote: After closing the watcher, mtime polling (already running as a fallback via startMtimePolling) will continue to detect changes, so no additional recovery is needed."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix WebSocket URL scheme mismatch in detect-apis.ts frame sample matching",
+      "description": "As a plugin developer using plugin_analyze_site, I want WebSocket frame samples to be correctly attached to their endpoints so that the analysis output includes actual frame payload examples for WebSocket APIs.",
+      "acceptanceCriteria": [
+        "A helper function normalizes WebSocket URLs by converting wss:// to https:// and ws:// to http:// for consistent origin comparison",
+        "The normalization is applied both when creating WebSocket endpoint URLs (lines 416-423) and when matching frame URLs (lines 449-456)",
+        "detectApis() correctly attaches frame samples to WebSocket endpoints when the endpoint URL uses https:// but frame URLs use wss://",
+        "detectApis() correctly attaches frame samples to WebSocket endpoints when both use the same scheme",
+        "Existing unit tests in detect-apis.test.ts continue to pass",
+        "New unit test verifies frame sample attachment with wss:// frame URLs matched against https:// endpoint URLs",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts\n\nThe bug: WebSocket endpoints are created from HTTP upgrade requests, so their normalized URL uses `https://` origin (e.g., `https://example.com/ws`). But WebSocket frame URLs use `wss://` scheme, so `new URL('wss://example.com/ws').origin` produces `wss://example.com`. The comparison `normalizedFrameUrl !== ep.url` on line 456 always fails for this scheme mismatch.\n\nFix approach: Create a small helper function (e.g., `normalizeWsUrl`) that converts WebSocket schemes to their HTTP equivalents:\n\n```ts\nconst normalizeWsUrl = (url: string): string => {\n  try {\n    const parsed = new URL(url);\n    if (parsed.protocol === 'wss:') parsed.protocol = 'https:';\n    else if (parsed.protocol === 'ws:') parsed.protocol = 'http:';\n    return `${parsed.origin}${parsed.pathname}`;\n  } catch {\n    return url;\n  }\n};\n```\n\nApply this normalization in two places:\n1. Line 416-423 in the grouping loop: when the protocol is 'websocket', use `normalizeWsUrl(req.url)` instead of `parsed.origin + parsed.pathname`\n2. Lines 449-456 in the frame matching loop: use `normalizeWsUrl(frame.url)` instead of the current `parsedFrame.origin + parsedFrame.pathname`\n\nAlternatively, apply it only in the frame matching loop (both to frame URL and endpoint URL) — this is simpler and equivalent since the normalization is only needed for comparison.\n\nTest file: platform/mcp-server/src/browser-tools/analyze-site/detect-apis.test.ts"
+    }
+  ]
+}
