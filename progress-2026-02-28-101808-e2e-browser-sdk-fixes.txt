@@ -1,0 +1,36 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-101808-e2e-browser-sdk-fixes~running.json
+Started: Sat Feb 28 18:18:36 UTC 2026
+---
+
+## Codebase Patterns
+- Network capture clear tests use `waitFor` polling (5s timeout, 200ms interval) to drain buffers after `clear: true` — same pattern applies to WebSocket frame buffer clearing
+- `waitFor` utility is defined in e2e/browser-tools.e2e.ts and used throughout for async polling
+- Dialog event listeners: use `tabPage.once()` not `tabPage.on()` for auto-cleanup; wrap in `Promise.race()` with a setTimeout timeout guard to prevent test hangs
+- Prettier printWidth is 120 for this project
+- Pre-commit hook runs prettier --write and eslint --fix automatically
+- E2E test page cleanup: wrap test body in try/finally with page.close() in finally to prevent page leaks on assertion failure
+- IIFE format (post commit 30c0178): `})();` is immediately followed by `(function(){` (hashAndFreeze snippet) on the same line, then a newline and `//# sourceMappingURL=...`. The `replaceIifeClosing` regex uses lookahead `(?=\(function\(\)\{|[\s]*$)` to match the original IIFE closing without requiring end-of-file
+
+## [2026-02-28 18:21] - US-001
+- Fixed WebSocket frame clear race condition: replaced single-shot `frames.length === 0` assertion with `waitFor` polling that calls `browser_get_websocket_frames` with `clear: true` until buffer is empty, matching the pattern used by network capture clear tests (lines ~1716, ~1903)
+- Fixed dialog unbounded promise: replaced `tabPage.on('dialog', ...)` (no timeout, no cleanup) with `Promise.race([tabPage.once() promise, setTimeout 10s reject])` to bound the test and auto-remove the listener
+- Files changed: e2e/browser-tools.e2e.ts
+- **Learnings for future iterations:**
+  - The active WebSocket on /ws-test page delivers frames continuously, so asserting `length === 0` immediately after `clear: true` races; polling is required
+  - `tabPage.once()` auto-removes the listener after first event, eliminating the need for explicit cleanup
+  - Prettier required the `setTimeout` call to be on a single line (118 chars, within 120 limit)
+---
+
+## [2026-02-28 18:35] - US-002
+- Added try/finally wrapping to every test in structured-errors.e2e.ts (13 tests), sdk-fetch-errors.e2e.ts (5 tests), and sdk-utilities.e2e.ts (11 tests) so page.close() is always called even when assertions fail
+- Removed page.close() from inside the try block; it now lives only in the finally block
+- Also fixed pre-existing failure in e2e/helpers.ts `replaceIifeClosing`: updated regex from `/}\)\(\);[\s]*$/` to `/}\)\(\);(?=\(function\(\)\{|[\s]*$)/` to handle the new IIFE format introduced by commit 30c0178 (hashAndFreeze snippet appended on same line as `})();` instead of on a new line)
+- Files changed: e2e/structured-errors.e2e.ts, e2e/sdk-fetch-errors.e2e.ts, e2e/sdk-utilities.e2e.ts, e2e/helpers.ts
+- All 385 E2E tests pass after the fix
+- **Learnings for future iterations:**
+  - The try/finally transformation is purely mechanical: move page.close() from end of test body into a finally block, wrap remaining assertions in try
+  - For tests using page.evaluate() (sdk-utilities.e2e.ts), those calls stay in the try block since they're part of the test assertions
+  - The IIFE format changed in commit 30c0178: `})();` is now followed immediately by `(function(){` (hashAndFreeze) on the same line. Any regex matching `})();` at end-of-file will fail; use lookahead instead
+  - 4 pre-existing E2E failures (iife-injection and strict-csp tests) were caused by the IIFE regex issue, not by the try/finally changes
+---
