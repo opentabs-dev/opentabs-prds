@@ -1,0 +1,47 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-141012-extension-bug-fixes~running.json
+Started: Sat Feb 28 22:10:36 UTC 2026
+---
+
+## Codebase Patterns
+- The exec wrapper template is in `platform/mcp-server/src/adapter-files.ts` (`writeExecFile`), not in plugin-tools
+- The browser extension polls for results in `platform/browser-extension/src/browser-commands/extension-commands.ts` (`handleBrowserExecuteScript`)
+- Use `Reflect.deleteProperty(obj, key)` instead of `delete obj[key]` for computed property deletions (ESLint `no-dynamic-delete` rule)
+- The exec file UUID is extracted from the filename pattern `__exec-<uuid>.js` — both the wrapper and the poller derive keys from this UUID
+- E2E tests for browser_execute_script are in `e2e/browser-tools.e2e.ts`
+
+## 2026-02-28T22:17 - US-001
+- Namespaced `__lastExecResult` → `__execResult_<uuid>` and `__lastExecAsync` → `__execAsync_<uuid>` across the exec script pipeline
+- **Files changed:**
+  - `platform/mcp-server/src/adapter-files.ts` — wrapper template now writes namespaced keys using the execId
+  - `platform/mcp-server/src/browser-tools/execute-script.ts` — updated JSDoc comment
+  - `platform/browser-extension/src/browser-commands/extension-commands.ts` — polling and cleanup now extract UUID from execFile and use namespaced keys
+  - `platform/mcp-server/src/adapter-files.test.ts` — updated assertions to check namespaced key names
+  - `platform/browser-extension/src/browser-commands/extension-commands.test.ts` — updated cleanup test to expect namespaced key args
+  - `e2e/browser-tools.e2e.ts` — updated cleanup and sequential tests to check for namespaced key patterns
+- **Learnings for future iterations:**
+  - The exec wrapper injects the UUID as JSON-escaped string literals into the IIFE template — the key names are baked in at file-write time, not extracted at runtime
+  - The browser extension passes the key names as `args` to `chrome.scripting.executeScript({ func, args })` for the polling and cleanup functions
+  - The extension-commands.test.ts has tests that verify the structure of executeScript calls (args, func, world) — changes to call signatures require test updates
+---
+
+## 2026-02-28T22:20 - US-002
+- Added `toggleCounter` ref to PluginCard to guard against stale optimistic rollbacks from concurrent toggle requests
+- Each handler captures `myVersion = ++toggleCounter.current` before the optimistic update; rollback only fires when `toggleCounter.current === myVersion`
+- **Files changed:**
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — added `toggleCounter` ref, updated both `handleToggleAll` and `handleToggleTool` with versioned rollback guards
+- **Learnings for future iterations:**
+  - The fix is purely in PluginCard.tsx — no tests needed updating since there are no unit tests for this component's async race behavior
+  - `useRef(0)` for monotonic counter is the correct React pattern (not `useState`) since the counter mutation must not trigger a re-render
+---
+
+## 2026-02-28T22:22 - US-003
+- Wrapped the `setInterval` callback body in `handleBrowserWaitForElement` with a try-catch so DOM errors produce a clear error result instead of a 25-second timeout
+- On catch: `clearInterval(poll)` is called and the promise resolves with `{ error: "Error checking element: <message>" }`
+- **Files changed:**
+  - `platform/browser-extension/src/browser-commands/interaction-commands.ts` — setInterval callback body wrapped in try-catch (lines 202-231)
+- **Learnings for future iterations:**
+  - The injected script lives inside a `func` passed to `chrome.scripting.executeScript` — it runs in the MAIN world in the tab's document context
+  - No existing unit tests cover this function's interval callback, so no test updates were needed
+  - The fix is purely additive — existing timeout and success paths are unchanged; the catch only fires on unexpected exceptions
+---
