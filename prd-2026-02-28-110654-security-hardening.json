@@ -1,0 +1,110 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Low-hanging-fruit security hardening with zero UX/DevX impact: restrict file permissions on config directory and log/pid files, add missing message types to EXTENSION_ONLY_TYPES in the browser extension, remove unnecessary secret reflection from /ws-info, and reduce unauthenticated /health information disclosure.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add missing message types to EXTENSION_ONLY_TYPES in browser extension",
+      "description": "As a platform developer, I want privileged message types (sp:confirmationResponse, sp:confirmationTimeout, port-changed) restricted to extension contexts only, so that content scripts running in web pages cannot forge confirmation approvals or redirect the WebSocket connection.",
+      "acceptanceCriteria": [
+        "EXTENSION_ONLY_TYPES set in background-message-handlers.ts includes 'sp:confirmationResponse', 'sp:confirmationTimeout', and 'port-changed'",
+        "A content script (sender with tab info) sending sp:confirmationResponse is rejected by the guard at line 237",
+        "A content script sending port-changed is rejected by the guard",
+        "Existing extension-context senders (side panel, offscreen document) are not affected — their sender.id still matches chrome.runtime.id",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/background-message-handlers.ts, lines 220-227. The EXTENSION_ONLY_TYPES set currently contains: offscreen:getUrl, ws:state, ws:message, bg:send, bg:getConnectionState, offscreen:getLogs. Add three more entries: 'sp:confirmationResponse', 'sp:confirmationTimeout', 'port-changed'. These messages should only come from extension pages (side panel sends confirmations, side panel sends port-changed), never from ISOLATED-world content scripts injected into web pages. The guard logic at line 237 checks `sender.id !== chrome.runtime.id` — extension pages have sender.id matching chrome.runtime.id, while content scripts in web pages have a sender.tab property. This is a one-line change (add 3 entries to the Set). No test changes needed unless there are existing tests for the guard — check and update if so."
+    },
+    {
+      "id": "US-002",
+      "title": "Add mode: 0o700 to all config/extension directory mkdir calls",
+      "description": "As a platform user on a shared system, I want the ~/.opentabs directory and its subdirectories created with owner-only permissions (0o700), so that other local users cannot list directory contents or traverse into subdirectories containing auth.json.",
+      "acceptanceCriteria": [
+        "mkdirSync in cli/src/commands/start.ts:118 uses { recursive: true, mode: 0o700 }",
+        "mkdir in cli/src/config.ts:121 uses { recursive: true, mode: 0o700 }",
+        "mkdir in cli/src/commands/config.ts:549 uses { recursive: true, mode: 0o700 }",
+        "mkdir in mcp-server/src/config.ts:367 uses { recursive: true, mode: 0o700 }",
+        "mkdir in mcp-server/src/config.ts:402 uses { recursive: true, mode: 0o700 }",
+        "mkdir in mcp-server/src/adapter-files.ts:21 uses { recursive: true, mode: 0o700 }",
+        "mkdirSync in cli/src/commands/setup.ts:92 (adapters dir) uses { recursive: true, mode: 0o700 }",
+        "The existing mkdir in mcp-server/src/config.ts:267 already has mode: 0o700 — do not change it",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Multiple locations need the same one-line fix — add `mode: 0o700` to the options object of mkdir/mkdirSync calls. Affected files and lines:\n\n1. platform/cli/src/commands/start.ts:118 — `mkdirSync(configDir, { recursive: true })` → add `mode: 0o700`\n2. platform/cli/src/config.ts:121 — `await mkdir(extensionDir, { recursive: true })` → add `mode: 0o700`\n3. platform/cli/src/commands/config.ts:549 — `await mkdir(extensionDir, { recursive: true })` → add `mode: 0o700`\n4. platform/mcp-server/src/config.ts:367 — `await mkdir(extensionDir, { recursive: true })` → add `mode: 0o700`\n5. platform/mcp-server/src/config.ts:402 — `await mkdir(extensionDir, { recursive: true })` → add `mode: 0o700`\n6. platform/mcp-server/src/adapter-files.ts:21 — `await mkdir(getAdaptersDir(), { recursive: true })` → add `mode: 0o700`\n7. platform/cli/src/commands/setup.ts:92 — `mkdirSync(join(extensionDest, 'adapters'), { recursive: true })` → add `mode: 0o700`\n\nThe reference implementation is at platform/mcp-server/src/config.ts:267 which already does it correctly: `await mkdir(configDir, { recursive: true, mode: 0o700 })`."
+    },
+    {
+      "id": "US-003",
+      "title": "Set restrictive permissions on server.log, server.pid, and version marker files",
+      "description": "As a platform user on a shared system, I want the server log file, PID file, and version marker file created with owner-only permissions (0o600), so that other local users cannot read server logs (which may contain tool invocation details) or the PID file.",
+      "acceptanceCriteria": [
+        "createWriteStream calls for logFilePath in cli/src/commands/start.ts (lines 284 and 309) use { flags: 'a', mode: 0o600 }",
+        "writeFile for PID file at cli/src/commands/start.ts:298 uses { mode: 0o600 }",
+        "writeFile for version marker at cli/src/commands/setup.ts:95 uses { mode: 0o600 }",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Three types of files need restrictive permissions:\n\n1. platform/cli/src/commands/start.ts:284 — `createWriteStream(logFilePath, { flags: 'a' })` → change to `{ flags: 'a', mode: 0o600 }`\n2. platform/cli/src/commands/start.ts:309 — same pattern, `createWriteStream(logFilePath, { flags: 'a' })` → `{ flags: 'a', mode: 0o600 }`\n3. platform/cli/src/commands/start.ts:298 — `await writeFile(getPidFilePath(), String(pid))` → `await writeFile(getPidFilePath(), String(pid), { mode: 0o600 })`\n4. platform/cli/src/commands/setup.ts:95 — `await writeFile(versionMarkerPath, version, 'utf-8')` → `await writeFile(versionMarkerPath, version, { encoding: 'utf-8', mode: 0o600 })`\n\nFor createWriteStream, the `mode` option sets the file permissions when the file is created (same as the open(2) system call). For writeFile, the `mode` option is in the options object.\n\nNote: The pattern used elsewhere in the codebase for sensitive files is `atomicWrite(path, content, 0o600)` from @opentabs-dev/shared. For log and PID files, atomic write is not necessary (they are append-only or overwritten), so just adding the mode to the existing calls is sufficient."
+    },
+    {
+      "id": "US-004",
+      "title": "Remove wsSecret from /ws-info response body",
+      "description": "As a security-conscious developer, I want the /ws-info endpoint to stop reflecting the WebSocket secret in its JSON response, so that the secret is not unnecessarily exposed in HTTP response bodies that could be logged by debugging tools or proxies.",
+      "acceptanceCriteria": [
+        "The /ws-info handler at mcp-server/src/http-routes.ts returns Response.json({ wsUrl }) without wsSecret",
+        "The extension's offscreen/index.ts continues to work — it reads wsUrl from the response and secret from auth.json (never from the HTTP response)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/http-routes.ts, line 243. Change:\n\n```typescript\nreturn Response.json({ wsUrl, ...(state.wsSecret ? { wsSecret: state.wsSecret } : {}) });\n```\n\nTo:\n\n```typescript\nreturn Response.json({ wsUrl });\n```\n\nThe extension's offscreen document (platform/browser-extension/src/offscreen/index.ts) reads `wsInfo.wsUrl` from this response but never reads `wsInfo.wsSecret` — it loads the secret from auth.json via `bootstrapFromAuthFile()`. Verify by searching for `wsInfo.wsSecret` in the offscreen code — it does not exist. The type for the wsInfo response (if any) may need updating too — check for a shared type. Also check if any tests reference the wsSecret field in ws-info responses and update them."
+    },
+    {
+      "id": "US-005",
+      "title": "Reduce unauthenticated /health endpoint information disclosure",
+      "description": "As a security-conscious developer, I want the unauthenticated /health response to return only { status: 'ok' } without version or extensionConnected fields, so that unauthenticated callers cannot fingerprint the server version or detect user activity.",
+      "acceptanceCriteria": [
+        "Unauthenticated GET /health returns { status: 'ok' } only — no version, no extensionConnected",
+        "Authenticated GET /health continues to return the full response with all fields",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/http-routes.ts, lines 255-261. Change the unauthenticated branch from:\n\n```typescript\nif (!authenticated) {\n  return Response.json({\n    status: 'ok',\n    version,\n    extensionConnected: state.extensionWs !== null,\n  });\n}\n```\n\nTo:\n\n```typescript\nif (!authenticated) {\n  return Response.json({ status: 'ok' });\n}\n```\n\nThe authenticated response (below this block) continues to return the full details including version, extensionConnected, plugins, etc. Check if the CLI's `opentabs status` command relies on the unauthenticated /health response — it likely uses authenticated requests (with Bearer token), but verify. Also check E2E tests that might hit /health without auth and expect version or extensionConnected fields — update any assertions.\n\nAlso verify that the CLI's `opentabs doctor` command (if it exists) and any other consumers of /health handle the reduced unauthenticated response correctly."
+    }
+  ]
+}
