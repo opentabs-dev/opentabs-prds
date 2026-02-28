@@ -131,7 +131,7 @@ else
 fi
 
 # Set git identity for all consolidator commits (merges, conflict resolutions)
-git -C "$CODE_DIR" config user.name "Ralph"
+git -C "$CODE_DIR" config user.name "Ralph Wiggum"
 git -C "$CODE_DIR" config user.email "ralph@opentabs.dev"
 
 # --- Verify Claude CLI ---

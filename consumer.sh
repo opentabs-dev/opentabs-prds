@@ -228,7 +228,7 @@ else
 fi
 
 # Set git identity for queue repo commits (claims, reverts, done/archive)
-git -C "$QUEUE_DIR" config user.name "Ralph"
+git -C "$QUEUE_DIR" config user.name "Ralph Wiggum"
 git -C "$QUEUE_DIR" config user.email "ralph@opentabs.dev"
 
 # Code repo — full clone for worktrees
@@ -243,7 +243,7 @@ else
 fi
 
 # Set git identity for all consumer commits (auto-save, worktree branches)
-git -C "$CODE_DIR" config user.name "Ralph"
+git -C "$CODE_DIR" config user.name "Ralph Wiggum"
 git -C "$CODE_DIR" config user.email "ralph@opentabs.dev"
 
 # --- Docker Check (if using Docker) ---
