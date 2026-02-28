@@ -1,0 +1,43 @@
+## Codebase Patterns
+- configWriteMutex pattern (platform/mcp-server): extract async body into `const writePromise = (async () => { ... })()`, then `state.configWriteMutex = writePromise.catch(() => {})` (mutex always fulfills), then `await writePromise` (throws to caller). Used in config.ts saveConfig/saveToolConfig and now plugin-management.ts removeLocalPlugin.
+- Use `path.basename()` not `.split('/').pop()` for cross-platform path segment extraction.
+- appendAuditEntry is already imported in mcp-tool-dispatch.ts from ./state.js — add calls before every early-return in handleBrowserToolCall for full audit coverage.
+
+# Ralph Progress Log
+PRD: prd-2026-02-27-223131-mcp-server-audit-fixes~running.json
+Started: Sat Feb 28 06:31:56 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Fixed `removeLocalPlugin` in `platform/mcp-server/src/plugin-management.ts` to use correct configWriteMutex pattern: `const writePromise = (async () => { ... })()`, `state.configWriteMutex = writePromise.catch(() => {})`, `await writePromise`. Old pattern re-threw inside `.catch()`, making mutex hold a rejected promise on error.
+- Fixed path splitting bug: replaced `resolvedPath.split('/').pop() ?? ''` with `basename(resolvedPath)` (added `basename` to `node:path` import). Correct for Windows paths.
+- Files changed: `platform/mcp-server/src/plugin-management.ts`
+- **Learnings for future iterations:**
+  - The correct mutex pattern is used in config.ts lines 306-314 and 333-357 — always match that pattern for new mutex-guarded writes in this package.
+  - The pre-commit hook runs prettier + eslint --fix automatically on staged files, so minor formatting is handled.
+---
+
+## 2026-02-28 - US-002
+- Added `appendAuditEntry` calls before all four early-return paths in `handleBrowserToolCall` in `platform/mcp-server/src/mcp-tool-dispatch.ts`:
+  1. Tool disabled → `error.code: 'DISABLED'`
+  2. Permission policy deny → `error.code: 'PERMISSION_DENIED'`
+  3. User denied confirmation → `error.code: 'USER_DENIED'`
+  4. Confirmation timeout → `error.code: 'CONFIRMATION_TIMEOUT'`
+- Used `new Date().toISOString()` for timestamp and `0` for durationMs on all early-return paths (no execution took place).
+- Files changed: `platform/mcp-server/src/mcp-tool-dispatch.ts`
+- **Learnings for future iterations:**
+  - `appendAuditEntry` is already imported from `./state.js` at line 19 — no import changes needed.
+  - The `plugin` field must be `'browser'` for browser tool audit entries (consistent with the existing finally-block entry).
+  - All fast checks (build, type-check, lint, knip, test) passed without issues.
+---
+
+## 2026-02-28 - US-003
+- Fixed `detectPrimaryApiBaseUrl` in `platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts`:
+  1. Lines 332 & 335: changed `+ endpoint.callCount` to `+ 1` so each endpoint contributes 1 to its prefix counts regardless of call frequency.
+  2. Line 345: changed `endpoints.reduce((sum, e) => sum + e.callCount, 0)` to `endpoints.length` so `totalEndpoints` reflects the number of distinct endpoints.
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts`
+- **Learnings for future iterations:**
+  - The intent was always "count distinct endpoints per prefix" — the comment on the minCount line says "shared by at least 2 endpoints" confirming this.
+  - All three changes were surgical (3 lines); no surrounding logic needed adjustment.
+  - All fast checks passed immediately.
+---
