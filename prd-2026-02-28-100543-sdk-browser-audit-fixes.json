@@ -1,0 +1,89 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix a real bug in fetchFromPage abort error classification and add missing test coverage for critical browser-context edge cases in the Plugin SDK (dom, fetch, storage, log utilities).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix fetchFromPage abort error misclassification and add tests",
+      "description": "As a plugin developer, I want fetchFromPage to correctly classify user-initiated aborts so that my error handling logic receives the right error code and retryable flag instead of a misleading retryable network_error.",
+      "acceptanceCriteria": [
+        "When fetchFromPage is called with an AbortSignal that is aborted with a non-DOMException reason (e.g., controller.abort(new Error('custom'))), the thrown ToolError has code 'aborted', NOT code 'network_error'",
+        "When fetchFromPage is called with an AbortSignal that is aborted with a non-DOMException reason, the thrown ToolError is NOT marked retryable (retryable: false or undefined)",
+        "The existing behavior for DOMException AbortError (code 'aborted') is preserved",
+        "The existing behavior for DOMException TimeoutError (code 'TIMEOUT', retryable: true) is preserved",
+        "The existing behavior for real network errors (code 'network_error', retryable: true) is preserved",
+        "A new test verifies that aborting with a non-DOMException reason produces a ToolError with code 'aborted'",
+        "A new test verifies that aborting with a non-DOMException reason does NOT produce a retryable error",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "BUG: In platform/plugin-sdk/src/fetch.ts lines 68-78, the catch block in fetchFromPage checks `error instanceof DOMException` for both TimeoutError and AbortError. When a user aborts with `controller.abort(new Error('custom'))`, fetch() throws that plain Error (per spec: fetch rejects with signal.reason). Since it's not a DOMException, both instanceof checks fail, and the code falls through to line 75 which creates a ToolError with code 'network_error', category 'internal', retryable: true. This is wrong — user aborts should produce code 'aborted'.\n\nFIX: After the two DOMException checks, add a check for AbortError-like behavior before the network error fallback. The simplest approach: check if the error is the abort reason from the signal. Since AbortSignal.any merges signals, check if any of the input signals are aborted. Alternatively, check if `error === combinedSignal.reason` and the signal is aborted — this catches both DOMException and non-DOMException abort reasons in one check. A clean fix:\n\n```typescript\n// After the two existing DOMException checks:\nif (combinedSignal.aborted) {\n  throw new ToolError(`fetchFromPage: request aborted for ${url}`, 'aborted');\n}\n```\n\nThis works because: if we reach the catch block AND the combined signal is aborted, the error was caused by the abort — regardless of whether the reason is a DOMException or a plain Error. The TimeoutError check must remain BEFORE this (it's already first) because AbortSignal.timeout sets the signal to aborted state when it fires.\n\nWait — that would also catch TimeoutError. The TimeoutError check is already handled above and throws, so by the time we reach this line, we know it's NOT a timeout. So the check is safe.\n\nActually, simplest correct fix: reorder to check TimeoutError first (already done), then check `combinedSignal.aborted` (covers ALL abort cases including non-DOMException), then fall through to network error. This replaces the DOMException AbortError check with a broader one.\n\nFiles to edit:\n- platform/plugin-sdk/src/fetch.ts (lines 68-78 in the catch block)\n- platform/plugin-sdk/src/fetch.test.ts (add new tests in the fetchFromPage describe block)\n\nThe test file uses a real HTTP server (createServer from node:http), not fetch mocks. For abort tests, you can use AbortController directly — no server endpoint needed since the request is aborted before completing."
+    },
+    {
+      "id": "US-002",
+      "title": "Add missing getCookie SecurityError test",
+      "description": "As a platform maintainer, I want the getCookie SecurityError handling to be tested so that I can confidently refactor the storage module without breaking sandboxed-iframe compatibility.",
+      "acceptanceCriteria": [
+        "A new test in getCookie describe block verifies that getCookie returns null when document.cookie getter throws a SecurityError (DOMException)",
+        "The test mocks document.cookie to throw, calls getCookie, and asserts the return value is null",
+        "The test restores the original document.cookie behavior after the test (no test pollution)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The getCookie function in platform/plugin-sdk/src/storage.ts (lines 82-99) has an outer try-catch that returns null when document.cookie access throws. This handles SecurityError in sandboxed iframes. However, platform/plugin-sdk/src/storage.test.ts has no test for this path — all existing getCookie tests mock document.cookie with a getter that returns a string.\n\nAdd a test similar to the existing SecurityError tests for localStorage/sessionStorage (see lines 49-61 for the pattern). Mock document.cookie to throw a DOMException('Access denied', 'SecurityError'), call getCookie('anything'), and assert null is returned. Restore the original document.cookie after.\n\nThe test file uses happy-dom (GlobalWindow). The existing cookie tests use Object.defineProperty(win.document, 'cookie', { get: () => ... }) pattern — follow the same pattern but make the getter throw.\n\nFile to edit: platform/plugin-sdk/src/storage.test.ts (add test in the getCookie describe block around line 277)"
+    },
+    {
+      "id": "US-003",
+      "title": "Add missing log serialization tests for nested non-serializable values",
+      "description": "As a platform maintainer, I want the log serialization tests to cover nested non-serializable values (functions, symbols, bigints inside objects) so that the JSON.stringify replacer behavior is verified and won't regress.",
+      "acceptanceCriteria": [
+        "A new test verifies that logging an object containing a function value serializes the function as '[Function: name]' within the object",
+        "A new test verifies that logging an object containing a bigint value serializes the bigint as '[BigInt: N]' within the object",
+        "A new test verifies that logging an object containing a symbol value serializes the symbol as '[Symbol: desc]' within the object",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In platform/plugin-sdk/src/log.ts, the safeSerializeArg function (lines 31-95) handles top-level functions, symbols, and bigints at lines 42-44. But when these appear as VALUES inside an object, they go through the JSON.stringify replacer at lines 78-87. The replacer handles functions (line 83), bigints (line 84), and symbols (line 85).\n\nExisting tests in platform/plugin-sdk/src/log.test.ts cover top-level functions (line 157), symbols (line 166), and bigints (line 174), but NOT when they appear nested inside objects. The replacer path is untested.\n\nAdd tests in the 'safe serialization' describe block. Example:\n\n```typescript\ntest('serializes functions nested inside objects via JSON replacer', () => {\n  const entries = collect();\n  log.info('test', { callback: function myCallback() {} });\n  const data = entries[0]?.data[0] as Record<string, unknown>;\n  expect(data?.callback).toBe('[Function: myCallback]');\n});\n```\n\nSimilar tests for bigint and symbol values inside objects.\n\nFile to edit: platform/plugin-sdk/src/log.test.ts (add tests in the 'safe serialization' describe block)"
+    },
+    {
+      "id": "US-004",
+      "title": "Add observeDOM cleanup verification test",
+      "description": "As a platform maintainer, I want a test that verifies observeDOM's cleanup function actually stops the observer so that resource leak regressions are caught.",
+      "acceptanceCriteria": [
+        "A new test in the observeDOM describe block verifies that after calling the cleanup function, subsequent DOM mutations on the observed element do NOT trigger the callback",
+        "The test sets up an observer, calls the cleanup function, adds a child to the observed element, waits briefly, and asserts the callback was NOT called after cleanup",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In platform/plugin-sdk/src/dom.test.ts, the observeDOM tests (lines 190-222) have a test at line 191 that calls disconnect() but never verifies that subsequent mutations are ignored. The test just checks 'typeof disconnect === function' and that the callback WAS called before disconnect.\n\nAdd a new test that:\n1. Creates a container element\n2. Sets up observeDOM on it with a counter callback\n3. Adds a child (triggers callback, counter = 1)\n4. Waits for MutationObserver to fire (setTimeout 50ms, same pattern as existing test)\n5. Calls the cleanup function\n6. Adds another child to the container\n7. Waits again (setTimeout 50ms)\n8. Asserts the counter is still 1 (not 2)\n\nThe test file uses happy-dom's GlobalWindow and MutationObserver. Follow the existing pattern at lines 191-209.\n\nFile to edit: platform/plugin-sdk/src/dom.test.ts (add test in the observeDOM describe block)"
+    }
+  ]
+}
