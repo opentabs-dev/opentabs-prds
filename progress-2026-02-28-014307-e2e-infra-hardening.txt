@@ -1,0 +1,50 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-014307-e2e-infra-hardening~running.json
+Started: Sat Feb 28 09:55:06 UTC 2026
+---
+
+## Codebase Patterns
+- E2E tests create temp dirs with `mkdtemp` using prefixes like `opentabs-e2e-config-`, `opentabs-e2e-plugin-copy-`, and `opentabs-e2e-` (for Chromium user-data and extension dirs)
+- MCP servers are spawned with `node /path/to/dist/dev-proxy.js` (hot) or `node /path/to/dist/index.js --dev` (non-hot); the configDir is passed via `OPENTABS_CONFIG_DIR` env var, NOT as a command line argument
+- Chromium instances have `--user-data-dir` and `--load-extension` paths containing `opentabs-e2e-`, making bare `pgrep -f "opentabs-e2e-"` match browsers
+- On macOS, `pgrep -f` may inspect env vars (via `sysctl KERN_PROCARGS2`), making it match MCP server processes via their env var; on Linux it only searches the argv[], not env vars
+- `e2e/orphan-guard.ts` handles MCP server cleanup via parent-process polling — the global teardown is a last-resort safety net for any remaining processes
+- Phase 1 (build + type-check + lint + knip + test) is sufficient for stories with `e2eCheckpoint: false`
+- In E2E tests, always declare `let server: McpServer | undefined` before the try block and assign inside it; use `server?.kill()` in finally to prevent cleanup skips when startMcpServer rejects
+- ESLint rule `import-x/consistent-type-specifier-style` requires top-level `import type { Foo }` rather than inline `type Foo` within a value import; and `import-x/order` requires the type import to follow all node: imports in the same group
+
+---
+
+## 2026-02-28 - US-001
+- Changed `killOrphanedProcesses` to pass `'node.*opentabs-e2e-'` instead of `'opentabs-e2e-'` for Unix pgrep
+- The bare pattern was overly broad: Playwright-launched Chromium instances have `--user-data-dir=/tmp/opentabs-e2e-xxx/` and `--load-extension=/tmp/opentabs-e2e-xxx/extension` in their command lines, so they matched
+- The node-scoped pattern also eliminates pgrep self-matching (pgrep's own cmdline is `pgrep -f ...`, not `node ...`)
+- Files changed: `e2e/global-teardown.ts`
+- **Learnings for future iterations:**
+  - `pgrep -f` on Linux only matches argv[], not environment variables — env vars are only visible via `pgrep -f` on macOS (sysctl-based)
+  - MCP server cmdlines don't contain `opentabs-e2e-` on Linux; orphan-guard.ts is the primary MCP server cleanup mechanism
+  - The global teardown is mainly useful for catching Chromium orphans and (on macOS) MCP server orphans via env var matching
+---
+
+## 2026-02-28 - US-002
+- Restructured all 5 tests in `e2e/npm-discovery.e2e.ts` to move `startMcpServer` inside the `try` block
+- Changed `const server = await startMcpServer(...)` (before try) to `let server: McpServer | undefined` (before try) + `server = await startMcpServer(...)` (first line of try)
+- Changed `server.kill()` to `server?.kill()` and `client.close()` to `client?.close()` in all finally blocks
+- Added `import type { McpServer, McpClient } from './fixtures.js'` as a separate top-level type import (after node: imports) to satisfy ESLint `import-x/consistent-type-specifier-style` and `import-x/order` rules
+- Files changed: `e2e/npm-discovery.e2e.ts`
+- **Learnings for future iterations:**
+  - ESLint requires `import type { Foo }` as a top-level statement, not inline `type Foo` within a value import; and the type import must be placed after all node: imports in the ordering
+  - The fix pattern: declare `let server: McpServer | undefined` before try, assign inside try, use `server?.kill()` in finally
+  - Same pattern applies to `McpClient` in tests that use both server and client
+---
+
+## 2026-02-28 - US-003
+- Added try/catch around `fs.readdirSync(adaptersDir)` in `waitForExecFileCleanup` in `e2e/browser-tools.e2e.ts`
+- When the directory is missing (ENOENT), the catch block returns `true` (no directory = no exec files = clean), allowing the `waitFor` predicate to succeed immediately
+- Other errors are re-thrown to preserve existing behavior (permission denied, etc.)
+- Files changed: `e2e/browser-tools.e2e.ts`
+- **Learnings for future iterations:**
+  - `waitFor` in `e2e/helpers.ts` does NOT catch predicate errors — exceptions propagate and bypass the timeout mechanism entirely, causing immediate test failures
+  - When polling for filesystem state, always handle ENOENT explicitly: a missing directory/file is often a valid "done" state, not an error
+  - Pattern: `try { ... } catch (err) { if ((err as NodeJS.ErrnoException).code === 'ENOENT') return true; throw err; }`
+---
