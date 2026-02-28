@@ -1,0 +1,51 @@
+## Codebase Patterns
+- E2E test assertions: use `expect(array).toContainEqual(expect.objectContaining({...}))` instead of `find()+toBeDefined()` or `Set.has().toBe(true)` — shows actual array on failure
+- `expect.stringContaining('...')` works inside `objectContaining` for partial string matches in toContainEqual
+- `expect.stringMatching(/regex/)` also works inside `objectContaining` for regex matches
+- E2E tests use Phase 1 (no test:e2e) for stories with `e2eCheckpoint: false`
+- Browser tools E2E tests use `testServer` fixture; to add WebSocket support, add a `/ws` upgrade handler and `/ws-test` HTML page to `e2e/test-server.ts`
+- The `ws` package is a root dependency — available for import in E2E test server code
+- Import order: `ws` (third-party) must come before `node:http` (node builtins) per ESLint import-x/order rule
+- `waitForWebSocketFrames` polling helper follows the same pattern as `waitForNetworkRequests` in browser-tools.e2e.ts
+- Side panel detection: `extension_get_side_panel` sends `chrome.runtime.sendMessage({ type: 'sp:getState' })` from the background; App.tsx listens and responds with `{ state, html }`; timeout (3s) → `{ open: false }`
+- Opening side panel via Playwright (`openSidePanel(extensionContext)`) works with the detection mechanism — the React app registers the listener and responds to `sp:getState`
+- Use `waitFor` polling after `openSidePanel` to wait for React to mount before asserting `open: true`
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-014307-e2e-assertion-coverage~running.json
+Started: Sat Feb 28 09:43:40 UTC 2026
+---
+
+## 2026-02-28 09:49 - US-001
+- Replaced 10 assertion sites in e2e/analyze-site.e2e.ts with `toContainEqual(expect.objectContaining({...}))` for better failure diagnostics
+- Changed patterns: `Set.has().toBe(true)` (authTypes + trpcMethods), `find()+toBeDefined()+optional-chain` (graphql_query, subscribe_realtime), `find()+if` blocks (list_items, create_items, list_users)
+- Files changed: e2e/analyze-site.e2e.ts
+- **Learnings for future iterations:**
+  - The file had NO `.some(s =>).toBe(true)` patterns as the PRD notes suggested; the existing patterns were `find()+toBeDefined` and `Set.has().toBe(true)` instead
+  - Lines over ~100 chars trigger prettier/eslint errors — multi-line object format inside `objectContaining` is required for longer assertions
+  - Pre-commit hook runs prettier+eslint fix automatically on staged files, which is a safety net
+---
+
+## 2026-02-28 09:57 - US-002
+- Added WebSocket server endpoint (`/ws`) and test page (`/ws-test`) to `e2e/test-server.ts` using the `ws` package
+- Added `waitForWebSocketFrames` polling helper in `e2e/browser-tools.e2e.ts` (mirrors `waitForNetworkRequests` pattern)
+- Added new `test.describe('Browser tools — WebSocket frame capture')` block with two tests:
+  1. `captures sent and received WebSocket frames` — verifies frame shape (url, direction, data, opcode, timestamp), received hello message, and sent ping message
+  2. `clear=true empties the WebSocket frame buffer` — verifies `clear` parameter drains the frame buffer
+- Files changed: e2e/test-server.ts, e2e/browser-tools.e2e.ts
+- **Learnings for future iterations:**
+  - Network capture must be enabled BEFORE navigating to the WebSocket page — the extension captures `Network.webSocketCreated` events via CDP, so the debugger must be attached first
+  - The test server's WebSocket handler echoes back messages, making it easy to verify both sent and received frames
+  - ESLint import-x/order requires third-party imports (`ws`) before node builtins (`node:http`)
+---
+
+## 2026-02-28 10:05 - US-003
+- Added positive test for `extension_get_side_panel` returning `{ open: true }` when side panel is open
+- Added `openSidePanel` to the import in `e2e/browser-tools.e2e.ts` (requires multi-line import format per prettier)
+- Test opens side panel via `openSidePanel(extensionContext)`, polls `extension_get_side_panel` with `waitFor` until `open: true`, asserts the result, then closes the page in `finally`
+- Files changed: e2e/browser-tools.e2e.ts
+- **Learnings for future iterations:**
+  - The `sp:getState` detection mechanism works correctly in the Playwright test environment — opening the side panel URL as a regular page loads the React app which registers the `chrome.runtime.onMessage` listener
+  - `openSidePanel` in helpers.ts uses `waitUntil: 'load'` but that's the HTML load, not React mounting — always use `waitFor` polling to wait for the listener to become active before asserting `open: true`
+  - The `extensionContext` fixture is a `BrowserContext` and can be passed directly to `openSidePanel`
+---
