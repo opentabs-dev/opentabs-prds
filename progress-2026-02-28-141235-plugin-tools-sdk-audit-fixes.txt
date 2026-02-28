@@ -1,0 +1,44 @@
+## Codebase Patterns
+- `pluginCacheKey` in `platform/plugin-tools/src/commands/build.ts` (line 47) is a module-scope counter used to bust the Node.js ESM module cache via `?t=N` query param on dynamic imports
+- Node.js ESM module cache is keyed by the full URL (including query string), so each unique `?t=N` gets a fresh module load
+- plugin-tools build.ts uses spawnSync for running tsc; on Windows, `shell: true` is required to resolve `.cmd` wrappers in node_modules/.bin
+- `fetchJSONImpl` in `platform/plugin-sdk/src/fetch.ts` handles 204 No Content by returning `undefined` (no schema) or throwing `ToolError.validation` with a clear "no body to validate" message (with schema)
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-141235-plugin-tools-sdk-audit-fixes~running.json
+Started: Sat Feb 28 22:13:06 UTC 2026
+---
+
+## [2026-02-28] - US-001
+- Fixed watch-mode module cache bug in `platform/plugin-tools/src/commands/build.ts`
+- Changed `pluginCacheKey = (pluginCacheKey + 1) % 2` (modulo 2) to `pluginCacheKey++` (monotonically increasing)
+- Updated the comment to explain that a unique URL per rebuild prevents stale Node.js ESM module cache hits
+- Files changed: `platform/plugin-tools/src/commands/build.ts` (lines 1032-1034)
+- **Learnings for future iterations:**
+  - The `pluginCacheKey` variable is declared at module scope (line 47) as `let pluginCacheKey = 0;`
+  - Node.js ESM cache is keyed by the full module URL including query string; `?t=N` busts the cache
+  - The old modulo-2 approach caused builds 3, 5, 7... to reuse URLs from builds 1, 3, 5... (stale cache)
+  - The monotonically increasing counter trades bounded cache growth for correctness; this is the right tradeoff for a watch session
+---
+
+## [2026-02-28] - US-002
+- Fixed tsc spawn failing on Windows in `platform/plugin-tools/src/commands/build.ts`
+- Added `shell: true` to the `spawnSync('tsc', [], { ... })` call at line 1010
+- The PATH augmentation (`envWithBin`) is preserved and works correctly with `shell: true`
+- Files changed: `platform/plugin-tools/src/commands/build.ts` (line 1010)
+- **Learnings for future iterations:**
+  - On Windows, `spawnSync` without `shell: true` cannot find `.cmd` wrapper scripts (e.g., `tsc.cmd`) in `node_modules/.bin/` even if they are on the PATH
+  - Adding `shell: true` delegates executable resolution to the OS shell, which handles `.cmd` files correctly on Windows while remaining fully functional on Unix
+  - The `envWithBin` PATH augmentation still works with `shell: true` — the shell inherits the modified env
+---
+
+## [2026-02-28] - US-003
+- Fixed misleading error message in `fetchJSONImpl` when a 204 No Content response is received with a schema
+- Instead of falling through to `schema.safeParse(undefined)` (which produces a generic "failed schema validation" message), the code now throws immediately with a clear message: "expected JSON response from URL but received 204 No Content — the server returned no body to validate"
+- Updated the test in `platform/plugin-sdk/src/fetch.test.ts` to check for the new message ('204 No Content' and 'no body to validate') instead of 'failed schema validation'
+- Files changed: `platform/plugin-sdk/src/fetch.ts` (lines 104-115), `platform/plugin-sdk/src/fetch.test.ts` (lines 576-588)
+- **Learnings for future iterations:**
+  - The 204+schema case is handled early in `fetchJSONImpl`, before the schema validation block — throw there instead of letting safeParse produce a confusing error
+  - The existing test server has a `/no-content` endpoint that responds with 204; no new test infrastructure was needed
+  - The fix is surgical: 3 lines added, 1 removed; the no-schema path (`return undefined`) is unchanged
+---
