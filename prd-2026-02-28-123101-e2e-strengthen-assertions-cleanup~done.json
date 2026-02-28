@@ -18,7 +18,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: e2e/audit-logging.e2e.ts\n\nThe test invokes exactly two tools on lines ~74-82 (e2e-test_echo and e2e-test_failing_tool), then fetches the audit log. The current assertions use .toBeGreaterThanOrEqual() which is too permissive — they'd pass even if extra entries leaked in from other operations.\n\nFix approach:\n1. After fetching audit entries, filter by toolName to isolate entries from THIS test's operations. The audit entry schema likely includes a `toolName` field — read the fetchAudit helper and the audit entries to understand the structure.\n2. Replace `expect(entries.length).toBeGreaterThanOrEqual(2)` with an exact count assertion on filtered entries.\n3. For the success/failure filter (lines ~111-112), filter by the specific tool names and then check counts.\n4. For line ~138, same approach — filter to the tool being tested.\n\nThe key insight is that the MCP server maintains an in-memory audit log of the last 500 invocations (see platform/mcp-server/CLAUDE.md). In tests using fixtures, each test gets an isolated MCP server, so the audit log should only contain entries from the current test. If that's the case, exact counts are safe. Verify by checking whether the fixture creates a fresh server per test."
@@ -38,7 +38,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "File: e2e/analyze-site.e2e.ts\nAlso read: e2e/analyze-site-test-server.ts (to understand what each scenario serves)\n\nThe analyze-site test server serves multiple scenarios (cookie-session, jwt-localstorage, graphql, jsonrpc-app, nextjs-app, apikey-app, trpc-app, mixed-auth, websocket-app, spa-app, suggestions-app, jwt-sessionstorage, basicauth-app). Each scenario has specific, known API endpoints and auth patterns.\n\nCurrent pattern (repeated ~15 times):\n```typescript\nexpect(cookieMethods.length).toBeGreaterThanOrEqual(1);\nexpect(restEndpoints.length).toBeGreaterThanOrEqual(1);\n```\n\nFix approach: For each test scenario, look at what the test server actually serves and what the analyze_site tool should detect. Then:\n\n1. For auth method assertions: Use toContainEqual() to verify specific expected auth method objects, or use exact counts based on the scenario.\n2. For endpoint assertions: Use toContainEqual() to verify specific expected endpoints are detected (by URL path or protocol), rather than just counting.\n3. For suggestion assertions: Similarly use specific expected suggestions.\n\nExample fix for cookie-session scenario:\n```typescript\n// Instead of:\nexpect(cookieMethods.length).toBeGreaterThanOrEqual(1);\n// Use:\nexpect(cookieMethods).toContainEqual(expect.objectContaining({ type: 'cookie-session' }));\n// Or if exact count is known:\nexpect(cookieMethods.length).toBe(1);\n```\n\nBe careful: the detection is heuristic-based, so some scenarios may detect variable numbers of endpoints depending on timing (network capture). For those, use toContainEqual() with specific expected entries rather than exact counts. The goal is to verify specific expected detections are present, not just that 'something' was detected.\n\nThis is marked opus because it requires reading and understanding both the test file and the analyze-site test server to determine correct expected values for each scenario."
@@ -58,7 +58,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: e2e/dispatch-resilience.e2e.ts\n\nAround line ~747, a raw WebSocket is created to test malformed message handling:\n```typescript\nconst rawWs = rawProtocols.length > 1 ? new WebSocket(rawWsUrl, rawProtocols) : new WebSocket(rawWsUrl);\nawait new Promise<void>((resolve, reject) => {\n  rawWs.onopen = () => resolve();\n  rawWs.onerror = () => reject(new Error('Raw WebSocket connect failed'));\n  setTimeout(() => reject(new Error('Raw WebSocket connect timeout')), 5_000);\n});\n\n// ... test logic with malformed messages ...\n\n// Close the raw WS and wait for the real extension to reconnect\nrawWs.close();\nawait waitForExtensionConnected(mcpServer, 45_000);\n```\n\nIf any assertion or operation between the connection open and rawWs.close() throws, the WebSocket leaks. Wrap the test logic in try-finally:\n```typescript\ntry {\n  // ... test logic with malformed messages ...\n} finally {\n  rawWs.close();\n}\nawait waitForExtensionConnected(mcpServer, 45_000);\n```\n\nNote: The waitForExtensionConnected should stay OUTSIDE the finally block because it needs the raw WS to be closed first (the real extension needs to reconnect). But if it fails, that's a test failure, not a resource leak."
@@ -78,7 +78,7 @@
         "npm run test:e2e passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "sonnet",
       "notes": "File: e2e/sdk-version.e2e.ts\n\nThe test around lines 83-122 creates a server and has a try-finally for cleanup:\n```typescript\nconst server = await startMcpServer(configDir, false);\n\ntry {\n  // test assertions\n} finally {\n  await server.kill();\n  cleanupTestConfigDir(configDir);\n  fs.rmSync(tmpDir, { recursive: true, force: true });\n}\n```\n\nThis is actually safe because startMcpServer is the last statement before try. However, the cleanup in the finally block should be more defensive — if server.kill() throws, the subsequent cleanups don't run.\n\nFix: Make cleanup operations independent so each runs even if a previous one throws:\n```typescript\nfinally {\n  await server.kill().catch(() => {});\n  try { cleanupTestConfigDir(configDir); } catch { /* best effort */ }\n  try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }\n}\n```\n\nCheck all standalone test blocks in the file (there may be 2-3 similar tests) and apply the same pattern. Look at how the fixture pattern in fixtures.ts handles cleanup for comparison — it wraps each cleanup in catch(() => {})."

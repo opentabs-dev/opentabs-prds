@@ -1,0 +1,54 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-123101-e2e-strengthen-assertions-cleanup~running.json
+Started: Sat Feb 28 20:31:32 UTC 2026
+---
+
+## Codebase Patterns
+- setupToolTest polls e2e-test_get_status repeatedly, so audit log always has extra entries beyond the test's explicit calls — always filter by specific tool names before counting
+- Each fixture-based test gets an isolated MCP server with a fresh in-memory audit log — filtered exact counts are safe
+- Prettier config: printWidth=120, singleQuote, trailingComma=all, arrowParens=avoid
+- analyze-site test server scenarios serve deterministic HTML with known API calls, auth patterns, and DOM — exact counts via `toHaveLength` are safe for single-source detections
+- API endpoints are deduplicated by URL+method in the analyze-site tool — multiple requests to the same URL+method yield 1 entry
+- `/api/auth.check` (extension isReady polling) appears in analyze-site REST endpoint captures — filter to app-specific URL path (e.g., `e.url.includes('/websocket-app/')`) when asserting exact REST endpoint counts to exclude this contaminant
+
+## [2026-02-28] - US-001
+- Tightened audit-logging.e2e.ts entry count assertions to use filtered exact counts
+- Files changed: e2e/audit-logging.e2e.ts
+- **Learnings for future iterations:**
+  - `setupToolTest` polls `e2e-test_get_status` repeatedly before the test, so the audit log always has more entries than just the test's explicit tool calls — never use bare `entries.length` counts
+  - Each fixture-based test gets an isolated MCP server with a fresh in-memory audit log, so filtered exact counts (filtering by specific tool names invoked in the test) are safe and appropriate
+  - Filter by `e.tool === 'expected_tool'` to isolate test-specific entries from setup noise
+  - Prettier config: printWidth=120, singleQuote, trailingComma=all, arrowParens=avoid — keep filter callbacks on one line if they fit within 120 chars
+---
+
+## [2026-02-28] - US-002
+- Tightened analyze-site.e2e.ts assertions to use exact counts (`toHaveLength`) and specific value checks (`toContainEqual`) instead of `toBeGreaterThanOrEqual(1)`
+- Files changed: e2e/analyze-site.e2e.ts
+- **Learnings for future iterations:**
+  - Each test scenario in the analyze-site test server serves known, deterministic HTML with specific API calls, auth patterns, and DOM elements — exact counts are safe for auth methods, forms, and endpoints with a single source
+  - For heuristic detections that depend on network capture timing (e.g., CSRF header detection in mixed-auth), keep `toBeGreaterThanOrEqual` with an appropriate minimum count
+  - API endpoints are deduplicated by URL+method, so 3 POST requests to `/graphql` appear as 1 graphql endpoint entry
+  - tRPC endpoints are NOT deduplicated across procedures (different procedure paths = separate entries), so `user.list`, `item.list`, `item.create` yields multiple entries
+  - Use `toContainEqual(expect.objectContaining({...}))` for REST endpoint assertions where exact count varies but specific URLs are known
+  - Use `toHaveLength(n)` where exact count is deterministic (e.g., auth methods from a single source, forms from known HTML, WebSocket connections)
+---
+
+## [2026-02-28] - US-003
+- Added try-finally cleanup for raw WebSocket in dispatch-resilience.e2e.ts malformed-message test
+- Files changed: e2e/dispatch-resilience.e2e.ts
+- **Learnings for future iterations:**
+  - Pattern: wrap test logic between resource creation and cleanup in try-finally to prevent resource leaks on assertion failures
+  - `waitForExtensionConnected` must stay OUTSIDE the finally block — it waits for the real extension to reconnect after the raw WS closes, so the WS must already be closed before calling it
+  - Indented inner code in try block by 2 more spaces (from 4 to 6 from test body base) — consistent with Prettier's formatting
+---
+
+## [2026-02-28] - US-004
+- Made cleanup operations in sdk-version.e2e.ts standalone test finally blocks defensive: `server.kill().catch(() => {})` and `fs.rmSync` wrapped in try-catch
+- Fixed analyze-site.e2e.ts WebSocket test REST endpoint assertion: filter to app-specific URL path to exclude `/api/auth.check` extension polling calls
+- Files changed: e2e/sdk-version.e2e.ts, e2e/analyze-site.e2e.ts
+- **Learnings for future iterations:**
+  - `server.kill()` can throw if the server has already exited — always add `.catch(() => {})` when calling it in a finally block to prevent blocking subsequent cleanup operations
+  - `cleanupTestConfigDir` already wraps its rmSync in try-catch internally (best-effort) — it won't throw, but `fs.rmSync(tmpDir, ...)` in tests needs its own try-catch
+  - The extension's `isReady()` polling makes `POST /api/auth.check` calls that are captured by analyze-site's network capture — when asserting exact REST endpoint counts for an app at a sub-path, filter to `e.url.includes('/app-path/')` to exclude the auth.check contaminant
+  - Phase 2 (E2E) failures from US-002 changes can surface here when asserting exact counts — always run E2E after assertion tightening to catch timing-sensitive contaminants
+---
