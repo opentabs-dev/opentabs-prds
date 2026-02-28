@@ -17,7 +17,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts line 83.\n\nCurrent code in the executeInTab finally block:\n```\n  } finally {\n    void deleteExecFile(filename);\n  }\n```\n\nCompare with the correct pattern in platform/mcp-server/src/browser-tools/execute-script.ts which awaits the deletion:\n```\n    } finally {\n      await deleteExecFile(filename);\n    }\n```\n\nFix: Change `void deleteExecFile(filename)` to:\n```\n    try {\n      await deleteExecFile(filename);\n    } catch {\n      // Best-effort cleanup\n    }\n```\n\nThe try-catch is needed because executeInTab runs 12+ times per analysis, and we don't want a single file deletion failure to abort the entire analysis. The execute-script.ts handler doesn't need the try-catch because it's a single execution where a failed delete should propagate."
@@ -37,7 +37,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/browser-tools/disable-network-capture.ts (24 lines).\n\nCurrent handler:\n```\n  handler: async (args, state) => {\n    const result = await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId: args.tabId });\n    state.activeNetworkCaptures.delete(args.tabId);\n    return result;\n  },\n```\n\nIf dispatchToExtension throws (extension disconnected, timeout), the delete never runs. The server then thinks capture is still active for that tab.\n\nFix: Move the delete into a finally block:\n```\n  handler: async (args, state) => {\n    try {\n      return await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId: args.tabId });\n    } finally {\n      state.activeNetworkCaptures.delete(args.tabId);\n    }\n  },\n```\n\nThis ensures the tracking state is cleaned up regardless of dispatch outcome. If the dispatch failed, the capture may or may not still be running in the extension, but the server-side tracking should reflect 'not active' since we can't know the true state."
@@ -57,7 +57,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts.\n\nThe analyzeSite function signature already receives `state: ServerState` as a parameter.\n\nThree locations need changes:\n\n1. After enabling capture (~line 829-832):\n```\n    await dispatchToExtension(state, 'browser.enableNetworkCapture', {\n      tabId,\n      maxRequests: 200,\n    });\n```\nAdd: `state.activeNetworkCaptures.add(tabId);`\n\n2. In the error catch block (~line 957-963) where capture is disabled as best-effort:\n```\n    } catch {\n      try {\n        await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId });\n      } catch {\n        // Best-effort cleanup\n      }\n    }\n```\nAdd: `state.activeNetworkCaptures.delete(tabId);` after the inner try-catch.\n\n3. In the finally block (~line 1034-1040):\n```\n    try {\n      await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId });\n    } catch {\n      // Best-effort cleanup\n    }\n```\nAdd: `state.activeNetworkCaptures.delete(tabId);` after the try-catch."
@@ -77,7 +77,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/browser-tools/export-har.ts lines 199-212.\n\nCurrent code (unsafe cast):\n```\n    const requestsResult = (await dispatchToExtension(state, 'browser.getNetworkRequests', {\n      tabId: args.tabId,\n      ...(args.clear !== undefined ? { clear: args.clear } : {}),\n    })) as { requests: CapturedRequest[] };\n\n    const entries = requestsResult.requests.map(requestToHarEntry);\n```\n\nIf the dispatch returns a plain array (or a shape without .requests), `requestsResult.requests` is undefined, and `.map()` throws.\n\nThe correct pattern is already used in analyze-site/index.ts lines 950-956:\n```\n      const networkResult = (await dispatchToExtension(state, 'browser.getNetworkRequests', {\n        tabId,\n        clear: true,\n      })) as { requests: NetworkRequest[] } | NetworkRequest[];\n      networkRequests = Array.isArray(networkResult)\n        ? networkResult\n        : ((networkResult as { requests?: NetworkRequest[] }).requests ?? []);\n```\n\nApply the same pattern to both requestsResult and framesResult in export-har.ts."
