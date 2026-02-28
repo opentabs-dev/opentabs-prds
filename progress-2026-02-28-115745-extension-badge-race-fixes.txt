@@ -1,0 +1,35 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-115745-extension-badge-race-fixes~running.json
+Started: Sat Feb 28 19:58:22 UTC 2026
+---
+
+## Codebase Patterns
+- `confirmation-badge.ts` owns all badge state: `pendingConfirmationCount`, `confirmationTimeouts` (Map), and now `clearedConfirmationIds` (Set). Module-level state is reset via `clearAllConfirmationBadges()`.
+- `clearAllConfirmationBadges()` is used as the reset mechanism in `beforeEach` tests — any new module-level state must be cleared there.
+- Tests use `vi.useFakeTimers()` + `vi.advanceTimersByTime()` for timeout testing. Module is imported with top-level await (`await import('./confirmation-badge.js')`).
+- `background-message-handlers.ts`: `wsConnected` is in-memory state, restored from `chrome.storage.session` asynchronously via `restoreWsConnectedState()`. Cleanup functions (`clearTabStateCache`, `clearAllConfirmationBadges`) are idempotent — safe to call regardless of prior state.
+- `background-message-handlers.test.ts`: uses `vi.hoisted()` + `vi.mock()` to bind mocks before module load; the module is imported at top level with `await import(...)`. `beforeEach` drives `wsConnected` to a known state then calls `vi.clearAllMocks()`.
+
+## [2026-02-28] - US-001
+- Added `clearedConfirmationIds = new Set<string>()` to track which confirmation IDs have been cleared
+- Updated `clearConfirmationBadge(id?)` to be idempotent when an ID is provided: if ID is already in the set, return early without decrementing; otherwise add to set and proceed
+- Updated `notifyConfirmationRequest` to call `clearedConfirmationIds.delete(id)` in the `else` branch (new/re-used ID) so a re-used ID can be cleared again after `clearAllConfirmationBadges` reset
+- Updated `clearAllConfirmationBadges` to also call `clearedConfirmationIds.clear()`
+- Added 5 new tests covering: idempotent double-clear, background+sidepanel race, 3-confirmation scenario, and re-use after full reset
+- **Learnings for future iterations:**
+  - `clearConfirmationBadge()` without an ID bypasses idempotency (for compatibility with no-ID callers)
+  - Background timeout callback calls `confirmationTimeouts.delete(id)` BEFORE `clearConfirmationBadge(id)`, so when the side panel then calls `clearConfirmationBackgroundTimeout(id)` it's a no-op — the second `clearConfirmationBadge(id)` is the double-decrement path
+  - `notifyConfirmationRequest` re-use of an existing ID (timeout still pending) goes through the `if` branch — no need to call `clearedConfirmationIds.delete` there since the timeout hasn't fired yet
+---
+
+## [2026-02-28] - US-002
+- Changed `handleWsState` guard from `if (!nowConnected && wasConnected)` to `if (!nowConnected)` so `clearTabStateCache` and `clearAllConfirmationBadges` always run on any disconnect message
+- Removed the now-unused `wasConnected` local variable from `handleWsState`
+- Updated test "disconnect when already disconnected: does NOT call clearTabStateCache" to reflect new behavior (cleanup IS called — renamed and split into two tests)
+- Added "service worker wake race" test verifying cleanup runs when wsConnected=false (default/unrestored) and ws:state connected=false arrives simultaneously
+- All 2564 unit tests + 394 E2E tests pass
+- **Learnings for future iterations:**
+  - `clearTabStateCache` and `clearAllConfirmationBadges` are both idempotent — calling them when already clean is harmless, so "always clean up on disconnect" is safe
+  - The old `wasConnected` guard was protecting against spurious cleanup on repeated disconnect messages, but that was unnecessary given idempotent cleanup functions
+  - The `beforeEach` in the test file drives `wsConnected=false` then clears mocks — so the "already disconnected" scenario is trivially testable (just call `handleWsState({connected: false})` without a preceding connect)
+---
