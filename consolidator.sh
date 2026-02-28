@@ -339,15 +339,23 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
     else
       # Run with timeout to prevent indefinite hangs.
       # Pass PATH explicitly so the subshell can find claude + node.
+      # Stream stdout through a timestamped prefixer so progress is visible
+      # in the log (like consumer workers). Also tee to result file for
+      # post-processing. Stderr goes to a separate file.
       timeout 600 env PATH="$PATH" bash -c '
+        set -o pipefail
         echo "$1" | (cd "$2" && claude \
           --dangerously-skip-permissions \
           --print \
           --model "$3" \
           --verbose \
           --output-format stream-json \
-        ) 2>"$5" > "$4"
-      ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" || ai_exit=$?
+        ) 2>"$5" | tee "$4"
+      ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" \
+        2>&1 | while IFS= read -r line; do
+          echo -e "$(ts) ${DIM}  [AI] $line${RESET}"
+        done
+      ai_exit=${PIPESTATUS[0]}
     fi
 
     if [ "$ai_exit" -eq 124 ]; then
