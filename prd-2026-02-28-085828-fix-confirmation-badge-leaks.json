@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix resource leaks and stale notification bugs in the browser extension's confirmation badge system: duplicate confirmation IDs leak timeout handles, and Chrome notifications are never cleared when confirmations resolve.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Clear old timeout before overwriting in confirmationTimeouts map",
+      "description": "As a developer, I want duplicate confirmation IDs to be handled defensively so that timeout handles are not leaked and the badge count stays accurate.",
+      "acceptanceCriteria": [
+        "When notifyConfirmationRequest is called with an id that already exists in confirmationTimeouts, the existing timeout is cleared (via clearTimeout) before the new one is stored",
+        "pendingConfirmationCount is NOT incremented a second time for a duplicate id — if the id already has a pending timeout, the count stays the same and only the timeout is replaced",
+        "Unit test verifies: calling notifyConfirmationRequest twice with the same id results in pendingConfirmationCount === 1, not 2",
+        "Unit test verifies: the old timeout handle does not fire after being replaced",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/confirmation-badge.ts\n\nThe bug is at lines 56-60 in notifyConfirmationRequest():\n```\npendingConfirmationCount++;\nconst bgTimeoutId = setTimeout(...);\nconfirmationTimeouts.set(id, bgTimeoutId);\n```\n\nIf `id` already exists in confirmationTimeouts, the old setTimeout handle is overwritten and leaked — it can never be cleared. The leaked timeout fires clearConfirmationBadge() unexpectedly, decrementing pendingConfirmationCount below the actual number of pending confirmations.\n\nFix: Before incrementing count and setting the new timeout, check if confirmationTimeouts already has the id. If so, clearTimeout the existing handle and do NOT increment pendingConfirmationCount (the count was already incremented on the first call).\n\nThe test file is platform/browser-extension/src/confirmation-badge.test.ts (create it if it doesn't exist). Mock setTimeout/clearTimeout and chrome.action.setBadgeText/setBadgeBackgroundColor."
+    },
+    {
+      "id": "US-002",
+      "title": "Clear Chrome notifications when confirmations resolve",
+      "description": "As a user, I want handled confirmation notifications to be automatically dismissed so that stale 'Approval Required' notifications don't accumulate in my notification center.",
+      "acceptanceCriteria": [
+        "clearConfirmationBadge(id) calls chrome.notifications.clear(id) (fire-and-forget with .catch) to dismiss the Chrome notification associated with the resolved confirmation",
+        "clearAllConfirmationBadges() iterates all entries in confirmationTimeouts and calls chrome.notifications.clear for each before clearing the map",
+        "Unit test verifies: resolving a confirmation clears the corresponding Chrome notification",
+        "Unit test verifies: clearAllConfirmationBadges clears all Chrome notifications",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/confirmation-badge.ts\n\nThe notification is created at lines 62-71 using chrome.notifications.create(id, ...). But when the confirmation is resolved (clearConfirmationBadge at line 75 or clearAllConfirmationBadges at line 96), the Chrome notification is never dismissed — only the badge count and background timeout are cleaned up.\n\nFix 1: In clearConfirmationBadge(id), add: chrome.notifications.clear(id).catch(() => {});\nFix 2: In clearAllConfirmationBadges(), before the for-of loop that clears timeouts, also iterate the entries and call chrome.notifications.clear for each id.\n\nThe notification ID matches the confirmation ID (line 62: chrome.notifications.create(id, ...)), so just pass the same id to chrome.notifications.clear.\n\nTests should mock chrome.notifications.clear and verify it's called with the correct id."
+    }
+  ]
+}

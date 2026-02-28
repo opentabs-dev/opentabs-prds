@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix memory leaks in the browser extension's network capture module: requestIdToRequest entries are only pruned inside requestWillBeSent (never during idle periods), and wsFramesByRequestId entries are orphaned when WebSocket connections don't properly close.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add periodic pruning of stale requestIdToRequest entries independent of new requests",
+      "description": "As a developer, I want stale request entries to be pruned on a timer so that memory does not grow during long-running captures with idle periods.",
+      "acceptanceCriteria": [
+        "A periodic pruning mechanism (e.g., setInterval) runs during active captures to remove requestIdToRequest entries older than PENDING_REQUEST_TTL_MS, independent of whether new requestWillBeSent events arrive",
+        "The interval is started in startCapture and cleared in stopCapture — no interval runs when no capture is active",
+        "The pruning interval is reasonable (e.g., 30-60 seconds) and does not cause performance overhead",
+        "Unit test verifies: stale requestIdToRequest entries are removed even when no new requests arrive",
+        "Unit test verifies: the pruning interval is cleared when stopCapture is called",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/network-capture.ts\n\nThe stale request pruning logic is at lines 190-194, inside the Network.requestWillBeSent handler:\n```\nconst cutoff = now - PENDING_REQUEST_TTL_MS;\nfor (const [rid, ts] of state.requestIdToRequest) {\n  if (ts < cutoff) state.requestIdToRequest.delete(rid);\n}\n```\n\nThis only runs when a new request arrives. If no requests come in (idle capture), stale entries from responseReceived (line 237) that never got loadingFinished sit forever.\n\nFix: Add an intervalId field to CaptureState (line 77-93). In startCapture (line 381), start a setInterval that calls the same pruning logic. In stopCapture (line 420), clearInterval it.\n\nKeep the existing pruning in requestWillBeSent as well — it's a good optimization for active captures. The interval is a safety net for idle periods.\n\nPruning interval suggestion: 30_000ms (30 seconds). Use the same PENDING_REQUEST_TTL_MS (60_000ms) as the cutoff.\n\nTest file: platform/browser-extension/src/network-capture.test.ts (it already exists). Use vi.useFakeTimers to test that advancing the timer prunes entries."
+    },
+    {
+      "id": "US-002",
+      "title": "Clean up wsFramesByRequestId entries in stopCapture",
+      "description": "As a developer, I want all WebSocket frame tracking entries to be cleaned up when a capture stops so that entries from WebSocket connections that didn't fire webSocketClosed are not orphaned.",
+      "acceptanceCriteria": [
+        "stopCapture clears the wsFramesByRequestId map as part of capture cleanup, alongside the existing cleanup of requests, consoleLogs, and requestIdToRequest",
+        "Unit test verifies: wsFramesByRequestId entries are removed after stopCapture even if webSocketClosed was never fired",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/network-capture.ts\n\nThe wsFramesByRequestId map (line 93 in CaptureState) stores frames per WebSocket requestId. Entries are added in webSocketCreated (line 305) and only removed in webSocketClosed (line 343). If a WebSocket connection is open when the capture stops (or the page navigates away while WS is open), the entry is orphaned in the old CaptureState.\n\nLooking at stopCapture (line 420-436), it deletes the entire CaptureState from the captures Map (line 433: captures.delete(tabId)). This means the entire CaptureState object, including wsFramesByRequestId, is garbage collected when the capture stops. So entries ARE cleaned up by GC.\n\nHowever, getWsFrames (line 360-371) aggregates frames from wsFramesByRequestId. If getWsFrames is called BEFORE stopCapture but AFTER the WebSocket connections are logically abandoned (page navigated), it could return stale frame data. This is minor but worth cleaning up for correctness.\n\nActually, on closer inspection: since stopCapture deletes the entire CaptureState from the map (line 433), and all map accessors use captures.get(tabId), this is effectively cleaned up. The wsFramesByRequestId entries are NOT orphaned — the entire CaptureState is removed.\n\nRe-evaluate: the real issue is during an ACTIVE capture where WebSocket connections open and the page navigates (but capture continues). The entries persist in wsFramesByRequestId until webSocketClosed fires, which it never will for connections on the old page. This is within the CaptureState's lifetime.\n\nFix: In the Network.requestWillBeSent handler's pruning loop (or in the new periodic pruning from US-001), also prune wsFramesByRequestId entries whose requestId no longer appears in the active requestIdToRequest tracking AND whose webSocketClosed event was never received. Actually, the simpler fix: make the periodic pruning (from US-001) also clear wsFramesByRequestId entries that are older than PENDING_REQUEST_TTL_MS by tracking their creation timestamp.\n\nAlternatively, the simplest correct fix: track a createdAt timestamp for each wsFramesByRequestId entry and prune entries older than PENDING_REQUEST_TTL_MS during the periodic cleanup. Add a wsCreatedAt: Map<string, number> field to CaptureState.\n\nThis is a very minor leak (frames accumulate for the lifetime of the capture session at most). Given the complexity of the fix vs the impact, consider simplifying: just clear wsFramesByRequestId entries during the periodic TTL pruning added in US-001. Check if any wsFramesByRequestId key has a corresponding entry in requestIdToRequest; if not and no frames have been added recently, it's an orphaned connection."
+    }
+  ]
+}
