@@ -1,0 +1,118 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix the extension auth bootstrap fragility that causes 'Authentication Failed' errors, by ensuring auth.json is always available when the extension loads and re-read on every reconnect attempt. Add comprehensive E2E tests for auth edge cases.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Write auth.json before copying extension files in opentabs start",
+      "description": "As a user running opentabs start, I want auth.json to exist before the extension files are copied, so that Chrome never loads the extension without a valid secret.",
+      "acceptanceCriteria": [
+        "ensureAuthSecret() is called BEFORE autoInitialize(configDir) in handleStart()",
+        "The secret returned by ensureAuthSecret() is passed to autoInitialize() so it can be used for first-time setup instructions",
+        "First-time install: auth.json exists in ~/.opentabs/extension/ before cpSync copies extension files",
+        "Subsequent starts: auth.json is preserved (existing behavior, unchanged)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in `platform/cli/src/commands/start.ts` in `handleStart()` (lines 251-253). Currently the order is:\n\n```\nconst configDir = getConfigDir();           // line 251\nconst isFirstTime = await autoInitialize(configDir);  // line 252 — copies extension\nconst secret = await ensureAuthSecret();    // line 253 — writes auth.json\n```\n\nSwap lines 252 and 253 so auth.json is written first:\n\n```\nconst configDir = getConfigDir();\nconst secret = await ensureAuthSecret();    // writes auth.json FIRST\nconst isFirstTime = await autoInitialize(configDir);  // then copies extension files\n```\n\nNote: `ensureAuthSecret()` calls `getExtensionDir()` which is `~/.opentabs/extension/`. It creates the directory with `mkdir(extensionDir, { recursive: true })` if needed (line 120 of config.ts). So it will create `~/.opentabs/extension/` and write auth.json even if the extension directory doesn't exist yet. The subsequent `installExtension()` will then copy extension files into this already-existing directory, and cpSync with `force: true` won't overwrite auth.json because auth.json doesn't exist in the source extension package.\n\nAlso check that `ensureAuthSecret()` doesn't depend on anything that `autoInitialize()` produces — it doesn't, it only depends on `getExtensionDir()` which is a pure path computation."
+    },
+    {
+      "id": "US-002",
+      "title": "Re-read auth.json before every WebSocket connection attempt",
+      "description": "As a Chrome extension, I want to re-read auth.json before each connection attempt, so that I pick up a newly-written secret when the server starts after the extension was already loaded.",
+      "acceptanceCriteria": [
+        "bootstrapFromAuthFile() is called at the start of connect() (before refreshWsUrl)",
+        "If auth.json now has a valid secret and wsSecret was previously null, the new secret is used for the /ws-info request",
+        "If auth.json is still missing/unreadable, connect proceeds with the existing wsSecret (no regression)",
+        "The existing 401 retry in fetchWsInfo() that re-reads auth.json is preserved (belt and suspenders)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in `platform/browser-extension/src/offscreen/index.ts` in `connect()` (line 259). Currently `connect()` calls `refreshWsUrl()` which calls `fetchWsInfo()` which only re-reads auth.json on 401. Add `await bootstrapFromAuthFile()` at the start of connect(), right after the guard check:\n\n```typescript\nconst connect = async (): Promise<void> => {\n  if (connecting || ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) {\n    return;\n  }\n  connecting = true;\n  try {\n    await bootstrapFromAuthFile();  // <-- ADD THIS LINE\n    const reason = await refreshWsUrl();\n    ...\n```\n\nThis ensures that on every reconnect attempt (including after the server was down and comes back up), the extension reads the latest auth.json. This handles the scenario where:\n1. Extension loads before `opentabs start` runs → auth.json doesn't exist → wsSecret = null\n2. User runs `opentabs start` → auth.json is written\n3. Extension reconnect timer fires → connect() → re-reads auth.json → picks up the secret → /ws-info succeeds → WebSocket connects\n\nThe `bootstrapFromAuthFile()` call is cheap (reads a small local file) and idempotent (just sets wsSecret if valid), so calling it on every connect attempt has negligible overhead."
+    },
+    {
+      "id": "US-003",
+      "title": "Add console.warn logging when auth.json bootstrap fails",
+      "description": "As a developer debugging auth issues, I want to see why auth.json bootstrap failed in the extension's console logs, so that I can diagnose 'Authentication Failed' errors.",
+      "acceptanceCriteria": [
+        "When fetch(chrome.runtime.getURL('auth.json')) returns a non-ok response, a console.warn is logged with the status code",
+        "When fetch(chrome.runtime.getURL('auth.json')) throws an error, a console.warn is logged with the error message",
+        "When auth.json parses successfully but has no valid secret field, a console.warn is logged",
+        "Successful auth.json reads do NOT log anything (avoid noise)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in `platform/browser-extension/src/offscreen/index.ts` in `bootstrapFromAuthFile()` (line 509). Currently the function has a silent catch block and no logging on non-ok responses.\n\nAdd logging in three places:\n\n1. After `if (res.ok)` — add an else branch: `console.warn('[opentabs:offscreen] auth.json returned HTTP', res.status)`\n2. After the `typeof auth.secret === 'string'` check — add an else: `console.warn('[opentabs:offscreen] auth.json missing or invalid secret field')`\n3. In the catch block: `console.warn('[opentabs:offscreen] Failed to read auth.json:', e)`\n\nUse `console.warn` (not `console.error`) since this is expected during first-time setup before `opentabs start` has run. The `[opentabs:offscreen]` prefix matches the existing log convention in this file (see line 300, 323, 334).\n\nNote: since US-002 calls bootstrapFromAuthFile() on every reconnect attempt, these warnings will appear repeatedly while the server is down. This is acceptable since the reconnect interval is exponentially backed off (1s → 2s → 4s → ... → 30s cap), and the warnings help diagnose issues. But to avoid excessive noise, consider only logging on the FIRST failure and not on subsequent ones. A simple boolean flag `let authJsonWarned = false` would work — set it to true after the first warning, reset to false after a successful read. This is a nice-to-have, not required."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: extension connects after auth.json is written post-load",
+      "description": "As a platform maintainer, I want an E2E test that verifies the extension can connect when auth.json is written AFTER the extension is loaded in Chrome, simulating the first-time setup scenario.",
+      "acceptanceCriteria": [
+        "Test launches extension WITHOUT auth.json in the extension directory",
+        "Extension shows disconnected state (connection_refused or auth_failed)",
+        "Test then writes auth.json with the server's secret into the extension directory",
+        "Extension's reconnect loop re-reads auth.json, picks up the secret, and connects",
+        "Extension shows connected state",
+        "Tool dispatch works after connection",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Create a new test file `e2e/auth-bootstrap.e2e.ts`. This test requires a custom setup that differs from the standard `extensionContext` fixture (which always symlinks auth.json). The approach:\n\n1. Use `createTestConfigDir()` which creates a config dir with auth.json (line 214 of fixtures.ts)\n2. Start the MCP server using `startMcpServer()` — this reads auth.json normally\n3. Create extension copy using `createExtensionCopy(port)` WITHOUT passing a secret — this skips writing auth.json to the extension copy (line 850 of fixtures.ts)\n4. Also ensure NO auth.json symlink is created (the standard fixture creates one at line 1537-1540)\n5. Launch Chrome with the extension\n6. Wait briefly — extension should be disconnected (no auth.json → wsSecret is null → 401 from /ws-info → auth_failed)\n7. Write auth.json to the extension copy directory with the correct secret: `fs.writeFileSync(path.join(extensionDir, 'auth.json'), JSON.stringify({ secret: server.secret }) + '\\n')`\n8. Wait for extension to reconnect (the backoff timer will trigger connect() → bootstrapFromAuthFile() reads the new auth.json → /ws-info succeeds → WebSocket connects)\n9. Verify connection via `/health` endpoint showing `extensionConnected: true`\n10. Optionally dispatch a tool to verify full connectivity\n\nThe wait in step 8 depends on the reconnect backoff. The initial backoff is 1s, doubling each time up to 30s. Since the extension will have been trying to connect since launch, the backoff might be at 2-4s by the time auth.json is written. Use a generous poll timeout (30s) when waiting for `extensionConnected: true`.\n\nFor the custom fixture setup, look at how `launchExtensionContext()` (line 862 of fixtures.ts) sets up Chrome with the extension. The key helper is `createExtensionCopy()` which needs to be called without a secret, and the auth.json symlink step must be skipped.\n\nSee `e2e/lifecycle.e2e.ts` for examples of custom fixture setups and polling for extension connection state."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: extension recovers from stale secret after server restart with new secret",
+      "description": "As a platform maintainer, I want an E2E test that verifies the extension recovers when the server restarts with a new secret, simulating a secret rotation or server reinstall scenario.",
+      "acceptanceCriteria": [
+        "Test starts server and extension with matching secret A — extension connects",
+        "Test writes a new secret B to auth.json (both server config dir and extension dir)",
+        "Test triggers server reload (POST /reload with old secret, or SIGUSR1 for hot reload)",
+        "Server picks up new secret B",
+        "Extension's existing WebSocket connection closes (server sends close code 4001 or extension.reload signal)",
+        "Extension reconnects: re-reads auth.json → gets secret B → connects with new secret",
+        "Tool dispatch works after reconnection",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Add this test to `e2e/auth-bootstrap.e2e.ts` (same file as US-004). This test is similar to the existing secret rotation test in `e2e/lifecycle.e2e.ts:445` but explicitly tests the extension's re-read-auth.json-on-reconnect behavior.\n\nThe existing test at lifecycle.e2e.ts:445 already covers secret rotation via hot reload, so this new test should focus on a slightly different scenario: what happens when auth.json is updated and the server reloads, but the extension's auth.json is updated independently (not via the symlink).\n\nApproach:\n1. Start server and extension normally (standard fixtures, extension connected)\n2. Generate a new secret: `const newSecret = crypto.randomUUID()`\n3. Write new secret to BOTH locations:\n   - Server's auth.json: `fs.writeFileSync(path.join(configDir, 'extension', 'auth.json'), JSON.stringify({ secret: newSecret }) + '\\n')`\n   - Extension's auth.json: `fs.writeFileSync(path.join(extensionDir, 'auth.json'), JSON.stringify({ secret: newSecret }) + '\\n')`\n   (If the fixture uses a symlink, writing to one writes to both)\n4. Trigger server reload: `POST /reload` with the OLD secret as Bearer token, OR send SIGUSR1 for hot reload\n5. Wait for reload to complete (poll server logs or /health)\n6. Wait for extension to reconnect with the new secret (poll /health for extensionConnected: true)\n7. Dispatch a tool to verify full connectivity\n\nNote: the standard fixture symlinks auth.json (line 1537-1540 of fixtures.ts), so writing to the server's auth.json automatically updates the extension's copy. This is ideal for this test.\n\nUse the `mcpServer.triggerHotReload()` helper from fixtures if available, or send SIGUSR1 directly to the server process. Check `e2e/lifecycle.e2e.ts` for examples of triggering hot reload and waiting for completion."
+    }
+  ]
+}
