@@ -1,0 +1,97 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-081519-improve-build-dev-ergonomics~running.json
+Started: Tue Feb 24 08:15:34 PST 2026
+---
+
+## Codebase Patterns
+- The dev orchestrator is in scripts/dev.ts; it spawns tsc watch, extension builds, and the MCP server as child processes
+- The dev:mcp script in package.json directly runs `bun --hot platform/mcp-server/dist/index.js --dev` — the `--dev` flag is a script argument, not a bun argument
+- scripts/dev.ts uses Bun.spawn with process group management (children array) for cleanup on exit
+- `tsc --build --noEmit` works correctly with TypeScript 5.9.3 and the project's composite references setup
+- The `check` pipeline should not include `type-check` since `build` (which uses `tsc --build`) already type-checks
+- The `build` script should be incremental by default (no `--force`); `build:force` exists for full rebuilds
+- When removing package.json scripts, also update: .github/workflows/ci.yml, CONTRIBUTING.md command table, and CLAUDE.md commands section
+- scripts/dev.ts calls extension build steps directly via Bun.spawn, not via `bun run` script names
+- The docs project has its own `check` script; root `check:docs` delegates to it via `bun run --cwd docs check`
+- When renaming package.json scripts, check: CLAUDE.md, CONTRIBUTING.md, README.md, .github/workflows/ci.yml (CHANGELOG.md is historical — leave it)
+
+## 2026-02-24 08:16 - US-001
+- Fixed missing `--dev` flag in MCP server spawn in scripts/dev.ts line 263
+- Added `'--dev'` as the fourth element in the spawn args array, after the script path
+- Files changed: scripts/dev.ts
+- **Learnings for future iterations:**
+  - The `--dev` flag must come AFTER the script path in Bun.spawn args (it's a script argument, not a bun flag)
+  - dev:mcp in package.json is the reference for correct MCP server invocation
+---
+
+## 2026-02-24 08:20 - US-002
+- Changed `type-check` from `tsc --build` to `tsc --build --noEmit` (true non-emitting check)
+- Changed `build` from `tsc --build --force` to `tsc --build` (incremental by default)
+- Added `build:force` script with the old `tsc --build --force` behavior for CI/clean rebuilds
+- Removed `type-check` from `check` and `check:all` pipelines (build already type-checks)
+- Files changed: package.json
+- **Learnings for future iterations:**
+  - `tsc --build --noEmit` requires TypeScript 5.x+, which this project uses (5.9.3)
+  - Incremental `tsc --build` (no `--force`) is significantly faster for iterative development since it uses `.tsbuildinfo` caches
+  - The `check:all` pipeline also had the same `type-check` double-work issue as `check`
+---
+
+## 2026-02-24 08:25 - US-003
+- Removed 6 redundant scripts from root package.json: `build:tsc`, `test:unit`, `build:e2e-plugin`, `build:icons`, `build:install-extension`, `check:tsconfig-coverage`
+- Inlined icon generation and extension install commands in `build` and `build:force` scripts (using `bun scripts/generate-icons.ts` and `bun scripts/install-extension.ts` directly)
+- Inlined e2e-test plugin build into `test:e2e` script
+- Updated `.github/workflows/ci.yml` to call `bun scripts/check-tsconfig-coverage.ts` directly instead of `bun run check:tsconfig-coverage`
+- Updated CONTRIBUTING.md to remove references to removed scripts (`build:tsc`, `test:unit`) and add `build:force`
+- Updated comment in scripts/clean.ts referencing `build:icons`
+- Files changed: package.json, .github/workflows/ci.yml, CONTRIBUTING.md, scripts/clean.ts
+- **Learnings for future iterations:**
+  - scripts/dev.ts calls extension build steps directly via Bun.spawn (not via `bun run build:icons`), so removing those scripts doesn't affect dev.ts
+  - The CI workflow at `.github/workflows/ci.yml` references script names — always check it when removing scripts
+  - CONTRIBUTING.md has a command reference table that mirrors package.json scripts — keep them in sync
+---
+
+## 2026-02-24 08:30 - US-004
+- Renamed `check:all` to `check:everything` in package.json, now delegates to `bun run check` instead of duplicating the command list
+- Simplified `check:docs` from inline command duplication to `bun run --cwd docs check` (delegates to docs' own check script)
+- Updated all `check:all` references to `check:everything` in: CLAUDE.md, CONTRIBUTING.md, README.md
+- Left CHANGELOG.md references unchanged (historical entries)
+- Files changed: package.json, CLAUDE.md, CONTRIBUTING.md, README.md
+- **Learnings for future iterations:**
+  - CHANGELOG.md references to old script names are historical and should NOT be updated
+  - The docs project has its own `check` script in `docs/package.json` — use `bun run --cwd docs check` instead of duplicating the command list at the root level
+  - When renaming scripts, search all `.md`, `.yml`, and `.ts`/`.json` files for references
+---
+
+## 2026-02-24 08:32 - US-005
+- Removed `bun run knip` from `.husky/pre-commit` hook
+- The ralph state file guard and lint-staged remain intact
+- Knip continues to run as part of `bun run check` (not lost, just out of commit hook)
+- Files changed: .husky/pre-commit
+- **Learnings for future iterations:**
+  - Pre-commit hooks should only run checks scoped to staged files (like lint-staged), not full-project analysis tools
+  - Knip scans the entire project — it's not useful in a commit hook since it can't be scoped to staged changes
+---
+
+## 2026-02-24 08:35 - US-006
+- Created scripts/dev-mcp.ts wrapper that checks for platform/mcp-server/dist/index.js before starting bun --hot
+- If dist/ is missing, prints a clear error message and exits with code 1
+- If dist/ exists, re-execs with `bun --hot` and the `--dev` flag
+- Updated dev:mcp script in package.json from direct `bun --hot` invocation to `bun scripts/dev-mcp.ts`
+- Files changed: scripts/dev-mcp.ts (new), package.json
+- **Learnings for future iterations:**
+  - tsconfig.scripts.json covers `scripts/**/*.ts`, so new scripts in that directory are automatically type-checked
+  - Wrapper scripts that re-exec with Bun.spawn should use `process.exit(await proc.exited)` to forward the exit code
+  - The existing scripts (check-bun-version.ts, etc.) follow a consistent pattern: import from node:path, resolve ROOT, use Bun APIs for file operations
+---
+
+## 2026-02-24 08:39 - US-007
+- Updated CLAUDE.md Commands section to reflect the actual package.json scripts after all previous stories
+- Removed references to deleted scripts: `build:tsc`, `build:icons`, `test:unit`
+- Added `build:force` script documentation
+- Updated descriptions: `build` (incremental by default), `type-check` (--noEmit verification), `check` (no type-check since build already does it), `check:docs` (delegates to docs check)
+- Verified no stale references to removed scripts remain in CLAUDE.md
+- Files changed: CLAUDE.md
+- **Learnings for future iterations:**
+  - The `check:everything` rename and Verification section update were already done in US-004, so only the Commands section listing needed updating
+  - Always grep for removed script names across the entire CLAUDE.md to catch references outside the Commands section
+---

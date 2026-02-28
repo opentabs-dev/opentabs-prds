@@ -1,0 +1,170 @@
+{
+  "project": "Backend / Side Panel Architecture Hardening",
+  "description": "Fix defects found during comprehensive audit of the MCP server + Chrome extension background + side panel UI architecture. Eliminates race conditions, improves type safety, adds missing test coverage, and ensures deterministic behavior across the full three-layer stack.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Remove fragile sync.full delay in side panel ws:message fallback",
+      "description": "As a developer, I want the side panel to refresh its plugin list via event-driven notifications only, so that there are no magic timeout delays that can cause race conditions or stale UI.",
+      "acceptanceCriteria": [
+        "The ws:message handler in App.tsx no longer uses setTimeout for sync.full",
+        "The ws:message handler for sync.full either: (a) is removed entirely because the sp:serverMessage plugins.changed path is sufficient, or (b) triggers loadPlugins when it receives a plugins.changed notification via the ws:message path",
+        "The primary sp:serverMessage path for plugins.changed continues to work unchanged",
+        "No magic number constants (1_500, 1500, etc.) remain in App.tsx related to sync.full delays",
+        "Side panel still refreshes correctly on initial connection (verified by reading the code flow)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/App.tsx lines 125-137.\n\nThe ws:message fallback currently does:\n```\nif (wsData?.method === 'sync.full') {\n  setTimeout(() => loadPluginsRef.current(), 1_500);\n}\n```\n\nThis 1.5s delay is a workaround for a race condition where the background hasn't finished processing sync.full yet. But the primary path already handles this correctly: handleSyncFull in message-router.ts sends a `plugins.changed` notification to the side panel AFTER all storage writes and injection complete (line 289-292 of message-router.ts). The side panel already handles `plugins.changed` in the sp:serverMessage handler (line 109-113 of App.tsx).\n\nThe safest fix: in the ws:message handler, instead of special-casing sync.full with a delay, handle `plugins.changed` the same way the sp:serverMessage path does (call loadPluginsRef.current()). The sync.full case can be removed since the background always sends plugins.changed after processing sync.full.\n\nAlternatively, if you want to be extra defensive, you can keep listening for sync.full via ws:message but handle it the same way as plugins.changed in the sp:serverMessage path — just call loadPluginsRef.current() without a delay, since by the time the ws:message broadcast reaches the side panel, the background has already finished processing (the offscreen document broadcasts ws:message to all contexts simultaneously, and the background processes it synchronously before the side panel's listener fires in practice).\n\nThe simplest and most correct approach: change the sync.full case to also call `loadPluginsRef.current()` directly (no delay), matching how plugins.changed is handled. Or better yet, just handle plugins.changed in the ws:message path too."
+    },
+    {
+      "id": "US-002",
+      "title": "Remove unnecessary type cast in forwardToSidePanel",
+      "description": "As a developer, I want type-safe code without redundant casts, so that the code is clear and doesn't mask potential type errors.",
+      "acceptanceCriteria": [
+        "forwardToSidePanel in messaging.ts uses message.type directly instead of (message as { type?: string }).type",
+        "The console.warn log message still includes the message type",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/messaging.ts line 16-19.\n\nCurrent code:\n```typescript\nexport const forwardToSidePanel = (message: SidePanelMessage): void => {\n  const type = (message as { type?: string }).type ?? 'unknown';\n  chrome.runtime.sendMessage(message).catch((err: unknown) => {\n    console.warn(`[OpenTabs] forwardToSidePanel failed for \"${type}\":`, err);\n  });\n};\n```\n\nSidePanelMessage is `SpConnectionStateMessage | SpRelayMessage`, both of which have a `type` field. So `message.type` is always defined and typed. The cast is redundant.\n\nFix: change to `const type = message.type;` — no cast needed, TypeScript knows message.type is 'sp:connectionState' | 'sp:serverMessage'."
+    },
+    {
+      "id": "US-003",
+      "title": "Make bridge.ts handleServerResponse defensive against numeric JSON-RPC ids",
+      "description": "As a developer, I want the side panel bridge to handle any valid JSON-RPC id type, so that the code is robust against protocol evolution.",
+      "acceptanceCriteria": [
+        "handleServerResponse in bridge.ts accepts both string and number id values from server responses",
+        "The pendingRequests map lookup converts the id to string via String(id) for consistency",
+        "The type annotation for id in handleServerResponse is string | number | undefined (not just string | undefined)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/bridge.ts lines 81-99.\n\nCurrent code:\n```typescript\nconst handleServerResponse = (data: Record<string, unknown>): boolean => {\n  const id = data.id as string | undefined;\n  if (!id || data.method) return false;\n  const pending = pendingRequests.get(id);\n  ...\n};\n```\n\nThe issue: JSON-RPC 2.0 allows id to be string, number, or null. The current code casts to `string | undefined`, which means a numeric id (e.g., 42) would pass the truthy check but fail the Map lookup because the Map uses string keys (from crypto.randomUUID()).\n\nFix:\n```typescript\nconst handleServerResponse = (data: Record<string, unknown>): boolean => {\n  const rawId = data.id;\n  if (rawId === undefined || rawId === null || data.method) return false;\n  const id = String(rawId);\n  const pending = pendingRequests.get(id);\n  ...\n};\n```\n\nThis is defensive — today the side panel only sends string UUIDs, so numeric ids won't appear. But the code should handle any valid JSON-RPC id without silently failing."
+    },
+    {
+      "id": "US-004",
+      "title": "Sort plugins alphabetically in config.getState response",
+      "description": "As a user, I want the side panel plugin list to have a stable, predictable order regardless of server restart or plugin discovery order.",
+      "acceptanceCriteria": [
+        "handleConfigGetState in extension-protocol.ts sorts plugins by name before sending the response",
+        "The sort uses localeCompare for consistent alphabetical ordering",
+        "Side panel displays plugins in alphabetical order after connecting",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/extension-protocol.ts line 521-547.\n\nCurrent code:\n```typescript\nconst handleConfigGetState = (state: ServerState, id: string | number): void => {\n  const plugins = Array.from(state.plugins.values()).map(p => {\n    ...\n  });\n  ...\n};\n```\n\nFix: Add `.sort((a, b) => a.name.localeCompare(b.name))` after the map:\n```typescript\nconst plugins = Array.from(state.plugins.values())\n  .sort((a, b) => a.name.localeCompare(b.name))\n  .map(p => {\n    ...\n  });\n```\n\nAlternatively, sort after the map (on the mapped result) — either works since the name field is preserved in the output. Sorting before the map is marginally cleaner since you're sorting by the source field."
+    },
+    {
+      "id": "US-005",
+      "title": "Add unit tests for side panel bridge module",
+      "description": "As a developer, I want the side panel bridge's request/response correlation, timeout, and error handling to be tested, so that regressions in this critical communication layer are caught.",
+      "acceptanceCriteria": [
+        "A new test file exists at platform/browser-extension/src/side-panel/bridge.test.ts",
+        "Tests cover: handleServerResponse returning true for matching response ids",
+        "Tests cover: handleServerResponse returning false for messages with method field",
+        "Tests cover: handleServerResponse returning false for unknown ids",
+        "Tests cover: rejectAllPending rejecting all inflight requests with 'Server disconnected'",
+        "Tests cover: rejectAllPending clearing all pending request timers",
+        "Tests cover: server error responses (with 'error' field) rejecting the pending promise",
+        "Tests mock chrome.runtime.sendMessage appropriately",
+        "The test file is included in an appropriate tsconfig for type-checking",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File to create: platform/browser-extension/src/side-panel/bridge.test.ts\n\nThe bridge module (platform/browser-extension/src/side-panel/bridge.ts) exports:\n- handleServerResponse(data): boolean — matches responses by id\n- rejectAllPending(): void — rejects all inflight requests\n- getConnectionState(): Promise<boolean>\n- fetchConfigState(): Promise<ConfigStateResult>\n- setToolEnabled(plugin, tool, enabled): Promise<unknown>\n- setAllToolsEnabled(plugin, enabled): Promise<unknown>\n\nThe key internal state is `pendingRequests: Map<string, PendingRequest>` — not directly accessible. But handleServerResponse and rejectAllPending modify it, so we can test through them.\n\nTesting approach:\n1. Mock chrome.runtime.sendMessage globally (like plugin-storage.test.ts does)\n2. For handleServerResponse tests: call sendRequest (which adds to pendingRequests), then call handleServerResponse with matching/non-matching data\n3. For rejectAllPending tests: call sendRequest to create pending entries, then call rejectAllPending and verify promises reject\n4. For error response tests: call sendRequest, then handleServerResponse with { id: ..., error: { message: 'test error' } }\n\nFollow the pattern in plugin-storage.test.ts for chrome API mocking:\n```typescript\n(globalThis as Record<string, unknown>).chrome = {\n  runtime: {\n    sendMessage: (message: unknown, callback?: (response: unknown) => void) => {\n      // Mock implementation\n      if (callback) callback({ ok: true });\n    },\n    lastError: null,\n  },\n};\n```\n\nThe test file should be covered by the existing tsconfig.test.json (which includes src/**/*.test.ts)."
+    },
+    {
+      "id": "US-006",
+      "title": "Add unit tests for config.setToolEnabled and config.setAllToolsEnabled handlers",
+      "description": "As a developer, I want the tool toggle handlers in extension-protocol.ts to be tested, so that this core user-facing feature is protected against regressions.",
+      "acceptanceCriteria": [
+        "Tests for handleConfigSetToolEnabled are added to extension-protocol.test.ts",
+        "Tests for handleConfigSetAllToolsEnabled are added to extension-protocol.test.ts",
+        "Tests cover: successful toggle updates state.toolConfig correctly",
+        "Tests cover: invalid params returns -32602 error",
+        "Tests cover: unknown plugin name returns error",
+        "Tests cover: unknown tool name returns error for setToolEnabled",
+        "Tests cover: callbacks.onToolConfigChanged and onToolConfigPersist are called on success",
+        "Tests cover: setAllToolsEnabled updates all tools for the given plugin",
+        "The handleConfigSetToolEnabled and handleConfigSetAllToolsEnabled functions are exported from extension-protocol.ts (or tested via handleExtensionMessage)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/extension-protocol.test.ts (may need to be created or extended).\n\nThe handlers handleConfigSetToolEnabled and handleConfigSetAllToolsEnabled are currently not exported — they're private to extension-protocol.ts. The cleanest testing approach is through handleExtensionMessage, which IS exported.\n\nSetup: create a minimal ServerState with a plugin and tools, set extensionWs to a mock that captures sent messages.\n\n```typescript\nconst createMockState = (): ServerState => {\n  const state = createState();\n  state.plugins.set('test-plugin', {\n    name: 'test-plugin',\n    version: '1.0.0',\n    urlPatterns: ['*://example.com/*'],\n    trustTier: 'local',\n    iife: '',\n    tools: [\n      { name: 'tool-a', description: 'Tool A', input_schema: {}, output_schema: {} },\n      { name: 'tool-b', description: 'Tool B', input_schema: {}, output_schema: {} },\n    ],\n  });\n  // Mock WsHandle\n  const sent: string[] = [];\n  state.extensionWs = {\n    send: (data: string) => sent.push(data),\n    close: () => {},\n  };\n  return state;\n};\n```\n\nThen call handleExtensionMessage with JSON strings matching the config.setToolEnabled and config.setAllToolsEnabled methods, and verify:\n1. The response sent via extensionWs has result: { ok: true }\n2. state.toolConfig has the correct entry\n3. The callbacks were invoked\n\nCheck if extension-protocol.test.ts already exists — it does (from glob results). Read it to see what's already tested and add the new tests following the same patterns."
+    },
+    {
+      "id": "US-007",
+      "title": "Add E2E test coverage for side panel plugin list and tool toggle flow",
+      "description": "As a developer, I want E2E test coverage for the side panel's core user flows (plugin list rendering, tool toggle), so that the full background-to-side-panel communication path is verified.",
+      "acceptanceCriteria": [
+        "A new E2E test file or test block covers the side panel flow",
+        "Test verifies: side panel shows plugin list after MCP server connects",
+        "Test verifies: plugin card displays correct name, version, and tab state",
+        "Test verifies: tool toggle sends config.setToolEnabled to the MCP server",
+        "Test verifies: MCP server receives the tool config change and updates state",
+        "Tests use the existing Playwright fixtures from e2e/fixtures.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Files: e2e/ directory. The existing fixtures in e2e/fixtures.ts already set up the MCP server, Chrome extension, and a test web server.\n\nThe challenge: Playwright needs to interact with the side panel. Chrome's side panel can be opened via chrome.sidePanel.open() or by clicking the extension icon. The existing E2E test setup loads the extension as an unpacked extension.\n\nApproach:\n1. Read the existing E2E tests (e2e/full-e2e.e2e.ts and e2e/lifecycle.e2e.ts) to understand the test patterns\n2. The side panel is an extension page at chrome-extension://<id>/side-panel/side-panel.html — Playwright can navigate to it directly in a new page/tab\n3. Open the side panel page directly via its URL (get extension ID from the loaded extension)\n4. Wait for the plugin list to render (the side panel will connect to the background, which connects to the MCP server)\n5. Verify plugin names, versions, and states appear\n6. Click a tool toggle and verify the MCP server state changes\n\nKey gotcha: The side panel page opened directly (not via chrome.sidePanel.open) behaves like a regular extension page. The comment in App.tsx lines 121-136 explains that ws:message fallback exists for exactly this scenario. This actually makes it easier to test.\n\nLook at how e2e/fixtures.ts gets the extension ID — it likely uses chrome.management.getAll() or inspects the loaded extension path."
+    },
+    {
+      "id": "US-008",
+      "title": "Add runtime version negotiation between side panel and MCP server",
+      "description": "As a developer, I want the side panel to detect when it's running against an incompatible MCP server version, so that version mismatches are surfaced to the user instead of causing silent failures.",
+      "acceptanceCriteria": [
+        "The config.getState response from the MCP server includes a protocolVersion field",
+        "A PROTOCOL_VERSION constant is defined in @opentabs-dev/shared and used by both MCP server and side panel",
+        "The side panel checks protocolVersion in the config.getState response on connect",
+        "If protocolVersion is missing or mismatched, the side panel shows a clear warning to the user (e.g., 'MCP server version mismatch — please restart the server')",
+        "The warning does not block normal operation — the side panel continues to work best-effort",
+        "The PROTOCOL_VERSION is a simple integer that only increments when the config.getState response shape changes in a breaking way",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "This addresses the 'Remaining Concern #2' from the audit: if the managed extension auto-install gets out of sync with the MCP server, the side panel could silently receive unexpected data shapes.\n\nImplementation plan:\n\n1. In platform/shared/src/index.ts, add:\n```typescript\n/** Protocol version for side panel ↔ MCP server communication.\n *  Increment when the config.getState response shape changes in a breaking way. */\nexport const SIDE_PANEL_PROTOCOL_VERSION = 1;\n```\n\n2. In platform/mcp-server/src/extension-protocol.ts, handleConfigGetState:\nAdd `protocolVersion: SIDE_PANEL_PROTOCOL_VERSION` to the result object (import from shared).\n\n3. Update ConfigStateResult in platform/shared/src/index.ts to include `protocolVersion?: number`.\n\n4. In platform/browser-extension/src/side-panel/App.tsx:\nAfter fetchConfigState() resolves, check if result.protocolVersion matches SIDE_PANEL_PROTOCOL_VERSION. If not, set a warning state. Show a subtle banner below the header when mismatched.\n\n5. The warning should be a small amber/yellow bar with text like 'Server version mismatch — restart the MCP server for best results'. Non-blocking.\n\nThe protocolVersion field is optional in ConfigStateResult so that older servers without it gracefully degrade (the side panel treats missing as 'potentially mismatched' but only shows a warning, never blocks)."
+    }
+  ]
+}

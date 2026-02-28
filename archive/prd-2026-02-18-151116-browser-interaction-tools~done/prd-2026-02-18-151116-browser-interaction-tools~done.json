@@ -1,0 +1,64 @@
+{
+  "project": "OpenTabs Platform — Browser Interaction Tools (Retry)",
+  "description": "Complete the remaining browser interaction tools: JS dialog handling and E2E tests for all interaction tools (press_key, scroll, hover, handle_dialog).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add browser_handle_dialog tool for JS alert/confirm/prompt",
+      "description": "As an AI agent exploring a webapp, I want to automatically handle JavaScript dialogs (alert, confirm, prompt) so that they don't block all subsequent script execution and leave the tab in an unusable state.",
+      "acceptanceCriteria": [
+        "New file platform/mcp-server/src/browser-tools/handle-dialog.ts defines the browser_handle_dialog tool using defineBrowserTool",
+        "Tool accepts tabId (required), action ('accept' | 'dismiss', required), and optional promptText (string — text to enter for prompt() dialogs)",
+        "Tool dispatches to extension via 'browser.handleDialog' method",
+        "Extension handler in browser-commands.ts implements handleBrowserHandleDialog",
+        "Handler uses chrome.debugger to send CDP Page.handleJavaScriptDialog command with accept boolean and optional promptText",
+        "Uses same debugger management pattern as resource tools: if network capture is active (isCapturing(tabId)), reuses session; otherwise attaches, sends command, detaches",
+        "Enables Page domain before sending the command (idempotent if already enabled)",
+        "Returns { handled: true, action } on success",
+        "Returns a clear error if no dialog is currently open (CDP will error — catch and provide helpful message)",
+        "'browser.handleDialog' added to dispatch table in message-router.ts",
+        "'browser.handleDialog' added to ALLOWED_METHODS in offscreen/index.ts",
+        "Tool registered in platform/mcp-server/src/browser-tools/index.ts",
+        "Tool description explains that JS alert/confirm/prompt dialogs block all script execution in a tab until dismissed, and this tool allows dismissing them programmatically — use action 'accept' for confirm/alert, 'dismiss' to cancel, and promptText for prompt() dialogs",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "CDP command: Page.handleJavaScriptDialog takes { accept: boolean, promptText?: string }. Set accept=true for 'accept' action, accept=false for 'dismiss'.\n\nThe debugger management follows the same pattern used in the resource tools (PRD 2). Import isCapturing from './network-capture.js' and check it before attaching.\n\nCDP also has a Page.javascriptDialogOpening event that fires when a dialog appears. We could set up a listener to auto-detect dialogs, but that would require the debugger to be always attached. For now, the manual tool is sufficient — the AI calls it when it encounters errors from other tools that indicate a dialog is blocking.\n\nCommon scenario: AI calls browser_execute_script or browser_click_element, gets an error or timeout because a dialog is blocking. AI then calls browser_handle_dialog to dismiss it, then retries the original action.\n\nThe error handling for 'no dialog open' is important — Page.handleJavaScriptDialog throws if no dialog is present. Catch this and return a helpful message like 'No JavaScript dialog is currently open on this tab'.\n\nFiles to create/edit: (1) Create platform/mcp-server/src/browser-tools/handle-dialog.ts, (2) Add to browser-tools/index.ts, (3) Add handleBrowserHandleDialog to browser-commands.ts, (4) Add 'browser.handleDialog' to message-router.ts dispatch table, (5) Add to ALLOWED_METHODS in offscreen/index.ts."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E tests for browser_press_key, browser_scroll, browser_hover_element, and browser_handle_dialog",
+      "description": "As a developer, I want comprehensive E2E tests for all interaction tools so that keyboard input, scrolling, hover events, and dialog handling are verified through the full pipeline.",
+      "acceptanceCriteria": [
+        "Test server /interactive page updated with new test elements: a form with text input that logs 'form-submitted' to window.__formSubmitted on Enter keypress, a long scrollable section (2000px tall) with a #scroll-bottom marker at the bottom, a hoverable element #hover-target that sets window.__hovered=true on mouseenter, and a button #show-alert that calls alert('test-alert') on click",
+        "New test describe block 'Browser tools — keyboard input' in browser-tools.e2e.ts",
+        "Test: browser_press_key sends Enter on a form input — types text, presses Enter, verifies window.__formSubmitted is true via execute_script",
+        "Test: browser_press_key sends Escape — verifies the key event was dispatched by checking window.__lastKeydown via execute_script (set up a keydown listener in the test page)",
+        "New test describe block 'Browser tools — scrolling' in browser-tools.e2e.ts",
+        "Test: browser_scroll with direction='down' scrolls the page — checks returned scrollPosition.y > 0",
+        "Test: browser_scroll with selector scrolls element into view — scrolls to #scroll-bottom, verifies scrollPosition changed",
+        "New test describe block 'Browser tools — hover' in browser-tools.e2e.ts",
+        "Test: browser_hover_element dispatches mouseenter on target — hovers #hover-target, verifies window.__hovered is true via execute_script",
+        "Test: browser_hover_element returns error for non-existent selector",
+        "New test describe block 'Browser tools — dialog handling' in browser-tools.e2e.ts",
+        "Test: browser_handle_dialog dismisses an alert — clicks #show-alert button, then calls handle_dialog with action='accept', then verifies execute_script works again (not blocked by dialog)",
+        "BROWSER_TOOL_NAMES in helpers.ts updated to include all 4 new tool names",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "The /interactive page in e2e/test-server.ts needs new HTML elements for testing. Add them to the existing /interactive route handler. Key additions:\n\n1. Form with keydown handler: <form id='test-form' onsubmit='event.preventDefault(); window.__formSubmitted=true;'><input id='form-input' type='text'></form>\n2. Long content for scroll testing: <div id='scroll-section' style='height:2000px;background:linear-gradient(white,lightgray);'><div id='scroll-bottom' style='position:absolute;bottom:0;'>Bottom marker</div></div>\n3. Hover target: <div id='hover-target' onmouseenter='window.__hovered=true;'>Hover me</div>\n4. Alert trigger: <button id='show-alert' onclick='alert(\"test-alert\")'>Show Alert</button>\n5. Keydown logger: <script>document.addEventListener('keydown', e => { window.__lastKeydown = e.key; });</script>\n\nFor the dialog test: the challenge is that alert() blocks the JS thread. The test needs to click #show-alert (which triggers alert), then IMMEDIATELY call browser_handle_dialog to dismiss it. Since the click is async and the dialog blocks the page, the extension's browser_click_element should return before the dialog blocks (because el.click() returns synchronously and the alert fires in the next microtask). If this is an issue, use execute_script with setTimeout to trigger the alert with a delay.\n\nAdd the 4 new tool names to BROWSER_TOOL_NAMES: 'browser_press_key', 'browser_scroll', 'browser_hover_element', 'browser_handle_dialog'."
+    }
+  ]
+}

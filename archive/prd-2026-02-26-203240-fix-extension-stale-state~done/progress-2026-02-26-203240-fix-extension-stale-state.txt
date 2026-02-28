@@ -1,0 +1,39 @@
+# Ralph Progress Log
+PRD: prd-2026-02-26-203240-fix-extension-stale-state~running.json
+Started: Fri Feb 27 11:55:47 UTC 2026
+---
+
+## Codebase Patterns
+- `platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts` uses `useRef<Map<string, ReturnType<typeof setTimeout>>>` for managing timeouts keyed by string IDs (confirmation timeouts, invocation timeouts)
+- `platform/browser-extension/src/side-panel/constants.ts` holds side-panel-specific constants like `TOOL_INVOCATION_TIMEOUT_MS`
+- `loadPlugins` in App.tsx is async and returns a promise — pruning logic is added inside the `.then()` callback using the resolved plugin list
+- `setActiveTools` is passed to `useServerNotifications` hook and also used directly in `loadPlugins` for pruning
+- The `bun run test` suite can have transient failures in `platform/create-plugin/src/index.test.ts` when tests run concurrently (bun install cache races) — re-running resolves it
+- `bun run type-check` can fail with `TS6310: Referenced project may not disable emit` if tsbuildinfo files are stale from a previously failed build — fix by running `bun run clean && bun run build` to reset all incremental caches
+- `confirmation-badge.ts` in `platform/browser-extension/src/` manages badge count for pending confirmations; timeout logic is tracked in a `Map<string, ReturnType<typeof setTimeout>>` at module scope
+
+## 2026-02-27 - US-001
+- US-001 was fully implemented by a previous iteration (commits 33a41f7 and f80bdc2)
+- Implementation verified: `setActiveTools` pruning in `loadPlugins` after `.then()` resolves (App.tsx lines 61-69), `invocationTimeoutIds` ref with 5-minute timeout in `useServerNotifications.ts`, cleanup of both timeout maps on component unmount
+- PRD was not updated to `passes: true` by previous iteration — corrected here
+- All Phase 1 checks pass: build, type-check, lint, knip, test (74/74)
+- **Learnings:**
+  - Previous agent committed but did not update the PRD — always update PRD after commit
+  - `bun run test` can show a false failure on first run due to concurrent bun install cache races in create-plugin tests; re-run confirms green
+---
+
+## 2026-02-27 - US-002
+- Implemented background-side confirmation timeout tracking in `platform/browser-extension/src/confirmation-badge.ts`
+- Added `confirmationTimeouts` Map (module-scope) and `CONFIRMATION_BACKGROUND_TIMEOUT_BUFFER_MS = 2000` constant
+- In `notifyConfirmationRequest`: extract `id` and `timeoutMs` from params; set a background timeout (`timeoutMs + 2000ms`) that calls `clearConfirmationBadge()` and removes itself from the map
+- Added `clearConfirmationBackgroundTimeout(id: string)` export for cancelling a specific timeout when the side panel handles the confirmation first
+- Updated `clearAllConfirmationBadges` to clear all timeout entries on disconnect
+- In `platform/browser-extension/src/background-message-handlers.ts`: imported `clearConfirmationBackgroundTimeout`; called it in `handleSpConfirmationResponse` (accessing `message.data.id`) and `handleSpConfirmationTimeout` (accessing `message.id` directly)
+- Pre-existing `bun run type-check` failure due to stale tsbuildinfo files — fixed with `bun run clean && bun run build`
+- All Phase 1 checks pass: build, type-check, lint, knip, test (74/74)
+- All Phase 2 E2E checks pass: 357/357 tests passed
+- **Learnings:**
+  - `bun run type-check` can fail with `TS6310` due to stale `.tsbuildinfo` files from prior failed builds; `bun run clean && bun run build` resets all incremental caches
+  - `SpConfirmationTimeoutMessage.id` is at the top level, while `SpConfirmationResponseMessage.data.id` is nested in `data` — check extension-messages.ts types before accessing
+  - Background timeout should fire AFTER the server-side timeout expires; using `timeoutMs + 2000ms` ensures the side panel's `+1000ms` buffer fires first, then the background clears any residual count
+---

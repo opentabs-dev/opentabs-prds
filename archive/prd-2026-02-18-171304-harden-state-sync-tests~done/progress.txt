@@ -1,0 +1,74 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-171304-harden-state-sync-tests~running.json
+Started: Wed Feb 18 20:27:06 PST 2026
+---
+
+## Codebase Patterns
+- `clearTabStateCache()` in tab-state.ts is called on WebSocket disconnect (background.ts). It must clear both `lastKnownState` and `pluginLocks` maps to avoid stale promise chains surviving into the next connection session.
+- `clearPluginTabState(pluginName)` already clears both maps for a single plugin — the full cache clear should be consistent.
+- For testing modules with module-level state (e.g., rate-limiter's `methodTimestamps` Map), do NOT use `jest.useFakeTimers()` to mock `Date.now()` — bun:test runs all files in the same process and `jest.useRealTimers()` in other test files will overwrite the mock. Instead, add an optional `now` parameter to the function and a `resetForTesting` export to clear module state.
+- `tsconfig.test.json` in `platform/browser-extension/` includes `src/**/*.test.ts`, so new test files are automatically covered.
+- In `sanitize-error.ts`, regex replacements run in order: Windows paths → Unix paths → URLs → localhost → IPs. The Unix path regex catches parts of URLs (e.g., `//example.com/path`) before the URL regex runs. When testing URL sanitization, assert that sensitive content is absent (`.not.toContain`) rather than expecting a specific `[URL]` token.
+
+## 2026-02-18 20:28 PST - US-001
+- Added `pluginLocks.clear()` to `clearTabStateCache()` in `platform/browser-extension/src/tab-state.ts`
+- Files changed: `platform/browser-extension/src/tab-state.ts`
+- **Learnings for future iterations:**
+  - The `pluginLocks` Map holds per-plugin promise chains for serializing state computations. On disconnect, these chains become stale because the next connect triggers `sendTabSyncAll` which starts fresh.
+  - `clearPluginTabState()` (line 166-169) already clears both maps for individual plugins — this was the pattern to follow for the full clear.
+---
+
+## 2026-02-18 20:33 PST - US-002
+- Added early URL validation in the `ws:setUrl` handler in `platform/browser-extension/src/offscreen/index.ts`
+- Validates `rawUrl` with `new URL()` and checks `ws:`/`wss:` protocol before proceeding to fetch `/ws-info`
+- Invalid URLs get a `console.warn` and early return with `sendResponse({ ok: true })`
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - The offscreen document's `ws:setUrl` handler now mirrors the defensive validation pattern used by `isValidWsOrigin()` — both parse with `new URL()` and check protocol
+  - `sendResponse({ ok: true })` is the convention for graceful rejection in this handler — it acknowledges the message without triggering error handling in the background script
+  - Prettier/ESLint requires long `console.warn` template strings to be on a single line in this file
+---
+
+## 2026-02-18 20:37 PST - US-003
+- Added 5 new port-matching test cases to the existing `port matching` describe block in `platform/browser-extension/src/tab-matching.test.ts`
+- Test cases cover: localhost with explicit port, default port in pattern vs URL without explicit port (URL.port edge case), port-only difference detection, pattern without port matches localhost with any port, non-default explicit port matching
+- Files changed: `platform/browser-extension/src/tab-matching.test.ts`
+- **Learnings for future iterations:**
+  - `URL.port` returns `''` for default ports (80 for http, 443 for https), so a pattern like `https://example.com:443/*` does NOT match `https://example.com/path` — the port comparison is `'443' !== ''`
+  - The existing test file already had 4 port tests; the PRD asked for 5 new ones. Always check existing test coverage before adding to avoid duplication.
+  - `matchPattern` splits host:port by finding the last colon and checking if what follows is all digits — this correctly handles `*.domain.com` patterns (no port split)
+---
+
+## 2026-02-18 20:42 PST - US-004
+- Created `platform/browser-extension/src/rate-limiter.test.ts` with 13 unit tests across 6 describe blocks
+- Added optional `now` parameter to `checkRateLimit()` and exported `resetRateLimiter()` for test isolation
+- Tests cover: exempt methods (sync.full, extension.reload, plugin.update, plugin.uninstall), method-specific limits (screenshotTab at 2/s, enableNetworkCapture at 2/s, executeScript at 10/s, tool.dispatch at 30/s), default limit (20/s), window expiration, boundary conditions, method independence
+- Files changed: `platform/browser-extension/src/rate-limiter.ts`, `platform/browser-extension/src/rate-limiter.test.ts`
+- **Learnings for future iterations:**
+  - bun:test's `jest.useFakeTimers()`/`jest.useRealTimers()` affect `Date.now()` globally across all test files in the same process. If another test file calls `jest.useRealTimers()`, it restores the original `Date.now`, destroying any mock from your file. Direct `Date.now = () => fakeNow` assignment has the same problem.
+  - The correct approach for testing time-dependent modules: add an optional `now` parameter with `Date.now()` as default. This avoids global mock conflicts entirely and makes tests deterministic.
+  - The rate limiter's `methodTimestamps` Map is module-level state that persists across tests. Export a `resetRateLimiter()` function and call it in `beforeEach` to isolate tests.
+  - The rate limiter uses lazy pruning: expired timestamps are only removed when `checkRateLimit` is called again. The filter is `t > cutoff` (strict greater than), so timestamps exactly at the cutoff are pruned.
+---
+
+## 2026-02-18 20:50 PST - US-005
+- Created `platform/browser-extension/src/sanitize-error.test.ts` with 12 unit tests across 8 describe blocks
+- Tests cover: Windows backslash paths, Windows forward-slash paths, Unix multi-segment paths, single-segment path passthrough, URL content stripping (3 tests), localhost:port, IPv4 addresses, truncation (over 500 and exactly 500), passthrough (clean strings and empty string), combined patterns
+- Files changed: `platform/browser-extension/src/sanitize-error.test.ts`
+- **Learnings for future iterations:**
+  - The sanitize-error regex replacement order matters: Unix path regex runs before URL regex. URLs like `https://api.example.com/v1/data` get partially caught by the Unix path regex (`//api.example.com/v1/data` matches as multi-segment path), leaving `http[PATH]` instead of `[URL]`. Tests should assert that sensitive content is stripped (`.not.toContain`) rather than asserting exact replacement tokens for URLs.
+  - The Unix path regex requires at least 2 segments (`/segment1/segment2`), so `/api` alone is not replaced — this is intentional to avoid false positives.
+  - Truncation uses `slice(0, 497) + '...'` so the total length is exactly 500.
+---
+
+## 2026-02-18 20:52 PST - US-006
+- Added 1 new test to the existing `write serialization` describe block in `platform/browser-extension/src/plugin-storage.test.ts`
+- The existing block already had 4 tests covering concurrent storePluginsBatch, concurrent store+remove, three concurrent writes, and concurrent removePluginsBatch+store — these satisfied the first two acceptance criteria
+- Added the missing "failing write does not break mutex chain" test: mocks `chrome.storage.local.set` to reject on first call, fires two concurrent writes, verifies the first rejects while the second succeeds and produces correct final state
+- Used `Promise.allSettled` to await both promises and check their settlement status (avoids ESLint `@typescript-eslint/await-thenable` and `no-confusing-void-expression` errors with `await expect(...).rejects`)
+- Files changed: `platform/browser-extension/src/plugin-storage.test.ts`
+- **Learnings for future iterations:**
+  - The `serialize()` mutex uses `.then(() => {}, () => {})` to swallow errors on the chain — this means a failed write does NOT break subsequent writes. The test explicitly verifies this behavior.
+  - When testing promise rejection in bun:test, `await expect(p).rejects.toThrow()` can trigger ESLint `@typescript-eslint/await-thenable` if the return type isn't recognized as thenable. Use `Promise.allSettled` + status checks as an alternative.
+  - The `invalidatePluginCache()` call is necessary after a failed write because the cache may be in an inconsistent state (the failed write started modifying cache state before the `chrome.storage.local.set` rejection).
+---

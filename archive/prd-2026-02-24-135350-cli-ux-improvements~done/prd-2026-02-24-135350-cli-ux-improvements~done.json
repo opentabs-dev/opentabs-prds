@@ -1,0 +1,574 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Comprehensive CLI UX improvements: better error messages, confirmation prompts for destructive operations, server notification after config changes, consistent patterns across commands, aliases, secret masking, and numerous small polish fixes.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Notify running server after config set changes",
+      "description": "As a user, I want config changes to take effect immediately so that I don't have to manually restart the server after changing tool settings or local plugins.",
+      "acceptanceCriteria": [
+        "handleSetTool, handleSetBrowserTool, handleSetPort, handleSetLocalPluginsAdd, handleSetLocalPluginsRemove all call a notify function after writing config",
+        "The notify function POSTs to /reload on the running server (same pattern as plugin.ts notifyServer)",
+        "If the server is not running, a dim message is printed: 'Server not running — changes will apply on next start'",
+        "If the server is running and reload succeeds, a dim message is printed: 'Server notified'",
+        "The notifyServer helper is extracted to a shared location (e.g., platform/cli/src/notify-server.ts) so both plugin.ts and config.ts can import it",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The notifyServer helper is currently defined in platform/cli/src/commands/plugin.ts at line 55. It POSTs to `http://localhost:${port}/reload`. Extract it to a new file platform/cli/src/notify-server.ts, update plugin.ts to import from there, and add calls in config.ts after each set handler. Use the port from optsWithGlobals or the resolved port. The server may not be running — catch connection refused errors gracefully."
+    },
+    {
+      "id": "US-002",
+      "title": "Add confirmation prompt to plugin remove",
+      "description": "As a user, I want to be warned before a plugin is permanently removed so that I don't accidentally uninstall a plugin I depend on.",
+      "acceptanceCriteria": [
+        "opentabs plugin remove <name> prints what will be removed and asks for confirmation via a --confirm flag",
+        "Without --confirm, the command prints the plugin name and path, then exits with 'Use --confirm to proceed'",
+        "With --confirm, the command proceeds with uninstall as before",
+        "A -y alias is also accepted for --confirm",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/plugin.ts handlePluginRemove (around line 224). Follow the same pattern as config reset which already has --confirm (platform/cli/src/commands/config.ts lines 349-369). Add a .option('--confirm', 'Confirm removal') and .alias('-y') to the remove subcommand registration."
+    },
+    {
+      "id": "US-003",
+      "title": "Add confirmation prompt to config rotate-secret",
+      "description": "As a user, I want to be warned before rotating my secret so that I understand it will invalidate all existing MCP client configurations.",
+      "acceptanceCriteria": [
+        "opentabs config rotate-secret without --confirm prints a warning explaining consequences and exits",
+        "The warning mentions that all connected MCP clients will need their configuration updated",
+        "With --confirm, the command proceeds as before",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/config.ts handleRotateSecret (around line 382). Follow the same pattern as handleConfigReset. Add --confirm option to the rotate-secret subcommand. Print a warning like: 'This will generate a new authentication secret. All MCP client configurations (Claude Code, Cursor, etc.) will need to be updated with the new secret. Use --confirm to proceed.'"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix doctor to use readAuthSecret instead of config.secret",
+      "description": "As a user, I want the doctor command to correctly verify my authentication setup by reading the secret from auth.json, the single source of truth.",
+      "acceptanceCriteria": [
+        "Doctor imports and uses readAuthSecret() from platform/cli/src/config.ts instead of reading config.secret",
+        "The auth secret check reads from ~/.opentabs/extension/auth.json",
+        "The server health check uses the correct secret for authentication",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/doctor.ts line 325. Replace `const secret = config && typeof config.secret === 'string' ? config.secret : null;` with a call to readAuthSecret() which is exported from platform/cli/src/config.ts (line 64). Import readAuthSecret in the imports at line 5. The readAuthSecret function reads from `join(getExtensionDir(), 'auth.json')` and returns the secret string or null."
+    },
+    {
+      "id": "US-005",
+      "title": "Add timeout handling to audit command error path",
+      "description": "As a user, I want clear error messages when the audit endpoint times out instead of a generic error.",
+      "acceptanceCriteria": [
+        "The audit command's catch block checks for timeout errors (matching the pattern used in status.ts)",
+        "Timeout errors display 'Server not responding (timed out). Is the server running?' instead of a generic error",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/audit.ts lines 247-260. Add an isTimeout check between the isConnectionRefused check and the generic else. Check platform/cli/src/commands/status.ts around line 135 for the isTimeout pattern — it likely checks err.name === 'TimeoutError' or err.name === 'AbortError'. Apply the same pattern."
+    },
+    {
+      "id": "US-006",
+      "title": "Improve start command MCP server entry not found message",
+      "description": "As a user who installed the CLI via npm, I want a helpful error message when the server entry point is missing instead of being told to run bun run build.",
+      "acceptanceCriteria": [
+        "The error message distinguishes between dev (monorepo) and installed (npm global) contexts",
+        "For npm-installed CLI, the message suggests reinstalling: 'Try reinstalling: bun install -g @opentabs-dev/cli'",
+        "For dev context (detected by presence of workspace root package.json or .git), the current 'Run bun run build' message is preserved",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/start.ts lines 133-137. A reasonable heuristic for dev context: check if import.meta.url resolves to a path containing 'node_modules' (npm installed) vs a local workspace path. Or check if a root package.json with 'workspaces' exists relative to the CLI package. Keep it simple — the key is not showing 'bun run build' to end users."
+    },
+    {
+      "id": "US-007",
+      "title": "Fix alignment in start command output",
+      "description": "As a user, I want the start command output to have consistent column alignment for readability.",
+      "acceptanceCriteria": [
+        "MCP endpoint, Health check, and Log file labels are right-padded to the same width",
+        "Values align vertically in the terminal output",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/start.ts lines 163-165. The labels are 'MCP endpoint:' (13), 'Health check:' (13), and 'Log file:' (9). Use .padEnd(14) on the label strings (or equivalent) to ensure consistent spacing. The status command has a pad() helper pattern that could be referenced."
+    },
+    {
+      "id": "US-008",
+      "title": "Add did-you-mean suggestions for config set keys",
+      "description": "As a user, I want the CLI to suggest the correct config key when I make a typo in opentabs config set.",
+      "acceptanceCriteria": [
+        "When an unknown config key is provided to config set, the CLI computes string distance against known prefixes (tool., browser-tool., port, localPlugins.add, localPlugins.remove)",
+        "If a close match is found, it is printed as a suggestion: 'Did you mean \"tool.slack_send_message\"?'",
+        "The existing list of supported keys is still printed below",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/config.ts around lines 340-342. Implement a simple Levenshtein or prefix-matching check against the known key prefixes: 'tool.', 'browser-tool.', 'port', 'localPlugins.add', 'localPlugins.remove'. For the prefix match, check if the key starts with something close to these. A simple approach: check if the key prefix (part before the dot) is within edit distance 2 of a known prefix. Keep it simple — no need for a library."
+    },
+    {
+      "id": "US-009",
+      "title": "Mask secret in config show output",
+      "description": "As a user, I want my authentication secret to be masked by default when displaying config to prevent accidental exposure in shared terminal sessions.",
+      "acceptanceCriteria": [
+        "opentabs config show displays the secret as first 4 chars + '...' + last 4 chars (e.g., 'ab12...ef56')",
+        "opentabs config show --show-secret displays the full secret (for copy-paste when needed)",
+        "JSON output mode (--json) also masks the secret unless --show-secret is provided",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/config.ts. Add --show-secret option to the config show subcommand. In the show handler (around line 47 for JSON and line 95 for display), mask the secret unless --show-secret is true. Masking: if secret.length > 8, show first 4 + '...' + last 4. Otherwise just show '****'."
+    },
+    {
+      "id": "US-010",
+      "title": "Add status command 401 error handling",
+      "description": "As a user, I want clear guidance when the status command gets an authentication failure instead of a vague 'server may be misconfigured' message.",
+      "acceptanceCriteria": [
+        "A 401 response from the server prints 'Authentication failed. Check your secret in ~/.opentabs/extension/auth.json'",
+        "The message is distinct from the generic HTTP error message",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/status.ts around lines 64-67. The current 401 message is 'MCP server returned HTTP 401. The server may be misconfigured.' Change it to something actionable like 'Authentication failed. The secret in ~/.opentabs/extension/auth.json may not match the running server. Try restarting the server or running opentabs config rotate-secret --confirm.' Also check platform/cli/src/commands/audit.ts line 217 for a reference pattern."
+    },
+    {
+      "id": "US-011",
+      "title": "Fix update command to use platformExec for Windows compatibility",
+      "description": "As a user on Windows, I want the update command to work correctly by using the platform-appropriate executable names.",
+      "acceptanceCriteria": [
+        "update.ts imports platformExec from @opentabs-dev/shared",
+        "getLatestVersion uses platformExec('npm') instead of raw 'npm'",
+        "performUpdate uses platformExec('bun') instead of raw 'bun'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/update.ts. Add platformExec to the import from @opentabs-dev/shared (line 11). Replace 'npm' at line 32 with platformExec('npm'), and 'bun' at line 57 with platformExec('bun'). Follow the pattern used in plugin.ts lines 171, 238, 256, 469."
+    },
+    {
+      "id": "US-012",
+      "title": "Fix plugin search empty query display",
+      "description": "As a user, I want the plugin search 'no results' message to not show empty quotes when no query was provided.",
+      "acceptanceCriteria": [
+        "opentabs plugin search with no query and no results prints 'No plugins found.' without the empty '' quotes",
+        "opentabs plugin search somequery with no results still prints 'No plugins found for \"somequery\".'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 12,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/plugin.ts around lines 375-378. Change the no-results message to conditionally include the query: if query is truthy, print 'No plugins found for \"<query>\". Try a different search term.' Otherwise print 'No plugins found. Try a more specific search term.'"
+    },
+    {
+      "id": "US-013",
+      "title": "Add command aliases for common plugin operations",
+      "description": "As an experienced CLI user, I want to use shorthand aliases like 'ls', 'rm', and 'add' for plugin subcommands.",
+      "acceptanceCriteria": [
+        "opentabs plugin ls works as alias for opentabs plugin list",
+        "opentabs plugin rm works as alias for opentabs plugin remove",
+        "opentabs plugin add works as alias for opentabs plugin install",
+        "Aliases appear in help text",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/plugin.ts where the subcommands are registered. Commander supports .alias('ls') on commands. Find where list, remove, and install subcommands are created (search for .command('list'), .command('remove'), .command('install')) and add .alias() calls. For example: pluginCmd.command('list').alias('ls')."
+    },
+    {
+      "id": "US-014",
+      "title": "Add config show alias 'config get'",
+      "description": "As a user, I want opentabs config get to work as an alias for opentabs config show for discoverability.",
+      "acceptanceCriteria": [
+        "opentabs config get works identically to opentabs config show",
+        "The alias appears in help text",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 14,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/config.ts where the show subcommand is registered. Add .alias('get') to the show command definition."
+    },
+    {
+      "id": "US-015",
+      "title": "Format start command first-time JSON config across multiple lines",
+      "description": "As a new user, I want the MCP client configuration JSON to be readable when displayed during first-time setup.",
+      "acceptanceCriteria": [
+        "MCP client config examples in the start command are printed as formatted multi-line JSON",
+        "Each JSON object is indented for readability",
+        "The output remains copy-pasteable",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 15,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/start.ts printMcpClientConfigs function (around lines 108-124). Instead of building the JSON as a template literal string on one line, construct a JS object and use JSON.stringify(obj, null, 2). Indent each line of the output with appropriate padding. Keep the dim styling with pc.dim()."
+    },
+    {
+      "id": "US-016",
+      "title": "Improve audit empty results message",
+      "description": "As a new user, I want guidance when the audit log shows no entries so I understand why and what to do.",
+      "acceptanceCriteria": [
+        "When audit has no entries and no filters are active, the message includes guidance: 'Invoke tools through an MCP client to generate audit entries.'",
+        "When audit has no entries but filters are active (--plugin, --tool, --since, --status), the message includes: 'No entries match the current filters. Try broadening the search.'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 16,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/audit.ts around lines 176-178 (file mode) and 241-243 (server mode). Check the options object to determine if any filters are active (plugin, tool, since, status). Print different messages accordingly."
+    },
+    {
+      "id": "US-017",
+      "title": "Log warning for unexpected errors in plugin list offline fallback",
+      "description": "As a user, I want to know when the plugin list falls back to offline mode due to an unexpected error rather than silently swallowing it.",
+      "acceptanceCriteria": [
+        "Non-connection-refused errors in the server fetch path log a dim warning: 'Could not reach server. Showing offline data.'",
+        "Connection-refused errors (server not running) silently fall through to offline mode as before",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 17,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/plugin.ts around lines 546-550. The current code has an empty if block: `if (!isConnectionRefused(err)) { /* empty */ }`. Add a console.error(pc.dim('Could not reach server: ' + toErrorMessage(err) + '. Showing offline data.')) inside that block."
+    },
+    {
+      "id": "US-018",
+      "title": "Add malformed line count warning to audit file parsing",
+      "description": "As a user, I want to know when audit log entries are skipped due to malformed data so I can detect log corruption.",
+      "acceptanceCriteria": [
+        "The NDJSON parser tracks the count of skipped (malformed) lines",
+        "After parsing, if any lines were skipped, a dim note is printed: 'Note: N malformed log entries were skipped.'",
+        "Valid entries are still displayed normally",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 18,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/audit.ts around lines 150-155. Add a counter variable before the loop, increment it in the catch block, and print the count after the loop completes."
+    },
+    {
+      "id": "US-019",
+      "title": "Add shutdown message to start command SIGINT handler",
+      "description": "As a user, I want confirmation that the server has stopped when I press Ctrl+C.",
+      "acceptanceCriteria": [
+        "When the server process exits after SIGINT, a dim 'Server stopped.' message is printed",
+        "The exit code is preserved",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 19,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/start.ts around lines 188-197 where SIGINT is handled. After the child process exits, print console.log(pc.dim('Server stopped.'))."
+    },
+    {
+      "id": "US-020",
+      "title": "Add bun run dev to plugin create next steps",
+      "description": "As a plugin developer, I want the scaffolding output to mention the dev workflow so I can start developing with watch mode.",
+      "acceptanceCriteria": [
+        "The 'Next steps' output after plugin create includes a 'bun run dev' step with description",
+        "The step is listed after 'bun run build'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 20,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/scaffold.ts around lines 506-511 where the 'Next steps' are printed. Add a line like: '  bun run dev       # Watch mode — auto-rebuild on changes'. The scaffolded plugin template should already have a dev script defined."
+    },
+    {
+      "id": "US-021",
+      "title": "Add auth.json check to doctor command",
+      "description": "As a user, I want the doctor command to verify that auth.json exists and contains a valid secret.",
+      "acceptanceCriteria": [
+        "Doctor includes an 'Auth secret' check that verifies auth.json exists at ~/.opentabs/extension/auth.json",
+        "The check verifies the file contains a valid JSON object with a non-empty string 'secret' field",
+        "Pass: auth.json exists with valid secret",
+        "Warn: auth.json missing or invalid (suggest running opentabs start to generate it)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 21,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/doctor.ts. Add a new check after the existing config file check. Use readAuthSecret() from platform/cli/src/config.ts to attempt reading the secret. If null, report a warning. Follow the existing check pattern with pass/warn labels."
+    },
+    {
+      "id": "US-022",
+      "title": "Validate plugin package after install",
+      "description": "As a user, I want a warning if the installed npm package does not appear to be a valid OpenTabs plugin.",
+      "acceptanceCriteria": [
+        "After successful npm install, the CLI checks the installed package's package.json for the 'opentabs' field or 'opentabs-plugin' keyword",
+        "If neither is found, a yellow warning is printed: 'Warning: This package does not appear to be an OpenTabs plugin (missing opentabs metadata). It may not load correctly.'",
+        "The installation is not rolled back (just a warning)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 22,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/plugin.ts handlePluginInstall (around line 152). After the npm install succeeds, resolve the installed package path (use the global node_modules path), read its package.json, and check for the 'opentabs' field or 'opentabs-plugin' in keywords. Print a warning if missing. Don't fail — just warn."
+    },
+    {
+      "id": "US-023",
+      "title": "Warn when config set tool name does not match any registered tool",
+      "description": "As a user, I want a warning when I set a tool configuration for a tool name that doesn't exist, to catch typos.",
+      "acceptanceCriteria": [
+        "When the server is running, config set tool.<name> checks the tool name against registered tools",
+        "If the tool name is not found, a yellow warning is printed but the config is still saved",
+        "When the server is not running, no validation is attempted (just save silently)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 23,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/config.ts handleSetTool (around line 180). After writing the config, try fetching the tool list from the server (same endpoint used by handleListTools). If the server responds and the tool name is not in the list, print a yellow warning. Catch connection errors silently — if the server is not running, skip validation."
+    },
+    {
+      "id": "US-024",
+      "title": "Warn when config set localPlugins.add path does not contain package.json",
+      "description": "As a user, I want a warning when I add a local plugin path that does not look like a valid plugin directory.",
+      "acceptanceCriteria": [
+        "After adding a local plugin path, the CLI checks if the resolved path exists",
+        "If the path does not exist, a yellow warning is printed: 'Warning: Path does not exist'",
+        "If the path exists but has no package.json, a yellow warning is printed: 'Warning: No package.json found at <path>. Plugin may not load.'",
+        "The path is still added to config regardless of warnings",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 24,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/config.ts handleSetLocalPluginsAdd (around line 268). After adding the path to config, resolve it to an absolute path and check if package.json exists using Bun.file(join(resolvedPath, 'package.json')).exists(). Print a warning if not found."
+    },
+    {
+      "id": "US-025",
+      "title": "Detect dev vs installed context in update command",
+      "description": "As a developer running from source, I want the update command to warn me that it's for globally installed versions only.",
+      "acceptanceCriteria": [
+        "The update command detects when running from a monorepo/source checkout",
+        "When running from source, prints a warning: 'You appear to be running from source. Use git pull to update instead.' and exits",
+        "When running from global npm install, proceeds with update normally",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 25,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/update.ts. A reasonable heuristic: check if the CLI's directory (resolved from import.meta.url) is within a path that does NOT contain 'node_modules'. If so, it's running from source. Or check if a root package.json with 'workspaces' field exists in an ancestor directory."
+    },
+    {
+      "id": "US-026",
+      "title": "Add hint when logs --plugin matches nothing",
+      "description": "As a user, I want a hint when my plugin log filter produces no output to help me troubleshoot.",
+      "acceptanceCriteria": [
+        "When opentabs logs --plugin <name> produces no output and reaches the end of available logs, a dim hint is printed",
+        "The hint suggests checking the plugin name or that the plugin may not have produced log output yet",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 26,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/logs.ts. After the log reading/filtering is complete, if the plugin filter was active and no lines were output, print a dim hint. Track a counter of displayed lines to know whether anything was shown."
+    },
+    {
+      "id": "US-027",
+      "title": "Improve config reset success message",
+      "description": "As a user, I want the config reset success message to be styled consistently with other success messages and include the deleted path.",
+      "acceptanceCriteria": [
+        "The success message uses pc.green() for the confirmation text",
+        "The message includes the full config file path that was deleted",
+        "The 'Run opentabs start to regenerate' instruction is preserved",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 27,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/config.ts around line 368. Change from plain text to styled output: pc.green('Config file deleted:') + ' ' + configPath + '\\n' + pc.dim('Run opentabs start to regenerate.')"
+    },
+    {
+      "id": "US-028",
+      "title": "Add config set list-tools help when server not running",
+      "description": "As a user, I want alternative ways to discover tool names when the server is not running.",
+      "acceptanceCriteria": [
+        "When handleListTools fails because the server is not running, the error message also suggests 'opentabs plugin list' as an alternative",
+        "The suggestion is printed as a dim hint below the error",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 28,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/config.ts around lines 155-165 in handleListTools. After the existing error messages, add a dim hint: 'You can also list installed plugins with: opentabs plugin list'"
+    },
+    {
+      "id": "US-029",
+      "title": "Add doctor check for Chrome/Chromium browser installation",
+      "description": "As a user, I want the doctor command to verify that a Chromium-based browser is installed since it's a prerequisite for the extension.",
+      "acceptanceCriteria": [
+        "Doctor includes a 'Browser' check that looks for Chrome, Chromium, Edge, or Brave",
+        "On macOS, checks common application paths (/Applications/Google Chrome.app, etc.)",
+        "Pass: at least one Chromium-based browser found",
+        "Warn: no Chromium browser found with a message suggesting installation",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 29,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit platform/cli/src/commands/doctor.ts. Add a browser check. On macOS, check for: /Applications/Google Chrome.app, /Applications/Chromium.app, /Applications/Microsoft Edge.app, /Applications/Brave Browser.app. On Linux, check for 'google-chrome', 'chromium', 'chromium-browser', 'microsoft-edge' in PATH. On Windows, check Program Files paths. Use process.platform to determine OS. Keep it simple — just check for file/directory existence."
+    },
+    {
+      "id": "US-030",
+      "title": "Use terminal width for plugin search description truncation",
+      "description": "As a user, I want plugin search results to use my terminal width intelligently rather than a fixed truncation length.",
+      "acceptanceCriteria": [
+        "Plugin search description truncation adapts to terminal width (process.stdout.columns)",
+        "On narrow terminals, descriptions are truncated shorter",
+        "On wide terminals, more description is shown",
+        "A reasonable minimum is maintained (e.g., 30 chars) even on very narrow terminals",
+        "Falls back to 60 chars if terminal width is unavailable",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 30,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "Edit platform/cli/src/commands/plugin.ts around lines 384-387. Use process.stdout.columns (or a default of 80) to calculate available space for the description column. Subtract the space used by the name column and padding. The name column width varies, so compute it from the max name length in the results. Apply Math.max(30, computed) to ensure a reasonable minimum."
+    }
+  ]
+}

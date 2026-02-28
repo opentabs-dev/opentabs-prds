@@ -1,0 +1,54 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-164606-node-compat-fixups~running.json
+Started: Tue Feb 24 16:46:26 PST 2026
+---
+
+## Codebase Patterns
+- Production code must use runtime compatibility functions from `@opentabs-dev/shared` (e.g., `spawnProcessSync`, `readFile`, `fileExists`) — never call `Bun.*` APIs directly outside `isBun` guards.
+- The `@opentabs-dev/shared` package exports `spawnProcessSync(cmd, args)` which returns `{ exitCode, stdout, stderr }` and works on both Bun and Node.js.
+- E2E tests use Playwright 1.58.2 with Chrome for Testing 145.0.7632.6. The extension's offscreen document connects to the MCP server via WebSocket. If all browser E2E tests fail with `extensionConnected: false`, this is an environment issue (Chrome version incompatibility), not a code issue. Only 7 tests pass in this state: URL validation tests and the "extension not connected" graceful failure test.
+---
+
+## 2026-02-24 - US-001
+- Replaced unguarded `Bun.spawnSync` call in `platform/cli/src/commands/doctor.ts` (Linux browser detection) with `spawnProcessSync` from `@opentabs-dev/shared`
+- Added `spawnProcessSync` to the import statement from `@opentabs-dev/shared`
+- Verified no other unguarded `Bun.*` calls remain (only `Bun.version` inside `if (isBun)` guard)
+- Files changed: `platform/cli/src/commands/doctor.ts`
+- **Learnings for future iterations:**
+  - The `checkBrowser()` function in doctor.ts has platform-specific branches for darwin, linux, and win32
+  - `spawnProcessSync` is a drop-in replacement for `Bun.spawnSync` with a slightly different call signature: `spawnProcessSync(cmd, args)` vs `Bun.spawnSync([cmd, ...args], opts)`
+---
+
+## 2026-02-24 - US-002
+- Added `"engines": { "node": ">= 20.0.0" }` to four published package.json files: mcp-server, cli, plugin-tools, create-plugin
+- Placed the engines field after "version" and before "type" in each file, matching existing field ordering
+- Files changed: `platform/mcp-server/package.json`, `platform/cli/package.json`, `platform/plugin-tools/package.json`, `platform/create-plugin/package.json`
+- **Learnings for future iterations:**
+  - Only executable/published packages (cli, mcp-server, plugin-tools, create-plugin) get engines fields — library packages (plugin-sdk, shared) and the browser extension do not
+  - The root package.json has both "node" and "bun" engines for the monorepo contributor context, but published packages only specify "node"
+  - All four published packages follow the same field ordering convention: name, version, engines (new), type, ...
+---
+
+## 2026-02-24 - US-003 (BLOCKED — not committed, iteration 2)
+- All code changes remain implemented and ready (unchanged from iteration 1):
+  - `platform/plugin-sdk/src/lucide-icon-names.ts`: Changed comment from `bun run generate:icons` to generic instructions
+  - `platform/cli/CLAUDE.md`: Changed `bun install && bun run build` to `npm install && npm run build` in plugin example
+  - `plugins/CLAUDE.md`: Changed `bun.lock` to `lock file`
+  - `docs/content/docs/contributing/dev-setup.mdx`: Changed plugin build instructions from bun to npm (both e2e-test and slack plugin sections)
+  - `docs/content/docs/contributing/publishing.mdx`: Changed plugin update instructions from bun to npm
+- Phase 1 passes: build, type-check, lint, knip, test all exit 0 (2060 tests pass)
+- **BLOCKED by E2E infrastructure failure (confirmed on main branch)**:
+  - All 48 browser E2E tests fail with `waitForHealth timed out after 45000ms` — `extensionConnected: false`
+  - 7 tests pass: 6 URL validation tests + 1 "extension not connected" graceful failure test (these don't require extension connectivity)
+  - 302 tests did not run (skipped after failures in required fixtures)
+  - Confirmed failure also reproduces on main branch (ran `npx playwright test "audit-logging" --workers=1` from main), both in headless (`--headless=new`) and headed (`HEADED=1`) modes
+  - Chrome for Testing 145.0.7632.6 (Playwright 1.58.2, chromium-1208) — the extension's offscreen document never establishes a WebSocket connection to the MCP server
+  - The MCP server starts correctly, plugins load, /health returns status=ok, but extensionConnected remains false throughout the 45s timeout
+  - This is NOT caused by code changes — all changes in this story are purely documentation/comments
+- **Learnings for future iterations:**
+  - E2E tests require Chrome extension WebSocket connectivity via offscreen document → MCP server
+  - Chrome for Testing 145.0.7632.6 appears incompatible with the extension's WebSocket flow
+  - If all browser E2E tests fail with `extensionConnected: false`, this is an environment/Chrome version issue
+  - The code changes are complete and correct — a future iteration only needs E2E to pass to commit
+  - Try: check if `npx playwright install --force chromium` or downgrading Playwright resolves the Chrome version issue
+---

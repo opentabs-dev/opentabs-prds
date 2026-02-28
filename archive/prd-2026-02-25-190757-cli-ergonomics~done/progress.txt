@@ -1,0 +1,84 @@
+## Codebase Patterns
+- CLI commands are registered via `register*Command(program)` functions in `platform/cli/src/commands/`
+- Handler functions (e.g. `handleStatus`) are separate from the commander registration functions and can be independently imported/exported
+- Root program `.action()` in Commander is called when no subcommand matches, making it ideal for default behavior
+- `command.optsWithGlobals()` is used to get merged options (including global `--port`) in Commander actions
+
+# Ralph Progress Log
+PRD: prd-2026-02-25-190757-cli-ergonomics~running.json
+Started: Thu Feb 26 07:05:09 UTC 2026
+---
+
+## 2026-02-26 - US-001
+- What was implemented: Added root `.action()` to the Commander program in `cli.ts` that delegates to `handleStatus` when no subcommand is provided
+- Files changed:
+  - `platform/cli/src/commands/status.ts`: Exported `handleStatus` function
+  - `platform/cli/src/commands/index.ts`: Re-exported `handleStatus`
+  - `platform/cli/src/cli.ts`: Imported `handleStatus`, added `.action()` to root program
+- **Learnings for future iterations:**
+  - Commander's `.action()` on the root program is only triggered when no subcommand matches — `--help`, `-V`, and subcommands still work normally
+  - `command.optsWithGlobals()` merges global options (like `--port`) with command-local options, so passing the result to `handleStatus` gives it all the port info it needs
+  - `handleStatus`'s `json?: boolean` field is simply `undefined` when called from root action — no issue since it's optional
+---
+
+## 2026-02-26 - US-003
+- What was implemented: Changed the audit table status column header from 'OK' to empty string '' — the green checkmark/red cross icons are self-explanatory
+- Files changed:
+  - `platform/cli/src/commands/audit.ts`: Changed `'OK'.padEnd(COL_STATUS)` to `''.padEnd(COL_STATUS)` in the header line (no other changes needed)
+- **Learnings for future iterations:**
+  - COL_STATUS = 4 provides 3 spaces of padding after the 1-char icon — sufficient for alignment
+  - The header and icon share the same COL_STATUS width, so changing the header text only requires changing the string literal in the header line
+---
+
+## 2026-02-26 - US-002
+- What was implemented: Changed the audit table tool column width from a fixed 30-char constant to a dynamically computed value based on actual tool name lengths in the result set
+- Files changed:
+  - `platform/cli/src/commands/audit.ts`: Renamed `COL_TOOL = 30` to `COL_TOOL_MIN = 'Tool'.length`, added `colTool` computation in `printAuditTable` using `reduce` to find max tool name length, replaced all `COL_TOOL` usages with `colTool`
+- **Learnings for future iterations:**
+  - Used `reduce` instead of spread + `Math.max` to avoid issues with potentially empty arrays (though `printAuditTable` is only called when entries are non-empty)
+  - The column width formula is `Math.max(COL_TOOL_MIN, maxToolLen) + 2` — the +2 ensures 2 chars of padding after the longest tool name
+  - All three usages of the column width (header, separator, row) needed to be updated to use the dynamic value
+---
+
+## 2026-02-26 - US-004
+- What was implemented: Added OpenCode to the doctor MCP client config check — detects `opencode.json` in the current working directory and checks for `mcp.opentabs` (OpenCode's config format, distinct from `mcpServers.opentabs` used by Claude Code and Cursor)
+- Files changed:
+  - `platform/cli/src/commands/doctor.ts`: Added `{ name: 'OpenCode', path: join(process.cwd(), 'opencode.json') }` to `defaultMcpClientLocations()`, updated `checkMcpClientConfig` to also check `mcp.opentabs` in addition to `mcpServers.opentabs`, updated warning hint to mention OpenCode
+  - `platform/cli/src/commands/doctor.test.ts`: Added 4 new tests for OpenCode: pass with `mcp.opentabs`, warn without opentabs entry, hint mentions OpenCode when no client configured, both formats in same config
+- **Learnings for future iterations:**
+  - OpenCode uses `{ mcp: { opentabs: ... } }` format (not `mcpServers`) — keep this in mind when adding other clients
+  - The `checkMcpClientConfig` function accepts custom `clients` arrays for testing, so no test infra changes needed
+  - Both config format checks (`hasMcpServersOpentabs` and `hasMcpOpentabs`) apply to all clients — any client can use either format
+  - Prettier enforces single-line vs multi-line `Bun.write(...)` calls in tests based on line length — run `bun run format` after writing tests
+---
+
+## 2026-02-26 - US-005
+- What was implemented: Parallelized plugin name resolution by replacing sequential `packageExistsOnNpm` (sync `spawnSync`) with async `packageExistsOnNpmAsync` (async `spawnProcessAsync`) and using `Promise.all` to check all candidates concurrently
+- Files changed:
+  - `platform/cli/src/commands/plugin.ts`: Removed `packageExistsOnNpm`, added `packageExistsOnNpmAsync`, changed `resolvePackageName` to async with `Promise.all`, updated both callers (`handlePluginInstall` and `handlePluginRemove`) with `await`, removed `packageExistsOnNpm` from the export
+- **Learnings for future iterations:**
+  - `resolvePluginPackageCandidates` returns 1 candidate for already-qualified names (scoped/@org or prefixed) and 2+ for shorthand names — the early return for length === 1 avoids unnecessary registry lookups
+  - `Promise.all` with `candidates.map` + `candidates.find((_, i) => results[i])` is the clean pattern for checking concurrently but returning in priority order
+  - `spawnProcessSync` stays in the file — still used by `fetchPackageInfo`, `npmSearchPlugins`, and the `npm list -g` check in `handlePluginRemove`
+  - Exported symbols in plugin.ts are checked by knip — removing `packageExistsOnNpm` from the export was required since no other file imports it
+---
+
+## 2026-02-26 - US-006
+- What was implemented: Simplified the `indent` function in `start.ts` to remove the redundant ternary — both branches produced identical output `${prefix}${line}`, so the `i === 0` condition was dead code
+- Files changed:
+  - `platform/cli/src/commands/start.ts`: Removed `(line, i) => (i === 0 ? ...)` and replaced with `line => \`${prefix}${line}\``
+- **Learnings for future iterations:**
+  - The pre-commit hook runs prettier + eslint on staged files automatically — no need to manually format/lint before committing
+  - This was a pure dead logic cleanup; the visual output of MCP client configs printed by `printMcpClientConfigs` is completely unchanged
+---
+
+## 2026-02-26 - US-007
+- What was implemented: Added `--verbose` (`-v`) flag to `opentabs plugin list` that shows tool names indented below each plugin entry
+- Files changed:
+  - `platform/cli/src/commands/plugin.ts`: Added `verbose?: boolean` to `PluginListOptions`, `tools?: string[]` to `HealthPluginDetail`, `toolNames?: string[]` to `ListPluginEntry`, extended `readLocalPluginInfo` return type to include `toolNames: string[]`, updated both online and offline display paths to print tool names when verbose, propagated `toolNames` in local entry construction, added `-v, --verbose` option and example to command registration
+- **Learnings for future iterations:**
+  - The health endpoint already returns `tools: string[]` (prefixed, e.g., `slack_send_message`) in each `pluginDetails` entry — no server changes needed
+  - `dist/tools.json` tool entries have an un-prefixed `name` field (e.g., `send_message`) — `pluginNameFromPackage` in mcp-server would be needed to prefix them, but it's not in `@opentabs-dev/shared` so offline tool names are shown without prefix
+  - The return type of `readLocalPluginInfo` is an inline object literal type — prettier enforces multi-line formatting when it exceeds 120 chars; use `bun run lint:fix` to auto-correct
+  - `bun run lint:fix` without a file argument runs on the entire project — the extra file path argument is ignored by ESLint when `--fix` is already implied by the script
+---

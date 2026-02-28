@@ -1,0 +1,52 @@
+# Ralph Progress Log
+Started: Tue Feb 17 11:09:28 PST 2026
+
+## Codebase Patterns
+- Side panel receives server notifications via two paths: `sp:serverMessage` (forwarded by background) and `ws:message` (broadcast by offscreen document). Only `sync.full` needs the `ws:message` fallback; all other notifications arrive via `sp:serverMessage`.
+- `SIDE_PANEL_METHODS` in `message-router.ts` controls which notification methods the background forwards to the side panel via `sp:serverMessage`.
+- `loadPlugins` in App.tsx calls `fetchConfigState()` which sends `config.getState` to the MCP server.
+- `loadPlugins` is called directly (no ref indirection) since it has stable identity from `useCallback([], [])`.
+- Optimistic UI updates in PluginCard capture pre-update state snapshots for rollback — never reconstruct from inverse values.
+
+---
+
+## 2026-02-17 - US-001
+- Removed the `else if (wsData) { handleNotification(wsData); }` branch from the `ws:message` handler in App.tsx
+- The `ws:message` handler now only processes `sync.full` (calling `loadPluginsRef.current()`), preventing duplicate processing of tab.stateChanged, tool.invocationStart, tool.invocationEnd, and plugins.changed notifications
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - The ws:message path exists as a fallback for sync.full only — all other notifications are reliably delivered via sp:serverMessage
+  - Changes to the side panel message handling are safe to test via build + type-check + lint + knip + unit tests + E2E tests (all 142 E2E tests cover relevant scenarios)
+---
+
+## 2026-02-17 - US-002
+- Added a 200ms timestamp guard (`lastFetchRef`) to `loadPlugins` in App.tsx to prevent duplicate `fetchConfigState` calls
+- When `sync.full` arrives, the `ws:message` handler and the `plugins.changed` notification both call `loadPlugins()` — the guard ensures only the first call within 200ms actually fires `fetchConfigState()`
+- Legitimate `plugins.changed` from `plugin.update` (which doesn't overlap with `sync.full` timing) still triggers a fetch normally
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - `useRef(0)` + `Date.now()` timestamp guard is a clean React pattern for deduplicating rapid-fire calls without introducing `setTimeout`-based debounce complexity
+  - The 200ms window is conservative enough to catch the sync.full + plugins.changed double-fire while not blocking legitimate separate notifications
+---
+
+## 2026-02-17 - US-003
+- Removed `loadPluginsRef` ref and its sync `useEffect` from App.tsx
+- Replaced all 4 `loadPluginsRef.current()` call sites with direct `loadPlugins()` calls
+- Added `loadPlugins` to the main `useEffect` dependency array (safe because `useCallback([], [])` gives it a stable identity)
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - When a `useCallback` has empty deps `[]`, its identity is stable for the component lifetime — no ref indirection needed
+  - Adding a stable-identity callback to a `useEffect` dependency array does not cause re-runs
+  - All 142 E2E tests + 384 unit tests passed with no changes needed outside the single file
+---
+
+## 2026-02-17 - US-004
+- Fixed `handleToggleAll` in PluginCard.tsx to capture `plugin.tools` before the optimistic update
+- On server error, the rollback now restores the exact original per-tool enabled states instead of uniformly setting all tools to `!newEnabled`
+- This correctly handles mixed-state scenarios where some tools were enabled and others disabled before toggle-all
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginCard.tsx`
+- **Learnings for future iterations:**
+  - In React optimistic updates, always capture the pre-update state snapshot before calling the setter — `plugin.tools` from render-time props is safe to capture since `setPlugins` hasn't committed yet
+  - The rollback pattern `{ ...p, tools: originalTools }` is cleaner than reconstructing per-tool states
+  - All 142 E2E tests + 384 unit tests passed
+---

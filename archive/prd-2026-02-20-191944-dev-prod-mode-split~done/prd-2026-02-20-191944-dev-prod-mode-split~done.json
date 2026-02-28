@@ -1,0 +1,118 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Split MCP server into dev mode (file watchers, hot reload, config watching) and production mode (static discovery, restart to reload). Remove mtime polling fallback and config file watcher from production. Ensure E2E tests pass.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add dev mode flag to MCP server",
+      "description": "As a platform developer, I want a clear dev/production mode distinction so that production is simple and dev has the file watching features.",
+      "acceptanceCriteria": [
+        "MCP server accepts a --dev flag or OPENTABS_DEV=1 environment variable",
+        "When running without --dev, the server is in production mode by default",
+        "The dev mode state is accessible as a boolean from a module (e.g., isDev() or state.devMode)",
+        "The entry point (index.ts) passes the dev mode flag to performReload",
+        "bun run dev in platform/mcp-server/package.json starts with --dev flag and bun --hot",
+        "bun run start or direct invocation starts in production mode without bun --hot",
+        "Log message on startup indicates which mode: 'MCP server v... listening on ... (dev mode)' or without the suffix",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/index.ts to detect dev mode. Check Bun.argv for '--dev' or Bun.env.OPENTABS_DEV. Store the boolean on state or export it from a small module. Edit platform/mcp-server/package.json to ensure 'dev' script uses bun --hot and passes --dev. The flag should be determined ONCE at startup and stored — not rechecked on every reload."
+    },
+    {
+      "id": "US-002",
+      "title": "Make file watchers dev-only for local plugins",
+      "description": "As a user running the MCP server in production, I want the server to not run file watchers so that it is simple and predictable — I restart after installing plugins.",
+      "acceptanceCriteria": [
+        "In production mode, startFileWatching is NOT called — no fs.watch() handles are created",
+        "In production mode, startConfigWatching is NOT called — config.json is not watched",
+        "In production mode, mtime polling is NOT started",
+        "In dev mode, file watchers work exactly as they do today (no behavior change)",
+        "In dev mode, config watching works exactly as it does today",
+        "The file watcher callbacks (onManifestChanged, onIifeChanged, onConfigChanged, onPluginDiscovered) are only created in dev mode",
+        "State fields related to file watching (fileWatcherEntries, fileWatcherTimers, configWatcher, mtimePollTimerId, etc.) remain on ServerState for dev mode use",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/reload.ts. In reloadCore, wrap startFileWatching/startConfigWatching calls in an isDev check. The stopFileWatching at the top of reloadCore should still run unconditionally (to clean up during hot reload transitions). In performReload, the createFileWatcherCallbacks call can be gated on dev mode. Production mode: discover once, serve forever."
+    },
+    {
+      "id": "US-003",
+      "title": "Remove POST /reload endpoint in production mode",
+      "description": "As a user, I want the production server to not accept runtime reload requests so that the plugin state is predictable and only changes on restart.",
+      "acceptanceCriteria": [
+        "In production mode, POST /reload returns 404 or 405 with a message: 'Reload is only available in dev mode. Restart the server to pick up plugin changes.'",
+        "In dev mode, POST /reload works exactly as it does today",
+        "The /health endpoint still works in both modes",
+        "The /health endpoint includes a 'mode' field: 'dev' or 'production'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/http-routes.ts. Gate the POST /reload handler on dev mode. Add 'mode' to the /health response. The performConfigReload function can still exist (it's used by the config watcher in dev mode), but the HTTP endpoint should be gated."
+    },
+    {
+      "id": "US-004",
+      "title": "Update E2E tests for dev mode",
+      "description": "As a platform developer, I want E2E tests to run the MCP server in dev mode so that file watcher and hot reload tests work correctly.",
+      "acceptanceCriteria": [
+        "E2E test fixtures start the MCP server with --dev flag (or OPENTABS_DEV=1 env var)",
+        "Hot reload E2E tests (lifecycle.e2e.ts) still pass — they require dev mode features",
+        "Tool dispatch E2E tests (tool-dispatch.e2e.ts) still pass",
+        "IIFE injection E2E tests still pass",
+        "The test server startup in fixtures.ts passes the dev flag",
+        "bun run test:e2e passes (or only fails on pre-existing unrelated issues)"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Edit e2e/fixtures.ts. In startMcpServer(), add --dev to the bun command args or set OPENTABS_DEV=1 in the env. E2E tests exercise file watchers and hot reload, so they need dev mode. The key change is in the spawn command — look for where 'bun' is invoked with the server entry point."
+    },
+    {
+      "id": "US-005",
+      "title": "Update CLAUDE.md for dev/production mode",
+      "description": "As a platform developer, I want CLAUDE.md to document the dev/production mode split so that AI assistants understand the architecture.",
+      "acceptanceCriteria": [
+        "CLAUDE.md documents the --dev flag and OPENTABS_DEV env var",
+        "CLAUDE.md explains production mode: static discovery, restart to reload",
+        "CLAUDE.md explains dev mode: file watchers, hot reload, config watching",
+        "The 'Starting the MCP Server' section shows both modes",
+        "The 'Development Workflow' section explains the dev mode workflow",
+        "CLAUDE.md does not reference opentabs-plugin.json (it was already updated by the previous PRD, just verify)",
+        "CLAUDE.md does not reference npmPlugins as a config field (already updated, verify)"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Edit CLAUDE.md at the repo root. The previous PRD already updated it for the new plugin format, so this story focuses on adding the dev/production mode documentation. Look at the 'Starting the MCP Server' section and the 'Development Workflow' section."
+    },
+    {
+      "id": "US-006",
+      "title": "Final verification — all quality gates and E2E tests pass",
+      "description": "As a platform developer, I want all checks passing so that the dev/production split is complete.",
+      "acceptanceCriteria": [
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Run all verification commands. Fix any remaining issues. This is the final cleanup story."
+    }
+  ]
+}

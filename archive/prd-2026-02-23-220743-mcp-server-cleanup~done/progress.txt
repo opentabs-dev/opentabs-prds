@@ -1,0 +1,80 @@
+# Ralph Progress Log
+PRD: prd-2026-02-23-220743-mcp-server-cleanup~running.json
+Started: Mon Feb 23 22:07:56 PST 2026
+---
+
+## Codebase Patterns
+- `listEnabledTools` in registry.ts was dead code — the actual implementation used by MCP is `getEnabledToolsList` in mcp-setup.ts (handles both plugin + browser tools)
+- ESLint config must ignore `.storybook/*.mjs` files since they are plain JS mocks without TypeScript type information
+- The registry module exports from a single barrel: buildRegistry, emptyRegistry, getPlugin, getTool, getResource, getPrompt, listAllResources, listAllPrompts, trustTierPrefix
+- extension-protocol.ts has `sendToExtension` (general-purpose), `sendJsonRpcError` (simple code+message errors), `sendPluginManagementError` (catches with code/message/data/retryAfterMs extraction), and `serializePluginForExtension` (common plugin+tools wire format) as internal helpers
+- plugin-management.ts has `runNpmGlobal(command, packageName)` for all npm global operations (install, update, uninstall) — spawns npm with 60s timeout, throws with code -32603 on failure
+---
+
+## 2026-02-24 - US-001
+- Removed `listEnabledTools` function from `platform/mcp-server/src/registry.ts`
+- Removed `listEnabledTools` from the export list in registry.ts
+- Removed unused `isToolEnabled` import and `ServerState` type import from registry.ts
+- Removed the entire `describe('listEnabledTools', ...)` test block and `makeState` helper from `platform/mcp-server/src/registry.test.ts`
+- Removed `listEnabledTools` import and `ServerState` type import from registry.test.ts
+- Fixed pre-existing ESLint crash: added `**/.storybook/*.mjs` to ESLint ignores in `eslint.config.ts` (`.mjs` files don't have TypeScript type info and can't be linted with type-checked rules)
+- Files changed: `platform/mcp-server/src/registry.ts`, `platform/mcp-server/src/registry.test.ts`, `eslint.config.ts`
+- **Learnings for future iterations:**
+  - The `.storybook/chrome-mock.mjs` file is intentionally plain JS for Storybook's module system — it must be excluded from ESLint's type-checked rules
+  - When removing an export, always check the test file for both the import and any test helpers that only existed to support those tests (e.g., `makeState` was only used by `listEnabledTools` tests)
+---
+
+## 2026-02-24 - US-002
+- Added `sendJsonRpcError(state, id, code, message)` helper to `platform/mcp-server/src/extension-protocol.ts`, placed right after `sendToExtension`
+- Replaced 14 occurrences of the `sendToExtension(state, { jsonrpc: '2.0', error: { code, message }, id })` pattern with `sendJsonRpcError` calls:
+  - handleTabStateChanged (1), handleConfigSetToolEnabled (4), handleConfigSetAllToolsEnabled (3), handlePluginSearch (1), handlePluginInstall (1), handlePluginUpdateFromRegistry (1), handlePluginRemove (1), Method not found fallback (1), handlePluginCheckUpdates (1)
+- Left complex catch blocks with `data` fields untouched (those are for US-003)
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`
+- **Learnings for future iterations:**
+  - handleTabStateChanged has a local `sendError` closure that conditionally logs OR sends an error depending on whether `id` is present — the `sendJsonRpcError` call is inside that closure, not a direct replacement
+  - handlePluginCheckUpdates catch block was the simplest (just code + message, no data) — it's a good candidate for `sendJsonRpcError` unlike the other plugin management catch blocks
+  - The complex catch blocks in handlePluginSearch/Install/Update/Remove extract `data` and `retryAfterMs` from errors — these need a separate helper (US-003)
+---
+
+## 2026-02-24 - US-003
+- Added `sendPluginManagementError(state, id, err)` helper to `platform/mcp-server/src/extension-protocol.ts`, placed right after `sendJsonRpcError`
+- The helper extracts `code`, `message`, `data`, and `retryAfterMs` from the caught error and sends a JSON-RPC error response with merged data
+- Replaced 5 catch blocks with `sendPluginManagementError` calls:
+  - handlePluginSearch (1), handlePluginInstall (1), handlePluginUpdateFromRegistry (1), handlePluginRemove (1), handlePluginCheckUpdates (1)
+- handlePluginCheckUpdates previously used `sendJsonRpcError` (from US-002) but now uses the unified `sendPluginManagementError` for consistency across all plugin management handlers
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`
+- **Learnings for future iterations:**
+  - The handlePluginSearch catch block had a slightly different pattern from the others — it built `data` inline with only `retryAfterMs`, while Install/Update/Remove extracted `err.data` as a whole object. The unified helper handles both by merging `data` and `retryAfterMs` separately.
+  - All 5 plugin management catch blocks now have identical one-line error handling, making it trivial to add new plugin management handlers in the future.
+---
+
+## 2026-02-24 - US-004
+- Added `runNpmGlobal(command, packageName)` helper to `platform/mcp-server/src/plugin-management.ts`, placed right after the `NPM_SUBPROCESS_TIMEOUT_MS` constant
+- The helper spawns `npm <command> -g <packageName>` via `Bun.spawn`, applies 60s timeout, collects stdout/stderr, and throws on non-zero exit with code -32603 and data `{ stderr, stdout }`
+- Replaced 3 inline npm subprocess patterns with `runNpmGlobal` calls:
+  - `installPlugin`: `await runNpmGlobal('install', pkg)`
+  - `updatePlugin`: `await runNpmGlobal('update', pkg)`
+  - `removePlugin`: `await runNpmGlobal('uninstall', pkg)`
+- Net reduction: 38 lines added (helper + calls), 78 lines removed (inline patterns) = 40 lines saved
+- Files changed: `platform/mcp-server/src/plugin-management.ts`
+- **Learnings for future iterations:**
+  - The callers don't use stdout/stderr on success — they only appear in error data. The `await runNpmGlobal(...)` call without destructuring is clean.
+  - The log.error for failure is now inside the helper, using the command name dynamically (`npm ${command} failed for ${packageName}`), which matches the original per-caller log messages exactly.
+  - The existing tests only cover `normalizePluginName` and `isValidPluginPackageName` — no tests for the npm subprocess functions, so the refactor is purely structural.
+---
+
+## 2026-02-24 - US-005
+- Added `serializePluginForExtension(plugin, state)` helper to `platform/mcp-server/src/extension-protocol.ts`, placed after `sendPluginManagementError`
+- The helper returns the common core wire format: `{ name, version, displayName, urlPatterns, trustTier, iconSvg?, iconInactiveSvg?, tools: [...] }`
+- Added `RegisteredPlugin` to the type imports from `./state.js`
+- Replaced 3 inline serialization sites with the helper:
+  - `sendSyncFull`: `{ ...serializePluginForExtension(p, state), sourcePath, adapterHash }`
+  - `sendPluginUpdate`: `{ ...serializePluginForExtension(plugin, state), sourcePath, adapterHash }`
+  - `handleConfigGetState`: `{ ...serializePluginForExtension(p, state), source, tabState, sdkVersion?, update? }`
+- Net change: 49 insertions, 48 deletions — the helper definition is offset by eliminating 3 copies of the tool serialization loop
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`
+- **Learnings for future iterations:**
+  - The three serialization sites share the core fields (name, version, displayName, urlPatterns, trustTier, icons, tools) but differ in extras: sendSyncFull/sendPluginUpdate add sourcePath+adapterHash, while handleConfigGetState adds source+tabState+sdkVersion+update
+  - The helper returns the common intersection; callers spread additional fields on top. This keeps the wire format identical while consolidating the tool serialization loop
+  - handleConfigGetState sorts plugins by name before serializing — that's caller logic, not part of the helper
+---

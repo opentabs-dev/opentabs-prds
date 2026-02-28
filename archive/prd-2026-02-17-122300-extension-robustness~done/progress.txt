@@ -1,0 +1,111 @@
+# Ralph Progress Log
+Started: Tue Feb 17 11:35:05 PST 2026
+
+## Codebase Patterns
+- The keepalive alarm handler in background.ts fires periodically (KEEPALIVE_INTERVAL_MINUTES) and is the right place to add periodic health checks
+- ensureOffscreenDocument() is idempotent — it attempts chrome.offscreen.createDocument and catches the error if one already exists
+- The browser extension uses a creatingOffscreen promise guard to prevent concurrent creation attempts
+- Extension lifecycle events (onInstalled, onStartup, top-level) all call ensureOffscreenDocument() + setupKeepaliveAlarm() + reinjectStoredPlugins()
+- The offscreen ws:setUrl handler has three branches: active ws, pending reconnect timer, and neither (backoff exhausted). All three must be covered for URL changes to always trigger reconnection.
+- The codebase pattern for chrome.runtime.sendMessage is promise-style `.catch()` (see messaging.ts). The bridge.ts sendRequest was the last callback-style holdout. getConnectionState still uses callback-style because it needs the response value.
+- ESLint enforces `@typescript-eslint/use-unknown-in-catch-callback-variable` — catch callbacks must type the error as `unknown`, not `Error`.
+- Side panel E2E tests use manual setup (not fixtures) for side-panel-data-flow tests: MCP server + test server + extension context + adapter symlink, with try/finally cleanup.
+- When the plugin is in 'unavailable' state, `TabStateHint` renders "Log in to {displayName}" which can cause `getByText(displayName)` to match multiple elements. Use `locator('button[aria-expanded]').first()` to target the plugin card button directly.
+- To trigger a tab state recheck after toggling auth, reload the app tab — the `status=complete` event fires `checkTabStateChanges` in the background script.
+- Tab state CSS classes: ready → `bg-emerald-400`, unavailable → `bg-amber-400`, closed → `bg-red-400`.
+- Bun fires the WebSocket close handler synchronously during `ws.close()`. In `createHandleWsOpen`, `state.extensionWs` must be assigned to the new WS BEFORE calling `.close()` on the old one, otherwise the close handler rejects pending dispatches incorrectly.
+- To test the server-side DISPATCH_TIMEOUT_MS (30s), replace the extension's WS with a fake client mid-dispatch so the response has no path back. Use the test server's slow mode (60s) to ensure the adapter is still blocked when the WS is replaced. Use a raw HTTP fetch with a 45s timeout (not the standard mcpClient which has 30s).
+- Opening a raw WebSocket to the MCP server replaces the extension's connection. The extension reconnects quickly (~1s), so any raw WS tests must complete their sends rapidly without inter-message waits.
+---
+
+## 2026-02-17 — US-001
+- Added `ensureOffscreenDocument().catch(console.error)` call inside the chrome.alarms.onAlarm listener in background.ts
+- Updated the comment to describe both keepalive and offscreen health-check purposes
+- Files changed: platform/browser-extension/src/background.ts (lines 170-174)
+- **Learnings for future iterations:**
+  - The alarm handler was previously a no-op; it only kept the service worker alive by waking it. Adding the ensureOffscreenDocument() call gives it a second purpose: recovering the offscreen document if Chrome terminates it.
+  - ensureOffscreenDocument() is already called at top-level, onInstalled, and onStartup — the alarm handler adds periodic re-verification.
+  - All quality checks (build, type-check, lint, knip, test, test:e2e) pass with 142 E2E tests.
+---
+
+## 2026-02-17 — US-003
+- Converted `sendRequest()` in bridge.ts from callback-style `sendMessage(msg, callback)` to promise-style `sendMessage(msg).catch()`
+- Updated bridge.test.ts mock to return `Promise.resolve()`/`Promise.reject()` instead of calling callbacks
+- Renamed `nextLastError` → `nextSendError` in test mock, removed `callback` field from captured calls
+- Updated `getConnectionState` test overrides to match new `sendMessageCalls` type (removed extra `callback` property)
+- Files changed: platform/browser-extension/src/side-panel/bridge.ts, platform/browser-extension/src/side-panel/bridge.test.ts
+- **Learnings for future iterations:**
+  - ESLint rule `@typescript-eslint/use-unknown-in-catch-callback-variable` requires `.catch((err: unknown) => ...)` — using `: Error` triggers a lint error. The error must be narrowed with `instanceof Error` before use.
+  - The `getConnectionState` function still uses callback-style because it needs the response value from the callback. The promise-style `sendMessage` returns the response as the resolved value, but `getConnectionState` was out of scope for this story.
+  - The test mock was straightforward to convert: instead of pushing `{ message, callback }` and calling the callback synchronously, the mock now returns `Promise.resolve()` or `Promise.reject(new Error(...))`.
+  - All quality checks (build, type-check, lint, knip, test, test:e2e) pass with 142 E2E tests.
+---
+
+## 2026-02-17 — US-002
+- Added `else { void connect(); }` branch to the ws:setUrl handler in offscreen/index.ts
+- The if/else chain now covers all three cases when the URL changes: (1) ws active → close it, (2) ws null + reconnect timer pending → cancel timer and connect, (3) ws null + no reconnect timer → connect immediately
+- Files changed: platform/browser-extension/src/offscreen/index.ts (lines 321-324)
+- **Learnings for future iterations:**
+  - The offscreen document's ws:setUrl handler uses a three-way if/else: active ws, pending reconnect timer, and neither. The third case (backoff exhausted or no connection ever established) was the gap.
+  - backoffMs is already reset to INITIAL_BACKOFF_MS at line 308, so the new connect() call starts with a fresh backoff.
+  - All quality checks (build, type-check, lint, knip, test, test:e2e) pass with 142 E2E tests.
+---
+
+## 2026-02-17 — US-004
+- Added E2E test 'tab state dot shows unavailable (amber) when auth is toggled off' to side-panel-data-flow.e2e.ts
+- Test verifies the full ready → unavailable → ready transition cycle:
+  1. Opens matching tab with auth ON → verifies green dot (bg-emerald-400)
+  2. Toggles auth OFF + reloads app tab → verifies amber dot (bg-amber-400)
+  3. Toggles auth ON + reloads app tab → verifies green dot restored
+- Files changed: e2e/side-panel-data-flow.e2e.ts
+- **Learnings for future iterations:**
+  - When the plugin is 'unavailable', TabStateHint renders "Log in to E2E Test" which causes `getByText('E2E Test')` to match 2 elements (strict mode violation). Use `locator('button[aria-expanded]').first()` instead.
+  - Toggling auth on the test server (`testServer.setAuth(false)`) doesn't trigger an automatic recheck — the app tab must be reloaded to fire a `status=complete` event that triggers `checkTabStateChanges`.
+  - The health endpoint's `pluginDetails` array contains `{ name, tabState }` objects that can be polled to wait for state transitions before asserting on the side panel UI.
+  - All quality checks (build, type-check, lint, knip, test, test:e2e) pass with 143 E2E tests.
+---
+
+## 2026-02-17 - US-005
+- Implemented E2E test for server-side DISPATCH_TIMEOUT_MS (30s) in edge-cases.e2e.ts
+- Test strategy: replaces extension's WebSocket mid-dispatch with a fake client so the adapter's response never reaches the server
+- Uses test server's slow mode (60s delay) to keep the adapter blocked during the WS replacement
+- Uses a raw HTTP fetch with 45s timeout (instead of standard mcpClient's 30s) to avoid racing with the dispatch timeout
+- Also fixed a bug in createHandleWsOpen: Bun fires WS close handlers synchronously during ws.close(), so state.extensionWs must be assigned before closing the old connection to prevent incorrect rejection of pending dispatches
+- Files changed: e2e/edge-cases.e2e.ts, platform/mcp-server/src/http-routes.ts
+- **Learnings for future iterations:**
+  - Bun fires WebSocket close handlers synchronously during ws.close() — code that closes a WS must not rely on the close handler running asynchronously
+  - To simulate a "response never reaches server" scenario, replace the extension's WS with a fake client AND set slow mode so the adapter is still waiting when the WS is replaced
+  - The standard MCP client (createMcpClient in fixtures.ts) has a 30s fetch timeout hardcoded — for tests that need to wait longer, build a minimal inline MCP session with raw HTTP fetches
+  - The MCP Streamable HTTP transport returns SSE responses for tool calls — parse them by extracting `data:` lines and matching JSON-RPC by request ID
+  - All quality checks (build, type-check, lint, knip, test, test:e2e) pass with 144 E2E tests
+---
+
+## 2026-02-17 — US-006
+- Added E2E test 'invalid JSON, non-object JSON, and missing method+id do not drop the connection' to edge-cases.e2e.ts
+- Test opens a raw WebSocket to the MCP server, sends 4 types of malformed messages in rapid succession:
+  1. Invalid JSON (`this is not valid JSON {{{`)
+  2. Valid JSON string primitive (`"just a string"`)
+  3. Valid JSON array (`[1, 2, 3]`)
+  4. JSON object with neither method nor id (`{ jsonrpc: "2.0", data: "..." }`)
+- Verifies the connection survived via a ping/pong roundtrip after all malformed messages
+- After closing the raw WS, waits for the real extension to reconnect and confirms tool calls work
+- Files changed: e2e/edge-cases.e2e.ts
+- **Learnings for future iterations:**
+  - When opening a raw WebSocket to the MCP server, it replaces the extension's WS connection. The extension reconnects quickly (~1s initial backoff), creating a race condition. Malformed messages and the verification ping must be sent in rapid succession without waits between them, before the extension's reconnect timer fires and replaces the raw WS.
+  - The server's handleExtensionMessage gracefully handles non-object JSON (strings, arrays) because `JSON.parse` succeeds but accessing `.method` and `.id` on a non-object returns `undefined`, routing to the "no method, no id" warning path.
+  - All quality checks (build, type-check, lint, knip, test, test:e2e) pass with 145 E2E tests.
+---
+
+## 2026-02-17 — US-007
+- Added E2E test '3 concurrent tool calls that all time out return clean errors without interfering' to edge-cases.e2e.ts
+- Test fires 3 concurrent echo calls with 27s slow mode (exceeding 25s SCRIPT_TIMEOUT_MS) via Promise.allSettled
+- Verifies all 3 return fulfilled results with isError: true and "timed out" message
+- Verifies elapsed time is ~25s (concurrent, not sequential ~75s)
+- After resetting slow mode, verifies a subsequent normal tool call succeeds
+- Files changed: e2e/edge-cases.e2e.ts
+- **Learnings for future iterations:**
+  - Promise.allSettled is the right pattern for concurrent timeout tests — all calls resolve (MCP protocol returns timeout as isError: true tool result, not a transport failure)
+  - The 3 concurrent timeouts all fire around the same ~25s mark, confirming the extension handles concurrent dispatches independently without serialization
+  - The elapsed time check (>20s, <40s) guards against sequential execution which would take ~75s
+  - All quality checks (build, type-check, lint, knip, test, test:e2e) pass with 146 E2E tests
+---

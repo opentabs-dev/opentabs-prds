@@ -1,0 +1,67 @@
+# Ralph Progress Log
+PRD: prd-2026-02-25-190352-mcp-server-bugs~running.json
+Started: Thu Feb 26 03:04:23 UTC 2026
+---
+
+## Codebase Patterns
+- Adapter files use the format `{pluginName}-{8hexchars}.js` in the adapters/ directory
+- `escapeRegex` helper added to adapter-files.ts to safely build plugin-name-specific regexes
+- Tests for adapter-files.ts use `mkdtempSync` + `OPENTABS_CONFIG_DIR` env override for isolation
+
+## 2026-02-26 - US-001
+- Fixed prefix collision in `writeAdapterFile` cleanup filter in `platform/mcp-server/src/adapter-files.ts`
+- Changed `f.startsWith(`${pluginName}-`)` to a regex `^{escapedPluginName}-[0-9a-f]{8}\.js(\.map)?$`
+- Added `escapeRegex` helper to safely handle plugin names with special regex characters
+- Added test case "does not delete adapter files for plugins whose names share a prefix" to `adapter-files.test.ts`
+- Files changed: `platform/mcp-server/src/adapter-files.ts`, `platform/mcp-server/src/adapter-files.test.ts`
+- **Learnings for future iterations:**
+  - The `.tmp` suffix exclusion in the old filter was redundant with the new regex (since `$` anchors prevent matching `.js.tmp`), but harmless
+  - The `cleanupStaleAdapterFiles` function uses a different approach (stripHash + Set lookup) that is not affected by this prefix collision bug
+  - All 2062 tests pass; build, type-check, lint, knip all green
+---
+
+## 2026-02-26 - US-002
+- Added `pruneStaleBuffers(activePlugins: Set<string>)` to `platform/mcp-server/src/log-buffer.ts`
+- Imported and called `pruneStaleBuffers` from `pruneStaleState` in `platform/mcp-server/src/reload.ts`
+- Added 4 test cases for `pruneStaleBuffers` in `platform/mcp-server/src/log-buffer.test.ts`
+- Files changed: `platform/mcp-server/src/log-buffer.ts`, `platform/mcp-server/src/log-buffer.test.ts`, `platform/mcp-server/src/reload.ts`
+- **Learnings for future iterations:**
+  - Log buffers are stored on `globalThis` keyed by `__opentabs_log_buffers__` to survive `bun --hot` re-evaluations; `getBuffers()` is the internal accessor
+  - `pruneStaleState` in `reload.ts` is the single place to clean up all per-plugin state after a registry swap; add new per-plugin cleanup here
+  - 2066 tests pass; build, type-check, lint, knip all green
+---
+
+## 2026-02-26 - US-003
+- Imported `rejectAllPendingConfirmations` from `extension-handlers.ts` into `shutdown.ts`
+- Called `rejectAllPendingConfirmations(state)` in the shutdown handler between step 1 (reject pending dispatches) and step 3 (stop sweep timer)
+- Updated step numbering in the module-level JSDoc comment (now 6 steps instead of 5)
+- Files changed: `platform/mcp-server/src/shutdown.ts`
+- **Learnings for future iterations:**
+  - `rejectAllPendingConfirmations` is already exported from `extension-handlers.ts` and used in `createHandleWsClose`; reuse it for shutdown symmetry
+  - When `bun run type-check` fails with TS6310 ("Referenced project may not disable emit"), run `bun run clean && bun run build` first to refresh stale `.tsbuildinfo` files — this resolves the issue without any code changes
+  - The stale tsbuildinfo issue is caused by TypeScript 5.9.x with composite project references and `noEmit`; a fresh build restores the correct state
+  - 2066 tests pass; build, type-check, lint, knip all green
+---
+
+## 2026-02-26 - US-004
+- Added `maxPayload: 10 * 1024 * 1024` to `new WebSocketServer(...)` in `platform/mcp-server/src/server-node.ts`
+- This matches the Bun server's `maxPayloadLength: 10 * 1024 * 1024` set in `index.ts`
+- Files changed: `platform/mcp-server/src/server-node.ts`
+- **Learnings for future iterations:**
+  - `MAX_MESSAGE_SIZE` in `extension-protocol.ts` is not exported; inline the value with a comment referencing that constant (matching the pattern used in `index.ts`)
+  - 2066 tests pass; build, type-check, lint, knip all green
+---
+
+## 2026-02-26 - US-005
+- Fixed `npmTrustTier` in `platform/mcp-server/src/discovery.ts` to use `path.basename(path.dirname(dir)) === OFFICIAL_SCOPE` instead of `dir.includes('/${OFFICIAL_SCOPE}/')` to prevent false positives where the scope name appears elsewhere in the path
+- Added test case "returns community for community plugin installed under a path containing /@opentabs-dev/" to `platform/mcp-server/src/discovery.test.ts`
+- Fixed a race condition in `reloadCore` in `platform/mcp-server/src/reload.ts`: config.json writes that occur during the async reload window (between `stopFileWatching` and `startConfigWatching`) were silently dropped. Fix captures `prevConfigMtime` before async work and triggers a follow-up reload if mtime advanced.
+- Fixed `e2e/iife-injection.e2e.ts` teardown test: explicitly reset teardown markers via `page.evaluate()` before checking them to avoid stale state from previous injection
+- Increased timeouts in `e2e/side-panel-plugin-toggle.e2e.ts` to 30s to accommodate parallel test load
+- Files changed: `platform/mcp-server/src/discovery.ts`, `platform/mcp-server/src/discovery.test.ts`, `platform/mcp-server/src/reload.ts`, `e2e/iife-injection.e2e.ts`, `e2e/side-panel-plugin-toggle.e2e.ts`
+- **Learnings for future iterations:**
+  - The `configLastSeenMtime` field in `FileWatchingState` is updated by `startConfigWatching()` to record the current file mtime; use this as a baseline for change detection after reload
+  - `stopFileWatching()` cancels ALL pending debounce timers (both plugin and config timers) — any config write during the async reload window is silently dropped; the follow-up reload check in `reloadCore` detects this
+  - `analyze-site.e2e.ts` tRPC test is flaky under heavy parallel load but passes in isolation; it's a pre-existing issue not caused by these changes
+  - 2067 tests pass; build, type-check, lint, knip all green; all 4 side-panel-plugin-toggle E2E tests pass
+---

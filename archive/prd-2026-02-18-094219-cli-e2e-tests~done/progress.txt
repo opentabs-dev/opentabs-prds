@@ -1,0 +1,86 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-094219-cli-e2e-tests~running.json
+Started: Wed Feb 18 11:17:19 PST 2026
+---
+
+## Codebase Patterns
+- CLI binary for create-plugin is at `platform/create-plugin/dist/index.js` — run via `bun <path> <args>`
+- CLI binary for opentabs commands is at `platform/cli/dist/cli.js` — run via `bun <path> <subcommand> <args>`
+- Use `Bun.spawnSync` with `OPENTABS_CONFIG_DIR` env var for isolated CLI tests
+- The `scaffoldPlugin()` function uses `JSON.stringify()` for template generation, so generated code uses double quotes (not single quotes) for string literals
+- The `tsconfig.test.json` pattern: extends `../../tsconfig.base.json`, sets `noEmit: true`, includes `src/**/*.test.ts`, references the production tsconfig
+- Pre-commit hooks run prettier and eslint --fix on staged files, so formatting is auto-corrected
+- `@opentabs-dev/*` packages are private npm packages — tests that need `bun install` for scaffolded plugins must override `package.json` dependencies to use `file:` paths pointing to local `platform/` packages, plus `overrides` for transitive deps
+- Bun's `overrides` field in `package.json` resolves transitive dependency versions to specified values (similar to npm overrides)
+- Plugin paths in config.json are stored relative to the config dir — use `path.relative(configDir, absolutePath)` to compute expected values in tests
+- For `plugin list --json` tests, create a minimal plugin dir with `opentabs-plugin.json` manifest to get full plugin metadata in the output
+- For `opentabs build` E2E tests, copy the e2e-test plugin to a temp dir with `cpSync` (exclude node_modules) + `symlinkSync` (link original node_modules) — this avoids copying huge node_modules while keeping dependency resolution working
+
+## 2026-02-18 - US-001
+- Implemented E2E test for `create-opentabs-plugin` CLI binary
+- Created `platform/create-plugin/src/index.test.ts` with 9 tests across 3 describe blocks
+- Tests cover: successful scaffolding (7 files, package.json, class name, URL pattern, Zod schemas, config registration), --display/--description options, domain URL patterns (.example.com → wildcard, example.com → exact)
+- Also committed `platform/create-plugin/tsconfig.test.json` and updated root `tsconfig.json` to reference it
+- Files changed: `platform/create-plugin/src/index.test.ts` (new), `platform/create-plugin/tsconfig.test.json` (new, previously untracked), `tsconfig.json` (added test config reference)
+- **Learnings for future iterations:**
+  - The scaffold templates use `JSON.stringify()` which produces double-quoted strings — assertions must use `"` not `'`
+  - The `tsconfig.test.json` for create-plugin already existed on disk but was untracked in git — needed to be committed
+  - `Bun.spawnSync` returns stdout/stderr as `Buffer` objects — call `.toString()` to get strings
+---
+
+## 2026-02-18 - US-002
+- Added 4 error handling E2E tests to `platform/create-plugin/src/index.test.ts`
+- Tests cover: invalid plugin name (uppercase → exit 1 + "must be lowercase alphanumeric"), reserved name ("system" → exit 1 + "reserved"), existing directory (→ exit 1 + "already exists"), missing --domain flag (→ exit 1 + "--domain" in stderr)
+- Files changed: `platform/create-plugin/src/index.test.ts` (added `describe('error handling')` block with 4 tests)
+- **Learnings for future iterations:**
+  - Commander's `requiredOption` handles missing flags automatically — exits with code 1 and prints usage to stderr including the missing option name
+  - The `ScaffoldError` class in `platform/cli/src/scaffold.ts` catches all validation errors (name, URL pattern, existing dir) and prints to stderr via `console.error(pc.red(...))`
+  - `mkdirSync` can be used in tests to pre-create directories for "already exists" error testing
+---
+
+## 2026-02-18 - US-003
+- Added E2E test for the full scaffold → install → build pipeline to `platform/create-plugin/src/index.test.ts`
+- Test scaffolds a plugin, overrides `package.json` deps to use local `file:` paths (avoids npm auth requirement for private `@opentabs-dev/*` packages), runs `bun install`, runs `bun run build`, then verifies:
+  - `opentabs-plugin.json` exists with correct `name`, `version`, `adapterHash`, `url_patterns`, and `tools` array
+  - Tools have `name`, `description`, `input_schema`, `output_schema` fields
+  - `dist/adapter.iife.js` exists and is non-empty
+- Test has 60s timeout since install+build takes ~1-2s
+- Files changed: `platform/create-plugin/src/index.test.ts` (added `describe('scaffolded plugin install and build')` block with 1 test)
+- **Learnings for future iterations:**
+  - `@opentabs-dev/*` packages return 404 from public npm registry without auth — tests must use `file:` overrides to local platform packages
+  - Bun's `overrides` field handles transitive dependency resolution — needed for `@opentabs-dev/shared` which is a transitive dep of both `plugin-sdk` and `cli`
+  - The `overrideToLocalPackages` helper pattern: read scaffolded `package.json`, replace direct deps with `file:` paths, add `overrides` for all `@opentabs-dev/*` packages, write back
+  - ESLint forbids non-null assertions (`!`) — use optional chaining (`?.`) with separate `toBeDefined()` assertions instead
+---
+
+## 2026-02-18 - US-004
+- Implemented E2E tests for `opentabs plugin list`, `opentabs plugin add`, and `opentabs plugin remove` CLI commands
+- Created `platform/cli/src/commands/plugin.test.ts` with 11 tests across 3 describe blocks
+- Tests cover:
+  - **plugin add**: adds path to config.json (stored as relative), creates config.json if missing, detects duplicate paths ("already configured"), warns on non-existent path but still adds it
+  - **plugin list**: prints "No plugins configured" when empty, `--json` outputs JSON array with plugin info (path, resolvedPath, exists, hasManifest, name, version, toolCount), exits with code 1 when config missing
+  - **plugin remove**: removes plugin by stored path, removes plugin by directory name, exits with code 1 when plugin not found, exits with code 1 when config missing
+- Helper `createMinimalPlugin()` creates a directory with an `opentabs-plugin.json` manifest for `list --json` testing
+- Files changed: `platform/cli/src/commands/plugin.test.ts` (new)
+- **Learnings for future iterations:**
+  - `handlePluginAdd` stores paths relative to the config dir (using `path.relative(configDir, resolvedPath)`) — tests must account for this when verifying config.json contents
+  - `handlePluginAdd` does NOT exit with code 1 on duplicate — it returns 0 and prints "Plugin path already configured." to stdout
+  - `handlePluginRemove` supports matching by exact path OR by directory name (via `endsWith('/' + name)`)
+  - Async test functions without `await` trigger ESLint `@typescript-eslint/require-await` — remove `async` from test callbacks that only use synchronous operations
+  - The CLI binary at `platform/cli/dist/cli.js` handles all `plugin` subcommands: `list`, `add`, `remove`, `create`
+---
+
+## 2026-02-18 - US-005
+- Implemented E2E tests for the `opentabs build` CLI command
+- Created `platform/cli/src/commands/build-e2e.test.ts` with 6 tests across 2 describe blocks
+- Tests cover:
+  - **successful build**: copies e2e-test plugin to temp dir, runs `opentabs build`, verifies `opentabs-plugin.json` with correct name/version/adapterHash/url_patterns/tools structure, verifies `dist/adapter.iife.js` exists and starts with `(` (IIFE wrapper), contains `__adapterHash` assignment, and contains `Object.freeze` call
+  - **validation errors**: modifies compiled `dist/index.js` to set invalid name (`INVALID`) → exits with code 1 + "Validation failed"; modifies compiled `dist/index.js` to set empty tools array → exits with code 1 + "Validation failed"
+- Uses `cpSync` with filter to copy plugin excluding `node_modules`, then `symlinkSync` to link original `node_modules` for dependency resolution
+- Files changed: `platform/cli/src/commands/build-e2e.test.ts` (new)
+- **Learnings for future iterations:**
+  - When copying a plugin to a temp dir for build testing, `node_modules` must be available for the dynamic `import()` in `opentabs build` to resolve `@opentabs-dev/plugin-sdk` — use `symlinkSync` to avoid copying the full `node_modules` directory
+  - The compiled `dist/index.js` uses ES class field syntax (e.g., `name = 'e2e-test'`, `tools = [echo, greet, ...]`) — regex replacements must match this pattern, not `this.name = ...`
+  - `opentabs build` errors go to stderr via `console.error(pc.red(...))` and call `process.exit(1)` — test for `exitCode === 1` and `stderr.toContain('Validation failed')`
+  - The adapter IIFE starts with `(` (arrow function syntax `(() => { ... })()`) — use `startsWith('(')` to verify IIFE format
+---

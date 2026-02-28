@@ -1,0 +1,74 @@
+# Ralph Progress Log
+Started: Tue Feb 17 08:36:28 PST 2026
+
+## Codebase Patterns
+- `forwardToSidePanel` from `messaging.ts` wraps messages in `sp:serverMessage` type for the side panel listener in App.tsx
+- `sendToServer` sends JSON-RPC over WebSocket to MCP server; `forwardToSidePanel` sends to the side panel via chrome.runtime.sendMessage
+- Tab state changes flow through three call sites: `checkTabStateChanges` (tab events), `sendTabSyncAll` (connect/reconnect), `handlePluginUpdate` (hot reload)
+- The side panel message listener in App.tsx matches on `data.method` to route notifications (tab.stateChanged, plugins.changed, tool.invocationStart/End)
+- `SIDE_PANEL_METHODS` in message-router.ts controls which server messages are forwarded to the side panel by the generic `handleServerMessage` router
+- The `lastKnownState` Map in tab-state.ts is the authoritative cache for per-plugin tab states in the extension
+- `getPluginTabState(pluginName)` in tab-state.ts reads from `lastKnownState`, returning 'closed' as default — use this to build ConfigStatePlugin objects with tab state
+- The validated plugin payloads in handleSyncFull (`metas` array) have the same shape as ConfigStatePlugin except for `tabState` and `displayName` defaulting — map with `displayName: m.displayName ?? m.name` and `tabState: getPluginTabState(m.name)`
+- New push notification methods: `plugins.state` (full list), `plugin.updated` (single update) — both must be in SIDE_PANEL_METHODS
+
+---
+
+## 2026-02-17 - US-001
+- Implemented: Forward tab.stateChanged to side panel from background
+- Files changed:
+  - `platform/browser-extension/src/tab-state.ts` — imported `forwardToSidePanel`, added forwarding in `sendTabSyncAll` (per-plugin loop after tab.syncAll) and `checkTabStateChanges` (after sendToServer)
+  - `platform/browser-extension/src/message-router.ts` — added `forwardToSidePanel` call in `handlePluginUpdate` after the existing sendToServer for tab.stateChanged
+- **Learnings for future iterations:**
+  - The side panel already had a working `tab.stateChanged` handler in App.tsx — no side panel changes needed
+  - `tab.stateChanged` was already in `SIDE_PANEL_METHODS` so the generic message router in `handleServerMessage` also forwards server-originated tab.stateChanged — the new calls are for background-originated state changes that don't come from the server
+  - All quality checks pass (build, type-check, lint, knip, 366 unit tests, 137 E2E tests)
+---
+
+## 2026-02-17 - US-002
+- Implemented: Push sync.full plugin state directly to side panel
+- Files changed:
+  - `platform/browser-extension/src/tab-state.ts` — added `getPluginTabState()` export that reads from `lastKnownState` cache
+  - `platform/browser-extension/src/message-router.ts` — imported `getPluginTabState`, replaced `plugins.changed` notification in `handleSyncFull` with `plugins.state` containing full ConfigStatePlugin[] array, added `plugins.state` to `SIDE_PANEL_METHODS`
+  - `platform/browser-extension/src/side-panel/App.tsx` — added `plugins.state` handler before `plugins.changed` handler that calls `setPlugins()` directly
+- **Learnings for future iterations:**
+  - The `metas` array in `handleSyncFull` is `PluginMeta[]` (from `toPluginMeta`), which has the same fields as `ConfigStatePlugin` except `tabState` — just add `tabState: getPluginTabState(m.name)` and `displayName: m.displayName ?? m.name`
+  - Tab state in plugins.state may be slightly stale (before sendTabSyncAll completes), but US-001's tab.stateChanged forwarding corrects it moments later
+  - `plugins.changed` handler is kept as a fallback for any code path that still sends it (e.g., handlePluginUpdate still sends it until US-003)
+  - Watch for Prettier formatting on arrow functions that span lines — the auto-formatter fixed a trailing newline issue
+  - All quality checks pass (build, type-check, lint, knip, 366 unit tests, 137 E2E tests)
+---
+
+## 2026-02-17 - US-003
+- Implemented: Push plugin.update state directly to side panel
+- Files changed:
+  - `platform/browser-extension/src/message-router.ts` — replaced `plugins.changed` notification in `handlePluginUpdate` with `plugin.updated` containing single ConfigStatePlugin, added `plugin.updated` to `SIDE_PANEL_METHODS`
+  - `platform/browser-extension/src/side-panel/App.tsx` — added `plugin.updated` handler that updates by name or appends if new
+- **Learnings for future iterations:**
+  - For `handlePluginUpdate`, the tab state is already freshly computed via `computePluginTabState` (stored in `newState`), so use `newState.state` directly instead of `getPluginTabState()` which would return stale cached data
+  - The `plugin.updated` handler in App.tsx uses `findIndex` + splice pattern for updating a single plugin, and appends if not found (handles newly installed plugins)
+  - All quality checks pass (build, type-check, lint, knip, 366 unit tests, 137 E2E tests)
+---
+
+## 2026-02-17 - US-004
+- Implemented: Remove ws:message broadcast fallback in side panel
+- Files changed:
+  - `platform/browser-extension/src/side-panel/App.tsx` — removed the entire `ws:message` handler block (comment + if block with setTimeout 1500ms fallback)
+- **Learnings for future iterations:**
+  - Pure removal — no other code referenced or depended on this fallback behavior
+  - The ws:message type is still used elsewhere in the extension (offscreen document broadcasts it), but the side panel no longer needs to listen for it
+  - All quality checks pass (build, type-check, lint, knip, 366 unit tests, 137 E2E tests)
+---
+
+## 2026-02-17 - US-005
+- Implemented: Optimistic local toggle for tool enable/disable
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — replaced `onRefresh` prop with `setPlugins: Dispatch<SetStateAction<PluginState[]>>`, implemented optimistic toggle for both `handleToggleAll` and `handleToggleTool` with revert on error
+  - `platform/browser-extension/src/side-panel/components/PluginList.tsx` — replaced `onRefresh` prop with `setPlugins`, passed through to PluginCard
+  - `platform/browser-extension/src/side-panel/App.tsx` — changed `onRefresh={loadPlugins}` to `setPlugins={setPlugins}`
+- **Learnings for future iterations:**
+  - The `plugin` prop to PluginCard is derived from the `plugins` state array in App.tsx, so `setPlugins` updates the source of truth and PluginCard re-renders automatically
+  - `loadPlugins` and `loadPluginsRef` remain for initial mount and the `plugins.changed` fallback — only the toggle handlers use the optimistic pattern
+  - Use `Dispatch<SetStateAction<PluginState[]>>` from 'react' instead of `React.Dispatch` to avoid needing the React namespace import
+  - All quality checks pass (build, type-check, lint, knip, 366 unit tests, 137 E2E tests)
+---

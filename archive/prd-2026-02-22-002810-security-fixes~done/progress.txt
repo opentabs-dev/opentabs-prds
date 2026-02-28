@@ -1,0 +1,49 @@
+# Ralph Progress Log
+PRD: prd-2026-02-22-002810-security-fixes~running.json
+Started: Sun Feb 22 13:34:55 PST 2026
+---
+
+## Codebase Patterns
+- The `connectionToken` anti-takeover mechanism was fully removed in commit f81f1ae. There is no `connectionToken` anywhere in the codebase.
+- The e2e-test plugin (`plugins/e2e-test/`) is a standalone project that must be built separately: `cd plugins/e2e-test && bun install && bun run build`. Its `dist/` is gitignored and not present in a fresh worktree clone.
+- The `build-e2e.test.ts` tests in plugin-tools depend on the e2e-test plugin being built (they copy its `dist/` to a temp directory). Without building the plugin first, these tests fail with ENOENT.
+- The `/health` endpoint already has a test (`does not leak wsSecret in the response body`) that verifies secrets don't appear in the response text.
+- Browser extension tests run in Bun's default environment (no happy-dom/jsdom), so DOM-dependent utilities must use pure string processing for testability.
+- The extension's sole source for the wsSecret is `auth.json` (read via `bootstrapFromAuthFile()` in `offscreen/index.ts`). The `/ws-info` endpoint only returns `{ wsUrl }` — no secret.
+
+---
+
+## 2026-02-22 13:37 - US-001
+- **What was implemented**: No code changes needed — the `connectionToken` was already removed from the entire codebase in commit f81f1ae (`feat: US-003 — remove connection token anti-takeover mechanism`). The /health endpoint no longer has any `connectionToken` field. Tests already verify secrets are absent.
+- **Files changed**: None (fix was already in place)
+- **Pre-existing issue fixed**: The e2e-test plugin's `dist/` directory was missing, causing 6 test failures in `platform/plugin-tools/src/commands/build-e2e.test.ts`. Fixed by running `cd plugins/e2e-test && bun install && bun run build`.
+- **Learnings for future iterations:**
+  - When working in a fresh git worktree, always check if `plugins/e2e-test/` needs to be built — it's gitignored and won't have `dist/` or `node_modules/`
+  - PRD stories may reference line numbers from an older state of the codebase — always verify against the current code before making changes
+  - The quality check `bun run test` includes `build-e2e.test.ts` which requires the e2e-test plugin to be pre-built
+---
+
+## 2026-02-22 13:44 - US-002
+- **What was implemented**: Created `sanitizeSvg()` utility in `platform/browser-extension/src/sanitize-svg.ts` that uses an element/attribute allowlist approach to strip dangerous SVG content. Integrated into `PluginIcon.tsx` so both `iconSvg` and `iconInactiveSvg` are sanitized before being passed to `dangerouslySetInnerHTML`.
+- **Files changed**:
+  - `platform/browser-extension/src/sanitize-svg.ts` (new) — allowlist-based SVG sanitizer
+  - `platform/browser-extension/src/sanitize-svg.test.ts` (new) — 38 unit tests covering safe SVG passthrough, XSS vector stripping, and edge cases
+  - `platform/browser-extension/src/side-panel/components/PluginIcon.tsx` — imported and applied `sanitizeSvg()` before `dangerouslySetInnerHTML`
+- **Learnings for future iterations:**
+  - The SVG sanitizer uses pure string tokenization (not DOMParser) because Bun's test runner has no DOM environment — this makes the utility testable without any DOM polyfill
+  - The sanitizer strips disallowed elements AND their entire subtree (e.g., `<foreignObject>` with nested HTML is fully removed)
+  - href/xlink:href on `<use>` elements only allows internal fragment references (`#id`), blocking external SVG references and javascript:/data: URIs
+  - The build-time `validate-icon.ts` in plugin-tools catches issues early, but the runtime sanitizer is the real security boundary since npm-installed plugins ship pre-built artifacts that bypass build-time validation
+---
+
+## 2026-02-22 13:50 - US-003
+- **What was implemented**: Removed the `wsSecret` field from the `/ws-info` endpoint JSON response. The endpoint now only returns `{ wsUrl }`. Also removed the corresponding dead code in the Chrome extension's offscreen document that read `wsSecret` from the `/ws-info` response — the extension already obtains the secret from `auth.json` via `bootstrapFromAuthFile()`.
+- **Files changed**:
+  - `platform/mcp-server/src/http-routes.ts` — removed `wsSecret` spread from `/ws-info` response
+  - `platform/mcp-server/src/http-routes.test.ts` — updated `WsInfoResponse` type (removed `wsSecret?` field), changed test to assert `wsSecret` is absent instead of present
+  - `platform/browser-extension/src/offscreen/index.ts` — removed `wsSecret` reads from `/ws-info` responses in both `refreshWsUrl()` and the `ws:setUrl` handler
+- **Learnings for future iterations:**
+  - The extension's auth flow has two sources: primary is `auth.json` (read via `chrome.runtime.getURL`), and `/ws-info` was a secondary fallback for the secret. After this change, `auth.json` is the sole source of the secret.
+  - The `/ws-info` endpoint requires Bearer auth using the same secret it would return — so echoing it was always redundant (caller already has it).
+  - When removing fields from API responses, always check both the server (response construction) AND the client (response consumption) to remove dead code on both sides.
+---

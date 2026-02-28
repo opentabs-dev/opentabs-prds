@@ -1,0 +1,321 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Consolidate UX improvements across all three actor workflows: (1) End user: opentabs start auto-initializes config + extension, npm plugins auto-discovered from global node_modules, remove redundant CLI commands. (2) Plugin developer: opentabs-plugin build auto-registers in config localPlugins and calls POST /reload. (3) Platform developer: simplify publish script to use single npm token. Also: ungate POST /reload, split config into plugins (auto-discovered) vs localPlugins (explicit), update side panel to show local/npm distinction, fix misleading messages.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add localPlugins field to config and update config parsing",
+      "description": "As a platform developer, I want config.json to distinguish localPlugins from auto-discovered npm plugins so that the system knows which plugins are local dev projects.",
+      "acceptanceCriteria": [
+        "OpentabsConfig interface has localPlugins: string[] field",
+        "parseConfigRecord extracts localPlugins from raw config (defaults to [] if missing)",
+        "The existing plugins field is removed from OpentabsConfig",
+        "Migration: if raw config has a plugins array, entries that look like local paths (start with ./ or / or ~/) are moved to localPlugins, npm package names are dropped (they will be auto-discovered)",
+        "loadConfig auto-creates config with { localPlugins: [], tools: {}, secret: <uuid> }",
+        "Config file at ~/.opentabs/config.json uses localPlugins instead of plugins",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/config.ts. Replace plugins with localPlugins in OpentabsConfig. Update parseConfigRecord to extract localPlugins. Add migration: if raw config has 'plugins' array, filter local paths into localPlugins and log a notice about npm plugins being auto-discovered now. Update the default config template. Update all consumers of config.plugins to use config.localPlugins."
+    },
+    {
+      "id": "US-002",
+      "title": "Add npm global package auto-discovery to the resolver",
+      "description": "As an end user, I want the MCP server to auto-discover globally installed opentabs-plugin-* packages so that I don't need to manually register npm plugins.",
+      "acceptanceCriteria": [
+        "New function discoverGlobalNpmPlugins() in resolver.ts returns an array of resolved plugin directories",
+        "It finds the global node_modules path via npm root -g (cached, called once at startup)",
+        "It scans for directories matching opentabs-plugin-* and @*/opentabs-plugin-* patterns",
+        "It returns the absolute path to each matching directory that contains a valid package.json with an opentabs field",
+        "Scoped packages like @org/opentabs-plugin-foo are discovered",
+        "The scan is a single readdir + filter, not recursive",
+        "Errors during scan are collected, not thrown",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/resolver.ts. Add discoverGlobalNpmPlugins(). Use Bun.spawnSync(['npm', 'root', '-g']) to get the global path (cache it in a module-level variable). Then readdir the path, filter for opentabs-plugin-* entries. For scoped packages, readdir each @scope/ directory. For each match, check that package.json exists and has an opentabs field (quick validation). Return array of absolute directory paths. Also check bun's global path via Bun.spawnSync(['bun', 'pm', '-g', 'bin']) and derive node_modules from it, in case the user installed with bun add -g."
+    },
+    {
+      "id": "US-003",
+      "title": "Update discovery to merge npm auto-discovered + local plugins",
+      "description": "As a platform developer, I want the discovery orchestrator to combine auto-discovered npm plugins with explicit local plugins so that both sources are unified in one registry.",
+      "acceptanceCriteria": [
+        "discoverPlugins takes localPlugins (string[]) and configDir as input",
+        "It calls discoverGlobalNpmPlugins() to find npm plugins automatically",
+        "It resolves localPlugins paths via resolvePluginPath",
+        "Local plugins override npm plugins of the same name (local wins)",
+        "Trust tier: npm auto-discovered = 'community' or 'official' (based on scope), local = 'local'",
+        "The DiscoveryResult includes a source field per plugin: 'npm' or 'local'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/discovery.ts. Change the input from specifiers: string[] to localPlugins: string[]. Call discoverGlobalNpmPlugins() for npm plugins. Resolve local plugins via resolvePluginPath. Load both sets. When merging, if same plugin name exists in both local and npm, keep the local version. Build the registry from the merged set."
+    },
+    {
+      "id": "US-004",
+      "title": "Update reload.ts to pass localPlugins to discovery",
+      "description": "As a platform developer, I want reloadCore to pass config.localPlugins to the discovery orchestrator.",
+      "acceptanceCriteria": [
+        "reloadCore calls discoverPlugins(config.localPlugins, configDir) instead of discoverPlugins(config.plugins, configDir)",
+        "All references to config.plugins in reload.ts are updated to config.localPlugins",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/reload.ts. Change line ~165 from config.plugins to config.localPlugins. Search for any other references to config.plugins in the file and update."
+    },
+    {
+      "id": "US-005",
+      "title": "Ungate POST /reload endpoint",
+      "description": "As a plugin developer, I want POST /reload to be always available so that my build tooling can trigger server rediscovery.",
+      "acceptanceCriteria": [
+        "POST /reload works in both dev and production modes",
+        "The isDev() check and 405 response are removed from the /reload handler",
+        "Bearer auth is still required",
+        "Rate limiting is still in place",
+        "The /health endpoint still reports mode as dev or production",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/http-routes.ts. Remove the isDev() check at lines 208-213. The endpoint remains behind bearer auth and rate limiting. Update the comment above the handler to remove 'dev mode only'."
+    },
+    {
+      "id": "US-006",
+      "title": "opentabs-plugin build auto-registers in localPlugins and calls /reload",
+      "description": "As a plugin developer, I want opentabs-plugin build to auto-register my plugin in config and notify the server so that my plugin is immediately available for testing.",
+      "acceptanceCriteria": [
+        "After successful build, opentabs-plugin build reads ~/.opentabs/config.json",
+        "If the current plugin directory is not already in localPlugins, it adds it (as path relative to config dir)",
+        "Config is written atomically (same pattern as scaffold.ts autoRegisterPlugin)",
+        "After registration, opentabs-plugin build calls POST http://localhost:9515/reload with bearer auth from config secret",
+        "If the server is not running, the /reload call fails silently (build still succeeds)",
+        "If config.json does not exist, registration is skipped with a warning",
+        "In --watch mode, /reload is called after each rebuild (not just the first)",
+        "Registration only happens once (first build), reload happens every build",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Edit platform/plugin-tools/src/commands/build.ts. After the build completes (after generating tools.json), add two new steps: (1) readAndRegisterInConfig() — reads ~/.opentabs/config.json, checks if CWD is in localPlugins, adds if not, writes atomically. Use homedir() + '.opentabs/config.json' to find the config. (2) notifyServer() — reads secret from config, POST to http://localhost:<port>/reload with Authorization: Bearer <secret>. Port defaults to 9515 (or read from OPENTABS_PORT env). Both steps are wrapped in try/catch — failures are warnings, not errors. The build itself must succeed even if the server isn't running."
+    },
+    {
+      "id": "US-007",
+      "title": "opentabs start auto-initializes config and extension",
+      "description": "As an end user, I want opentabs start to auto-create config and install the extension on first run so that I don't need separate setup commands.",
+      "acceptanceCriteria": [
+        "opentabs start creates ~/.opentabs/ directory if it does not exist",
+        "opentabs start creates ~/.opentabs/config.json with defaults if it does not exist",
+        "opentabs start installs the extension to ~/.opentabs/extension/ if it does not exist or if the version has changed",
+        "The auto-install uses the same logic as the current opentabs setup command",
+        "On first run, opentabs start prints first-time setup instructions after the server starts",
+        "Setup instructions include: how to load extension in Chrome, how to configure MCP client",
+        "On subsequent runs, setup instructions are not repeated (check for extension already loaded or a marker file)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/start.ts. Before spawning the server process, call the extension install logic (from setup.ts). Check if ~/.opentabs/extension/manifest.json exists — if not, install. Check .opentabs-version marker — if version changed, reinstall. For the config, the MCP server's loadConfig() already auto-creates it, so we don't need to duplicate that in the CLI. But we should ensure ~/.opentabs/ directory exists before spawning the server. After the server starts (stdout shows 'listening on'), print setup instructions if this is a first-time run."
+    },
+    {
+      "id": "US-008",
+      "title": "Remove redundant CLI commands: config init, setup, plugin add, plugin remove, plugin list",
+      "description": "As a platform developer, I want to remove redundant CLI commands so that the CLI is focused and clean.",
+      "acceptanceCriteria": [
+        "opentabs config init command is removed (auto-init is in opentabs start)",
+        "opentabs setup command is removed (auto-install is in opentabs start)",
+        "opentabs plugin add command is removed (npm plugins auto-discovered, local plugins auto-registered by build)",
+        "opentabs plugin remove command is removed (npm uninstall removes the package, local plugins removed by deleting from config)",
+        "opentabs plugin list command is removed (opentabs status shows plugins)",
+        "The corresponding source files are deleted or the functions removed",
+        "commands/index.ts no longer exports removed command registrations",
+        "cli.ts no longer registers removed commands",
+        "opentabs --help shows: start, status, doctor, logs, plugin create, config show/set/path",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "Edit platform/cli/src/cli.ts — remove registrations. Delete platform/cli/src/commands/setup.ts (logic moved to start.ts in US-007). Remove config init from platform/cli/src/commands/config.ts. Remove plugin add, plugin remove, plugin list from platform/cli/src/commands/plugin.ts — keep only plugin create. The plugin.ts file should be simplified to only register the create subcommand. Delete any unused imports and helper functions. Keep the handlePluginAdd logic available as a shared utility if start.ts or build.ts needs it."
+    },
+    {
+      "id": "US-009",
+      "title": "opentabs status shows plugins with source labels",
+      "description": "As an end user, I want opentabs status to show all discovered plugins with npm/local labels so that I can see what's installed.",
+      "acceptanceCriteria": [
+        "opentabs status plugin list shows each plugin with a source label: (npm) or (local)",
+        "The /health endpoint includes a source field per plugin: 'npm' or 'local'",
+        "opentabs status --json includes the source field",
+        "Failed plugins are shown with their error message",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/http-routes.ts — add source field to pluginDetails in /health. The source can be derived from trustTier ('local' → 'local', anything else → 'npm') or from the DiscoveryResult source field added in US-003. Edit platform/cli/src/commands/status.ts to display the source label."
+    },
+    {
+      "id": "US-010",
+      "title": "Side panel shows local/npm distinction for plugins",
+      "description": "As a plugin developer, I want the side panel to show which plugins are local dev plugins so that I can distinguish them from installed npm plugins.",
+      "acceptanceCriteria": [
+        "config.getState response includes a source field per plugin: 'npm' or 'local'",
+        "PluginCard shows a 'dev' or 'local' badge for local plugins",
+        "The badge is subtle (small text or icon) and does not clutter the UI",
+        "npm plugins show no badge (they are the default)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/extension-protocol.ts — add source field to handleConfigGetState response per plugin. Edit platform/shared/src/index.ts — add source to ConfigStatePlugin type. Edit platform/browser-extension/src/side-panel/components/PluginCard.tsx — show a small 'DEV' badge when source is 'local'. Keep the badge minimal — perhaps a small outlined tag next to the plugin name."
+    },
+    {
+      "id": "US-011",
+      "title": "Remove scaffold auto-registration from config (moved to build)",
+      "description": "As a plugin developer, I want opentabs plugin create to only scaffold files, not register in config, so that registration happens when the plugin is actually built.",
+      "acceptanceCriteria": [
+        "scaffoldPlugin no longer calls autoRegisterPlugin",
+        "autoRegisterPlugin function is removed from scaffold.ts (or moved to a shared utility if needed by build.ts)",
+        "The 'Registered in ~/.opentabs/config.json' output line is removed",
+        "The 'Next steps' output still shows: cd, bun install, bun run build",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "Edit platform/cli/src/scaffold.ts. Remove the try/catch block that calls autoRegisterPlugin (lines 413-420). The autoRegisterPlugin function can be deleted entirely — the build tool (US-006) has its own registration logic. Update the console output to remove the 'Registered' line."
+    },
+    {
+      "id": "US-012",
+      "title": "Simplify publish script to use single npm token",
+      "description": "As a platform developer, I want the publish script to use the ~/.npmrc token directly so that I don't need a separate publish token file.",
+      "acceptanceCriteria": [
+        "scripts/publish.sh no longer references ~/.npmrc.publish",
+        "scripts/publish.sh no longer swaps/backs up/restores ~/.npmrc",
+        "scripts/publish.sh no longer has a trap/cleanup handler for token restoration",
+        "scripts/publish.sh verifies npm whoami succeeds before publishing",
+        "The setup instructions in the script header are simplified to just: ensure ~/.npmrc has a token with read+write access",
+        "bun run build passes (publish script is not type-checked but should be syntactically valid)"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "Edit scripts/publish.sh. Remove the PUBLISH_NPMRC variable, the existence check for ~/.npmrc.publish, the cp/backup/restore logic, and the trap handler. Replace with a simple npm whoami check at the start to verify auth is working. The header comment should be updated to explain the simplified setup: one token in ~/.npmrc with read+write access."
+    },
+    {
+      "id": "US-013",
+      "title": "Fix misleading auto-detect messages in plugin CLI",
+      "description": "As an end user, I want accurate messages about when changes take effect so that I know whether to restart the server.",
+      "acceptanceCriteria": [
+        "Since plugin add and plugin remove are deleted (US-008), their misleading messages are gone",
+        "If any remaining CLI output references 'auto-detect' or 'automatically', verify it is accurate",
+        "opentabs plugin create output does not mention auto-registration (registration now happens at build time)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "Search the entire CLI codebase for 'auto', 'detect', 'automatically' and verify each message is accurate. Since most of the problematic commands are deleted in US-008, this story is mainly verification + cleanup of remaining messages."
+    },
+    {
+      "id": "US-014",
+      "title": "Update E2E tests for new config format and discovery",
+      "description": "As a platform developer, I want E2E tests to work with the new localPlugins config and npm auto-discovery.",
+      "acceptanceCriteria": [
+        "E2E fixtures create config with localPlugins instead of plugins",
+        "E2E tests that test plugin discovery work with localPlugins",
+        "Hot reload tests that modify config use localPlugins field",
+        "Tests that add/remove plugins from config use localPlugins",
+        "The createMinimalPlugin helper in fixtures.ts uses localPlugins",
+        "bun run test:e2e passes"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": "Edit e2e/fixtures.ts and all E2E test files. Search for 'plugins' in config creation/modification and change to 'localPlugins'. The E2E test plugins are local filesystem plugins registered by path, so they should all go in localPlugins. npm auto-discovery won't affect E2E tests since they use isolated config directories."
+    },
+    {
+      "id": "US-015",
+      "title": "Update CLAUDE.md for new UX design",
+      "description": "As a platform developer, I want CLAUDE.md to accurately document the new plugin discovery, CLI commands, and config format.",
+      "acceptanceCriteria": [
+        "Config section shows localPlugins field instead of plugins",
+        "Plugin discovery section explains: npm auto-discovery from global node_modules + localPlugins from config",
+        "CLI commands section lists: start, status, doctor, logs, plugin create, config show/set/path",
+        "Removed commands (config init, setup, plugin add/remove/list) are not mentioned",
+        "Plugin development workflow explains: build auto-registers and calls /reload",
+        "Publishing section explains simplified single-token setup",
+        "No references to old plugins array or npmPlugins in config"
+      ],
+      "priority": 15,
+      "passes": true,
+      "notes": "Edit CLAUDE.md. Update the config file section, CLI commands section, plugin discovery section, development workflow section, and publishing section. Remove references to opentabs setup, config init, plugin add/remove."
+    },
+    {
+      "id": "US-016",
+      "title": "Final verification — all quality gates and E2E tests pass",
+      "description": "As a platform developer, I want all checks passing so that the UX improvements are complete.",
+      "acceptanceCriteria": [
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes",
+        "opentabs --help shows only: start, status, doctor, logs, plugin, config",
+        "opentabs plugin --help shows only: create",
+        "opentabs config --help shows only: show, set, path",
+        "No references to plugins array (without local prefix) in config handling code",
+        "No references to opentabs setup or config init as commands"
+      ],
+      "priority": 16,
+      "passes": true,
+      "notes": "Run all verification commands. Check CLI help output. Search for stale references. Fix any issues found."
+    }
+  ]
+}

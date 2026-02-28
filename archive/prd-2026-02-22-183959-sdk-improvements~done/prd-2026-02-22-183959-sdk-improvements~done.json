@@ -1,0 +1,69 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add postForm/postFormData SDK utilities for form-encoded requests and fix the typed prompt cast issue so plugin developers get full type safety without ugly workarounds.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add postForm utility for URL-encoded form submissions",
+      "description": "As a plugin developer, I want a postForm utility so that I can make application/x-www-form-urlencoded requests without manually building URLSearchParams.",
+      "acceptanceCriteria": [
+        "platform/plugin-sdk/src/fetch.ts exports a new postForm<T>(url, body, init?, schema?) function",
+        "postForm sets Content-Type to 'application/x-www-form-urlencoded'",
+        "postForm accepts body as Record<string, string> and serializes it using URLSearchParams internally",
+        "postForm uses fetchFromPage internally with credentials: 'include' (same as postJSON)",
+        "postForm parses the response as JSON and returns T (same pattern as postJSON)",
+        "postForm supports an optional Zod schema parameter for response validation (same overload pattern as fetchJSON)",
+        "postForm is exported from platform/plugin-sdk/src/index.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/plugin-sdk/src/fetch.ts. Add the function after the existing postJSON function (around line 185).\n\nFollow the exact same pattern as postJSON (lines 147-185) but:\n1. Replace `JSON.stringify(body)` with `new URLSearchParams(body).toString()`\n2. Replace `'Content-Type': 'application/json'` with `'Content-Type': 'application/x-www-form-urlencoded'`\n3. Body type is `Record<string, string>` instead of `unknown`\n\nSignature pattern matching existing conventions:\n```typescript\nexport const postForm: {\n  <T>(url: string, body: Record<string, string>, init?: RequestInit): Promise<T>;\n  <T>(url: string, body: Record<string, string>, init: RequestInit | undefined, schema: z.ZodType<T>): Promise<T>;\n} = async <T>(url: string, body: Record<string, string>, init?: RequestInit, schema?: z.ZodType<T>): Promise<T> => {\n```\n\nAlso export from platform/plugin-sdk/src/index.ts — find the existing fetch exports section and add postForm alongside postJSON, putJSON, etc."
+    },
+    {
+      "id": "US-002",
+      "title": "Add postFormData utility for multipart form submissions",
+      "description": "As a plugin developer, I want a postFormData utility for multipart/form-data requests so that I can upload files and send mixed form data.",
+      "acceptanceCriteria": [
+        "platform/plugin-sdk/src/fetch.ts exports a new postFormData<T>(url, body, init?, schema?) function",
+        "postFormData accepts body as FormData and does NOT set Content-Type (browser sets it with boundary)",
+        "postFormData uses fetchFromPage internally with credentials: 'include'",
+        "postFormData parses the response as JSON and returns T",
+        "postFormData supports an optional Zod schema parameter for response validation",
+        "postFormData is exported from platform/plugin-sdk/src/index.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/plugin-sdk/src/fetch.ts. Add after postForm.\n\nIMPORTANT: Do NOT set Content-Type header — the browser must set it automatically with the multipart boundary string. If you set it manually, the boundary will be missing and the server will reject the request.\n\nPattern:\n```typescript\nexport const postFormData: {\n  <T>(url: string, body: FormData, init?: RequestInit): Promise<T>;\n  <T>(url: string, body: FormData, init: RequestInit | undefined, schema: z.ZodType<T>): Promise<T>;\n} = async <T>(url: string, body: FormData, init?: RequestInit, schema?: z.ZodType<T>): Promise<T> => {\n  const response = await fetchFromPage(url, {\n    method: 'POST',\n    body,\n    ...init,\n    headers: { ...init?.headers },  // no Content-Type!\n  });\n  // ... same JSON parse + optional schema validation as postJSON\n};\n```\n\nExport from platform/plugin-sdk/src/index.ts alongside the other fetch utilities."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix typed prompt cast issue in definePrompt",
+      "description": "As a plugin developer, I want definePrompt with a Zod args schema to produce a value assignable to PromptDefinition[] without requiring 'as unknown as PromptDefinition' casts.",
+      "acceptanceCriteria": [
+        "A prompt created with definePrompt({ name, args: z.object({...}), render(typedArgs) {...} }) is directly assignable to PromptDefinition without any type assertion",
+        "The render function parameter is still typed as z.infer<TArgs> at the call site of definePrompt (type inference preserved)",
+        "The return type of definePrompt with args is still assignable to PromptDefinition (no breaking change)",
+        "The OpenTabsPlugin.prompts property accepts the return value of both typed and untyped definePrompt calls",
+        "Existing untyped prompts (without args schema) continue to work unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/plugin-sdk/src/index.ts, lines 117-155.\n\nThe root cause: PromptDefinition.render expects `(args: Record<string, string>) => Promise<PromptMessage[]>` (line 133), but TypedPromptConfig.render expects `(args: z.infer<TArgs>) => Promise<PromptMessage[]>` (line 145). Since z.infer<TArgs> is a specific object type (e.g., `{ name: string, age: string }`), it IS assignable to Record<string, string> when all values are strings. But TypeScript's function parameter contravariance means `(args: { name: string }) => ...` is NOT assignable to `(args: Record<string, string>) => ...` because the former doesn't accept arbitrary string keys.\n\nThe fix: Widen the PromptDefinition.render parameter type. Change line 133 from:\n```typescript\nrender(args: Record<string, string>): Promise<PromptMessage[]>;\n```\nto:\n```typescript\nrender(args: Record<string, string>): Promise<PromptMessage[]>;\n```\n\nActually, the real fix is to make the DefinePrompt overload return a type that's assignable to PromptDefinition. The cleanest approach:\n\n1. Change PromptDefinition.render to accept a more permissive parameter. The simplest change is to use `args: never` in PromptDefinition since the render function is only called internally by the adapter runtime (which always passes Record<string, string>). But this would break existing untyped prompts.\n\n2. Better approach: Change the overload implementation. The typed overload at line 150 returns `PromptDefinition`. The implementation at line 155 casts the input to PromptDefinition. The issue is that TypeScript checks the call site's return type against PromptDefinition assignment. The fix is to explicitly type the render function at the interface level to accept any Record-compatible type:\n\nChange line 133 to:\n```typescript\n// eslint-disable-next-line @typescript-eslint/no-explicit-any\nrender(args: any): Promise<PromptMessage[]>;\n```\n\nThis makes PromptDefinition.render accept any args type, which means both `Record<string, string>` and `z.infer<TArgs>` handlers are assignable. The type safety is preserved at the CALL SITE of definePrompt (where the TypedPromptConfig overload constrains the render parameter to z.infer<TArgs>). The PromptDefinition interface is an internal storage type, not a user-facing API for writing render functions.\n\nAlternatively, a more TypeScript-idiomatic approach is to make render a contravariant generic: `render(args: Record<string, string> & Partial<Record<string, unknown>>): ...` — but the simplest and most correct fix is to use `any` for the storage type since this is only consumed by the adapter runtime.\n\nAfter fixing, verify that the e2e-test plugin at plugins/e2e-test/src/index.ts can remove its 'as unknown as PromptDefinition' cast (lines 60-76). Check if any other files have similar casts by searching for 'as unknown as PromptDefinition' or 'as PromptDefinition'."
+    }
+  ]
+}

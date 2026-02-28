@@ -1,0 +1,50 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two runtime compatibility issues found during code review: an unguarded Bun.spawnSync in doctor.ts that crashes on Node.js, and fragile test mocks in version-check.test.ts that bypass the spawnProcessSync abstraction layer.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Replace Bun.spawnSync with spawnProcessSync in doctor.ts checkBrowser",
+      "description": "As a user running `opentabs doctor` on Linux under Node.js, I want the browser check to work without crashing so that the doctor command is fully Node.js-compatible.",
+      "acceptanceCriteria": [
+        "platform/cli/src/commands/doctor.ts no longer contains any direct Bun.spawnSync calls",
+        "The Linux browser detection at ~line 355 uses spawnProcessSync from @opentabs-dev/shared instead of Bun.spawnSync",
+        "spawnProcessSync is imported from @opentabs-dev/shared",
+        "The check still iterates LINUX_BROWSER_COMMANDS and returns pass() on the first found browser",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/cli/src/commands/doctor.ts around line 352-362, the `checkBrowser` function uses `Bun.spawnSync(['which', cmd], { stdout: 'pipe', stderr: 'pipe' })` inside a `platform === 'linux'` block. This will throw a ReferenceError on Node.js since `Bun` is not defined. Replace with `spawnProcessSync('which', [cmd])` from `@opentabs-dev/shared` and check `result.exitCode === 0`. The `spawnProcessSync` function is already imported by other files in the CLI — add it to the existing import from `@opentabs-dev/shared` at the top of doctor.ts. Also check if there are any other Bun.* references in doctor.ts (line 59 uses `Bun.version` but it's guarded by `if (isBun)` which is fine)."
+    },
+    {
+      "id": "US-002",
+      "title": "Refactor version-check.test.ts to mock spawnProcessSync instead of Bun.spawnSync",
+      "description": "As a maintainer, I want the version-check tests to mock the correct abstraction layer (spawnProcessSync) so that tests are robust against internal runtime layer changes.",
+      "acceptanceCriteria": [
+        "version-check.test.ts no longer mutates Bun.spawnSync directly",
+        "Tests use bun:test mock.module() to mock @opentabs-dev/shared's spawnProcessSync export",
+        "Mock return values are SpawnResult objects ({ exitCode: number, stdout: string, stderr: string }) — no Buffer.toString() wrappers or fake signalCode/pid/resourceUsage properties",
+        "No `as unknown as typeof Bun.spawnSync` casts remain",
+        "All existing test cases still pass with equivalent assertions",
+        "The mockNpmView helper returns SpawnResult-shaped objects",
+        "beforeEach/afterEach properly set up and tear down mocks",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "In platform/mcp-server/src/version-check.test.ts, all tests currently mock Bun.spawnSync by saving/restoring the global and replacing it with a fake. This is fragile because version-check.ts actually calls spawnProcessSync from @opentabs-dev/shared (which internally calls Bun.spawnSync). The correct approach is to use `import { mock } from 'bun:test'` and `mock.module('@opentabs-dev/shared', ...)` to mock spawnProcessSync at the module boundary. The mock should return simple SpawnResult objects: `{ exitCode: 0, stdout: '2.0.0\\n', stderr: '' }`. This eliminates all the verbose `as unknown as typeof Bun.spawnSync` casts and fake properties like signalCode, pid, resourceUsage. Make sure to call `mock.restore()` in afterEach to clean up. The test file has three describe blocks: isNewer (pure logic, no mocks needed), fetchLatestVersion (needs spawnProcessSync mock), and checkForUpdates (needs spawnProcessSync mock). Keep all existing test cases and assertions — just change the mock mechanism."
+    }
+  ]
+}

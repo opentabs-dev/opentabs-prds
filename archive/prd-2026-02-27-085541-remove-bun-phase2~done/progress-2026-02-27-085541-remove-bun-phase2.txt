@@ -1,0 +1,82 @@
+# Ralph Progress Log
+PRD: prd-2026-02-27-085541-remove-bun-phase2~running.json
+Started: Fri Feb 27 20:07:39 UTC 2026
+---
+
+## Codebase Patterns
+- Dev proxy (platform/mcp-server/src/dev-proxy.ts) logs "Dev proxy listening" BEFORE starting the worker. Wait for "Worker ready" before treating the server as ready.
+- Dev proxy restarts the worker process on SIGUSR1. MCP sessions don't persist across worker restarts — the MCP client auto-reinitializes on 400/502/503.
+- In-flight HTTP requests through the proxy may fail with 502 when the worker is killed during hot reload. This is expected proxy behavior.
+- The auth secret (auth.json) is written by the worker during startup. Don't read it until the worker is confirmed ready.
+- E2E test fixtures.ts uses `hot` param in `startMcpServer` — hot=true spawns dev-proxy.js, hot=false spawns index.js directly.
+- npm run commands work from root; bun run fails for npm --prefix subcommands.
+
+## 2026-02-27 20:37 UTC - US-004
+- **What was implemented**: Fixed dev-proxy hot reload E2E tests to work with proxy-based worker model. All 357 E2E tests now pass.
+- **Files changed**:
+  - `e2e/fixtures.ts` — Fixed startMcpServer to wait for "Worker ready" (not just proxy "listening") in hot mode; added 502/503 retry to MCP client request()
+  - `e2e/hot-reload-dynamic.e2e.ts` — Removed session re-registration assertion (sessions don't persist across proxy restarts); updated in-flight dispatch test to tolerate 502
+  - `e2e/lifecycle.e2e.ts` — Simplified secret rotation test for proxy model; fixed flaky WS replacement test to use waitForHealth polling
+  - `e2e/CLAUDE.md` — Removed last Bun-specific API reference
+- **Learnings for future iterations:**
+  - The root cause of 56 failing E2E tests was that `startMcpServer` resolved when the dev proxy logged "listening" but the worker hadn't started yet. The auth secret (auth.json) wasn't written yet, causing all authenticated requests to fail with 401.
+  - The proxy model differs from bun --hot: bun --hot keeps the process alive and reloads modules (sessions survive), while the proxy kills and restarts the worker (sessions are lost, in-flight requests may 502).
+  - Tests that assert on server log messages about session re-registration don't apply with the proxy model.
+  - The flaky "old extension WS" test was caused by a single health() call after waitForExtensionConnected — a brief disconnect-reconnect cycle could cause the single call to see stale state. Using waitForHealth polling instead is more robust.
+---
+
+## 2026-02-27 20:41 UTC - US-005
+- **What was implemented**: Migrated CI workflow (.github/workflows/ci.yml) from Bun to Node/npm.
+- **Files changed**:
+  - `.github/workflows/ci.yml` — Replaced oven-sh/setup-bun@v2 with actions/setup-node@v4 (cache: npm), bun install with npm ci, bun run with npm run, bunx with npx, bun scripts/ with npx tsx scripts/ across all 7 CI jobs.
+- **Learnings for future iterations:**
+  - actions/setup-node@v4 has built-in `cache: 'npm'` support that replaces the manual actions/cache@v4 step — it automatically caches ~/.npm using package-lock.json as the key.
+  - The `bun scripts/check-tsconfig-coverage.ts` invocation needs `npx tsx` since it's a plain .ts file without a shebang.
+  - This was a clean, documentation/config-only change — no source code or tests affected.
+---
+
+## 2026-02-27 20:47 UTC - US-006
+- **What was implemented**: Migrated Dockerfile and Ralph scripts from Bun to Node/npm, deleted all bun.lock files.
+- **Files changed**:
+  - `.ralph/Dockerfile` — Removed Bun install section (ENV BUN_INSTALL, curl bun.sh, symlinks)
+  - `.ralph/ralph.sh` — Changed `bun install --frozen-lockfile` to `npm ci`, `bun run build` to `npm run build` in setup script and e2e-test plugin build
+  - `.ralph/worker.sh` — Changed `bun run` to `npm run` in safety net verification and fix iteration prompt
+  - `.ralph/perfect-docs.sh` — Changed `bun run` to `npm run` in qualityChecks reference
+  - `.ralph/RALPH.md` — Changed all `bun run` to `npm run`, `bun install` to `npm ci` across all quality check commands, tables, and instructions
+  - `.claude/skills/ralph/__SKILL__.md` — Changed all `bun run` to `npm run` across quality checks, acceptance criteria, and project type examples
+  - Deleted `bun.lock`, `docs/bun.lock`, `plugins/e2e-test/bun.lock`, `plugins/slack/bun.lock`
+- **Learnings for future iterations:**
+  - package-lock.json was already generated in a prior phase, so no `npm install` was needed
+  - The Dockerfile base image (mcr.microsoft.com/playwright) already has Node/npm from the Node.js base — only the Bun install section needed removal
+  - The `bun run` to `npm run` replacement needs to be done carefully with `replace_all` to catch all occurrences, but must check for partial replacements (e.g., `bun run format:check` won't be caught by a `bun run test` replacement since it's a distinct string)
+  - The `.ralph/` directory has several .sh scripts beyond the ones explicitly listed in the PRD — always grep the whole directory for remaining references
+---
+
+## 2026-02-27 20:58 UTC - US-007
+- **What was implemented**: Updated all documentation to reference Node.js/npm instead of Bun across 18 files.
+- **Files changed**:
+  - `CLAUDE.md` — Runtime says Node.js 22+, testing says Vitest, all commands use npm, workspace references say npm, isBun section removed, bun:test→Vitest
+  - `README.md` — Prerequisites say Node.js 22+ (Bun removed), all commands use npm
+  - `CONTRIBUTING.md` — Full rewrite: prereqs Node.js 22+, all commands npm, "Bun-first APIs" code convention replaced with "Node.js APIs", debugging section says Node.js process, bunx→npx
+  - `docs/CLAUDE.md` — All commands use npm, runtime context updated to reference Node.js/npm for all tiers
+  - `docs/package.json` — check script: bun run→npm run
+  - `docs/next.config.mjs` — Comment updated from "bun.lock" to "lockfile"
+  - `docs/.prettierignore` — Removed bun.lock entry
+  - `docs/content/docs/contributing/dev-setup.mdx` — All commands npm, hot reload describes dev proxy, unit tests say Vitest, workspaces say npm
+  - `docs/content/docs/contributing/architecture.mdx` — Server description removed Bun.serve(), hot reload describes dev proxy instead of bun --hot
+  - `docs/content/docs/contributing/publishing.mdx` — bun scripts/publish.ts→npx tsx scripts/publish.ts, bun run→npm run
+  - `docs/content/docs/install/index.mdx` — Contributors prereqs: Node.js 22+ (Bun removed), all commands npm
+  - `docs/content/docs/reference/configuration.mdx` — bun run dev→npm run dev, "requires Bun" removed
+  - `docs/components/illustrations.tsx` — SVG text: "bun workspaces"→"npm workspaces", "bun install"→"npm install", "bun run build"→"npm run build"
+  - `platform/cli/CLAUDE.md` — "Bun is not required" removed, bun install→npm install
+  - `platform/plugin-tools/CLAUDE.md` — "Bun is not required" removed
+  - `plugins/CLAUDE.md` — "bun workspace"→"npm workspace", "bun.lock"→"package-lock.json", bun run→npm run
+  - `plugins/README.md` — bun run→npm run
+  - `.ralph/CLAUDE.md` — bun install→npm ci, bun run→npm run
+- **Learnings for future iterations:**
+  - ComponentInstall.tsx (bun tab for package manager choice) is user-facing content showing install commands with multiple package managers — this is NOT about the project's own tooling and should stay
+  - CHANGELOG.md contains historical entries that document what actually happened — these must never be modified
+  - The docs/package.json check script was still using bun run despite package.json scripts being updated — always check package.json scripts too
+  - docs/.prettierignore had a bun.lock entry that was no longer needed after lockfile deletion in US-006
+  - docs/next.config.mjs had a comment about bun.lock — check non-md config files too
+---

@@ -1,0 +1,46 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two bugs in the browser extension network capture module: (1) getRequests(clear=true) does not clear pendingRequests, causing stale in-flight requests to appear in subsequent reads; (2) async response body callback can write to an already-evicted request, silently losing body data.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Clear pendingRequests map when getRequests is called with clear=true",
+      "description": "As a developer using network capture, I want getRequests(tabId, clear=true) to fully reset the capture buffer so that no stale in-flight requests leak into subsequent reads.",
+      "acceptanceCriteria": [
+        "getRequests(tabId, true) clears state.pendingRequests in addition to state.requests and state.requestIdToRequest",
+        "A unit test verifies: start capture → fire requestWillBeSent (no responseReceived yet) → call getRequests(tabId, true) → fire responseReceived for the pending request → call getRequests(tabId, false) → result is empty (the stale pending request was discarded)",
+        "Existing network-capture tests still pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/network-capture.ts\n\nAt lines 406-409, the getRequests function clears state.requests and state.requestIdToRequest when clear=true, but does NOT clear state.pendingRequests. This means requests that were captured by requestWillBeSent but haven't received responseReceived yet will survive the clear. When they eventually complete (responseReceived fires), they get added to the now-empty state.requests buffer, appearing in the next getRequests() call — confusing users who expected a clean slate.\n\nFix: Add `state.pendingRequests.clear();` inside the `if (clear)` block at line 406, alongside the existing clears.\n\nTest file: platform/browser-extension/src/network-capture.test.ts — add a test case in the getRequests describe block that simulates the race condition."
+    },
+    {
+      "id": "US-002",
+      "title": "Guard against writing response body to an evicted request",
+      "description": "As a developer using network capture, I want response body data to only be written to requests still in the capture buffer so that body data is not silently lost when the buffer is at capacity.",
+      "acceptanceCriteria": [
+        "The Network.loadingFinished handler verifies the request is still present in state.requests before writing responseBody",
+        "A unit test verifies: fill buffer to capacity → fire requestWillBeSent + responseReceived for a new request (evicting the oldest) → fire loadingFinished for the evicted request → the evicted request's responseBody is NOT set",
+        "Existing network-capture tests still pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/network-capture.ts\n\nAt lines 251-276, the Network.loadingFinished handler does:\n1. Gets the request reference from state.requestIdToRequest (line 255)\n2. Deletes it from requestIdToRequest (line 257)\n3. Fires an async chrome.debugger.sendCommand callback (line 263)\n4. In the callback, writes request.responseBody (line 275)\n\nBetween steps 2 and 4, the buffer can hit capacity and evictOldestRequest can shift this request out of state.requests. The callback then writes responseBody to an object no longer in the buffer — the data is silently lost.\n\nFix: In the callback (around line 266), after checking chrome.runtime.lastError, verify the request is still in state.requests before writing. For example: `if (!state.requests.includes(request)) return;`\n\nNote: The request was already deleted from requestIdToRequest on line 257, so the eviction cleanup in evictOldestRequest won't find it. The eviction just shifts from state.requests. The fix needs to check state.requests membership.\n\nTest file: platform/browser-extension/src/network-capture.test.ts"
+    }
+  ]
+}

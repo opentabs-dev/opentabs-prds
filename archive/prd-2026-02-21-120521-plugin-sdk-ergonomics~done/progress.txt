@@ -1,0 +1,145 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-120521-plugin-sdk-ergonomics~running.json
+Started: Sat Feb 21 13:09:47 PST 2026
+---
+
+## Codebase Patterns
+- Plugin SDK public API in `platform/plugin-sdk/src/index.ts` uses `import-x/exports-last` lint rule — every declaration between imports and the end of file must be exported. Non-exported interfaces break the lint rule.
+- The `import-x/exports-last` rule applies to ALL SDK source files (`fetch.ts`, `storage.ts`, etc.), not just `index.ts`. Any helper function must be exported and re-exported from `index.ts`.
+- For overloaded factory functions (like `definePrompt`), use an exported call signature interface + `export const` instead of `export function` with overloads, to satisfy the exports-last rule.
+- Zod 4: `instanceof z.ZodOptional` and `instanceof z.ZodDefault` work for detecting optional fields. `.description` property on schemas works for extracting `.describe()` metadata.
+- Plugins in `plugins/` depend on published npm versions of `@opentabs-dev/plugin-sdk`, not the source. New SDK features can only be used in plugins after publishing.
+- ToolError factory method codes are uppercase (`TIMEOUT`, `NOT_FOUND`, `AUTH_ERROR`, `RATE_LIMITED`, `VALIDATION_ERROR`, `INTERNAL_ERROR`). Tests must use these exact codes, not ad-hoc lowercase ones.
+- `ToolDefinition` (SDK) allows optional fields for authoring convenience; `ManifestTool` (shared) keeps them required since `opentabs-plugin build` always resolves defaults before writing `tools.json`. The loader validates `ManifestTool` fields at load time.
+- Use `string.charAt(0)` instead of `string[0]` in strict TypeScript (noUncheckedIndexedAccess). Cast `ToolDefinition` to `Record<string, unknown>` via `as unknown as Record<string, unknown>`.
+- The `ToolHandlerContext` with `reportProgress` is created in `platform/browser-extension/src/tool-dispatch.ts` (in `executeToolOnTab`), not in the adapter IIFE wrapper (`build.ts`). Changes to the progress context API must be made there.
+- `@typescript-eslint/no-unnecessary-type-parameters` (from `strictTypeChecked`) flags return-only generics like `<T>(path: string): T | undefined`. Workaround: use a branded intersection `<T>(path: string & { __brand?: T }): T | undefined` so T appears in both parameter and return. Combine with a non-generic overload via a call signature type for backward compat.
+- bun-types `expect()` overloads resolve `unknown | undefined` differently from `unknown` — a return type of `T | undefined` where `T = unknown` breaks `.toBe()` assertions that worked with plain `unknown`. Fix: use overloaded call signature types with non-generic first, generic second.
+- When an overloaded function needs to be called internally (e.g., `postJSON` → `fetchJSON`), extract the core logic into a non-overloaded `*Impl` function. Overload resolution fails when an argument is `T | undefined` and neither overload signature accepts `undefined`. Both the public overloaded const and internal callers use the impl directly.
+- Generic interfaces with type parameters in covariant-only positions (readonly/optional fields, return types) can be used directly in arrays (`ResourceDefinition[]`) without issues. The overloaded factory pattern is only needed when the generic appears in contravariant positions (method parameters), as with `PromptDefinition`'s `render(args)`.
+---
+
+## 2026-02-21 - US-001
+- Implemented Zod-based typed arguments for `definePrompt`
+- Files changed:
+  - `platform/plugin-sdk/src/index.ts` — added `args?: z.ZodObject<z.ZodRawShape>` to `PromptDefinition`, added `TypedPromptConfig<TArgs>` and `DefinePrompt` interfaces for overloaded type inference
+  - `platform/plugin-sdk/src/index.test.ts` — added 3 tests: typed render with args schema, untyped backward compat, args + explicit arguments coexistence
+  - `platform/plugin-tools/src/commands/build.ts` — added `extractArgsFromSchema()` to auto-generate `ManifestPromptArgument[]` from Zod object shape, updated `generatePromptsManifest` to use it when `args` is present and `arguments` is not
+  - `platform/plugin-tools/src/commands/build.test.ts` — added 3 tests: auto-gen from schema, explicit arguments priority, schema without descriptions
+- **Learnings for future iterations:**
+  - Making `PromptDefinition` generic breaks arrays (`PromptDefinition[]`) due to contravariance on the `render` method parameter. The correct pattern: keep the interface non-generic, use an overloaded factory function (`DefinePrompt` interface) to provide type inference at definition time, and erase the type to the base `PromptDefinition` for storage.
+  - The e2e-test plugin can't use the new `args` field until `@opentabs-dev/plugin-sdk` is published with the new version. The typed pattern was validated through platform-level unit tests instead.
+  - `import-x/exports-last` rule requires ALL declarations in the file to be exported if they appear between other exports. Internal (non-exported) interfaces break the chain.
+  - Helper functions in SDK source files (like `fetch.ts`) must be exported to satisfy `import-x/exports-last`. Export them and re-export from `index.ts` — they're useful for plugin developers doing custom fetch calls.
+---
+
+## 2026-02-21 - US-002
+- Added structured ErrorCategory metadata to all ToolError instances thrown by fetch utilities
+- Files changed:
+  - `platform/plugin-sdk/src/fetch.ts` — replaced manual `new ToolError(msg, code)` calls with factory methods (`ToolError.timeout`, `ToolError.auth`, `ToolError.notFound`, `ToolError.rateLimited`, `ToolError.validation`); added `httpStatusToToolError` helper for HTTP status→category mapping; added `parseRetryAfterMs` for Retry-After header parsing; network errors now have `{ category: 'internal', retryable: true }`
+  - `platform/plugin-sdk/src/fetch.test.ts` — added test endpoints for 401, 403, 429 (with/without Retry-After); updated existing tests to verify `category`, `retryable`, `retryAfterMs` fields; updated error code assertions to match factory method codes (e.g., `TIMEOUT` instead of `timeout`, `NOT_FOUND` instead of `http_error`)
+  - `platform/plugin-sdk/src/index.ts` — re-exported `httpStatusToToolError` and `parseRetryAfterMs` from fetch module
+- **Learnings for future iterations:**
+  - `ToolError.timeout()` uses code `'TIMEOUT'`, `ToolError.notFound()` uses `'NOT_FOUND'`, etc. — these are uppercase factory defaults, not the previous lowercase ad-hoc codes. Tests checking error codes must match the factory method defaults.
+  - The `import-x/exports-last` rule applies to all SDK source files, not just `index.ts`. Any new helper function in `fetch.ts`, `storage.ts`, etc. must be exported.
+---
+
+## 2026-02-21 - US-003
+- Added optional custom code parameter to all ToolError factory methods for consistency
+- Files changed:
+  - `platform/plugin-sdk/src/errors.ts` — added optional `code?: string` parameter to `auth`, `rateLimited`, `validation`, `timeout`, and `internal` factory methods (already present on `notFound`). Default codes are used via `??` when custom code is omitted.
+  - `platform/plugin-sdk/src/errors.test.ts` — new test file with 14 tests covering default codes, custom code overrides, and `rateLimited` retryAfterMs passthrough with custom code.
+- **Learnings for future iterations:**
+  - `rateLimited` has `retryAfterMs` as its second parameter, so `code` is the third parameter for that method. All other factories have `code` as the second parameter. This inconsistency is intentional since `rateLimited` already had `retryAfterMs` before this change.
+  - Test files in the plugin SDK must have local imports before `bun:test` imports to satisfy `import-x/order` lint rule.
+---
+
+## 2026-02-21 - US-004
+- Made `displayName` and `icon` optional in `ToolDefinition` interface; build command auto-derives displayName from tool name and defaults icon to `'wrench'` when omitted
+- Files changed:
+  - `platform/plugin-sdk/src/index.ts` — made `displayName` and `icon` optional in `ToolDefinition` interface
+  - `platform/plugin-tools/src/commands/build.ts` — added `deriveDisplayName()` helper (snake_case → Title Case), updated `generateToolsManifest` to apply defaults, updated `validatePlugin` to accept omitted displayName/icon (only reject empty strings)
+  - `platform/plugin-tools/src/commands/build.test.ts` — updated existing displayName/icon validation tests, added `deriveDisplayName` unit tests (4), added `generateToolsManifest` default behavior tests (4)
+- **Learnings for future iterations:**
+  - `ToolDefinition` (SDK) has optional `displayName`/`icon` for plugin authoring convenience, but `ManifestTool` (shared) keeps them required since the build command always resolves values before writing `tools.json`. The MCP server loader validates `ManifestTool` fields, so defaults must be applied at build time, not at load time.
+  - `string.charAt(0)` is safer than `string[0]` when strict noUncheckedIndexedAccess is enabled — `charAt` returns `''` for out-of-range indices while `[0]` returns `undefined`.
+  - `@typescript-eslint/no-non-null-assertion` is enforced — use optional chaining (`?.`) in test assertions instead of `!`. For array destructuring in tests, prefer `const manifest = ...; expect(manifest[0]?.field)` over `const [first] = ...; expect(first!.field)`.
+  - Casting `ToolDefinition` to `Record<string, unknown>` requires going through `unknown` first: `(tool as unknown as Record<string, unknown>)` — direct cast fails due to index signature incompatibility.
+---
+
+## 2026-02-21 - US-005
+- Made `progress` and `total` optional in `ProgressOptions` for indeterminate progress reporting
+- Files changed:
+  - `platform/plugin-sdk/src/index.ts` — changed `progress: number` and `total: number` to `progress?: number` and `total?: number` in `ProgressOptions`
+  - `platform/browser-extension/src/tool-dispatch.ts` — updated `reportProgress` opts type to accept optional `progress`/`total`, added `?? 0` defaults when dispatching the CustomEvent detail so downstream consumers (ISOLATED world relay, background, server) always receive numbers
+  - `platform/plugin-sdk/src/index.test.ts` — added 3 tests: indeterminate progress with message only, empty object for indeterminate, and handle reporting indeterminate progress
+- **Learnings for future iterations:**
+  - The progress pipeline has four stages: MAIN world adapter → ISOLATED world relay → background service worker → MCP server. The defaults for optional fields should be applied at the earliest stage (MAIN world) so all downstream consumers see valid numbers. The server's `handleToolProgress` validates `typeof progress !== 'number'` and would silently drop `undefined` values.
+  - The `reportProgress` context is created inline in `tool-dispatch.ts` `executeToolOnTab`, not in the adapter IIFE wrapper (`build.ts`). The PRD notes suggested editing `build.ts` but the actual progress dispatch happens in the extension's `tool-dispatch.ts`.
+---
+
+## 2026-02-21 - US-006
+- Removed `_setLogTransport` from `@opentabs-dev/plugin-sdk` public API re-exports
+- Files changed:
+  - `platform/plugin-sdk/src/index.ts` — removed `_setLogTransport` from the log.js re-export line (line 290)
+- **Learnings for future iterations:**
+  - `_setLogTransport` is still exported from `log.ts` (required by `import-x/exports-last` rule and used by unit tests importing directly from `./log.js`). The knip config has `ignoreExportsUsedInFile: true`, so knip doesn't flag it as unused because `log.ts` uses `_setLogTransport` in-file to register it on `globalThis.__openTabs._setLogTransport`.
+  - This was a minimal one-line change. The runtime access pattern via `globalThis.__openTabs._setLogTransport` (set up in `log.ts` line 165) is completely independent of the module's export list.
+---
+
+## 2026-02-21 - US-007
+- Added typed generic overload to `getPageGlobal` so callers can write `getPageGlobal<string>('path')` and get `string | undefined` back without `as` casts
+- Files changed:
+  - `platform/plugin-sdk/src/page-state.ts` — added `GetPageGlobal` overloaded call signature type with non-generic `(path: string): unknown` and generic `<T>(path: string & { __brand?: T }): T | undefined` overloads; changed `getPageGlobal` from plain arrow function to typed const using `GetPageGlobal`
+  - `platform/plugin-sdk/src/page-state.test.ts` — added 3 tests: generic narrows return type, default unknown when omitted, generic returns undefined for missing path
+  - `platform/plugin-sdk/src/index.ts` — re-exported `GetPageGlobal` type from page-state module
+- **Learnings for future iterations:**
+  - `@typescript-eslint/no-unnecessary-type-parameters` (part of `strictTypeChecked`) flags generics that appear only once in a function signature — even in call signatures inside interfaces and type literals. The `__brand` intersection pattern (`string & { __brand?: T }`) makes T appear in both the parameter and return type positions, satisfying the rule without changing the runtime API.
+  - bun-types' `expect()` has overloads that resolve differently for `unknown | undefined` vs `unknown`. When `getPageGlobal` returned `T | undefined` with `T = unknown`, `expect(result).toBe('hello')` would fail at the type level because bun-types inferred `Matchers<undefined>`. The fix: use call signature overloads with non-generic `(path: string): unknown` listed first, so calls without explicit type args match the non-generic overload and return plain `unknown`.
+  - TypeScript resolves call signature overloads top-to-bottom. When an explicit type argument is provided (`getPageGlobal<string>(...)`), TS matches the generic overload. Without an explicit type argument, TS matches the first non-generic overload. Order matters.
+---
+
+## 2026-02-21 - US-008
+- Added `removeLocalStorage` and `removeSessionStorage` utilities to the plugin SDK
+- Files changed:
+  - `platform/plugin-sdk/src/storage.ts` — added `removeLocalStorage(key)` and `removeSessionStorage(key)` functions following the existing try-catch pattern (silently fail on SecurityError)
+  - `platform/plugin-sdk/src/storage.test.ts` — added 6 tests (3 per function): removes existing key, no-op for missing key, silently fails when storage throws
+  - `platform/plugin-sdk/src/index.ts` — re-exported both new functions from the storage section
+- **Learnings for future iterations:**
+  - This was a straightforward addition — the existing `setLocalStorage` pattern provides the exact template for storage mutation utilities (try-catch wrapping SecurityError). No architectural decisions or gotchas.
+  - Storage utility functions group naturally: get/set/remove for localStorage, get/remove for sessionStorage, getCookie. No setSessionStorage exists yet (could be added in the future if needed).
+---
+
+## 2026-02-21 - US-009
+- Verified PromptMessage literal type inference works without `as const` casts; added explicit tests and removed unnecessary casts from the e2e-test plugin
+- Files changed:
+  - `platform/plugin-sdk/src/index.test.ts` — added 2 tests: literal types infer without `as const` in untyped render(), literal types infer without `as const` in typed render() with Zod args schema
+  - `plugins/e2e-test/src/index.ts` — removed `as const` casts from prompt render function (line 48: `role: 'user' as const` → `role: 'user'`, `type: 'text' as const` → `type: 'text'`)
+- **Learnings for future iterations:**
+  - The PromptMessage interface already had literal types (`role: 'user' | 'assistant'`, `content: { type: 'text'; text: string }`) from prior implementation. TypeScript's contextual typing narrows string literals when the return type of `render()` is `Promise<PromptMessage[]>`, so `as const` is not needed inside `definePrompt()`'s render method.
+  - The published SDK (`@opentabs-dev/plugin-sdk@0.0.16`) also has literal types in `PromptMessage`, so `as const` casts in plugin code are unnecessary even against the published version.
+  - `async render()` without `await` triggers `@typescript-eslint/require-await`. Use `render: () => Promise.resolve(...)` pattern in tests instead.
+---
+
+## 2026-02-21 - US-010
+- Added optional Zod schema validation to `fetchJSON` and `postJSON` via overloaded call signatures
+- Files changed:
+  - `platform/plugin-sdk/src/fetch.ts` — added `import type { z } from 'zod'`; extracted `fetchJSONImpl` shared implementation that accepts optional `schema?: z.ZodType` and validates via `safeParse`; added `FetchJSON` and `PostJSON` overloaded call signature interfaces; `fetchJSON` and `postJSON` now accept an optional Zod schema parameter that triggers runtime validation with `ToolError.validation` on failure
+  - `platform/plugin-sdk/src/fetch.test.ts` — added 5 tests: fetchJSON validates against schema, fetchJSON throws on schema mismatch, fetchJSON backward compat without schema, postJSON validates against schema, postJSON throws on schema mismatch
+  - `platform/plugin-sdk/src/index.ts` — re-exported `fetchJSONImpl`, `FetchJSON`, and `PostJSON` types
+- **Learnings for future iterations:**
+  - When an overloaded function (via call signature interface) needs to call itself internally (e.g., `postJSON` calling `fetchJSON`), TypeScript's overload resolution fails if the argument might be `undefined` and neither overload accepts it. The fix: extract the core logic into a non-overloaded `Impl` function and have both the public function and internal callers use the impl directly.
+  - `export const fn: FnInterface = fnImpl as FnInterface` is the cleanest way to assign an implementation function to an overloaded call signature type when the impl has a `Promise<unknown>` return. The `as` cast is safe because the overloads narrow the return type at call sites.
+  - The `import-x/exports-last` rule forces `fetchJSONImpl` to be exported even though it's an implementation detail. It must also be re-exported from `index.ts`. This is consistent with `httpStatusToToolError` and `parseRetryAfterMs` being publicly exported.
+---
+
+## 2026-02-21 - US-011
+- Added optional Zod schema to `ResourceDefinition` for content type safety documentation
+- Files changed:
+  - `platform/plugin-sdk/src/index.ts` — added generic `<TContent extends z.ZodType = z.ZodType>` to `ResourceDefinition` interface, added `schema?: TContent` field, made `defineResource` generic to preserve schema type inference
+  - `platform/plugin-sdk/src/index.test.ts` — added 3 tests: schema is optional (backward compat), defineResource with schema provides typed contract, typed resource is assignable to ResourceDefinition[]
+- **Learnings for future iterations:**
+  - Unlike `PromptDefinition` (US-001) where the generic affected the `render()` method parameter (causing contravariance issues with arrays), `ResourceDefinition`'s generic only appears in the `schema` field which is covariant. This means `ResourceDefinition<z.ZodString>` is assignable to `ResourceDefinition<z.ZodType>` and the interface can be directly generic without needing the overloaded factory pattern.
+  - The `generateResourcesManifest` in `build.ts` only extracts `uri`, `name`, `description`, `mimeType` — the `schema` field is intentionally not serialized to `tools.json`. It exists purely for type-level documentation and IDE autocomplete.
+  - When a generic interface's type parameter only appears in covariant positions (readonly fields, return types), it can be used directly in arrays without issues. Contravariance only becomes a problem when the generic appears in method parameter positions.
+---

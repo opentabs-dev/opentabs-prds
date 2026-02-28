@@ -1,0 +1,458 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-235235-analyze-site~running.json
+Started: Sat Feb 21 07:48:41 PST 2026
+---
+
+## Codebase Patterns
+- Browser tools follow a consistent pattern: `defineBrowserTool()` factory with Zod schema and handler
+- The analyze-site modules are pure analysis functions (no browser tool dispatch) — the orchestrator (US-005) collects data and passes it in
+- Network capture redacts sensitive headers (authorization, cookie, x-csrf-token, x-xsrf-token) to `[REDACTED]` — detection must work with redacted values
+- ESLint forbids non-null assertions (`!`) — use explicit type guards (`if (!x) throw` or `if (!x) return`) instead
+- Test helpers like `findMethod()` that throw on missing values are the pattern for narrowing `find()` results in tests
+- New files in `platform/mcp-server/src/` are automatically covered by the existing tsconfig for both build and test
+- ESLint `arrow-body-style` requires removing block braces from single-expression arrow functions
+- ESLint `@typescript-eslint/no-unnecessary-condition` flags `typeof x === 'object'` checks on values already typed as Record — remove them
+- The `NetworkRequest` type from detect-auth.ts is the shared type used across all analyze-site modules
+- For import ordering in test files, type imports must be alphabetically ordered by module path (`./detect-apis.js` before `./detect-auth.js`)
+- Framework and globals detection modules follow the same pure-function pattern as auth/APIs: take structured input, return structured output
+- `FrameworkDetectionInput` uses pre-computed booleans (hasSingleRootElement, usesPushState, hasNextData, etc.) — the page-context probing happens in the orchestrator, not the detection module
+- `GlobalsDetectionInput` uses pre-collected `GlobalProperty[]` with path, type, and topLevelKeys — the heavy Object.keys(window) filtering happens in a page script, this module just classifies
+- Auth-related key pattern for globals: `/session|token|auth|jwt|csrf|user|login|credential|account|profile/i`
+- The orchestrator dispatches to the extension using `dispatchToExtension()` directly — not through browser tool handlers — to avoid redundant Zod validation
+- Import ordering: value imports first (alphabetical by module path), then type imports (alphabetical by module path); merge all named imports from the same module into one statement
+- `browser.getCookies` takes a `url` param (not `tabId`); returns `{ cookies: [...] }` not a raw array
+- `browser.getNetworkRequests` result may be `{ requests: [...] }` or a raw array — handle both shapes
+- `browser.openTab` returns `{ id, title, url, windowId }` — use `.id` not `.tabId`
+- `browser.executeScript` results are nested `{ value: { value: <actual>, error?: <msg> } }` — must unwrap
+- E2E test filters for "plugin-only tools" should use BROWSER_TOOL_NAMES set, not prefix matching
+- Analyze-site test servers use relative URLs in client-side JS to avoid TypeScript circular reference errors with `server.port`
+- Network capture can include noise requests (Chrome extension internals, check calls) — E2E tests should assert specific expected suggestions rather than strict validation on all suggestions
+- Page-context scripts for `browser.executeScript` must be plain JS strings (the MAIN world does not run TypeScript)
+- SESSION_COOKIE_PATTERNS use exact-match regexes — test server cookies must use names that exactly match (e.g., `session`, `connect.sid`, `sid`), NOT names like `session_id` which fall between patterns
+- Chrome CDP fires `Network.webSocketCreated` (not `Network.requestWillBeSent`) for WebSocket connections — the network-capture module handles this as a synthetic request with status 101
+- Network capture preserves auth scheme prefix in Authorization headers: `"Bearer [REDACTED]"` not `"[REDACTED]"` — enables detect-auth to distinguish Basic from Bearer
+---
+
+## 2026-02-21 08:00 - US-001
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts`
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.test.ts` (41 tests)
+- Files changed:
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts` (new)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.test.ts` (new)
+- **Learnings for future iterations:**
+  - The `AuthDetectionInput` interface defines the contract between the orchestrator and detection modules: cookies, storage entries, network requests, CSRF DOM tokens, and window globals
+  - Network capture scrubs `authorization` header values to `[REDACTED]`, so bearer vs basic distinction requires cross-referencing with storage data (JWT in storage → likely Bearer)
+  - API key headers (`X-API-Key`, `Api-Key`, `apikey`) are NOT in the redacted headers list, so their values are visible
+  - The custom auth header detection uses a threshold (50% of requests or minimum 2) and token-like value pattern (16+ alphanumeric chars)
+  - Window globals detection only probes known SSR framework globals (`__NEXT_DATA__`, `__NUXT__`, `__INITIAL_STATE__`, `__APP_STATE__`) — limited to 2 levels deep
+  - All exported types are needed for future modules (US-002 through US-005) that will import from detect-auth
+---
+
+## 2026-02-21 08:10 - US-002
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts`
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-apis.test.ts` (56 tests)
+- Files changed:
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts` (new)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-apis.test.ts` (new)
+- **Learnings for future iterations:**
+  - Protocol classification uses a priority order: gRPC-Web → SSE → WebSocket → tRPC → GraphQL → JSON-RPC → form-submission → REST → path-based REST fallback
+  - GraphQL detection checks both URL path (`/graphql`) and request body (`{ query: "..." }`) — the body check catches non-standard GraphQL endpoint URLs
+  - JSON-RPC detection checks for `body.jsonrpc === '2.0'` — requires the exact spec-mandated version string
+  - tRPC detection uses regex `/(api\/)?trpc\//i` to match both `/api/trpc/` and `/trpc/` path prefixes
+  - Noise filtering covers: static asset extensions (20+), analytics domains (30+), browser extension URLs, and tracking pixel paths (/pixel, /track, /beacon)
+  - Primary API base URL detection registers prefixes at multiple depths (1-3 segments) and picks the deepest prefix shared by ≥2 endpoints
+  - Request grouping uses `method + origin + pathname` as key, stripping query params for deduplication
+  - The `NetworkRequest` type is imported from `detect-auth.ts` to maintain a single source of truth
+---
+
+## 2026-02-21 08:12 - US-003
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-framework.ts`
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-framework.test.ts` (24 tests)
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-globals.ts`
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-globals.test.ts` (21 tests)
+- Files changed:
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-framework.ts` (new)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-framework.test.ts` (new)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-globals.ts` (new)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-globals.test.ts` (new)
+- **Learnings for future iterations:**
+  - Framework detection takes pre-computed `FrameworkProbe[]` (name + version) from the orchestrator — the actual global/DOM probing runs as a page script
+  - SPA detection uses two signals: (1) known SPA frameworks (react, vue, angular, svelte, nextjs, nuxt, ember), or (2) single root element + pushState usage
+  - SSR detection looks for __NEXT_DATA__, __NUXT__, or hydration markers (data-reactroot, data-server-rendered)
+  - jQuery and Backbone are detected as frameworks but do NOT trigger SPA detection (they're not SPA frameworks)
+  - Globals detection takes pre-collected `GlobalProperty[]` — the heavy lifting of filtering browser builtins happens in the page script, this module classifies and flags auth data
+  - The `hasAuthData` flag on globals uses the same pattern as auth detection but expanded: `/session|token|auth|jwt|csrf|user|login|credential|account|profile/i`
+- DOM detection module takes pre-collected data (forms, interactive elements, data attributes) — orchestrator handles all DOM querying
+- Storage detection module only reports key names (not values) with `isAuth` flag — uses pattern `/session|token|auth|jwt|csrf|user|login|credential|sid|key|secret/i`
+- The `sid` pattern in storage auth detection matches substrings (e.g., "sidebar" matches "sid") — test data must avoid ambiguous names
+---
+
+## 2026-02-21 08:17 - US-004
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-dom.ts`
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-dom.test.ts` (30 tests)
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-storage.ts`
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/detect-storage.test.ts` (27 tests)
+- Files changed:
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-dom.ts` (new)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-dom.test.ts` (new)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-storage.ts` (new)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-storage.test.ts` (new)
+- **Learnings for future iterations:**
+  - DOM detection follows the same pure-function pattern: `DomDetectionInput` with pre-collected forms, interactive elements, and data attributes → `DomAnalysis` output
+  - Interactive elements are capped at 50 (`MAX_INTERACTIVE_ELEMENTS`) — the orchestrator collects more but detectDom truncates
+  - Data attributes are deduplicated and sorted alphabetically in the output
+  - Storage detection only analyzes key names (security: never reads values). The `isAuth` flag uses regex substring matching
+  - The `sid` in the auth pattern causes substring false positives (e.g., "sidebar-state" matches). Test data should avoid words containing "sid", "key", "user", "token", etc. as substrings
+  - `FormInput` captures action, method, and fields (name + type). `FormField` type covers input, select, textarea, and hidden types
+---
+
+## 2026-02-21 08:30 - US-005
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site/index.ts` (orchestrator)
+- Implemented `platform/mcp-server/src/browser-tools/analyze-site.ts` (browser tool definition)
+- Modified `platform/mcp-server/src/browser-tools/index.ts` (registered tool in barrel)
+- Files changed:
+  - `platform/mcp-server/src/browser-tools/analyze-site/index.ts` (new)
+  - `platform/mcp-server/src/browser-tools/analyze-site.ts` (new)
+  - `platform/mcp-server/src/browser-tools/index.ts` (modified)
+- **Learnings for future iterations:**
+  - The orchestrator uses `dispatchToExtension()` directly (not the browser tool handlers) to dispatch browser commands — this avoids re-validating Zod schemas and gives access to raw results
+  - Script execution uses the file-based injection pattern (`writeExecFile` → `dispatchToExtension('browser.executeScript')` → `deleteExecFile`) to bypass page CSP
+  - Page-context scripts must be plain JS strings (not TypeScript) — they run in the MAIN world via chrome.scripting.executeScript
+  - Page-context probes run sequentially to stay under the extension's rate limit (max 15 browser.executeScript calls per second)
+  - The `browser.getCookies` dispatch takes a `url` parameter (not `tabId`) — it returns cookies that would be sent with a request to that URL, including HttpOnly cookies
+  - `browser.getNetworkRequests` returns a result that may be wrapped in `{ requests: [...] }` or be a raw array — handle both shapes
+  - Import ordering rules: value imports sorted alphabetically by module path, then type imports sorted alphabetically by module path; no duplicate module imports (merge all named imports into one statement per module)
+  - Non-null assertions are forbidden by ESLint — use explicit guards (`if (!x) return`) instead
+  - Suggestion generation derives tool names from REST endpoints (GET /api/items → `list_items`), GraphQL operation names, tRPC procedure names, and form fields
+  - The `_framework` parameter pattern (underscore prefix) signals an intentionally unused parameter to ESLint
+---
+
+## 2026-02-21 16:57 - US-006
+- Created `e2e/analyze-site-test-server.ts` — test server simulating cookie-session auth with CSRF meta tags, hidden form inputs, and REST API endpoints
+- Created `e2e/analyze-site.e2e.ts` — E2E test calling plugin_analyze_site and verifying detection of cookie-based session auth, CSRF tokens, REST APIs, and DOM forms
+- Fixed 3 orchestrator bugs:
+  - `browser.openTab` returns `{ id: ... }` not `{ tabId: ... }` — extracted tab ID from wrong property
+  - `browser.executeScript` returns nested `{ value: { value: <actual> } }` — added unwrapping in `executeInTab`
+  - `browser.getCookies` returns `{ cookies: [...] }` — not a plain array
+- Changed script execution from parallel `Promise.all()` to sequential to avoid extension rate limit
+- Bumped browser.executeScript rate limit from 10 to 15/second (11 scripts needed for full analysis)
+- Added `plugin_analyze_site` to `BROWSER_TOOL_NAMES` in helpers.ts
+- Fixed E2E test filters in config-watcher.e2e.ts and hot-reload-dynamic.e2e.ts to use BROWSER_TOOL_NAMES set instead of prefix-based filtering
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (new)
+  - `e2e/analyze-site.e2e.ts` (new)
+  - `e2e/fixtures.ts` (modified — added startAnalyzeSiteServer)
+  - `e2e/helpers.ts` (modified — added plugin_analyze_site to BROWSER_TOOL_NAMES)
+  - `e2e/config-watcher.e2e.ts` (modified — fixed plugin tool filter)
+  - `e2e/hot-reload-dynamic.e2e.ts` (modified — fixed plugin tool filter)
+  - `platform/browser-extension/src/rate-limiter.ts` (modified — bumped executeScript limit)
+  - `platform/browser-extension/src/rate-limiter.test.ts` (modified — updated test assertion)
+  - `platform/mcp-server/src/browser-tools/analyze-site/index.ts` (modified — 3 bug fixes + sequential execution)
+- **Learnings for future iterations:**
+  - `browser.openTab` returns `{ id, title, url, windowId }` — use `.id` not `.tabId` to extract the tab ID
+  - `browser.executeScript` wraps results in `{ value: { value: <actual>, error?: <msg> } }` — callers must unwrap the nested structure
+  - `browser.getCookies` returns `{ cookies: [...] }` not a raw array — unwrap via `.cookies`
+  - The extension's rate limiter counts each WebSocket message per method per 1-second sliding window; sequential dispatchToExtension calls can still trigger rate limits if round-trip is <100ms (11 calls at ~50ms each = 550ms window)
+  - E2E tests filtering "plugin tools" should use the `BROWSER_TOOL_NAMES` set (not prefix matching) because browser tools like `plugin_analyze_site` don't follow the `browser_` prefix convention
+  - HttpOnly cookies are NOT visible via `document.cookie` (used by the storage detection module) but ARE visible via `chrome.cookies.getAll()` (used by the auth detection module) — test assertions must account for this
+  - The analyze-site test server uses relative URLs in client-side JS to avoid port-coupling issues (TypeScript circular reference error when referencing `server.port` inside the Bun.serve fetch handler)
+- Client-side fetch calls in test scenarios that use Authorization headers must be delayed (~1.5s) to allow the orchestrator's `browser.enableNetworkCapture` (CDP `Network.enable`) to complete before the requests fire — without the delay, requests are missed by the capture
+- The `beforeAll`/`afterAll` for the analyze-site test server should be at file scope (not inside `test.describe`) to share the server across all test groups in the file
+---
+
+## 2026-02-21 17:05 - US-007
+- Added `/jwt-localstorage/` scenario to `e2e/analyze-site-test-server.ts`
+  - JWT token with valid 3-segment base64url structure (header.payload.signature)
+  - localStorage stores JWT under `auth_token` key
+  - API calls with `Authorization: Bearer <jwt>` header
+  - Server endpoints validate Bearer token and return 401 without it
+  - Client-side fetch calls delayed 1.5s to ensure network capture is enabled
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - `auth.methods` includes `jwt-localstorage` with `auth_token` key
+  - `extractionHint` contains `localStorage.getItem('auth_token')`
+  - `auth.methods` includes `bearer-header` from network requests
+  - REST API endpoints detected with auth headers
+  - `storage.localStorage` reports `auth_token` with `isAuth: true`
+- Refactored test server lifecycle to file-level `beforeAll`/`afterAll` (shared across test groups)
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added JWT localStorage scenario)
+  - `e2e/analyze-site.e2e.ts` (modified — added JWT localStorage test, refactored server lifecycle)
+- **Learnings for future iterations:**
+  - The orchestrator opens a tab then enables network capture — there's a race between CDP `Network.enable` and the page's client-side fetch calls. If the page fires fetches immediately on load, they may complete before network capture starts. Fix: delay client-side API calls with `setTimeout(fn, 1500)` in test scenarios that need network request analysis
+  - Bearer header detection in `detect-auth.ts` works with redacted `[REDACTED]` Authorization header values — it cross-references with JWT in storage to classify as `bearer-header`
+  - Each `test.describe` block in Playwright gets its own worker with independent fixture instances — shared state (like the test server) must be at file scope, not inside describe blocks
+---
+
+## 2026-02-21 17:30 - US-008
+- Added `/graphql-app/` scenario to `e2e/analyze-site-test-server.ts`
+  - Serves HTML page at `/graphql-app/` that makes 3 GraphQL requests on load (2 queries + 1 mutation)
+  - POST `/graphql` endpoint handles query routing based on operation name matching
+  - Queries: `GetUsers` (returns 2 users), `GetItems` (returns 3 items); Mutation: `CreateItem` (returns created item)
+  - Client-side fetch calls delayed 1.5s to ensure network capture is active
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - `apis.endpoints` includes entries with `protocol: 'graphql'`
+  - GraphQL endpoint URL contains `/graphql` with method `POST`
+  - `requestBodySample` contains `query` field
+  - `suggestions` includes the generic `graphql_query` suggestion
+  - Named operation suggestions (prefixed `gql_`) are generated from captured queries
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added GraphQL scenario)
+  - `e2e/analyze-site.e2e.ts` (modified — added GraphQL E2E test)
+- **Learnings for future iterations:**
+  - The GraphQL page must be served at a path distinct from `/graphql` (used `/graphql-app/`) to avoid conflict with the POST `/graphql` API endpoint
+  - GraphQL protocol classification in detect-apis uses two signals: URL path ending in `/graphql` AND request body containing `{ query: "..." }` — both are checked
+  - The suggestion generator produces both a generic `graphql_query` tool and named `gql_<operation>` tools from parsed query bodies
+  - For named operation suggestions, the query body must include named operations (`query GetUsers { ... }`) — anonymous queries (`{ users { ... } }`) won't produce named suggestions
+---
+
+## 2026-02-21 17:30 - US-009
+- Added `/jsonrpc-app/` scenario to `e2e/analyze-site-test-server.ts`
+  - POST `/rpc` endpoint accepting JSON-RPC 2.0 requests (`{ jsonrpc: '2.0', method, params, id }`)
+  - Two methods: `getItems` (returns 3 items) and `createItem` (returns created item)
+  - Proper JSON-RPC error handling: parse errors (-32700) and method not found (-32601)
+  - Client-side JS fires 2 RPC calls on load with 1.5s delay for network capture
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - `apis.endpoints` includes entries with `protocol: 'jsonrpc'`
+  - Endpoint URL contains `/rpc` with method `POST`
+  - `requestBodySample` contains `jsonrpc` field
+  - Page title detected as `JSON-RPC Test App`
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added JSON-RPC scenario)
+  - `e2e/analyze-site.e2e.ts` (modified — added JSON-RPC E2E test)
+- **Learnings for future iterations:**
+  - JSON-RPC detection in detect-apis.ts requires `body.jsonrpc === '2.0'` (exact match on the spec-mandated version string)
+  - JSON-RPC scenarios follow the same pattern as GraphQL: separate page path (`/jsonrpc-app/`) from API endpoint (`/rpc`)
+  - The JSON-RPC server should return proper error codes for spec compliance: -32700 (parse error), -32601 (method not found)
+---
+
+## 2026-02-21 17:40 - US-010
+- Added `/nextjs-app/` scenario to `e2e/analyze-site-test-server.ts`
+  - Serves HTML page with `window.__NEXT_DATA__` containing session/user/accessToken data
+  - `div#__next` root element (triggers SPA container ID detection)
+  - `__NEXT_DATA__` includes `buildId`, `session` (top-level for globals hasAuthData), and nested `props.pageProps.session` (realistic Next.js pattern)
+  - No API calls needed — this scenario tests framework/globals/SSR detection only
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - `framework.frameworks` includes `{ name: 'nextjs' }`
+  - `framework.isSPA` is `true` (nextjs in known SPA frameworks)
+  - `framework.isSSR` is `true` (__NEXT_DATA__ + hydration marker detection)
+  - `auth.methods` includes `auth-global` referencing `__NEXT_DATA__`
+  - `auth.authenticated` is `true`
+  - `globals.globals` includes `__NEXT_DATA__` with `hasAuthData: true`
+  - `__NEXT_DATA__` topLevelKeys include `props` and `buildId`
+  - Title detected as `Next.js SSR Test App`
+- Fixed test interface: `isSpa`/`isSsr` → `isSPA`/`isSSR` to match actual wire format from `detectFramework`
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added Next.js SSR scenario)
+  - `e2e/analyze-site.e2e.ts` (modified — added Next.js SSR test, fixed framework interface)
+- **Learnings for future iterations:**
+  - The `detectGlobals` module only checks top-level keys of globals for auth patterns (it does NOT recurse into nested objects). To trigger `hasAuthData: true`, the global must have an auth-matching key at the top level (e.g., `session`, `user`, `token`)
+  - The `detectAuthInGlobals` (in detect-auth.ts) DOES recurse up to 2 levels deep via `findAuthKeys()` — so `auth.methods` will detect nested auth data even if the globals module doesn't flag `hasAuthData`
+  - These are two different detections: globals.hasAuthData (shallow, top-level keys only) vs auth.methods auth-global (deep, 2-level recursion)
+  - The SPA_SSR_PROBE_SCRIPT detects `__NEXT_DATA__` for both `hasNextData` (SSR) and hydration markers (`window.__NEXT_DATA__ && window.__NEXT_DATA__.props`)
+  - The SPA container ID check uses `document.getElementById('__next')` — the div must use `id="__next"` not just a class
+  - Next.js pages don't need API calls for framework/globals/SSR detection — the globals and DOM markers are sufficient
+---
+
+## 2026-02-21 17:45 - US-011
+- Added `/apikey-app/` scenario to `e2e/analyze-site-test-server.ts`
+  - HTML page stores API key in a JS variable, makes 3 API calls (2 GET + 1 POST) with `X-API-Key` header
+  - Server endpoints validate `X-API-Key` header and return 401 without it
+  - Client-side fetch calls delayed 1.5s to ensure network capture is active
+  - Added `X-API-Key` to CORS `Access-Control-Allow-Headers` for preflight requests
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - `auth.authenticated` is `true`
+  - `auth.methods` includes `api-key-header` type
+  - The detected method's `details` mentions `X-API-Key` (case-insensitive match)
+  - `extractionHint` references the `X-API-Key` header name
+  - REST API endpoints are detected
+  - Title detected as `API Key Auth Test App`
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added API key header scenario + CORS header)
+  - `e2e/analyze-site.e2e.ts` (modified — added API key header auth E2E test)
+- **Learnings for future iterations:**
+  - The `X-API-Key` header is NOT in the network capture redacted headers list (unlike `authorization` and `cookie`), so the header name AND value are both visible in captured requests
+  - The `detectApiKeyHeaders` function in detect-auth.ts matches headers case-insensitively against the set `{x-api-key, api-key, apikey}` — but reports the original header casing in `details`
+  - Custom headers like `X-API-Key` require adding them to the CORS `Access-Control-Allow-Headers` response on preflight (OPTIONS) requests, otherwise the browser blocks the request
+  - The API key scenario is simpler than JWT/Bearer scenarios because no storage is involved — the key is hardcoded in the client JS (simulating app-level config)
+---
+
+## 2026-02-21 18:00 - US-012
+- Added `/trpc-app/` scenario to `e2e/analyze-site-test-server.ts`
+  - HTML page makes 3 tRPC-style requests on load: 2 GET queries (`user.list`, `item.list`) and 1 POST mutation (`item.create`)
+  - GET queries pass input as encoded JSON query parameter (`?input=...`)
+  - POST mutations send JSON body directly
+  - Server endpoints at `/api/trpc/user.list`, `/api/trpc/item.list`, `/api/trpc/item.create`
+  - Response format follows tRPC convention: `{ result: { data: ... } }`
+  - Client-side fetch calls delayed 1.5s to ensure network capture is active
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - `apis.endpoints` includes entries with `protocol: 'trpc'`
+  - Endpoint URLs contain `/api/trpc/`
+  - Both GET and POST HTTP methods detected
+  - `suggestions` include tRPC-specific tool suggestions (`trpc_*` prefix)
+  - Title detected as `tRPC Test App`
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added tRPC scenario)
+  - `e2e/analyze-site.e2e.ts` (modified — added tRPC E2E test)
+- **Learnings for future iterations:**
+  - tRPC detection uses regex `/(api\/)?trpc\//i` on the pathname — any URL containing `/trpc/` or `/api/trpc/` is classified as tRPC
+  - tRPC queries use GET with `?input=<json>` query param, mutations use POST with JSON body — both are correctly classified
+  - The suggestion generator produces `trpc_<procedure>` tool names by extracting the procedure from the URL path after `/trpc/` and replacing dots with underscores
+  - tRPC scenarios follow the same pattern as other test scenarios: separate page path (`/trpc-app/`) from API paths (`/api/trpc/...`)
+  - No actual tRPC framework needed — the URL path pattern is sufficient for detection
+---
+
+## 2026-02-21 19:00 - US-013
+- Added `/mixed-auth/` scenario to `e2e/analyze-site-test-server.ts`
+  - Session cookie (`session`) set via Set-Cookie with HttpOnly flag
+  - CSRF meta tag (`csrf-token`) in `<head>` AND hidden input (`authenticity_token`) in a form
+  - Bearer token for XHR API calls, sourced from `window.__APP_CONFIG__.apiToken` global
+  - `window.__APP_CONFIG__` also has `session.user` data for auth-global detection
+  - Server endpoints validate Bearer token and return 401 without it
+  - Client-side fetch calls delayed 1.5s to ensure network capture is active
+  - POST request includes `X-CSRF-Token` header alongside Bearer for CSRF header detection
+- Added `Authorization` and `X-CSRF-Token` to CORS `Access-Control-Allow-Headers` for preflight requests
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - `auth.authenticated` is `true`
+  - `auth.methods` includes `cookie-session` type with `"session"` cookie name
+  - `auth.methods` includes `csrf-token` type with meta tag and hidden input sources
+  - Optional: `X-CSRF-Token` header detected (depends on network capture timing)
+  - `auth.methods` includes `bearer-header` type from API calls
+  - All three auth types present in one analysis result
+  - REST API endpoints detected
+  - DOM forms detected with `authenticity_token` and `setting_name` fields
+  - Title detected as `Mixed Auth Test App`
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added mixed auth scenario + CORS headers)
+  - `e2e/analyze-site.e2e.ts` (modified — added mixed auth E2E test)
+- **Learnings for future iterations:**
+  - The SESSION_COOKIE_PATTERNS in detect-auth.ts use exact-match regexes (e.g., `/^session$/i`), so `session_id` does NOT match — use cookie names that exactly match a pattern (e.g., `session`, `connect.sid`, `sid`)
+  - Mixed auth scenarios are the most realistic test — real apps like Slack use cookie sessions for page auth, CSRF tokens for form safety, and Bearer tokens (from globals) for XHR API calls
+  - The `X-CSRF-Token` header in POST requests is detected by the CSRF token detector separately from DOM-based CSRF tokens (meta tags and hidden inputs)
+  - The `window.__APP_CONFIG__` global triggers `auth-global` detection since `session` key matches the AUTH_KEY_PATTERN — but this detection is separate from the explicit Bearer header detection
+---
+
+## 2026-02-21 19:55 - US-014
+- Added `Network.webSocketCreated` CDP event handling to `platform/browser-extension/src/network-capture.ts`
+  - Chrome's CDP fires `Network.webSocketCreated` (not `Network.requestWillBeSent`) for WebSocket connections
+  - Captures the event as a synthetic `CapturedRequest` with status 101, synthetic `Upgrade: websocket` headers
+  - This enables the existing `classifyProtocol()` in detect-apis.ts to classify WebSocket connections correctly
+- Added `/websocket-app/` scenario to `e2e/analyze-site-test-server.ts`
+  - HTML page creates `new WebSocket('ws://host/ws?token=...')` with auth token in URL query param
+  - Bun.serve's `websocket` handler accepts connections and sends 2 periodic messages (welcome + updates)
+  - Also makes a REST API call (`GET /websocket-app/api/config`) to test combined detection
+  - Client-side WebSocket connection delayed 1.5s to ensure network capture is active
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - `apis.endpoints` includes entries with `protocol: 'websocket'`
+  - WebSocket endpoint URL contains `/ws`
+  - `suggestions` includes `subscribe_realtime` tool suggestion referencing `/ws`
+  - REST API also detected alongside WebSocket
+  - Title detected as `WebSocket Test App`
+- Files changed:
+  - `platform/browser-extension/src/network-capture.ts` (modified — added Network.webSocketCreated handling)
+  - `e2e/analyze-site-test-server.ts` (modified — added WebSocket scenario)
+  - `e2e/analyze-site.e2e.ts` (modified — added WebSocket E2E test)
+- **Learnings for future iterations:**
+  - Chrome's CDP `Network.enable` does NOT fire `Network.requestWillBeSent` for WebSocket connections — it fires `Network.webSocketCreated` instead (with `requestId` and `url` params)
+  - The `Network.webSocketCreated` event provides the WebSocket URL (with `ws://` or `wss://` scheme), not the HTTP upgrade URL — the detect-apis module's `url.startsWith('ws://')` check handles this correctly
+  - To capture WebSocket connections, add a handler for `Network.webSocketCreated` that creates a synthetic CapturedRequest with status 101 and `Upgrade: websocket` headers
+  - Bun.serve supports WebSocket via the `websocket` option + `server.upgrade(req)` in the fetch handler; the second param to fetch is the `server` instance
+  - `server.upgrade(req)` returns `true` on success; the response should return `undefined` cast to `Response` (Bun convention) since the HTTP response is handled by the WebSocket upgrade
+  - WebSocket messages in the test server use `setInterval` for periodic sends — they clean up automatically when the WebSocket closes
+---
+
+## 2026-02-21 20:05 - US-015
+- Added `/spa-app/` scenario to `e2e/analyze-site-test-server.ts`
+  - Single `div#root` element (triggers SPA container detection)
+  - Simulated `__REACT_DEVTOOLS_GLOBAL_HOOK__` with renderers map containing React 18.2.0
+  - Client-side pushState router with 3 routes (home, about, settings)
+  - `history.replaceState` on load to mark SPA routing active
+  - Link click interception with `[data-route]` attributes and `pushState` navigation
+  - `popstate` event handler for browser back/forward
+  - Catch-all server route (`path.startsWith('/spa-app')`) to simulate SPA server
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - `framework.frameworks` includes `{ name: 'react', version: '18.2.0' }`
+  - `framework.isSPA` is `true` (react is in known SPA frameworks list)
+  - Title detected as `SPA React Test App`
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added SPA scenario)
+  - `e2e/analyze-site.e2e.ts` (modified — added SPA E2E test)
+- **Learnings for future iterations:**
+  - The FRAMEWORK_PROBE_SCRIPT detects React via `window.__REACT_DEVTOOLS_GLOBAL_HOOK__` and extracts version from `hook.renderers.values().next().value.version`
+  - To simulate React for tests, create a `__REACT_DEVTOOLS_GLOBAL_HOOK__` with a `renderers` Map containing at least one entry with a `version` property
+  - SPA detection uses two independent signals: (1) known SPA framework detected (react is in the set), OR (2) single root element + pushState evidence — either is sufficient
+  - The SPA_SSR_PROBE_SCRIPT checks for known container IDs (`root`, `app`, `__next`, `__nuxt`, `svelte`) via `document.getElementById()` — using `div#root` triggers the SPA container check
+  - SPA test scenarios don't need API calls or auth — framework/SPA detection is based purely on globals and DOM structure
+  - The catch-all route pattern (`path.startsWith('/spa-app')`) is needed because the client-side router uses pushState to navigate between sub-paths
+---
+
+## 2026-02-21 21:30 - US-016
+- Added `/suggestions-app/` scenario to `e2e/analyze-site-test-server.ts`
+  - REST API endpoints: GET /api/items (list), POST /api/items (create), GET /api/users (list)
+  - GET /api/search with query parameter for search functionality
+  - POST /api/settings for form submission
+  - Two forms: a search form (GET) and a settings form (POST) with multiple field types
+  - Client-side fetch calls delayed 1.5s for network capture timing
+- Added E2E test in `e2e/analyze-site.e2e.ts` verifying:
+  - At least 3 suggestions generated
+  - Each suggestion has toolName, description, approach, complexity fields
+  - Complexity values are valid ('low', 'medium', 'high')
+  - GET /api/items generates `list_items` tool suggestion with approach referencing `/api/items`
+  - POST /api/items generates `create_items` tool suggestion
+  - GET /api/users generates `list_users` tool suggestion
+  - REST suggestions reference their specific API endpoints in the approach field
+  - Form suggestions (`submit_*`) are generated for detected forms
+  - snake_case validation on specific REST endpoint tool names (not global — see learnings)
+  - Title detected as `Suggestions Quality Test App`
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added suggestions-app scenario)
+  - `e2e/analyze-site.e2e.ts` (modified — added suggestion quality E2E test)
+- **Learnings for future iterations:**
+  - The `restEndpointSuggestion` function produces tool names from URL path segments via `toSnakeCase()`, but `toSnakeCase` does NOT remove dots from path segments — so paths like `/auth.check` produce tool names like `create_auth.check` which fail a strict `^[a-z][a-z0-9_]*$` regex
+  - Network capture can pick up requests beyond the test page's own API calls (e.g., Chrome extension internal requests, check calls to other routes) — so the suggestion list may include unexpected entries from noise requests
+  - Strict snake_case validation should only be applied to specific expected suggestions (like `list_items`, `create_items`), not globally to all suggestions in the array
+  - The suggestions-app test server routes must be added BEFORE the SPA catch-all route (`path.startsWith('/spa-app')`) in the server fetch handler to avoid path conflicts
+---
+
+## 2026-02-21 22:30 - US-017
+- Added `/jwt-sessionstorage/` scenario to `e2e/analyze-site-test-server.ts`
+  - JWT token stored in sessionStorage under `auth_token` key
+  - API calls with `Authorization: Bearer <jwt>` header
+  - Server endpoints validate Bearer token and return 401 without it
+  - Client-side fetch calls delayed 1.5s to ensure network capture is active
+- Added `/basicauth-app/` scenario to `e2e/analyze-site-test-server.ts`
+  - API calls with `Authorization: Basic <base64>` header
+  - Server endpoints validate Basic Auth header and return 401 with WWW-Authenticate challenge
+  - Client-side fetch calls delayed 1.5s for network capture timing
+- Modified `platform/browser-extension/src/network-capture.ts` — scrubHeaders now preserves the auth scheme prefix (e.g., "Bearer [REDACTED]" instead of "[REDACTED]") for Authorization and Proxy-Authorization headers
+- Updated `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts` — updated detectBearerHeaders and detectBasicAuth to work with scheme-preserving redacted headers
+- Updated `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.test.ts` — added test for scheme-preserving redacted Basic Auth detection
+- Added E2E tests in `e2e/analyze-site.e2e.ts`:
+  - sessionStorage JWT: detects `jwt-sessionstorage` with `auth_token` key, `bearer-header` from network, sessionStorage entry with `isAuth: true`
+  - Basic Auth: detects `basic-auth` from `Authorization: Basic` header, verifies bearer-header is NOT present (distinct from Basic Auth)
+- Files changed:
+  - `e2e/analyze-site-test-server.ts` (modified — added sessionStorage JWT and Basic Auth scenarios)
+  - `e2e/analyze-site.e2e.ts` (modified — added 2 E2E tests)
+  - `platform/browser-extension/src/network-capture.ts` (modified — scheme-preserving header scrubbing)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts` (modified — updated detection logic)
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.test.ts` (modified — updated unit tests)
+- **Learnings for future iterations:**
+  - The network capture's `scrubHeaders` previously replaced the entire Authorization header value with `[REDACTED]`, making it impossible to distinguish Basic from Bearer auth. The fix preserves the scheme prefix: `"Bearer [REDACTED]"` or `"Basic [REDACTED]"`.
+  - `detectBasicAuth` now works with scheme-preserving redacted headers (`val.startsWith('Basic ')` matches `"Basic [REDACTED]"`)
+  - `detectBearerHeaders` now correctly handles three cases: (1) explicit `"Bearer [REDACTED]"`, (2) fully redacted `"[REDACTED]"` with JWT in storage, (3) fully redacted `"[REDACTED]"` without Basic prefix (legacy fallback)
+  - Basic Auth test verifies that bearer-header is NOT detected when only Basic Auth is present — this ensures the two are correctly distinguished
+  - Basic Auth server endpoints should include `WWW-Authenticate: Basic realm="..."` header on 401 responses (standard practice)
+  - The `Proxy-Authorization` header also gets scheme-preserving treatment for consistency
+---
+
+## 2026-02-21 22:45 - US-018
+- Added documentation for `plugin_analyze_site` browser tool to CLAUDE.md's Key Concepts section
+- Added two new Key Concept entries:
+  - **Browser tools**: Overview of built-in browser tools, their categories, and `defineBrowserTool()` pattern
+  - **Site analysis tool**: Full documentation of `plugin_analyze_site` — what it detects (auth, APIs, framework, globals, DOM, storage), when to use it (developing new plugins), its detection module architecture, and the suggestions output
+- Files changed:
+  - `CLAUDE.md` (modified — added 13 lines in Key Concepts section)
+- **Learnings for future iterations:**
+  - CLAUDE.md has a strict "plugin-agnostic" policy at the bottom — browser tools are OK to document since they are platform-level, not plugin-specific
+  - The Key Concepts section is the right place for new platform capabilities — each entry follows the `**Bold title**: description` pattern
+  - Documentation-only stories still require all quality checks to pass (build, type-check, lint, knip, test) even though no code changed
+---

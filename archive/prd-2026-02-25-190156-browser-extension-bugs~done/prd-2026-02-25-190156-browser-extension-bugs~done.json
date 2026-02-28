@@ -1,0 +1,191 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource leaks, and code quality issues in the Chrome extension — background service worker, offscreen document, network capture, and side panel React code.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add error handling to onInstalled/onStartup lifecycle handlers",
+      "description": "As a developer, I want the extension lifecycle handlers to log errors so that silent failures during extension startup are diagnosable.",
+      "acceptanceCriteria": [
+        "The onInstalled and onStartup handlers in background.ts have .catch() handlers that log warnings, matching the pattern used by the top-level calls on lines 129-131",
+        "If ensureOffscreenDocument() fails inside onInstalled, setupKeepaliveAlarm() and reinjectStoredPlugins() still do not execute (sequential dependency is correct), but the error is logged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/background.ts lines 113-127. The `void (async () => { ... })()` pattern silently swallows errors. Add a `.catch((err: unknown) => console.warn(...))` to each IIFE, matching the pattern on lines 129-131. The simplest fix is to add `.catch(...)` to the end of each IIFE call. Keep the `void` prefix since the return value is intentionally discarded."
+    },
+    {
+      "id": "US-002",
+      "title": "Add port range validation for storage change relay",
+      "description": "As a user, I want invalid port numbers to be rejected so that out-of-range or fractional port values don't produce invalid WebSocket URLs.",
+      "acceptanceCriteria": [
+        "The port validation in background.ts checks that the port is an integer AND within the range 1-65535",
+        "A port value of 99999, 0.5, or -1 does NOT trigger a ws:setUrl message",
+        "A port value of 9515, 1, or 65535 still triggers a ws:setUrl message correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/background.ts line 141. Currently checks `typeof portChange?.newValue === 'number' && portChange.newValue > 0`. Change to also check `Number.isInteger(portChange.newValue) && portChange.newValue <= 65535`."
+    },
+    {
+      "id": "US-003",
+      "title": "Clean up stale window IDs in side panel toggle on window removal",
+      "description": "As a user, I want the side panel toggle to work correctly after closing and reopening Chrome windows, without needing to click twice.",
+      "acceptanceCriteria": [
+        "A chrome.windows.onRemoved listener is registered in initSidePanelToggle that removes the closed window ID from the openWindows set",
+        "The listener is only registered when canToggle is true (Chrome 141+)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/side-panel-toggle.ts. The `openWindows` Set accumulates stale IDs when windows close while the side panel is open (onClosed may not fire). Add `chrome.windows.onRemoved.addListener((windowId) => { openWindows.delete(windowId); });` inside the `if (canToggle)` block."
+    },
+    {
+      "id": "US-004",
+      "title": "Clear stale lastDisconnectReason in disconnectAndReconnect",
+      "description": "As a user, I want to see the correct error state in the side panel when the port changes or a force reconnect is triggered, instead of a flash of the previous error.",
+      "acceptanceCriteria": [
+        "disconnectAndReconnect in offscreen/index.ts clears lastDisconnectReason to undefined before closing the WebSocket",
+        "After a port change, the side panel does not briefly show 'Authentication Failed' if the previous disconnect was auth_failed",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts line 122-141. The `disconnectAndReconnect` function resets `backoffMs` but does not clear `lastDisconnectReason`. Add `lastDisconnectReason = undefined;` at the top of the function body (after `backoffMs = INITIAL_BACKOFF_MS`)."
+    },
+    {
+      "id": "US-005",
+      "title": "Add pendingRequests cleanup for aborted network requests",
+      "description": "As a developer, I want the network capture pendingRequests map to not grow unboundedly when requests are aborted without CDP events.",
+      "acceptanceCriteria": [
+        "pendingRequests entries older than a reasonable TTL (e.g., 60 seconds) are pruned during new requestWillBeSent events or periodically",
+        "The pruning does not affect requests that are still actively loading (only stale entries)",
+        "requestIdToRequest entries for requests that never receive loadingFinished are also cleaned up",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/network-capture.ts. The `pendingRequests` Map (line 76) and `requestIdToRequest` Map (line 78) can leak entries for requests that never complete. Add a TTL-based cleanup: during `Network.requestWillBeSent` handling, before adding the new entry, prune any pendingRequests entries older than 60 seconds. Similarly, prune requestIdToRequest entries that reference requests no longer in the requests array. A simple approach: add a `const PENDING_REQUEST_TTL_MS = 60_000;` constant, and at the start of the requestWillBeSent handler, iterate pendingRequests and delete entries where `Date.now() - entry.timestamp > PENDING_REQUEST_TTL_MS`."
+    },
+    {
+      "id": "US-006",
+      "title": "Prune stale keys from rate limiter methodTimestamps map",
+      "description": "As a developer, I want the rate limiter to not accumulate empty timestamp arrays for methods that are no longer being called.",
+      "acceptanceCriteria": [
+        "After pruning expired timestamps, if the resulting array is empty, the key is deleted from the methodTimestamps map",
+        "The checkRateLimit function still correctly tracks and limits active methods",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/rate-limiter.ts lines 54-63. After the filter on line 54 (`timestamps = ... .filter(t => t > cutoff)`), if timestamps is empty and the request is also rejected (won't happen — empty means allowed), or more importantly: when timestamps become empty after filtering, the key is still set back into the map on line 57 or 62. Fix: after the filter, if `timestamps.length === 0` and the request is not about to be added, delete the key. The simplest approach: after line 54, if `timestamps.length === 0`, skip the `methodTimestamps.set` on line 57 (the reject path won't be reached since 0 < maxRequests). On line 62, the new timestamp is always pushed so the array is always non-empty in the allow path. The issue is specifically on the reject path (line 57-58): if all timestamps expired but the count check somehow fails — actually this cannot happen since 0 < maxRequests. The real leak is that keys with expired-but-filtered timestamps are set back. After line 54, add: `if (timestamps.length === 0) { methodTimestamps.delete(method); }` — but then immediately re-add on line 62. Better approach: only set the map key on line 62 (allow path). Move `methodTimestamps.set(method, timestamps)` from line 57 to be only in the reject path, and in the allow path (line 62) always set. And delete empty keys in the reject path."
+    },
+    {
+      "id": "US-007",
+      "title": "Clear CountdownBar interval when countdown reaches zero",
+      "description": "As a developer, I want the CountdownBar component to stop its interval timer when the countdown reaches zero, avoiding unnecessary CPU work.",
+      "acceptanceCriteria": [
+        "The setInterval in CountdownBar is cleared when remaining reaches 0",
+        "The countdown bar still visually shows 0s at the end",
+        "No interval continues ticking after the countdown expires",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/side-panel/components/ConfirmationDialog.tsx lines 28-36. The interval continues firing after remaining reaches 0. Inside the `update` function, check if the computed remaining is 0 and clear the interval if so. Store the interval ID in a variable accessible to the update function (it already is via `id`): after `setRemaining(Math.max(0, ...))`, add `if (timeoutMs - elapsed <= 0) clearInterval(id);`."
+    },
+    {
+      "id": "US-008",
+      "title": "Clear toolFilter on disconnect in side panel",
+      "description": "As a user, I want the tool filter to be cleared when the server disconnects so that reconnecting shows all plugins without a stale filter hiding some.",
+      "acceptanceCriteria": [
+        "When sp:connectionState fires with connected=false, toolFilter is set to ''",
+        "After reconnecting, all plugins are visible (no stale filter)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/side-panel/App.tsx lines 110-116. The disconnect handler clears plugins, failedPlugins, activeTools, and pendingConfirmations — but not toolFilter. Add `setToolFilter('');` alongside the other state resets in the `else` branch (after `setPendingConfirmations([])`)."
+    },
+    {
+      "id": "US-009",
+      "title": "Add error handling to getConnectionState in side panel startup",
+      "description": "As a developer, I want the side panel to handle Chrome runtime errors during startup gracefully instead of getting stuck in the loading state.",
+      "acceptanceCriteria": [
+        "The getConnectionState() call in the initial useEffect has a .catch() handler",
+        "If getConnectionState() rejects, loading is set to false and connected defaults to false",
+        "The side panel shows the disconnected state instead of infinite loading",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/side-panel/App.tsx lines 74-82. The `void getConnectionState().then(...)` has no `.catch()`. Add `.catch(() => { setLoading(false); })` after the `.then()` call. This ensures the side panel exits the loading state even if the Chrome runtime is unavailable."
+    },
+    {
+      "id": "US-010",
+      "title": "Fix optimistic revert race condition in handleToggleTool",
+      "description": "As a user, I want tool toggle state to remain consistent with the server even under rapid toggling with server errors.",
+      "acceptanceCriteria": [
+        "handleToggleTool captures the original tools array before the optimistic update (matching the pattern in handleToggleAll)",
+        "The .catch() handler reverts to the captured original state instead of toggling back",
+        "Rapid toggling with server errors does not desynchronize the displayed state from the server state",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "File: platform/browser-extension/src/side-panel/components/PluginCard.tsx lines 53-60. Currently the catch handler reverts by toggling `!newEnabled`, which is wrong under rapid toggling. The fix: capture `const originalTools = plugin.tools;` before the optimistic update (like handleToggleAll does on line 45), then in the catch handler use `updatePluginTools(() => originalTools)`. This matches the safe pattern already in the codebase on lines 44-51."
+    }
+  ]
+}

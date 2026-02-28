@@ -1,0 +1,128 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-194543-platform-bug-fixes~running.json
+Started: Wed Feb 18 20:55:17 PST 2026
+---
+
+## Codebase Patterns
+- Browser extension code runs in Chrome MV3 context with access to `chrome.debugger` API for CDP
+- Network capture uses CDP's `Network.getResponseBody` which returns base64-encoded UTF-8 text
+- Quality checks: build, type-check, lint, knip, test — all must pass before committing
+- Pre-commit hooks run prettier, eslint, and knip automatically
+- `@typescript-eslint/no-unnecessary-condition` tracks async variables — placing checks in `finally` blocks avoids false positives for variables modified during `await`
+
+---
+
+## 2026-02-18 20:57 PST - US-001
+- Fixed `atob()` corrupting non-ASCII response bodies in `network-capture.ts` line 202
+- Replaced bare `atob(res.body)` with `new TextDecoder().decode(Uint8Array.from(atob(res.body), c => c.charCodeAt(0)))` to properly decode base64 to UTF-8
+- Non-base64 text content (`res.base64Encoded === false`) continues to be stored directly
+- Files changed: `platform/browser-extension/src/network-capture.ts`
+- **Learnings for future iterations:**
+  - `atob()` returns a Latin1 binary string, not Unicode text — the standard browser pattern for base64→UTF-8 is `TextDecoder` + `Uint8Array.from(atob(...), c => c.charCodeAt(0))`
+  - Chrome CDP `Network.getResponseBody` returns `{ body: string, base64Encoded: boolean }` — when base64Encoded is true, the body is UTF-8 bytes encoded as base64
+---
+
+## 2026-02-18 21:00 PST - US-002
+- Fixed MCP session leak when `sessionServer.connect(transport)` throws in `http-routes.ts`
+- Wrapped the session creation + connect block (lines 293-296) in try/catch that calls `removeSession()` before re-throwing
+- Used `return await` instead of `return` inside the try block to satisfy the `@typescript-eslint/return-await` lint rule
+- Files changed: `platform/mcp-server/src/http-routes.ts`
+- **Learnings for future iterations:**
+  - The `@typescript-eslint/return-await` rule requires `return await` inside try blocks so the catch clause can intercept rejections — bare `return promise` would skip the catch
+  - The stale session sweeper (`sweepStaleSessions`) skips sessions without transport IDs, so orphaned sessions from failed `connect()` calls are never cleaned up without explicit removal
+  - The `removeSession()` closure captures `sessionServer` by reference and handles indexOf + splice safely
+---
+
+## 2026-02-18 21:04 PST - US-003
+- Fixed `EXTENSION_COPY_EXCLUDE_PATTERN` regex in `platform/shared/src/index.ts` to match root-level tsconfig files
+- Changed the tsconfig part of the regex from `[\\/]tsconfig[^/\\]*` to `(?:^|[\\/])tsconfig[^/\\]*` so it also matches at string start (no leading path separator)
+- Added test cases for `tsconfig.json` and `tsconfig.test.json` at root level in `validation.test.ts`
+- Updated describe block title from "require path separator prefix" to just "tsconfig exclusions"
+- Files changed: `platform/shared/src/index.ts`, `platform/shared/src/validation.test.ts`
+- **Learnings for future iterations:**
+  - `EXTENSION_COPY_EXCLUDE_PATTERN` is used during `opentabs setup` to filter files when copying the browser extension to `~/.opentabs/extension/`
+  - `relative()` returns paths without a leading separator for root-level files, so regex alternations must include `^` to match the start of string
+  - Prettier auto-formats long regex lines by splitting across two lines — run `bun run format` if the regex line is too long
+---
+
+## 2026-02-18 21:08 PST - US-004
+- Fixed `opentabs build --watch` silently dropping file changes during rebuild in `platform/cli/src/commands/build.ts`
+- Added `pendingRebuild` flag: when a rebuild is requested while one is already in progress, the flag is set instead of silently returning
+- After the current build completes (in a `finally` block), the code checks `pendingRebuild` and initiates another rebuild if set
+- Existing debounce behavior is preserved — changes still go through the debounce timer before calling `rebuild()`
+- Files changed: `platform/cli/src/commands/build.ts`
+- **Learnings for future iterations:**
+  - ESLint's `@typescript-eslint/no-unnecessary-condition` doesn't track that variables can be mutated during `await` by concurrent async calls. Placing the variable check in a `finally` block avoids the false positive.
+  - The `void rebuild()` pattern is used to call an async function without awaiting it (fire-and-forget) while satisfying `@typescript-eslint/no-floating-promises`
+---
+
+## 2026-02-18 21:12 PST - US-005
+- Fixed `followFile` race condition in `platform/cli/src/commands/logs.ts`
+- Moved `offset = currentSize` from synchronous assignment (line 60) into the stream's `end` event callback, preventing stale offset when the file grows during async delivery
+- Added `reading` flag to prevent overlapping `createReadStream` calls when the file watcher fires while a read is in flight
+- Added `readRequested` flag to defer watcher-triggered reads until the current stream completes, then re-invoke `readNewContent`
+- Added `error` event handler on the stream to reset the `reading` flag on failures
+- Files changed: `platform/cli/src/commands/logs.ts`
+- **Learnings for future iterations:**
+  - `createReadStream` delivers data asynchronously via `data` events, but `statSync` captures file size synchronously — setting offset before the stream finishes can cause data to be re-read or skipped
+  - Node.js `fs.watch` can fire multiple times rapidly for a single write (OS-level coalescing varies), so concurrent read guards are essential for stream-based file tailing
+  - The `end` event on a read stream fires after all `data` events have been emitted, making it the correct place to update the read offset
+---
+
+## 2026-02-18 21:15 PST - US-006
+- Removed dead code in `handleBrowserTypeText` in `platform/browser-extension/src/browser-commands.ts`
+- Removed the redundant `if (clr) { input.value = ''; }` block (lines 528-530) that was immediately overwritten by `input.value = clr ? txt : input.value + txt` on line 531
+- No events were dispatched between the two assignments, so the empty-string assignment had zero observable effect
+- Files changed: `platform/browser-extension/src/browser-commands.ts`
+- **Learnings for future iterations:**
+  - The `chrome.scripting.executeScript` func parameter runs in the page's MAIN world — assignments to `input.value` only trigger events if explicitly dispatched via `dispatchEvent`
+  - Dead code in `executeScript` funcs is easy to miss since the code runs in a different context (injected into the page) and is not directly testable with unit tests — only E2E tests cover it
+---
+
+## 2026-02-18 21:20 PST - US-007
+- Added separate `meta` boolean modifier parameter to `browser_press_key` tool for independent Ctrl/Meta (Cmd) key handling
+- MCP server tool definition (`press-key.ts`): added `meta` to the modifiers schema object, updated tool description to mention Cmd+K and independent Ctrl/Meta support
+- Extension handler (`browser-commands.ts`): extracted `metaKey` from `modifiers.meta`, passed it as a 6th argument to `executeScript` func, set `metaKey: meta` instead of `metaKey: ctrl` in `KeyboardEventInit`
+- Files changed: `platform/mcp-server/src/browser-tools/press-key.ts`, `platform/browser-extension/src/browser-commands.ts`
+- **Learnings for future iterations:**
+  - `chrome.scripting.executeScript` `args` array is positional — when adding a new parameter, append it to the end of the array and add a matching parameter to the `func` signature
+  - The `modifiers` parameter is passed through from the MCP tool schema to the extension handler as a nested object in the dispatch params — the extension reads it as `Record<string, unknown>` and extracts individual booleans with `=== true` checks
+  - Previously `metaKey` was aliased to `ctrl` for "cross-platform compat" — this prevented web apps that distinguish Ctrl from Cmd (like VS Code web, Figma) from receiving correct events
+---
+
+## 2026-02-18 21:23 PST - US-008
+- Fixed Slack token regex in `plugins/slack/src/slack-api.ts` line 157 to include underscores in the character class
+- Changed `[a-zA-Z0-9-]+` to `[a-zA-Z0-9_-]+` for the xoxc- token match pattern
+- Built and type-checked the Slack plugin independently (`cd plugins/slack && bun run build`)
+- All platform quality checks pass (build, type-check, lint, knip, test, test:e2e — 231 E2E tests)
+- Files changed: `plugins/slack/src/slack-api.ts`
+- **Learnings for future iterations:**
+  - Slack xoxc- tokens can contain underscores — always include `_` in token character classes
+  - Plugins are standalone projects: `dist/` is gitignored in plugins, so only source files and non-gitignored manifests are committed
+  - Plugin builds are verified independently with `cd plugins/<name> && bun run build`, not by root `bun run build`
+---
+
+## 2026-02-18 21:28 PST - US-009
+- Added runtime validation for `parsed.params` in `handleExtensionMessage` in `extension-protocol.ts`
+- Centralized the check before method-specific handlers: validates `rawParams` is a plain object (or undefined/null), rejecting arrays, primitives, and booleans with a warning log
+- Replaced all unsafe `parsed.params as Record<string, unknown>` casts with the validated `params` variable (typed as `Record<string, unknown> | undefined`)
+- The `Array.isArray()` check is needed because `typeof [] === 'object'` in JavaScript
+- `ping` and response handlers (which don't use params) are unaffected — validation runs after them
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`
+- **Learnings for future iterations:**
+  - `typeof null === 'object'` in JavaScript, so null must be checked separately before the `typeof` check
+  - JSON-RPC spec says params must be a structured value (object or array), but this codebase expects only objects — arrays are rejected as non-object params
+  - Centralizing params validation before method dispatch eliminates scattered `as` casts and ensures all handlers get a consistently typed value
+---
+
+## 2026-02-18 21:31 PST - US-010
+- Fixed `isNewer` version comparison in `platform/mcp-server/src/version-check.ts` to handle NaN segments
+- Added `Number.isFinite(n) ? n : 0` guard after `Number()` parse so malformed segments (e.g., "abc") are treated as 0 instead of NaN
+- NaN comparisons (`NaN > x` and `NaN < x`) both return false, causing the loop to skip past malformed segments as if they were equal to anything — the fix normalizes them to 0 for correct numeric comparison
+- Added 4 test cases in `version-check.test.ts` covering: malformed current, malformed latest, both malformed, and same-position malformed segments
+- Files changed: `platform/mcp-server/src/version-check.ts`, `platform/mcp-server/src/version-check.test.ts`
+- **Learnings for future iterations:**
+  - `Number('abc')` returns `NaN`, and NaN comparisons with `>` and `<` both return `false` — this silently skips segments in comparison loops
+  - `Number.isFinite()` is the correct guard for NaN (rejects NaN, Infinity, and -Infinity) — prefer it over `isNaN()` which has quirky coercion behavior
+  - The `isNewer` function strips prerelease suffixes at the hyphen before parsing, so "1.0.0-beta.1" becomes [1, 0, 0] — the NaN fix handles segments where the entire segment is non-numeric (not just hyphenated prereleases)
+---

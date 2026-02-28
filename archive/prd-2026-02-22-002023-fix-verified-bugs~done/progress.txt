@@ -1,0 +1,72 @@
+# Ralph Progress Log
+PRD: prd-2026-02-22-002023-fix-verified-bugs~running.json
+Started: Sun Feb 22 12:44:41 PST 2026
+---
+
+## Codebase Patterns
+- The e2e-test plugin in `plugins/e2e-test/` needs `bun install && bun run build` before unit tests pass — its `dist/` and `node_modules/` are gitignored and not present in fresh worktrees
+- The `build-e2e.test.ts` tests copy the e2e-test plugin to temp dirs and run builds; they depend on the plugin's `dist/index.js` and `node_modules/` being present
+- The globals scan script in `analyze-site/index.ts` is a string literal executed in the browser context — it's not TypeScript-checked at build time
+- `bun-types` narrows some DOM types compared to standard lib (e.g., `Element.textContent` is `string` not `string | null`). When adding null safety for DOM properties, use `as string | null` type assertion to widen the type, then check explicitly — optional chaining alone triggers `@typescript-eslint/no-unnecessary-condition`
+- Use `bun run test` to run unit tests — root `package.json` has `"test": "bun test platform/"` which scopes tests to the platform directory
+- Manifest types: `ManifestResource` requires `uri`+`name`; `ManifestPrompt` requires `name` only; `ManifestPromptArgument` requires `name` only. All other fields are optional.
+
+## 2026-02-22T12:46 - US-001
+- Fixed AND vs OR logic error in globals filtering: changed `&&` to `||` on line 419 of `platform/mcp-server/src/browser-tools/analyze-site/index.ts`
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site/index.ts`
+- **Learnings for future iterations:**
+  - In fresh worktrees, `plugins/e2e-test/` lacks `dist/` and `node_modules/`, causing 6 test failures in `build-e2e.test.ts`. Run `cd plugins/e2e-test && bun install && bun run build` before running tests.
+  - The globals scan script is a raw string template, so logic errors there aren't caught by TypeScript — only manual review or runtime testing catches them.
+---
+
+## 2026-02-22T21:02 - US-002
+- Fixed null safety in `getTextContent` SDK utility: widened `el.textContent` from bun-types' `string` to `string | null` via type assertion, then added explicit null check before calling `.trim()`
+- Files changed: `platform/plugin-sdk/src/dom.ts`
+- **Learnings for future iterations:**
+  - `bun-types` types `Element.textContent` as `string` (non-nullable), whereas standard DOM lib types it as `string | null`. The `@typescript-eslint/no-unnecessary-condition` rule flags optional chaining on `textContent` as unnecessary. To add null safety, use `as string | null` type assertion to widen the type, then check explicitly — this satisfies both the linter and defensive coding.
+  - `querySelector` only returns `Element` subclasses where `textContent` is always a string in practice. The null case is theoretical (applies only to Document/DocumentType nodes per MDN), but defensive coding is still preferred.
+---
+
+## 2026-02-22T21:10 - US-003
+- Added `validateResources()`, `validatePrompts()`, and `validatePromptArguments()` functions in `platform/mcp-server/src/loader.ts` to validate resource and prompt entries from `tools.json` at load time
+- Replaced direct `as ManifestResource[]` / `as ManifestPrompt[]` casts with calls to validation functions that filter out invalid entries with `log.warn()`
+- Added comprehensive unit tests for both validation functions, plus integration tests via `loadPlugin` with mixed valid/invalid entries
+- Exported `validateResources` and `validatePrompts` from `loader.ts` for testability
+- Files changed: `platform/mcp-server/src/loader.ts`, `platform/mcp-server/src/loader.test.ts`
+- **Learnings for future iterations:**
+  - The `ManifestResource` type requires `uri` and `name` as mandatory fields; `description` and `mimeType` are optional. `ManifestPrompt` requires `name` only; `description` and `arguments` are optional. `ManifestPromptArgument` requires `name` only.
+  - The loader follows a pattern where tools use hard-failure validation (`validateTools` returns `Result<T, string>`), but resources/prompts use soft-failure (filter invalid + warn). This matches the acceptance criteria and is sensible since missing tools are more critical than missing resources/prompts.
+  - The `bun test` command (not `bun run test`) is the correct way to run unit tests — `bun run test` fails because there's no `test` script in `package.json`.
+---
+
+## 2026-02-22T21:15 - US-004
+- Added file existence checks before calling `.stat()` on IIFE and source map files in `platform/plugin-tools/src/commands/build.ts`
+- Both the IIFE file (line 787) and source map file (line 791) now use `Bun.file(path).exists()` before `stat()`
+- If a file doesn't exist, the build prints a dim warning message instead of crashing
+- Files changed: `platform/plugin-tools/src/commands/build.ts`
+- **Learnings for future iterations:**
+  - The `Bun.file(path)` object can be stored in a variable and reused for `.exists()` and `.stat()` — avoids creating multiple BunFile instances for the same path.
+  - The IIFE file is written immediately before the stat check (`Bun.write` then `stat`), so it should always exist. But defensive checks are still worthwhile since a write failure during disk-full conditions could leave no file.
+  - Use `bun run test` (there IS a `test` script in root package.json: `"test": "bun test platform/"`). The earlier pattern note was incorrect.
+---
+
+## 2026-02-22T21:25 - US-005
+- Fixed `BASE64URL_SEGMENT` regex in `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts` to accept `=` padding characters
+- Changed regex from `/^[A-Za-z0-9_-]+$/` to `/^[A-Za-z0-9_-]+=*$/`
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts`
+- **Learnings for future iterations:**
+  - Base64url (RFC 4648 §5) uses `_` and `-` instead of `+` and `/`. Padding with `=` is optional per spec but common in practice for JWTs.
+  - The `looksLikeJwt` function checks for three dot-separated base64url segments. The regex change only affects the character class at the trailing position — `=*` allows zero or more padding chars after the base64url content.
+---
+
+## 2026-02-22T21:30 - US-006
+- Fixed audit table status column alignment by extracting duplicated table formatting into a shared `printAuditTable()` helper function
+- Changed approach from "colorize icon, then manually pad with spaces" to "pad plain-text icon to column width, then colorize the padded string" — this ensures ANSI escape codes never affect `padEnd` alignment
+- Eliminated code duplication: both file-mode and server-mode paths now call the same `printAuditTable()` function
+- Column width constants extracted to module-level (`COL_TIME`, `COL_TOOL`, `COL_STATUS`, `COL_DURATION`)
+- Files changed: `platform/cli/src/commands/audit.ts`
+- **Learnings for future iterations:**
+  - When working with ANSI-colored terminal output, always pad plain text first, then wrap in color. `padEnd()` counts string bytes/chars including invisible ANSI escape sequences, so colorizing before padding breaks alignment.
+  - The previous code used `' '.repeat(statusCol - 1)` which actually produced correct visual alignment by coincidence (fixed 3 spaces regardless of ANSI), but the approach was fragile. The correct pattern is `pc.green(icon.padEnd(width))`.
+  - When two code paths have identical formatting logic, extract to a helper immediately — duplicated formatting code is a maintenance hazard.
+---

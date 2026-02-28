@@ -1,0 +1,144 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix plugin disappearance during development. Root causes: loadConfig() fallback wipes plugins on transient errors, onToolConfigPersist overwrites externally-added plugin paths, file watcher can't recover plugins that failed initial discovery, CLI uses non-atomic writes and gives misleading guidance.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "loadConfig throws on persistent read failure instead of returning empty fallback",
+      "description": "As a platform developer, I want loadConfig() to throw when config.json is transiently unreadable so that reloadCore preserves previous state instead of wiping all plugins to zero.",
+      "acceptanceCriteria": [
+        "loadConfig reads config.json with retry + exponential backoff (3 retries, 100ms/200ms/400ms) before giving up",
+        "When all retries fail, loadConfig throws an error (not returns empty fallback)",
+        "reloadCore's existing catch block at reload.ts:176 catches the error and preserves previous state.plugins",
+        "The FALLBACK_CONFIG constant and the generateSecret() call in the catch block at config.ts:140 are removed",
+        "When config.json does not exist at all (first run), loadConfig still creates a default config with a fresh secret",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/config.ts. The current code at lines 138-141 catches ALL errors and returns { ...FALLBACK_CONFIG, secret: generateSecret() } which has plugins: []. This wipes state.pluginPaths in reloadCore (reload.ts:125). Also at line 103-104, a non-object JSON value returns the same fallback. The fix: extract a readConfigWithRetry helper (similar to readFileWithRetry in file-watcher.ts:46-58) that retries reads with backoff. Extract a parseConfigRecord helper for the validation logic at lines 112-136. loadConfig should throw on persistent failure so reload.ts:176 catch block preserves previous state. IMPORTANT: a partial fix for this already exists on the current branch — check what's there and ensure it's complete and correct. The FALLBACK_CONFIG constant may still exist but should only be used for the genuine first-run case (file doesn't exist)."
+    },
+    {
+      "id": "US-002",
+      "title": "onToolConfigPersist does read-modify-write on tools field only",
+      "description": "As a developer, I want tool toggle persists to only write the tools field to config.json so that externally-added plugin paths are never overwritten by stale in-memory state.",
+      "acceptanceCriteria": [
+        "A new saveToolConfig function exists that reads config.json from disk, updates only the tools field, and writes back atomically",
+        "onToolConfigPersist in http-routes.ts calls saveToolConfig instead of saveConfig",
+        "saveToolConfig reads the current config from disk before writing, preserving plugins/secret/npmPlugins as they exist on disk",
+        "saveToolConfig uses the configWriteMutex to serialize with other config writes",
+        "If config.json is unreadable when saveToolConfig runs, it logs a warning and skips the write (does not crash)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/config.ts and platform/mcp-server/src/http-routes.ts. The current onToolConfigPersist at http-routes.ts:48-52 calls saveConfig with state.pluginPaths from memory. If a plugin was added externally (opentabs plugin add, manual edit) but the config watcher's 200ms debounce hasn't fired yet, state.pluginPaths is stale and the persist overwrites the file. IMPORTANT: a partial fix for this already exists on the current branch — check what's there and ensure saveToolConfig is correctly implemented and exported, and http-routes.ts uses it. The saveToolConfig function should do: read config from disk with retry -> update only the tools key -> atomic write back."
+    },
+    {
+      "id": "US-003",
+      "title": "File watcher watches all config plugin paths, not just successfully-discovered ones",
+      "description": "As a plugin developer, I want the file watcher to watch plugin directories even if initial discovery failed so that when I build my plugin the MCP server automatically picks it up without a manual reload.",
+      "acceptanceCriteria": [
+        "startFileWatching watches directories from state.pluginPaths (all configured paths) not just state.plugins (successfully loaded plugins)",
+        "When a manifest or IIFE change is detected for a path not in state.plugins, the watcher attempts loadPluginFromDir and adds the plugin to state on success",
+        "When a newly-discovered plugin is added via the watcher, MCP tools are re-registered and sync.full is sent to the extension",
+        "Paths that don't exist on disk are skipped (no crash on watching non-existent directory)",
+        "The existing behavior for already-loaded plugins is unchanged (IIFE update, manifest update)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/file-watcher.ts, platform/mcp-server/src/reload.ts. Currently startFileWatching at file-watcher.ts:337-360 iterates state.plugins.values() which only contains successfully-loaded plugins. Plugins that failed discovery (no manifest, no IIFE, parse error) are never watched. The fix: startFileWatching should also receive the list of configured plugin paths (state.pluginPaths resolved to absolute). For each path that exists on disk but is NOT in state.plugins, set up a watcher. The watcher callback for these 'pending' plugins should attempt full discovery (loadPluginFromDir from discovery.ts), add to state.plugins on success, and trigger the same callbacks (onManifestChanged). This requires: (1) adding a new callback like onPluginDiscovered to FileWatcherCallbacks, (2) in reload.ts, passing resolved plugin paths to startFileWatching, (3) in the watcher handler, calling loadPluginFromDir and updating state. Be careful about the pluginName derivation — for pending plugins the name isn't known yet, so the watcher should parse the manifest to get it."
+    },
+    {
+      "id": "US-004",
+      "title": "CLI plugin add/remove uses atomic writes and correct guidance messages",
+      "description": "As a plugin developer, I want opentabs plugin add to use atomic writes and tell me the truth about what to do next so that my config is safe and I don't waste time restarting the server unnecessarily.",
+      "acceptanceCriteria": [
+        "opentabs plugin add writes config.json atomically (write to .tmp file then rename)",
+        "opentabs plugin remove writes config.json atomically",
+        "opentabs plugin add says 'The MCP server will detect the change automatically.' instead of 'Restart the MCP server to pick up the new plugin.'",
+        "opentabs plugin remove says 'The MCP server will detect the change automatically.' instead of 'Restart the MCP server to pick up the change.'",
+        "opentabs plugin add validates that the plugin directory contains opentabs-plugin.json and dist/adapter.iife.js, and warns if either is missing (non-fatal warning, still adds the path)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Files: platform/cli/src/commands/plugin.ts. handlePluginAdd at line 135 uses `await Bun.write(configPath, ...)` which is not atomic. Change to write-to-tmp + rename pattern (same as atomicWriteConfig in platform/mcp-server/src/config.ts:50-60 — consider extracting to @opentabs-dev/shared or duplicating the pattern). The misleading 'Restart the MCP server' messages are at lines 137 and 164. For validation: after resolving the path at line 115, check existsSync on join(resolvedNew, 'opentabs-plugin.json') and join(resolvedNew, 'dist/adapter.iife.js'). If missing, print a yellow warning like 'Warning: No opentabs-plugin.json found — run bun run build in the plugin directory.' The existing path-not-exist warning at line 131 should remain."
+    },
+    {
+      "id": "US-005",
+      "title": "CLI config set and scaffold use atomic writes",
+      "description": "As a developer, I want all CLI commands that write config.json to use atomic writes so that the MCP server never reads a partially-written file.",
+      "acceptanceCriteria": [
+        "handleConfigInit in config.ts uses atomic write (write to .tmp then rename)",
+        "handleConfigSet in config.ts uses atomic write",
+        "autoRegisterPlugin in scaffold.ts uses atomic write",
+        "All three sites follow the same pattern: write to configPath + '.tmp', then rename over configPath",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Files: platform/cli/src/commands/config.ts (lines 40 and 138), platform/cli/src/scaffold.ts (line 264). All three use `await Bun.write(configPath, ...)`. Change each to: (1) write to configPath + '.tmp', (2) rename(configPath + '.tmp', configPath). Import rename from 'node:fs/promises'. The pattern is: `const tmpPath = configPath + '.tmp'; await Bun.write(tmpPath, content); const { rename } = await import('node:fs/promises'); await rename(tmpPath, configPath);`. Alternatively, extract an atomicWriteJson helper in cli/src/config.ts and use it from all three sites."
+    },
+    {
+      "id": "US-006",
+      "title": "Health endpoint exposes failed plugin paths for debugging",
+      "description": "As a developer debugging plugin issues, I want the /health endpoint to show which plugin paths failed to load and why so that I can diagnose problems without reading server logs.",
+      "acceptanceCriteria": [
+        "The /health response includes a failedPlugins array with entries like { path: string, error: string }",
+        "Each plugin path from config that was not successfully loaded appears in failedPlugins with a human-readable error (e.g., 'No opentabs-plugin.json found', 'Adapter IIFE is empty', 'Manifest validation failed: ...')",
+        "Successfully loaded plugins do NOT appear in failedPlugins",
+        "The failedPlugins array is empty when all plugins loaded successfully",
+        "The HealthResponse type in state.ts or http-routes.ts is updated to include the new field",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Files: platform/mcp-server/src/reload.ts, platform/mcp-server/src/state.ts, platform/mcp-server/src/http-routes.ts, platform/mcp-server/src/discovery.ts. Approach: (1) Add a failedPlugins field to ServerState: Array<{ path: string; error: string }>. (2) In discoverFromLocalPaths (discovery.ts:397-427), instead of just logging warnings/errors, collect them into a returned structure. The discoverPlugins function currently returns Map<string, RegisteredPlugin> — change it to return { plugins: Map<...>, failures: Array<{ path: string; error: string }> }. (3) In reloadCore (reload.ts:122-123), store the failures on state.failedPlugins. (4) In the /health handler (http-routes.ts), include state.failedPlugins in the response. Keep the change minimal — don't restructure discoverPlugins, just add a secondary return value or an out-parameter."
+    },
+    {
+      "id": "US-007",
+      "title": "Fix scaffolded plugin dev script for iterative development",
+      "description": "As a community plugin developer, I want the scaffolded dev script to work for iterative development so that I can edit source files and see changes automatically without running multiple terminals.",
+      "acceptanceCriteria": [
+        "The scaffolded package.json dev script runs tsc in watch mode and opentabs build in watch mode concurrently",
+        "Editing a .ts source file triggers automatic recompilation and IIFE rebuild without manual intervention",
+        "The dev script works with a single terminal command (bun run dev)",
+        "The opentabs build --watch mode (in platform/cli/src/commands/build.ts) is updated if needed to support the concurrent workflow",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "File: platform/cli/src/scaffold.ts (the template for package.json dev script). Currently the scaffolded dev script is `\"dev\": \"bun run build --watch\"` which expands to `tsc && opentabs build --watch`. Problem: tsc runs once and exits, then opentabs build --watch watches dist/ for changes — but nothing is producing changes to dist/ anymore. Fix options: (1) Change the dev script to use Bun's shell to run both concurrently: `\"dev\": \"tsc --watch --preserveWatchOutput & opentabs build --watch\"` (backgrounded tsc with &). (2) Or update opentabs build --watch to also run tsc --watch internally (more complex but better UX). Option 1 is simpler and more reliable. The `--preserveWatchOutput` flag prevents tsc from clearing the terminal. Also update the existing e2e-test and slack plugin package.json files to use the same pattern for consistency."
+    }
+  ]
+}

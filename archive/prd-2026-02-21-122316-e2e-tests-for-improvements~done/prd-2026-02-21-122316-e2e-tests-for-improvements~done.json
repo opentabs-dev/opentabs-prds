@@ -1,0 +1,235 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add comprehensive E2E tests for the UX improvements implemented in PRDs 1-7: CLI plugin lifecycle, doctor/audit improvements, SDK ergonomics (typed prompts, structured fetch errors, indeterminate progress, displayName/icon defaults), plugin devx (source maps, side panel refresh), and side panel onboarding reset.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "E2E tests for structured fetch errors with ErrorCategory",
+      "description": "As a platform developer, I want E2E tests that verify fetchFromPage errors carry proper ErrorCategory metadata through the full dispatch chain.",
+      "acceptanceCriteria": [
+        "A new tool 'sdk_fetch_error_categories' is added to the e2e-test plugin that exercises fetchFromPage against endpoints returning 401, 404, 429, and 500",
+        "E2E test verifies that calling the tool with a 401 endpoint returns an error with category 'auth' in the MCP response",
+        "E2E test verifies that calling the tool with a 404 endpoint returns an error with category 'not_found'",
+        "E2E test verifies that calling the tool with a 429 endpoint returns an error with category 'rate_limit' and retryable: true",
+        "E2E test verifies that a timeout from fetchFromPage returns an error with category 'timeout' and retryable: true",
+        "Test server endpoints are added for each HTTP status code scenario",
+        "All tests use the standard fixture pattern (mcpServer, testServer, extensionContext, mcpClient)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "This tests PRD 4 US-002 (structured fetch errors). Two places need changes:\n\n1. **e2e-test plugin** — Add a new tool at plugins/e2e-test/src/tools/sdk-fetch-error-categories.ts:\n```typescript\nexport const sdkFetchErrorCategories = defineTool({\n  name: 'sdk_fetch_error_categories',\n  displayName: 'SDK Fetch Error Categories',\n  description: 'Tests fetchFromPage error categorization',\n  icon: 'wrench',\n  input: z.object({ statusCode: z.number().describe('HTTP status code to trigger') }),\n  output: z.object({ ok: z.boolean() }),\n  handle: async (params) => {\n    // Call the test server endpoint that returns the requested status code\n    await fetchFromPage(`/api/status-code/${params.statusCode}`);\n    return { ok: true }; // Should not reach here\n  },\n});\n```\nRegister in plugins/e2e-test/src/index.ts. Then `cd plugins/e2e-test && bun run build`.\n\n2. **Test server** — Add a new endpoint in e2e/test-server.ts that returns configurable HTTP status codes: `GET /api/status-code/:code` returns that status code with an appropriate body. For 429, include a Retry-After header.\n\n3. **E2E test** — Create e2e/sdk-fetch-errors.e2e.ts following the pattern from e2e/structured-errors.e2e.ts. Use setupToolTest, then call the tool with different statusCode values and assert on the error content:\n```typescript\nconst result = await mcpClient.callTool('e2e-test_sdk_fetch_error_categories', { statusCode: 401 });\nexpect(result.isError).toBe(true);\nexpect(result.content).toContain('category=auth');\nexpect(result.content).toContain('retryable=false');\n```\n\nFor the timeout test, add a /api/slow-forever endpoint to the test server that never responds, and call fetchFromPage with a short timeout."
+    },
+    {
+      "id": "US-002",
+      "title": "E2E tests for indeterminate progress reporting",
+      "description": "As a platform developer, I want E2E tests verifying that tools can report progress without progress/total values.",
+      "acceptanceCriteria": [
+        "A new tool 'indeterminate_progress' is added to the e2e-test plugin that calls context.reportProgress({ message: 'Working...' }) without progress/total",
+        "E2E test verifies that the MCP client receives the progress notification with message 'Working...'",
+        "E2E test verifies that progress: 0, total: 0 (or the indeterminate sentinel) are in the notification",
+        "The test uses callToolWithProgress to capture progress notifications",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "This tests PRD 4 US-005 (indeterminate progress). The existing progress test is in e2e/progress.e2e.ts using the 'slow_with_progress' tool.\n\n1. **e2e-test plugin** — Add plugins/e2e-test/src/tools/indeterminate-progress.ts:\n```typescript\nexport const indeterminateProgress = defineTool({\n  name: 'indeterminate_progress',\n  displayName: 'Indeterminate Progress',\n  description: 'Reports progress without total for indeterminate operations',\n  icon: 'loader',\n  input: z.object({}),\n  output: z.object({ ok: z.boolean() }),\n  handle: async (_params, context?) => {\n    context?.reportProgress({ message: 'Step 1: Initializing...' });\n    await sleep(100);\n    context?.reportProgress({ message: 'Step 2: Processing...' });\n    await sleep(100);\n    context?.reportProgress({ message: 'Step 3: Finishing...' });\n    return { ok: true };\n  },\n});\n```\n\n2. **E2E test** — Add test cases to e2e/progress.e2e.ts:\n```typescript\ntest('indeterminate progress (no total)', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n  const { content, progressNotifications } = await mcpClient.callToolWithProgress(\n    'e2e-test_indeterminate_progress', {}\n  );\n  expect(progressNotifications.length).toBe(3);\n  expect(progressNotifications[0].message).toBe('Step 1: Initializing...');\n  // Verify indeterminate markers\n  for (const n of progressNotifications) {\n    expect(n.progress).toBe(0);\n    expect(n.total).toBe(0);\n  }\n  await page.close();\n});\n```"
+    },
+    {
+      "id": "US-003",
+      "title": "E2E tests for auto-derived displayName and default icon",
+      "description": "As a platform developer, I want E2E tests verifying that tools without explicit displayName/icon get sensible defaults.",
+      "acceptanceCriteria": [
+        "A new tool 'no_display_name' is added to the e2e-test plugin WITHOUT displayName and icon fields",
+        "E2E test verifies that tools/list returns the tool with displayName auto-derived from name ('No Display Name')",
+        "E2E test verifies that tools/list returns the tool with the default icon ('wrench')",
+        "E2E test verifies the tool is callable and functional despite omitted fields",
+        "The side panel shows the auto-derived display name correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "This tests PRD 4 US-004 (auto displayName and default icon).\n\n1. **e2e-test plugin** — Add plugins/e2e-test/src/tools/no-display-name.ts:\n```typescript\nexport const noDisplayName = defineTool({\n  name: 'no_display_name',\n  // Deliberately omit displayName and icon to test defaults\n  description: 'Tool with no explicit displayName or icon',\n  input: z.object({}),\n  output: z.object({ ok: z.boolean() }),\n  handle: async () => ({ ok: true }),\n});\n```\nRegister in index.ts. Build the plugin.\n\n2. **E2E test** — Add to an existing test file (sdk-utilities.e2e.ts or create e2e/tool-defaults.e2e.ts):\n```typescript\ntest('tool without displayName gets auto-derived name', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n  const health = await mcpServer.health();\n  // Check tools.json or health endpoint for the tool's displayName\n  // The manifest should show displayName: 'No Display Name' and icon: 'wrench'\n  const tools = await mcpClient.listTools();\n  const tool = tools.find(t => t.name === 'e2e-test_no_display_name');\n  expect(tool).toBeDefined();\n  // The MCP tools/list may not expose displayName (check schema), but the health endpoint does via pluginDetails\n  await page.close();\n});\n```\n\nNote: MCP tools/list returns name+description+inputSchema. displayName and icon are stored in tools.json and surfaced in /health. Test via the health endpoint's pluginDetails or by checking dist/tools.json content."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E tests for typed prompt arguments with Zod schema",
+      "description": "As a platform developer, I want E2E tests verifying that prompts defined with Zod args schemas work correctly through the full dispatch chain.",
+      "acceptanceCriteria": [
+        "The e2e-test plugin's 'greet' prompt is updated to use the new Zod args schema (if not breaking existing tests)",
+        "A new prompt 'typed_greet' is added to the e2e-test plugin using the Zod args pattern",
+        "E2E test verifies that prompts/list returns the correct argument metadata derived from the Zod schema",
+        "E2E test verifies that prompts/get returns correctly rendered messages with typed args",
+        "E2E test verifies that prompts/get with missing required args returns an appropriate error",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "This tests PRD 4 US-001 (typed prompt args).\n\n1. **e2e-test plugin** — Add a new prompt in plugins/e2e-test/src/index.ts:\n```typescript\nconst typedGreetPrompt = definePrompt({\n  name: 'typed_greet',\n  description: 'A typed greeting prompt',\n  args: z.object({\n    name: z.string().describe('Name to greet'),\n    formal: z.string().optional().describe('Whether to use formal greeting'),\n  }),\n  async render(args) {\n    const greeting = args.formal ? `Dear ${args.name}` : `Hey ${args.name}`;\n    return [{ role: 'user', content: { type: 'text', text: `${greeting}!` } }];\n  },\n});\n```\nAdd to the prompts array. Build.\n\n2. **E2E test** — Add to e2e/resources-prompts.e2e.ts:\n```typescript\ntest('typed prompt with Zod args', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n\n  // List prompts — verify metadata\n  const prompts = await mcpClient.listPrompts();\n  const typedPrompt = prompts.find(p => p.name === 'e2e-test_typed_greet');\n  expect(typedPrompt).toBeDefined();\n  expect(typedPrompt?.arguments).toContainEqual(\n    expect.objectContaining({ name: 'name', required: true })\n  );\n\n  // Get prompt with args\n  const messages = await mcpClient.getPrompt('e2e-test_typed_greet', { name: 'Alice' });\n  expect(messages[0].content.text).toBe('Hey Alice!');\n\n  // Get prompt with optional arg\n  const formalMessages = await mcpClient.getPrompt('e2e-test_typed_greet', { name: 'Alice', formal: 'true' });\n  expect(formalMessages[0].content.text).toBe('Dear Alice!');\n\n  await page.close();\n});\n```"
+    },
+    {
+      "id": "US-005",
+      "title": "E2E tests for ToolError factory methods with custom codes",
+      "description": "As a platform developer, I want E2E tests verifying that ToolError factory methods accept and propagate custom error codes.",
+      "acceptanceCriteria": [
+        "A new tool 'error_custom_code' is added to the e2e-test plugin that throws ToolError.auth('msg', 'CUSTOM_AUTH_CODE')",
+        "E2E test verifies the MCP response contains 'code=CUSTOM_AUTH_CODE' instead of the default 'AUTH_ERROR'",
+        "E2E test verifies the category is still 'auth' despite the custom code",
+        "E2E test verifies retryable metadata is preserved with custom codes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "This tests PRD 4 US-003 (custom codes on factory methods).\n\n1. **e2e-test plugin** — Add plugins/e2e-test/src/tools/error-custom-code.ts:\n```typescript\nimport { defineTool, ToolError } from '@opentabs-dev/plugin-sdk';\nimport { z } from 'zod';\n\nexport const errorCustomCode = defineTool({\n  name: 'error_custom_code',\n  displayName: 'Error Custom Code',\n  description: 'Throws ToolError with custom code via factory methods',\n  icon: 'alert-triangle',\n  input: z.object({\n    factory: z.enum(['auth', 'not_found', 'rate_limited', 'validation', 'timeout', 'internal']).describe('Which factory method to use'),\n  }),\n  output: z.object({ ok: z.boolean() }),\n  handle: async (params) => {\n    switch (params.factory) {\n      case 'auth': throw ToolError.auth('Custom auth error', 'CUSTOM_AUTH');\n      case 'not_found': throw ToolError.notFound('Custom not found', 'CUSTOM_NOT_FOUND');\n      case 'rate_limited': throw ToolError.rateLimited('Custom rate limit', 5000, 'CUSTOM_RATE_LIMIT');\n      case 'validation': throw ToolError.validation('Custom validation', 'CUSTOM_VALIDATION');\n      case 'timeout': throw ToolError.timeout('Custom timeout', 'CUSTOM_TIMEOUT');\n      case 'internal': throw ToolError.internal('Custom internal', 'CUSTOM_INTERNAL');\n    }\n  },\n});\n```\n\nNote: The factory method signature for rateLimited needs to be checked — if the second param is retryAfterMs, the custom code would be the third param. Adjust the call signature to match the actual API after PRD 4 US-003 is implemented.\n\n2. **E2E test** — Add to e2e/structured-errors.e2e.ts:\n```typescript\ntest.describe('custom error codes', () => {\n  test('auth with custom code', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n    const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n    const result = await mcpClient.callTool('e2e-test_error_custom_code', { factory: 'auth' });\n    expect(result.isError).toBe(true);\n    expect(result.content).toContain('code=CUSTOM_AUTH');\n    expect(result.content).toContain('category=auth');\n    await page.close();\n  });\n  // Similar tests for each factory...\n});\n```"
+    },
+    {
+      "id": "US-006",
+      "title": "E2E tests for removeLocalStorage and removeSessionStorage SDK utilities",
+      "description": "As a platform developer, I want E2E tests verifying the new storage removal utilities work through the adapter dispatch chain.",
+      "acceptanceCriteria": [
+        "A new tool 'sdk_remove_storage' is added to the e2e-test plugin that uses removeLocalStorage and removeSessionStorage",
+        "E2E test sets a localStorage key on the test page, calls the tool to remove it, then verifies the key is gone",
+        "E2E test does the same for sessionStorage",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "This tests PRD 4 US-008 (removeLocalStorage/removeSessionStorage).\n\n1. **e2e-test plugin** — Add plugins/e2e-test/src/tools/sdk-remove-storage.ts:\n```typescript\nimport { defineTool, removeLocalStorage, removeSessionStorage, getLocalStorage, getSessionStorage } from '@opentabs-dev/plugin-sdk';\nimport { z } from 'zod';\n\nexport const sdkRemoveStorage = defineTool({\n  name: 'sdk_remove_storage',\n  displayName: 'SDK Remove Storage',\n  description: 'Tests removeLocalStorage and removeSessionStorage',\n  icon: 'trash',\n  input: z.object({\n    storageType: z.enum(['local', 'session']),\n    key: z.string(),\n  }),\n  output: z.object({ existed: z.boolean(), afterRemoval: z.boolean() }),\n  handle: async (params) => {\n    const getter = params.storageType === 'local' ? getLocalStorage : getSessionStorage;\n    const existed = getter(params.key) !== null;\n    if (params.storageType === 'local') {\n      removeLocalStorage(params.key);\n    } else {\n      removeSessionStorage(params.key);\n    }\n    const afterRemoval = getter(params.key) !== null;\n    return { existed, afterRemoval: afterRemoval };\n  },\n});\n```\n\n2. **E2E test** — Add to e2e/sdk-utilities.e2e.ts:\n```typescript\ntest('removeLocalStorage removes a key', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  // The SDK test page at /sdk-test pre-sets localStorage.testKey = 'testValue'\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n  // Navigate to the sdk-test page that has pre-set localStorage\n  await page.goto(`${testServer.url}/sdk-test`);\n  await page.evaluate(() => localStorage.setItem('removeMe', 'value'));\n  // Wait for adapter\n  await page.waitForFunction(() => globalThis.__openTabs?.adapters?.['e2e-test']);\n\n  const result = await callToolExpectSuccess(mcpClient, mcpServer, 'e2e-test_sdk_remove_storage', {\n    storageType: 'local', key: 'removeMe'\n  });\n  expect(result.existed).toBe(true);\n  expect(result.afterRemoval).toBe(false);\n});\n```"
+    },
+    {
+      "id": "US-007",
+      "title": "E2E tests for typed getPageGlobal with generics",
+      "description": "As a platform developer, I want E2E tests verifying that getPageGlobal<T> works correctly with the new generic type parameter.",
+      "acceptanceCriteria": [
+        "The existing 'sdk_get_page_global' tool already tests the basic functionality",
+        "E2E test verifies that getPageGlobal returns undefined for non-existent paths (not throwing)",
+        "E2E test verifies deep property access works (nested.deeply.nested.value)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "This tests PRD 4 US-007 (typed getPageGlobal). The existing sdk_get_page_global tool already tests basic functionality. We mainly need to verify the generic parameter doesn't break runtime behavior and that edge cases work.\n\nThe existing E2E test for getPageGlobal is in e2e/sdk-utilities.e2e.ts. Add additional test cases:\n\n```typescript\ntest('getPageGlobal returns undefined for non-existent path', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n  // Navigate to sdk-test page\n  await page.goto(`${testServer.url}/sdk-test`);\n  await page.waitForFunction(() => globalThis.__openTabs?.adapters?.['e2e-test']);\n  \n  // Call with a path that doesn't exist\n  const result = await mcpClient.callTool('e2e-test_sdk_get_page_global', { path: 'nonExistent.deeply.nested' });\n  expect(result.isError).toBe(false);\n  // Result should contain null/undefined\n  await page.close();\n});\n```\n\nNote: The runtime behavior doesn't change — this is a type-level improvement. The E2E test mainly confirms nothing broke."
+    },
+    {
+      "id": "US-008",
+      "title": "E2E tests for audit --tool and --since filters",
+      "description": "As a platform developer, I want E2E tests verifying the audit endpoint's tool and time-based filtering works correctly.",
+      "acceptanceCriteria": [
+        "E2E test invokes multiple different tools, then queries /audit with ?tool=<name> and verifies only matching entries are returned",
+        "E2E test queries /audit with ?tool=<name>&plugin=<name> combined filter and verifies correct filtering",
+        "The audit-logging.e2e.ts file is extended with these new test cases",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "This tests PRD 3 US-005 (--tool filter) and US-006 (--since). The /audit endpoint already supports ?tool= and ?success= query params (http-routes.ts lines 308-309). The CLI just didn't expose them. But the server-side filtering is already implemented, so this is testing existing server functionality that's now exposed via CLI.\n\nExtend e2e/audit-logging.e2e.ts:\n\n```typescript\ntest('audit filters by tool name', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n  \n  // Invoke two different tools\n  await callToolExpectSuccess(mcpClient, mcpServer, 'e2e-test_echo', { message: 'a' });\n  await callToolExpectSuccess(mcpClient, mcpServer, 'e2e-test_greet', { name: 'Test' });\n  \n  // Query audit filtered by tool\n  const res = await fetch(`http://localhost:${mcpServer.port}/audit?tool=e2e-test_echo`, {\n    headers: { Authorization: `Bearer ${mcpServer.secret}` },\n  });\n  const entries = await res.json();\n  expect(entries.length).toBeGreaterThanOrEqual(1);\n  for (const entry of entries) {\n    expect(entry.tool).toBe('e2e-test_echo');\n  }\n  \n  await page.close();\n});\n```\n\nFor --since: the CLI does client-side filtering, so there's no new server endpoint to test. The E2E test for --since would need to test the CLI binary itself or just verify the audit entries have timestamps (which they already do)."
+    },
+    {
+      "id": "US-009",
+      "title": "E2E tests for doctor npm plugin health check",
+      "description": "As a platform developer, I want E2E tests verifying that the /health endpoint provides accurate plugin health data that the doctor command can consume.",
+      "acceptanceCriteria": [
+        "E2E test verifies /health returns pluginDetails with correct source ('local'), tabState, and toolCount for the e2e-test plugin",
+        "E2E test verifies /health returns failedPlugins array when a plugin fails to load",
+        "E2E test verifies that after toggling auth off, the tabState changes to 'unavailable' in /health",
+        "These tests exercise the data pipeline that opentabs doctor now consumes for npm plugin checks",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "This tests the data that PRD 3 US-002 (npm plugin health in doctor) consumes. The doctor command reads /health and displays pluginDetails. We test the server-side data is correct.\n\nSome of this is already covered in existing tests (tab-state-sync.e2e.ts tests tab state transitions). Add focused tests for the health data format:\n\n```typescript\ntest('health endpoint shows plugin details', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n  \n  const health = await mcpServer.health();\n  expect(health).toBeDefined();\n  const pluginDetails = health.pluginDetails;\n  const e2ePlugin = pluginDetails.find(p => p.name === 'e2e-test');\n  expect(e2ePlugin).toBeDefined();\n  expect(e2ePlugin.source).toBe('local');\n  expect(e2ePlugin.toolCount).toBeGreaterThan(0);\n  expect(e2ePlugin.tabState).toBe('ready');\n  expect(e2ePlugin.sdkVersion).toBeDefined();\n  \n  await page.close();\n});\n\ntest('health shows failed plugins', async () => {\n  // Create a config with a non-existent plugin path\n  const configDir = createTestConfigDir();\n  const config = await readTestConfig(configDir);\n  config.localPlugins.push('/nonexistent/plugin/path');\n  await writeTestConfig(configDir, config);\n  \n  const server = await startMcpServer(configDir);\n  try {\n    const health = await fetchHealth(server.port);\n    expect(health.failedPlugins.length).toBeGreaterThanOrEqual(1);\n    expect(health.failedPlugins[0].path).toContain('/nonexistent/plugin/path');\n  } finally {\n    await server.kill();\n    cleanupTestConfigDir(configDir);\n  }\n});\n```"
+    },
+    {
+      "id": "US-010",
+      "title": "E2E tests for side panel onboarding reset",
+      "description": "As a platform developer, I want E2E tests verifying that the 'Show setup guide' link resets the onboarding flow.",
+      "acceptanceCriteria": [
+        "E2E test starts with plugins, removes them, verifies the returning user empty state appears",
+        "E2E test clicks the 'Show setup guide' link and verifies the onboarding state with checklist appears",
+        "E2E test verifies that hasEverHadPlugins was reset in chrome.storage.local",
+        "Uses the manual infrastructure setup pattern (custom config, try/finally cleanup)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "This tests PRD 7 US-001 (reset hasEverHadPlugins). Follow the pattern from e2e/onboarding.e2e.ts which already tests the onboarding flow.\n\nThe test flow:\n1. Start server WITH plugins -> side panel shows plugins -> hasEverHadPlugins is set to true\n2. Restart server WITHOUT plugins -> side panel shows ReturningUserEmptyState\n3. Find and click the 'Show setup guide' link\n4. Verify OnboardingState appears (Welcome to OpenTabs, checklist)\n\nThis is a complex test requiring server restart with different configs. Follow the onboarding.e2e.ts pattern which uses manual infrastructure setup.\n\n```typescript\ntest('show setup guide resets onboarding', async () => {\n  // Phase 1: Start with plugins to set hasEverHadPlugins\n  const configDir = createTestConfigDir(); // has e2e-test plugin\n  const server = await startMcpServer(configDir, true);\n  const { context, cleanupDir, extensionDir } = await launchExtensionContext(server.port);\n  setupAdapterSymlink(configDir, extensionDir);\n  await waitForExtensionConnected(server);\n  \n  const sidePanelPage = await openSidePanel(context);\n  // Wait for plugins to show (sets hasEverHadPlugins)\n  await expect(sidePanelPage.getByText('E2E Test')).toBeVisible({ timeout: 30_000 });\n  \n  // Phase 2: Remove all plugins\n  await server.kill();\n  const config = await readTestConfig(configDir);\n  config.localPlugins = [];\n  await writeTestConfig(configDir, config);\n  const server2 = await startMcpServer(configDir, true, server.port);\n  // ... reconnect, verify returning user state\n  \n  // Phase 3: Click 'Show setup guide'\n  await sidePanelPage.reload();\n  await expect(sidePanelPage.getByText('No Plugins Installed')).toBeVisible({ timeout: 30_000 });\n  await sidePanelPage.getByText('Show setup guide').click();\n  await expect(sidePanelPage.getByText('Welcome to OpenTabs')).toBeVisible();\n  \n  // Cleanup\n  ...\n});\n```"
+    },
+    {
+      "id": "US-011",
+      "title": "E2E tests for side panel auto-refresh on plugin rebuild",
+      "description": "As a platform developer, I want E2E tests verifying that the side panel updates automatically when plugins are reloaded.",
+      "acceptanceCriteria": [
+        "E2E test opens the side panel with plugins loaded and visible",
+        "E2E test triggers POST /reload on the MCP server to simulate a plugin rebuild",
+        "E2E test verifies the side panel updates within a reasonable timeout without manual refresh",
+        "E2E test verifies tool count or plugin state changes are reflected in the side panel",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "This tests PRD 5 US-007 (side panel auto-refresh). The side panel should already handle 'plugins.changed' notifications. This test verifies the full pipeline: POST /reload -> server rediscovers -> sends plugins.changed -> extension forwards to side panel -> UI updates.\n\nFollow the pattern from e2e/side-panel-live-update.e2e.ts which tests live updates.\n\n```typescript\ntest('side panel refreshes after POST /reload', async () => {\n  const configDir = createTestConfigDir();\n  const server = await startMcpServer(configDir, true);\n  const testSrv = await startTestServer();\n  const { context, cleanupDir, extensionDir } = await launchExtensionContext(server.port);\n  setupAdapterSymlink(configDir, extensionDir);\n  await waitForExtensionConnected(server);\n  \n  const sidePanelPage = await openSidePanel(context);\n  await expect(sidePanelPage.getByText('E2E Test')).toBeVisible({ timeout: 30_000 });\n  \n  // Trigger reload\n  await fetch(`http://localhost:${server.port}/reload`, {\n    method: 'POST',\n    headers: { Authorization: `Bearer ${server.secret}` },\n  });\n  \n  // Verify side panel still shows the plugin (it refreshed without losing state)\n  await expect(sidePanelPage.getByText('E2E Test')).toBeVisible();\n  \n  // ... cleanup\n});\n```\n\nA more thorough test: modify the e2e-test plugin's tools.json (add/remove a tool), trigger reload, and verify the tool count changes in the side panel."
+    },
+    {
+      "id": "US-012",
+      "title": "E2E tests for source maps in plugin IIFE bundles",
+      "description": "As a platform developer, I want E2E tests verifying that source maps are generated and accessible for debugging.",
+      "acceptanceCriteria": [
+        "E2E test verifies dist/adapter.iife.js.map exists after plugin build",
+        "E2E test verifies the IIFE contains a //# sourceMappingURL comment",
+        "E2E test verifies the source map is valid JSON with expected fields (version, sources, mappings)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "This tests PRD 5 US-001 (source maps). This is more of a build artifact test than a runtime E2E test. It can be a unit test in platform/plugin-tools or a lightweight E2E test.\n\nFor the E2E approach, check the e2e-test plugin's build output:\n\n```typescript\nimport { existsSync, readFileSync } from 'node:fs';\nimport path from 'node:path';\n\ntest('plugin build generates source map', async () => {\n  const pluginDir = path.resolve('plugins/e2e-test');\n  const iifeContent = readFileSync(path.join(pluginDir, 'dist/adapter.iife.js'), 'utf-8');\n  \n  // Check sourceMappingURL comment exists\n  expect(iifeContent).toContain('//# sourceMappingURL=');\n  \n  // Check .map file exists\n  const mapPath = path.join(pluginDir, 'dist/adapter.iife.js.map');\n  expect(existsSync(mapPath)).toBe(true);\n  \n  // Validate source map structure\n  const sourceMap = JSON.parse(readFileSync(mapPath, 'utf-8'));\n  expect(sourceMap.version).toBe(3);\n  expect(sourceMap.sources).toBeDefined();\n  expect(sourceMap.mappings).toBeDefined();\n});\n```\n\nThis can go in a new e2e/build-artifacts.e2e.ts or as a unit test in platform/plugin-tools/src/commands/build.test.ts."
+    }
+  ]
+}

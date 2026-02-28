@@ -1,0 +1,435 @@
+{
+  "project": "OpenTabs Platform Security Hardening",
+  "description": "Fix all security vulnerabilities identified in comprehensive codebase security audit. Covers critical code injection, authentication bypass, SSRF, path traversal, XSS, rate limiting, input validation, and defense-in-depth improvements across MCP server, browser extension, and plugins.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Replace predictable sequential dispatch IDs with cryptographic random IDs",
+      "description": "As a platform operator, I want dispatch request IDs to be cryptographically random so that an attacker cannot predict the next ID and hijack responses.",
+      "acceptanceCriteria": [
+        "getNextRequestId() in state.ts returns crypto.randomUUID() instead of incrementing counter",
+        "All type annotations for request IDs accept string (UUID format) instead of number",
+        "JSON-RPC id fields in extension-protocol.ts use string IDs",
+        "Pending dispatch Map keys in state.ts use string IDs",
+        "No sequential or predictable pattern in generated IDs",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/state.ts around lines 175-181. The getNextRequestId() function currently increments a counter. Replace the body with `return crypto.randomUUID()`. Then update the return type and all callers. The pendingDispatches Map key type needs to change from number to string. Also check extension-protocol.ts where IDs are used in JSON-RPC messages — the `id` field in JSON-RPC can be string or number, so string UUIDs are protocol-compliant. Search for `getNextRequestId` across the codebase to find all usages."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix exec script code injection via IIFE wrapper breakout",
+      "description": "As a platform operator, I want user-supplied JavaScript code to be safely sandboxed so that an attacker cannot break out of the IIFE wrapper and execute arbitrary code in the page context.",
+      "acceptanceCriteria": [
+        "writeExecFile() in extension-protocol.ts uses JSON.stringify(code) to escape user code as a string literal",
+        "The wrapped code uses new Function() constructor: var __userFn = new Function(JSON.stringify(code)); var __r = __userFn();",
+        "User code containing }); maliciousCode(); (function(){ does NOT break out of wrapper",
+        "Normal JavaScript code still executes correctly (return values, async/await, errors caught)",
+        "Async code detection still works (Promise.then handling)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/extension-protocol.ts around lines 674-705. The writeExecFile() function builds a wrapper string with template literals that directly interpolate user code. Change the wrapper to: `var __userFn = new Function(${JSON.stringify(code)});` then `var __r = __userFn();`. This way the user code is a JSON-escaped string literal passed to Function constructor — closing braces/parens in user code won't break the wrapper syntax. Keep the async detection (checking if __r is a thenable) and error handling (try/catch) intact. The rest of the wrapper (globalThis.__openTabs, __lastExecResult, __lastExecAsync) stays the same."
+    },
+    {
+      "id": "US-003",
+      "title": "Validate WebSocket URL origin in offscreen document",
+      "description": "As a platform operator, I want the offscreen document to validate that WebSocket URLs from /ws-info match the expected origin so that a malicious local process cannot redirect the connection to an attacker-controlled server.",
+      "acceptanceCriteria": [
+        "refreshWsUrl() validates the returned wsUrl has the same host as the source HTTP base URL",
+        "refreshWsUrl() validates protocol is ws: or wss:",
+        "refreshWsUrl() rejects URLs with mismatched host and logs a warning",
+        "ws:setUrl handler applies the same origin validation to the resolved URL",
+        "If validation fails, the existing mcpServerUrl is kept unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts. Two locations need fixing: (1) refreshWsUrl() around line 182 — after fetching wsUrl from /ws-info, parse both the httpBase and wsInfo.wsUrl with new URL(), check returnedUrl.protocol is 'ws:' or 'wss:', check sourceUrl.host === returnedUrl.host. (2) The ws:setUrl case around line 305 — same validation after resolving the URL. If either check fails, log a warning and return without updating mcpServerUrl."
+    },
+    {
+      "id": "US-004",
+      "title": "Add execFile path validation in browser extension",
+      "description": "As a platform operator, I want the execFile parameter to be validated as a simple filename so that path traversal attacks via chrome.scripting.executeScript are prevented.",
+      "acceptanceCriteria": [
+        "handleBrowserExecuteScript validates execFile against /^[a-z0-9_-]+\\.js$/ regex",
+        "Rejects execFile containing /, .., or any character outside the allowed set",
+        "Returns JSON-RPC error with code -32602 for invalid execFile format",
+        "Valid filenames like exec-abc123.js still work correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/browser-commands.ts around line 754. After the existing type check for execFile (typeof execFile === 'string' && execFile.length > 0), add: if (!/^[a-z0-9_-]+\\.js$/.test(execFile)) { sendToServer({ jsonrpc: '2.0', error: { code: -32602, message: 'Invalid execFile format' }, id }); return; }. The regex ensures only simple lowercase alphanumeric filenames with .js extension are accepted."
+    },
+    {
+      "id": "US-005",
+      "title": "Validate Slack upload URL domain to prevent SSRF",
+      "description": "As a plugin user, I want file upload URLs to be validated against known Slack domains so that my file data cannot be redirected to an attacker-controlled server.",
+      "acceptanceCriteria": [
+        "upload-file.ts validates uploadResponse.upload_url protocol is https:",
+        "upload-file.ts validates hostname ends with a known Slack domain (slack.com, slack-edge.com, files.slack.com)",
+        "fetch() call includes redirect: 'error' to reject silent redirects",
+        "Throws ToolError with code 'untrusted_upload_domain' for invalid domains",
+        "Throws ToolError with code 'insecure_protocol' for non-HTTPS URLs",
+        "cd plugins/slack && bun run build passes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: plugins/slack/src/tools/upload-file.ts around lines 56-70. After getting uploadResponse from slackApi, add URL validation before the fetch: const uploadUrl = new URL(uploadResponse.upload_url); if (uploadUrl.protocol !== 'https:') throw new ToolError(...); const SLACK_DOMAINS = ['slack.com', 'slack-edge.com']; if (!SLACK_DOMAINS.some(d => uploadUrl.hostname === d || uploadUrl.hostname.endsWith('.' + d))) throw new ToolError(...). Also add redirect: 'error' to the fetch options object. Import ToolError from @opentabs-dev/plugin-sdk if not already imported."
+    },
+    {
+      "id": "US-006",
+      "title": "Enforce HTTPS for Slack API calls",
+      "description": "As a plugin user, I want Slack API calls to always use HTTPS so that authentication tokens cannot be intercepted by network attackers.",
+      "acceptanceCriteria": [
+        "buildAuth() in slack-api.ts enforces https:// prefix on workspace URL",
+        "slackApi() validates auth.workspaceUrl starts with https:// before making API calls",
+        "Throws ToolError with code 'insecure_connection' if URL is not HTTPS",
+        "Existing HTTPS Slack URLs continue to work correctly",
+        "cd plugins/slack && bun run build passes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: plugins/slack/src/slack-api.ts. Two changes: (1) In buildAuth() around line 81, after constructing the URL, add: if (url && !url.startsWith('https://')) { url = url.replace(/^http:\\/\\//, 'https://'); }. (2) In slackApi() around line 387 before the fetch call, add: if (!auth.workspaceUrl.startsWith('https://')) { throw new ToolError('HTTPS required for Slack API calls', 'insecure_connection'); }. This ensures tokens are never sent over unencrypted connections."
+    },
+    {
+      "id": "US-007",
+      "title": "Move WebSocket token from URL query to sec-websocket-protocol subprotocol",
+      "description": "As a platform operator, I want the WebSocket authentication token to be sent via the sec-websocket-protocol header instead of a URL query parameter so that it is not exposed in server logs, browser history, or proxy logs.",
+      "acceptanceCriteria": [
+        "/ws-info endpoint returns wsUrl without the token query parameter",
+        "/ws endpoint reads auth token from sec-websocket-protocol header instead of URL query",
+        "Offscreen document sends token via WebSocket constructor's protocol parameter",
+        "WebSocket connection still authenticates successfully",
+        "Unauthenticated WebSocket connections are still rejected with 401",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Three files need coordinated changes: (1) platform/mcp-server/src/http-routes.ts: In /ws-info handler, remove token from wsUrl. In /ws upgrade handler, read token from sec-websocket-protocol: parse the protocols, find one matching the secret, accept it. The WebSocket constructor accepts protocols as the second argument: new WebSocket(url, ['opentabs', token]). The server must respond with the accepted protocol in the upgrade response. (2) platform/browser-extension/src/offscreen/index.ts: Update WebSocket construction to pass token as protocol: new WebSocket(mcpServerUrl, ['opentabs', wsSecret]). The wsSecret needs to be extracted from the initial URL or passed separately. (3) Also check if the MCP server's Bun.serve websocket handler can access sec-websocket-protocol — Bun's server.upgrade() can access request headers."
+    },
+    {
+      "id": "US-008",
+      "title": "Add plugin path traversal validation in discovery",
+      "description": "As a platform operator, I want local plugin paths to be validated against directory traversal so that malicious config entries cannot load plugins from outside expected directories.",
+      "acceptanceCriteria": [
+        "discoverFromLocalPaths() resolves each path to absolute with path.resolve()",
+        "Rejects paths that contain .. segments after resolution",
+        "Rejects paths that resolve outside the user home directory",
+        "Logs warning for rejected paths",
+        "Valid plugin paths still work correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/discovery.ts around lines 369-393. In discoverFromLocalPaths(), after resolving each path to absolute, add validation: const resolved = path.resolve(pluginPath); const home = os.homedir(); if (!resolved.startsWith(home) && !resolved.startsWith('/tmp/')) { log.warn('Rejected plugin path outside home directory: ' + resolved); continue; }. Also consider using fs.realpath() to resolve symlinks before the check. Import homedir from 'node:os' if not already imported."
+    },
+    {
+      "id": "US-009",
+      "title": "Validate plugin existence before accepting tab state changes",
+      "description": "As a platform operator, I want tab state change messages to be validated against known plugins so that an attacker cannot pollute server state with fake plugin names.",
+      "acceptanceCriteria": [
+        "handleTabStateChanged() checks that params.plugin exists in state.plugins Map",
+        "handleTabStateChanged() validates state value against allowed enum (closed, unavailable, ready)",
+        "Rejects messages with unknown plugin names and logs a warning",
+        "Rejects messages with invalid state values",
+        "Valid tab state changes for known plugins still work correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/extension-protocol.ts around lines 489-526. In handleTabStateChanged(), after extracting pluginName from params, add: if (!state.plugins.has(pluginName)) { log.warn('Rejected tab.stateChanged for unknown plugin: ' + pluginName); return; }. Also add: const VALID_TAB_STATES = new Set(['closed', 'unavailable', 'ready']); if (!VALID_TAB_STATES.has(state)) { log.warn('Rejected tab.stateChanged with invalid state: ' + state); return; }."
+    },
+    {
+      "id": "US-010",
+      "title": "Add plugin name format validation in side panel",
+      "description": "As a browser extension user, I want plugin names to be validated against a safe format so that malicious names with HTML/JS content cannot cause XSS.",
+      "acceptanceCriteria": [
+        "Side panel App.tsx validates plugin names against /^[a-z0-9]+(-[a-z0-9]+)*$/ regex",
+        "Rejects tab.stateChanged messages with invalid plugin name format",
+        "Logs warning for rejected plugin names",
+        "Valid plugin names (e.g., 'slack', 'my-plugin') still accepted",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/App.tsx around lines 64-76. Add a constant: const VALID_PLUGIN_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/; Then in the tab.stateChanged handler, add the regex check to the existing condition: if (typeof params.plugin === 'string' && typeof params.state === 'string' && validTabStates.has(params.state) && VALID_PLUGIN_NAME.test(params.plugin)). The shared package already has this regex in validatePluginName() — you could import it, but since the side panel bundles separately, a local constant is simpler."
+    },
+    {
+      "id": "US-011",
+      "title": "Add rate limiting on browser commands in extension",
+      "description": "As a platform operator, I want browser commands to be rate limited so that a compromised MCP server cannot exhaust browser resources by spamming expensive operations.",
+      "acceptanceCriteria": [
+        "A RateLimiter class or utility is created in the browser extension",
+        "Per-method rate limits are enforced (e.g., screenshot: 2/sec, executeScript: 10/sec, tool.dispatch: 5/sec)",
+        "Rate-limited requests receive JSON-RPC error with code -32603",
+        "Normal usage within rate limits is not affected",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "Create a new file platform/browser-extension/src/rate-limiter.ts with a simple sliding window rate limiter. Track request timestamps per method, reject if too many in the window. Then in message-router.ts, wrap the method dispatch with rate limit checks. Keep the implementation simple: Map<string, number[]> where values are arrays of timestamps. For each request, filter timestamps within the window, check count, add new timestamp. Return boolean indicating if allowed. Use reasonable defaults: screenshot/captureNetworkRequests at 2/sec, executeScript at 10/sec, most others at 20/sec."
+    },
+    {
+      "id": "US-012",
+      "title": "Add rate limiting on MCP server administrative endpoints",
+      "description": "As a platform operator, I want administrative endpoints (/reload, /extension/reload) to be rate limited so that they cannot be spammed to cause excessive CPU/IO usage.",
+      "acceptanceCriteria": [
+        "A simple rate limiter tracks requests per endpoint",
+        "/reload endpoint limited to 10 requests per 60 seconds",
+        "/extension/reload endpoint limited to 10 requests per 60 seconds",
+        "Returns 429 Too Many Requests with Retry-After header when limit exceeded",
+        "Normal usage within limits works correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/http-routes.ts around lines 153-179. Add a simple rate limiter at the top of the file: const endpointLastCalls = new Map<string, number[]>(); function checkRateLimit(endpoint: string, maxPerMinute: number): boolean { const now = Date.now(); const calls = (endpointLastCalls.get(endpoint) ?? []).filter(t => now - t < 60_000); if (calls.length >= maxPerMinute) return false; calls.push(now); endpointLastCalls.set(endpoint, calls); return true; }. Then before processing /reload and /extension/reload, check: if (!checkRateLimit(url.pathname, 10)) return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });"
+    },
+    {
+      "id": "US-013",
+      "title": "Add file upload type validation in Slack plugin",
+      "description": "As a plugin user, I want file uploads to validate file type against extension and enforce size limits so that malicious or oversized files cannot be uploaded.",
+      "acceptanceCriteria": [
+        "Executable file extensions (.exe, .sh, .bat, .cmd, .com, .app, .dmg, .msi) are rejected",
+        "Maximum file size reduced from 50MB to 20MB overall",
+        "Binary files (is_base64: true) have magic byte validation for PNG, JPEG, PDF, GIF",
+        "ToolError thrown with descriptive code for invalid file types",
+        "Valid text and binary file uploads still work correctly",
+        "cd plugins/slack && bun run build passes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "File: plugins/slack/src/tools/upload-file.ts. Changes: (1) Reduce .maxLength() on content field from 50000000 to 20000000. (2) In handle(), extract file extension from params.filename. (3) Check against BLOCKED_EXTENSIONS = ['exe', 'sh', 'bat', 'cmd', 'com', 'app', 'dmg', 'msi', 'bin']. (4) For binary files, add MAGIC_BYTES map: { png: [0x89, 0x50, 0x4E, 0x47], jpg: [0xFF, 0xD8, 0xFF], pdf: [0x25, 0x50, 0x44, 0x46], gif: [0x47, 0x49, 0x46] }. Check first N bytes match if extension is in the map. Throw ToolError with appropriate codes."
+    },
+    {
+      "id": "US-014",
+      "title": "Set restrictive file permissions on config file and directory",
+      "description": "As a platform operator, I want the config file and directory to have restrictive permissions so that other users on multi-user systems cannot read the WebSocket secret.",
+      "acceptanceCriteria": [
+        "Config directory (~/.opentabs/) created with mode 0o700",
+        "Config file (config.json) written with mode 0o600 after Bun.write()",
+        "chmod applied using node:fs/promises chmod function",
+        "Existing config files get permissions fixed on next write",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/config.ts. Two changes: (1) In the loadConfig/ensureConfig function where mkdir is called, change to: await mkdir(configDir, { recursive: true, mode: 0o700 }). (2) In saveConfig() after Bun.write(configPath, ...), add: import { chmod } from 'node:fs/promises'; await chmod(configPath, 0o600); Wrap the chmod in try/catch so it doesn't break on systems that don't support it. Note: Bun.write doesn't have a mode option, so chmod must be called separately after writing."
+    },
+    {
+      "id": "US-015",
+      "title": "Secure E2E test config directory permissions",
+      "description": "As a developer, I want E2E test config directories to have restrictive permissions so that secrets are not readable by other users on shared build systems.",
+      "acceptanceCriteria": [
+        "createTestConfigDir() applies chmodSync(configDir, 0o700) after mkdtempSync",
+        "Config file written with chmodSync(configPath, 0o600) after writeFileSync",
+        "Tests still pass with restrictive permissions",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 15,
+      "passes": true,
+      "notes": "File: e2e/fixtures.ts around lines 129-157. After const configDir = fs.mkdtempSync(...), add: fs.chmodSync(configDir, 0o700). After fs.writeFileSync(path.join(configDir, 'config.json'), ...), add: fs.chmodSync(path.join(configDir, 'config.json'), 0o600). Import chmodSync from 'node:fs' if not already available. E2E tests run under Node.js (Playwright), so Node.js APIs are correct here."
+    },
+    {
+      "id": "US-016",
+      "title": "Reject tool calls when schema compilation has failed",
+      "description": "As a platform operator, I want tool calls to be rejected when their schema failed to compile so that unvalidated input never reaches plugin handlers.",
+      "acceptanceCriteria": [
+        "If lookup.validate is null (schema compilation failed), tool call returns isError: true with descriptive message",
+        "Error message includes schema compilation failure reason from validationErrors()",
+        "Valid tools with compiled schemas still work correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 16,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/mcp-setup.ts around lines 276-291. Currently the code checks `if (lookup.validate)` and only validates if non-null. Change to: if (!lookup.validate) { return { content: [{ type: 'text' as const, text: 'Tool schema failed to compile. This tool cannot be called safely. Error: ' + lookup.validationErrors() }], isError: true }; }. Then the existing validation code follows for the non-null case."
+    },
+    {
+      "id": "US-017",
+      "title": "Sanitize error messages before returning to MCP clients",
+      "description": "As a platform operator, I want error messages to be sanitized before being sent to clients so that internal file paths, URLs, and system details are not leaked.",
+      "acceptanceCriteria": [
+        "A sanitizeErrorMessage() utility function exists in the shared package or mcp-server",
+        "Function strips absolute file paths (Unix and Windows), URLs, localhost references, and IP addresses",
+        "Function truncates messages to 500 characters maximum",
+        "Applied to error responses in http-routes.ts /reload endpoint",
+        "Applied to error responses in browser-commands.ts catch blocks",
+        "Applied to error responses in tool-dispatch.ts catch blocks",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 17,
+      "passes": true,
+      "notes": "Create the sanitize function in platform/mcp-server/src/error-sanitizer.ts (or inline in the files that need it). The function: (1) Replace /\\/[a-z0-9/_.-]+/gi with '[PATH]' (Unix paths). (2) Replace /[a-z]:[\\\\][a-z0-9\\\\/_.-]+/gi with '[PATH]' (Windows paths). (3) Replace /https?:\\/\\/[^\\s]+/gi with '[URL]'. (4) Replace /localhost:\\d+/gi with '[LOCALHOST]'. (5) Replace /\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}/g with '[IP]'. (6) Truncate to 500 chars. Then apply in: http-routes.ts (line 163 catch block), browser-commands.ts (all catch blocks that send error to server), tool-dispatch.ts (catch block around line 115)."
+    },
+    {
+      "id": "US-018",
+      "title": "Add atomic config file writes with race condition prevention",
+      "description": "As a platform operator, I want config writes to use atomic rename so that concurrent writes cannot corrupt the config file.",
+      "acceptanceCriteria": [
+        "saveConfig() writes to a temporary file first (config.json.tmp in same directory)",
+        "After successful write, renames temp file to config.json atomically",
+        "If write fails, temp file is cleaned up",
+        "Config file always contains complete, valid JSON",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 18,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/config.ts in saveConfig(). Change from: await Bun.write(configPath, content) to: const tmpPath = configPath + '.tmp'; await Bun.write(tmpPath, content); import { rename } from 'node:fs/promises'; await rename(tmpPath, configPath). Wrap in try/catch and clean up tmpPath on failure: try { await Bun.file(tmpPath).delete(); } catch {}. The rename() on same filesystem is atomic on POSIX systems."
+    },
+    {
+      "id": "US-019",
+      "title": "Add input size limit enforcement in tool dispatch",
+      "description": "As a platform operator, I want tool input size to be limited so that extremely large inputs cannot cause memory exhaustion in the browser extension.",
+      "acceptanceCriteria": [
+        "handleToolDispatch() checks serialized input size before dispatching",
+        "Maximum input size is 10MB (10 * 1024 * 1024 bytes)",
+        "Returns JSON-RPC error with descriptive message when input too large",
+        "Normal-sized inputs are not affected",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 19,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/tool-dispatch.ts around lines 179-188. After validating input is an object, add: const MAX_INPUT_SIZE = 10 * 1024 * 1024; const inputJson = JSON.stringify(input); if (inputJson.length > MAX_INPUT_SIZE) { sendToServer({ jsonrpc: '2.0', error: { code: -32602, message: `Tool input too large: ${(inputJson.length / 1024 / 1024).toFixed(1)}MB (limit: 10MB)` }, id }); return; }."
+    },
+    {
+      "id": "US-020",
+      "title": "Validate tab URL before tool execution to prevent TOCTOU race",
+      "description": "As a platform operator, I want tab URLs to be re-validated before tool execution so that navigation between match and execute does not cause tools to run on unintended content.",
+      "acceptanceCriteria": [
+        "Before executing a tool on a tab, the tab's current URL is re-fetched with chrome.tabs.get()",
+        "Tab URL is validated against plugin's URL patterns",
+        "If tab URL no longer matches, the tab is skipped and next matching tab is tried",
+        "If no matching tabs remain, appropriate error returned",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 20,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/tool-dispatch.ts around lines 216-252. Inside the for loop before executeToolOnTab(), add: try { const currentTab = await chrome.tabs.get(tab.id); if (!currentTab.url) continue; } catch { continue; }. For URL pattern matching, check if the existing urlMatchesPatterns or findAllMatchingTabs helper can be reused. The key insight is that between findAllMatchingTabs() and the actual execution, the tab might have navigated. Re-fetching is cheap and prevents the race."
+    },
+    {
+      "id": "US-021",
+      "title": "Upgrade WebSocket secret to 256-bit cryptographic random",
+      "description": "As a platform operator, I want the WebSocket secret to use 256 bits of cryptographic entropy instead of UUID's 122 bits for stronger authentication.",
+      "acceptanceCriteria": [
+        "New config secrets use crypto.getRandomValues(new Uint8Array(32)) converted to hex",
+        "Generated secret is a 64-character hex string (256 bits)",
+        "Existing UUID secrets still work (backwards compatible)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 21,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/config.ts around line 66. Create a helper: function generateSecret(): string { const bytes = new Uint8Array(32); crypto.getRandomValues(bytes); return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join(''); }. Replace crypto.randomUUID() with generateSecret() in the default config creation. Existing configs with UUID secrets don't need migration — they're still valid strings that work for comparison. Only new configs get the stronger secret."
+    },
+    {
+      "id": "US-022",
+      "title": "Sanitize tool output to prevent prototype pollution in MCP clients",
+      "description": "As a platform operator, I want tool output to be sanitized to remove dangerous keys like __proto__ so that MCP clients with deserialization vulnerabilities are not exploited.",
+      "acceptanceCriteria": [
+        "A sanitizeOutput() function recursively removes __proto__, constructor, and prototype keys from objects",
+        "Function handles nested objects and arrays up to depth 50",
+        "Function is applied to all tool results before JSON serialization in mcp-setup.ts",
+        "Normal tool output without dangerous keys is not modified",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 22,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/mcp-setup.ts around lines 335-339. Create a sanitizeOutput function (can be in same file or a separate util): const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']); function sanitizeOutput(obj: unknown, depth = 0): unknown { if (depth > 50 || obj === null || obj === undefined || typeof obj !== 'object') return obj; if (Array.isArray(obj)) return obj.map(item => sanitizeOutput(item, depth + 1)); const result: Record<string, unknown> = {}; for (const [key, value] of Object.entries(obj as Record<string, unknown>)) { if (!DANGEROUS_KEYS.has(key)) result[key] = sanitizeOutput(value, depth + 1); } return result; }. Apply before JSON.stringify(output) in the tool result handler."
+    }
+  ]
+}

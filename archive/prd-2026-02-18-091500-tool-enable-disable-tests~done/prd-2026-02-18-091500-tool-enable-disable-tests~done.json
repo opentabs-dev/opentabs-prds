@@ -1,0 +1,125 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add comprehensive unit and E2E tests for the tools enable/disable flow. A code review found that while the implementation is correct (dual gating in tools/list + tools/call, config persistence, MCP client notification), test coverage has critical gaps: no test verifies that disabled tools are rejected at dispatch time, no test covers the toggle-all flow, and no test confirms browser tools bypass enable/disable by design.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Extract getEnabledToolsList helper and add unit tests for disabled tool filtering in tools/list",
+      "description": "As a developer, I want the tools/list filtering logic extracted into a testable helper function so that I can verify disabled tools are excluded from the MCP tool list without needing a full MCP Server instance.",
+      "acceptanceCriteria": [
+        "A new exported function `getEnabledToolsList(state)` exists in mcp-setup.ts that returns the array of tool objects (name, description, inputSchema)",
+        "The `registerMcpHandlers` tools/list handler delegates to `getEnabledToolsList` instead of inlining the logic",
+        "Unit test: all tools enabled (default) — all plugin tools + all browser tools appear in the list",
+        "Unit test: one plugin tool disabled via toolConfig — that tool is excluded, others remain",
+        "Unit test: all plugin tools disabled — only browser tools appear",
+        "Unit test: browser tools always appear regardless of toolConfig entries matching their names",
+        "Unit test: multiple plugins with mixed enabled/disabled tools — correct filtering per plugin",
+        "Unit test: empty plugins map returns only browser tools",
+        "Existing behavior is unchanged — tools/list responses are identical before and after extraction",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/mcp-setup.ts. The tools/list handler is inside `registerMcpHandlers` (line 180). Extract the body into:\n\n```typescript\nexport const getEnabledToolsList = (state: ServerState): Array<{ name: string; description: string; inputSchema: Record<string, unknown> }> => {\n  const tools = [];\n  for (const plugin of state.plugins.values()) {\n    for (const toolDef of plugin.tools) {\n      const prefixed = prefixedToolName(plugin.name, toolDef.name);\n      if (!isToolEnabled(state, prefixed)) continue;\n      tools.push({ name: prefixed, description: trustTierPrefix(plugin.trustTier) + toolDef.description, inputSchema: toolDef.input_schema });\n    }\n  }\n  for (const cached of state.cachedBrowserTools) {\n    tools.push({ name: cached.name, description: cached.description, inputSchema: cached.inputSchema });\n  }\n  return tools;\n};\n```\n\nThen the handler becomes: `server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: getEnabledToolsList(state) }));`\n\nAdd tests in mcp-setup.test.ts. Use `createState()`, set up plugins with `state.plugins.set(...)`, set `state.toolConfig`, call `rebuildToolLookups(state)` to populate `cachedBrowserTools`, then call `getEnabledToolsList(state)` and assert on the returned array. Look at existing tests in that file for the pattern. Import `getEnabledToolsList` from `./mcp-setup.js`. For browser tools in tests, add entries to `state.browserTools` before calling `rebuildToolLookups()`."
+    },
+    {
+      "id": "US-002",
+      "title": "Add unit tests verifying disabled tool dispatch returns error in tools/call",
+      "description": "As a developer, I want unit tests proving that the tools/call handler rejects calls to disabled tools with 'Tool X is disabled' so that the security gate is verified at the unit level.",
+      "acceptanceCriteria": [
+        "A new exported function `checkToolCallable(state, toolName)` exists in mcp-setup.ts that returns `{ ok: true, pluginName, toolName }` or `{ ok: false, error: string, isNotFound?: boolean }`",
+        "The tools/call handler delegates to `checkToolCallable` for the lookup + enabled check before dispatching",
+        "Unit test: tool exists and is enabled — returns ok: true with correct pluginName and toolName",
+        "Unit test: tool exists but is disabled — returns ok: false with error containing 'disabled'",
+        "Unit test: tool does not exist (not in toolLookup) — returns ok: false with error containing 'not found'",
+        "Unit test: browser tool name is not checked by checkToolCallable (browser tools are handled separately before this check)",
+        "Existing tools/call behavior is unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/mcp-setup.ts. The relevant logic is in the tools/call handler starting at line 258:\n\n```typescript\nconst lookup = state.toolLookup.get(toolName);\nif (!lookup) { return { content: [...], isError: true }; }\n// ...\nif (!isToolEnabled(state, toolName)) { return { content: [...], isError: true }; }\n```\n\nExtract into:\n```typescript\nexport interface ToolCallableResult {\n  ok: boolean;\n  pluginName?: string;\n  toolName?: string;\n  error?: string;\n}\n\nexport const checkToolCallable = (state: ServerState, prefixedToolName: string): ToolCallableResult => {\n  const lookup = state.toolLookup.get(prefixedToolName);\n  if (!lookup) return { ok: false, error: `Tool ${prefixedToolName} not found` };\n  if (!isToolEnabled(state, prefixedToolName)) return { ok: false, error: `Tool ${prefixedToolName} is disabled` };\n  return { ok: true, pluginName: lookup.pluginName, toolName: lookup.toolName };\n};\n```\n\nThen in the handler, replace the inline checks with `const check = checkToolCallable(state, toolName); if (!check.ok) { return { content: [{ type: 'text', text: check.error }], isError: true }; }`\n\nAdd tests in mcp-setup.test.ts. To set up toolLookup entries, call `rebuildToolLookups(state)` after adding plugins to `state.plugins`."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: disabled tool call via MCP client returns error",
+      "description": "As a developer, I want an E2E test proving that when a tool is disabled via the side panel, calling it through the MCP client returns an error, so that the full-stack security gate is verified end-to-end.",
+      "acceptanceCriteria": [
+        "New test in e2e/side-panel-plugin-toggle.e2e.ts in a new describe block 'Side panel — disabled tool dispatch rejection'",
+        "Test starts MCP server with e2e-test plugin, connects extension, opens side panel",
+        "Test opens a matching tab so the e2e-test plugin reaches 'ready' state",
+        "Test verifies tool call succeeds initially (e2e-test_echo with args returns output)",
+        "Test disables the echo tool via the side panel toggle UI",
+        "Test verifies MCP tools/list no longer includes e2e-test_echo (polls with expect.poll)",
+        "Test calls e2e-test_echo via MCP client and verifies isError: true with content containing 'disabled'",
+        "Test re-enables the echo tool via the side panel toggle",
+        "Test verifies tool call succeeds again after re-enabling",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: e2e/side-panel-plugin-toggle.e2e.ts. Follow the pattern of the existing 'toggling a tool sends config.setToolEnabled and MCP server updates state' test (line 123-236) but add the tool dispatch verification.\n\nKey imports from fixtures.ts: `test, expect, startMcpServer, startTestServer, createMcpClient, cleanupTestConfigDir, writeTestConfig, readPluginToolNames, launchExtensionContext, E2E_TEST_PLUGIN_DIR`.\nKey imports from helpers.ts: `waitForExtensionConnected, waitForLog, openSidePanel, setupAdapterSymlink, openTestAppTab`.\n\nThe e2e-test plugin has an 'echo' tool that takes `{ message: string }` and returns `{ echo: message }`. To test dispatch:\n```typescript\nconst result = await mcpClient.callTool('e2e-test_echo', { message: 'test' });\nexpect(result.isError).toBe(false); // before disable\n// ... disable via UI ...\nconst disabled = await mcpClient.callTool('e2e-test_echo', { message: 'test' });\nexpect(disabled.isError).toBe(true);\nexpect(disabled.content).toContain('disabled');\n```\n\nYou need a testServer + matching tab open for the tool to be callable (tab state must be 'ready'). Use `waitForToolResult` from helpers.ts to poll until the tool is first callable, then proceed with the toggle test.\n\nAfter disabling via UI, use `expect.poll()` to wait for tools/list to update before calling the tool, since the notification is async."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: toggle-all switch disables and re-enables all plugin tools",
+      "description": "As a developer, I want an E2E test proving that the plugin-level toggle-all switch removes all tools from MCP tools/list and re-adds them when toggled back, so that the setAllToolsEnabled flow is verified end-to-end.",
+      "acceptanceCriteria": [
+        "New test in e2e/side-panel-plugin-toggle.e2e.ts in a new describe block 'Side panel — toggle all tools'",
+        "Test starts MCP server with e2e-test plugin, connects extension, opens side panel",
+        "Test verifies all e2e-test plugin tools initially appear in MCP tools/list",
+        "Test clicks the plugin card's master toggle switch (the ToggleSwitch in the header row)",
+        "Test verifies all e2e-test plugin tools disappear from MCP tools/list (polls with expect.poll)",
+        "Test verifies config.json on disk has all e2e-test tools set to false (polls with expect.poll)",
+        "Test clicks the master toggle again to re-enable all tools",
+        "Test verifies all e2e-test plugin tools reappear in MCP tools/list",
+        "Test verifies browser tools are NOT affected by the toggle (they remain in tools/list throughout)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: e2e/side-panel-plugin-toggle.e2e.ts. The master toggle is in PluginCard.tsx — it's the ToggleSwitch rendered in the header row (`<ToggleSwitch ... onClick={handleToggleAll} ariaLabel='Toggle all tools for ${plugin.name}' />`). \n\nLocate it via: `sidePanelPage.locator('button[role=\"switch\"][aria-label=\"Toggle all tools for e2e-test\"]')`.\n\nThe e2e-test plugin tools can be read dynamically via `readPluginToolNames()` from fixtures.ts. These return prefixed names like 'e2e-test_echo', 'e2e-test_get_status', etc.\n\nBrowser tool names are listed in `BROWSER_TOOL_NAMES` from helpers.ts. Verify at least a few of these remain in tools/list after disabling all plugin tools.\n\nFollow the same test setup pattern as the existing toggle test: `startMcpServer`, `createMcpClient`, `launchExtensionContext`, `setupAdapterSymlink`, `waitForExtensionConnected`, `waitForLog`, `mcpClient.initialize()`, `openSidePanel`."
+    },
+    {
+      "id": "US-005",
+      "title": "Unit test: tool config survives config file round-trip (save + load)",
+      "description": "As a developer, I want a unit test proving that disabled tool state persists through a config save → load cycle so that tool config survives MCP server restarts.",
+      "acceptanceCriteria": [
+        "New test in platform/mcp-server/src/config.test.ts",
+        "Test creates a temp config directory, writes a config with some tools disabled, loads it back, and verifies the disabled tools are present with value false",
+        "Test verifies that enabled tools (value true) are preserved",
+        "Test verifies that tools not in the config default to enabled (isToolEnabled returns true for absent keys)",
+        "Test uses saveConfig to write, then loadConfig to read, verifying round-trip fidelity",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/config.test.ts. Look at the existing tests in that file for the pattern (they already use temp directories with OPENTABS_CONFIG_DIR).\n\nThe test should:\n1. Set up a temp dir with OPENTABS_CONFIG_DIR env var\n2. Save a config with `saveConfig(state, { plugins: [], tools: { 'slack_send': false, 'slack_read': true }, secret: 'test' })`\n3. Load it back with `loadConfig()`\n4. Assert `loaded.tools['slack_send'] === false`\n5. Assert `loaded.tools['slack_read'] === true`\n6. Verify `isToolEnabled({ toolConfig: loaded.tools } as any, 'slack_send') === false`\n7. Verify `isToolEnabled({ toolConfig: loaded.tools } as any, 'unknown_tool') === true` (absent = enabled)\n\nRemember to clean up: restore OPENTABS_CONFIG_DIR and rmSync the temp dir in afterEach."
+    }
+  ]
+}

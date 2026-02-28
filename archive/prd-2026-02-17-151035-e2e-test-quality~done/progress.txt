@@ -1,0 +1,123 @@
+# Ralph Progress Log
+PRD: prd-2026-02-17-151035-e2e-test-quality~running.json
+Started: Tue Feb 17 15:11:51 PST 2026
+---
+
+## Codebase Patterns
+- Playwright fixtures in e2e/fixtures.ts use `try { await use(resource); } finally { await resource.kill(); }` pattern for subprocess cleanup
+- All quality checks: `bun run build && bun run type-check && bun run lint && bun run knip && bun run test && bun run test:e2e`
+- The `hot-reload-dynamic.e2e.ts` "IIFE change triggers plugin.update log" test is known to be flaky (file watcher race condition) — it retries and passes
+- Shared test helpers live in `e2e/helpers.ts` — getExtensionId, openSidePanel, setupAdapterSymlink, waitFor*, setupToolTest, etc.
+- Shared test server utilities live in `e2e/test-server-utils.ts` — Invocation, jsonResponse, readBody, recordInvocation, requireAuth
+- The linter (prettier via eslint) auto-formats short import lists to single-line; write imports in single-line format when 4 or fewer named imports
+- ESLint requires value imports before type imports from the same module, and type-only imports as separate `import type {}` statements
+- `setupAdapterSymlink` creates both `configDir/extension/adapters` symlink → `extensionDir/adapters` (creating extensionAdaptersDir if needed)
+- `setupIsolatedIifeTest` in helpers.ts encapsulates the full standalone test setup and uses `setupAdapterSymlink` internally
+- Both test servers use module-level mutable state — shared utilities accept state values as parameters to remain stateless
+- `createMcpClient(port)` creates an independent MCP session — use multiple instances for tests that need separate session state or different timeouts
+- `callTool` accepts `options?: { timeout?: number }` to override the default 30s fetch timeout
+
+## 2026-02-17 15:12 - US-001
+- Wrapped `testServer` and `strictCspServer` fixtures in try/finally blocks for subprocess cleanup
+- Files changed: `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - The mcpServer and mcpServerNoHot fixtures already had the correct try/finally pattern — use them as reference
+  - Simple change, no side effects — just pattern alignment
+---
+
+## 2026-02-17 15:30 - US-002
+- Extracted `getExtensionId`, `openSidePanel`, and `setupAdapterSymlink` into `e2e/helpers.ts`
+- Removed 5 copies of `getExtensionId` from lifecycle.e2e.ts, side-panel-data-flow.e2e.ts, side-panel-plugin-toggle.e2e.ts, side-panel-live-update.e2e.ts, iife-injection.e2e.ts
+- Removed 3 copies of `openSidePanel` from the 3 side-panel test files
+- Removed 3 copies of `setupAdapterSymlink` from the 3 side-panel test files
+- Updated `setupIsolatedIifeTest` in helpers.ts to use the shared `setupAdapterSymlink` instead of inline code
+- Removed now-unused `BrowserContext` and `Page` type imports from 3 side-panel test files
+- Files changed: `e2e/helpers.ts`, `e2e/lifecycle.e2e.ts`, `e2e/iife-injection.e2e.ts`, `e2e/side-panel-data-flow.e2e.ts`, `e2e/side-panel-plugin-toggle.e2e.ts`, `e2e/side-panel-live-update.e2e.ts`
+- Net: +53 lines, -187 lines (134 lines removed)
+- **Learnings for future iterations:**
+  - The side-panel test files use standalone test setup (not fixtures) — they create their own configDir, server, extension context. The `setupAdapterSymlink` helper encapsulates the symlink creation needed by these standalone tests
+  - `iife-injection.e2e.ts` has its own `openExtensionPage` that wraps `getExtensionId` — it's similar to `openSidePanel` but serves a different purpose (sending simulated messages), so it was left in place
+  - When extracting, the `setupAdapterSymlink` from side-panel files was slightly more robust than the inline version in `setupIsolatedIifeTest` (it includes `mkdirSync(extensionAdaptersDir)`) — the robust version was chosen
+---
+
+## 2026-02-17 15:50 - US-003
+- Created `e2e/test-server-utils.ts` exporting: `Invocation` interface, `jsonResponse`, `readBody`, `recordInvocation`, `requireAuth`
+- Updated `e2e/test-server.ts` to import shared utilities and create thin wrappers for module-scoped state access
+- Updated `e2e/strict-csp-test-server.ts` similarly
+- `jsonResponse` takes a `cors` parameter (default `false`); test-server passes `true` to preserve CORS header, strict-csp uses default
+- `recordInvocation` accepts the invocations array as a parameter (stateless utility)
+- `requireAuth` accepts the authenticated boolean and a jsonResponse function (to preserve per-server CORS behavior)
+- Files changed: `e2e/test-server-utils.ts` (new), `e2e/test-server.ts`, `e2e/strict-csp-test-server.ts`
+- Also completed US-002 cleanup: removed remaining local `getExtensionId` from `iife-injection.e2e.ts`, removed unused `getExtensionId` imports from side-panel test files
+- **Learnings for future iterations:**
+  - Both test servers use module-level `let state` that gets mutated by control endpoints — shared utilities must accept state as a parameter rather than accessing module globals
+  - ESLint rule `import-x/consistent-type-specifier-style` requires `import type {}` as a separate statement, not inline `type` keyword in a value import
+  - ESLint rule `import-x/order` requires value imports before type imports from the same module
+  - The strict-csp server's `maybeShortCircuit` is sync (no delay support), while test-server's is async (has sleep + delay) — these were intentionally left server-specific
+---
+
+## 2026-02-17 16:10 - US-004
+- Removed `errorMode` field from `ServerState` interface in `strict-csp-test-server.ts`
+- Removed `errorMode: false` from `createDefaultState`
+- Removed the entire `maybeShortCircuit` function (was unreachable since no `/control/set-error` endpoint exists)
+- Removed all 4 `maybeShortCircuit()` calls from API endpoints (auth.check, echo, greet, status)
+- Verified no test references `set-error`, `errorMode`, `set-slow`, or `delayMs` in strict-CSP test files
+- Files changed: `e2e/strict-csp-test-server.ts`
+- **Learnings for future iterations:**
+  - The strict-csp server has no delay/error mode endpoints — it's a simpler subset of the regular test server
+  - When removing dead code, always verify callers first with grep across the test suite
+---
+
+## 2026-02-17 16:30 - US-005
+- Removed unused `defaultUrl` variable from `createExtensionCopy` in `e2e/fixtures.ts`
+- Replaced template literal `"${defaultUrl}"` in error messages with literal string `"ws://localhost:9515/ws"`
+- Files changed: `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - Straightforward dead variable removal — the regex was already hardcoded, only error messages referenced the variable
+  - When a constant is only used in error messages but not in the logic it documents, prefer inlining the literal to keep the code simple
+---
+
+## 2026-02-17 16:50 - US-006
+- Renamed `McpServer.distDir` to `McpServer.wrapperDir` in `e2e/fixtures.ts`
+- Updated JSDoc comment to accurately describe the field (wrapper script temp directory, not dist directory)
+- Updated assignment from `distDir: wrapperDir` to shorthand `wrapperDir`
+- Only 3 occurrences existed, all in fixtures.ts — no other test files referenced `distDir`
+- Files changed: `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - The `wrapperDir` is a per-test temp directory containing a hot-reload wrapper script, not the actual `dist/` directory
+  - The actual dist directory is resolved via `path.resolve('platform/mcp-server/dist')` in the fixture setup code
+---
+
+## 2026-02-17 17:15 - US-007
+- Added optional `timeoutMs` parameter to internal `request()` function in `createMcpClient` (default 30_000)
+- Added `options?: { timeout?: number }` parameter to `McpClient.callTool` interface and implementation
+- Added JSON-RPC error response handling in `callTool` — returns `{ content: errorMessage, isError: true }` instead of crashing
+- Replaced 130-line inline `mcpRequest` function in dispatch-resilience.e2e.ts with `createMcpClient` + `callTool('...', args, { timeout: 45_000 })`
+- Also added `timeoutClient.close()` cleanup after the timeout test
+- Net: +33 lines, -109 lines (76 lines removed)
+- Files changed: `e2e/fixtures.ts`, `e2e/dispatch-resilience.e2e.ts`
+- **Learnings for future iterations:**
+  - The `createMcpClient` function creates its own MCP session — each instance is independent with its own `sessionId` and `nextId` counter
+  - `callTool` previously assumed `res.result` always exists, but dispatch timeouts can come back as JSON-RPC errors (`res.error`) — always handle both response shapes
+  - Prettier formats short argument lists to a single line, so multi-line `callTool(name, args, options)` calls get collapsed
+---
+
+## 2026-02-17 17:30 - US-008
+- Removed the redundant `await new Promise(r => setTimeout(r, 1_000))` sleep in the "plugin.uninstall with empty name does not affect installed plugins" test
+- The test already verifies adapter survival via `callToolExpectSuccess` (successful tool dispatch), which is a stronger proof than an arbitrary sleep
+- Replaced the sleep comment with a factual description of what the subsequent checks verify
+- Files changed: `e2e/iife-injection.e2e.ts`
+- **Learnings for future iterations:**
+  - When testing that an invalid operation had no effect, prefer observable assertions (checking state, successful operations) over arbitrary sleeps
+  - The test's `callToolExpectSuccess` call exercises the full dispatch pipeline (MCP → extension → adapter → test server → back), proving the adapter is alive
+---
+
+## 2026-02-17 18:00 - US-009
+- Wrapped `createExtensionCopy` patching logic (cpSync, readFileSync, writeFileSync, mkdirSync) in try/catch
+- On failure, the catch block removes `tmpBase` (containing both extensionDir and userDataDir) via `fs.rmSync(tmpBase, { recursive: true, force: true })` then re-throws
+- Normal success path is unaffected — `return { extensionDir, userDataDir }` is outside the try/catch
+- Files changed: `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - Prettier prefers single-line `throw new Error(...)` even for long strings — don't break error messages across multiple lines
+  - The `createExtensionCopy` function is synchronous (no async), so try/catch is straightforward without needing try/finally with await
+---

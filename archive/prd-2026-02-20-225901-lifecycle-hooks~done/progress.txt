@@ -1,0 +1,114 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-225901-lifecycle-hooks~running.json
+Started: Sat Feb 21 00:30:16 PST 2026
+---
+
+## Codebase Patterns
+- The `OpenTabsPlugin` class uses optional method syntax (`method?(): void`) for hooks that plugins may or may not implement
+- Existing pattern: `teardown?()` — new lifecycle hooks follow the same style
+- SDK interface changes require publishing via `./scripts/publish.sh` before plugins can consume them
+- Plugin SDK source: `platform/plugin-sdk/src/index.ts`
+- The IIFE wrapper in `bundleIIFE()` is a TypeScript template string bundled by `Bun.build` as an IIFE targeting the browser
+- Tool mutations (handle wrapping) must happen in the IIFE wrapper BEFORE `hashAndFreeze` which appends `Object.freeze` calls
+- To prevent double-fire of `onDeactivate`, the pattern is: capture in closure, set `plugin.onDeactivate = undefined`, and call via the wrapped `teardown`
+
+## 2026-02-21 08:32 — US-001
+- Added `onNavigate?(url: string): void` optional method to `OpenTabsPlugin` abstract class in `platform/plugin-sdk/src/index.ts`
+- Includes JSDoc explaining that the hook fires on pushState, replaceState, popstate, hashchange events
+- SDK interface only — wiring in the IIFE wrapper happens in US-004
+- Files changed: `platform/plugin-sdk/src/index.ts`
+- **Learnings for future iterations:**
+  - The `OpenTabsPlugin` class uses optional method syntax (`method?(): void`) for hooks that plugins may or may not implement
+  - The `teardown?()` method follows the same pattern — new hooks should be consistent with this style
+  - SDK changes need publishing (US-006) before plugins can use them
+---
+
+## 2026-02-21 08:35 — US-002
+- Added `onActivate?(): void` and `onDeactivate?(): void` optional methods to `OpenTabsPlugin` abstract class in `platform/plugin-sdk/src/index.ts`
+- `onActivate` JSDoc: called once after adapter registration on `globalThis.__openTabs.adapters`, for setting up page-level resources
+- `onDeactivate` JSDoc: called when adapter is being removed, fires before `teardown()` when both are defined
+- SDK interface only — wiring in the IIFE wrapper happens in US-004
+- Files changed: `platform/plugin-sdk/src/index.ts`
+- **Learnings for future iterations:**
+  - Hooks are placed in the class between `teardown` and `onNavigate` for logical grouping (activation lifecycle → navigation lifecycle)
+  - The ordering relationship (onDeactivate before teardown) is documented in the JSDoc and will be enforced by the IIFE wiring in US-004
+---
+
+## 2026-02-21 08:37 — US-003
+- Added `onToolInvocationStart?(toolName: string): void` and `onToolInvocationEnd?(toolName: string, success: boolean, durationMs: number): void` optional methods to `OpenTabsPlugin` abstract class
+- `onToolInvocationStart` JSDoc: called before each tool.handle() execution, receives unprefixed tool name, errors are caught and logged
+- `onToolInvocationEnd` JSDoc: called after tool.handle() completes (success or failure), receives tool name, success boolean, and wall-clock duration in ms
+- SDK interface only — the wrapping of tool.handle() in the IIFE happens in US-004
+- Files changed: `platform/plugin-sdk/src/index.ts`
+- **Learnings for future iterations:**
+  - Tool invocation hooks follow the same optional method pattern as all other lifecycle hooks
+  - The hook ordering in the class: teardown → onActivate → onDeactivate → onNavigate → onToolInvocationStart → onToolInvocationEnd (grouped by lifecycle concern)
+  - The "errors are caught and logged" behavior is documented in JSDoc but enforced by the IIFE wiring (US-004), not the SDK
+---
+
+## 2026-02-21 08:42 — US-004
+- Updated `bundleIIFE` wrapper code in `platform/plugin-tools/src/commands/build.ts` to wire all lifecycle hooks
+- **onActivate**: called after `adapters[name] = plugin` registration, wrapped in try-catch
+- **onDeactivate**: called on the OLD adapter before teardown during re-injection; for the NEW adapter, `onDeactivate` is captured in closure and fired via a wrapped `teardown` function (then set to `undefined` on the plugin to prevent double-fire when the frozen adapter is later torn down)
+- **onNavigate**: intercepts `history.pushState`/`history.replaceState` and adds `popstate`/`hashchange` listeners; only if `plugin.onNavigate` exists at runtime (no overhead otherwise); cleanup restores original history methods and removes event listeners
+- **onToolInvocationStart/End**: wraps each `tool.handle()` with `performance.now()` timing before `hashAndFreeze` freezes the tools; only if either hook exists on the plugin
+- All hook calls wrapped in try-catch to prevent errors from breaking tool execution or adapter registration
+- Files changed: `platform/plugin-tools/src/commands/build.ts`
+- **Learnings for future iterations:**
+  - The IIFE wrapper code is a TypeScript template string in `bundleIIFE()` — it's bundled by `Bun.build` as an IIFE targeting the browser
+  - Tool wrapping must happen BEFORE the `hashAndFreeze` snippet (appended after bundling) which calls `Object.freeze` on each tool
+  - The teardown wrapping pattern: capture `origTeardown` and `origOnDeactivate` in closure, assign a new wrapper to `plugin.teardown`, set `plugin.onDeactivate = undefined` to prevent double-fire on re-injection (since the wrapper already calls `origOnDeactivate`)
+  - The `hashAndFreeze` snippet runs after the IIFE, so mutations done in the wrapper (tool.handle wrapping, teardown wrapping) are preserved before freeze
+  - Navigation listener cleanup (restore `history.pushState`/`replaceState`, remove event listeners) is done inside the wrapped `teardown`, ensuring clean state on adapter replacement
+- The e2e-test plugin's npm-installed `@opentabs-dev/plugin-tools` must include lifecycle wiring code from US-004. Before publishing, use `bun link` to link local platform packages into the plugin for testing.
+- E2E tests use `waitFor()` polling instead of fixed timeouts to check globalThis markers — more reliable and faster
+- The `setupToolTest()` helper waits for adapter injection + tab ready state, so hook markers like `__opentabs_onActivate_called` are available immediately after
+- Hot reload (`mcpServer.triggerHotReload()`) causes sync.full → re-injection → teardown of old adapter (fires onDeactivate) → new adapter registered (fires onActivate)
+---
+
+## 2026-02-21 08:50 — US-005
+- Added lifecycle hook implementations to e2e-test plugin: onActivate, onDeactivate, onNavigate, onToolInvocationStart, onToolInvocationEnd — each sets globalThis markers for E2E verification
+- Created `e2e/lifecycle-hooks.e2e.ts` with 5 tests:
+  1. onActivate fires when adapter is injected
+  2. onNavigate fires on pushState URL change
+  3. onToolInvocationStart and onToolInvocationEnd fire around tool calls (success)
+  4. onToolInvocationEnd reports failure for failing tools (success=false)
+  5. onDeactivate fires on adapter re-injection via hot reload
+- Used `bun link` to link local `@opentabs-dev/plugin-sdk` and `@opentabs-dev/plugin-tools` into the e2e-test plugin (npm versions don't have lifecycle wiring yet — US-006 will publish)
+- Files changed: `plugins/e2e-test/src/index.ts`, `e2e/lifecycle-hooks.e2e.ts` (new)
+- All quality checks pass: build, type-check, lint, knip, test (901 pass), test:e2e (243 pass, 1 pre-existing flaky)
+- **Learnings for future iterations:**
+  - The e2e-test plugin uses npm-published `@opentabs-dev/plugin-tools` for `opentabs-plugin build`. If platform packages have new features not yet published, use `bun link` to temporarily link local packages for testing
+  - E2E lifecycle hook tests use `waitFor()` polling on globalThis markers — avoids flaky fixed-timeout waits
+  - The hot reload path (triggerHotReload → sync.full → re-injection) exercises the teardown → onDeactivate → new onActivate sequence, making it the right mechanism for testing onDeactivate
+  - Playwright test formatting must match prettier config — `bun run lint:fix` auto-fixes most issues, but unused imports and non-null assertions need manual fixes
+---
+
+## 2026-02-21 09:00 — US-006
+- Published all platform packages at v0.0.12: shared, plugin-sdk, plugin-tools, cli
+- Used `./scripts/publish.sh 0.0.12` which handles version bumping, cross-reference updates, build, and publish in dependency order
+- Waited 30s for npm CDN propagation
+- Updated `plugins/e2e-test/package.json` and `plugins/slack/package.json` to depend on `@opentabs-dev/plugin-sdk: ^0.0.12` and `@opentabs-dev/plugin-tools: ^0.0.12`
+- Removed `bun link` symlinks from e2e-test plugin by deleting `node_modules` and running fresh `bun install`
+- Both plugins build successfully with the published v0.0.12 packages
+- All quality checks pass: build, type-check, lint, knip, test (901 pass), test:e2e (244 pass)
+- Files changed: `platform/shared/package.json`, `platform/plugin-sdk/package.json`, `platform/plugin-tools/package.json`, `platform/cli/package.json`, `plugins/e2e-test/package.json`, `plugins/e2e-test/bun.lock`, `plugins/slack/package.json`
+- **Learnings for future iterations:**
+  - The publish script (`./scripts/publish.sh`) handles everything: version bumping all 4 platform packages, updating cross-references, rebuilding, and publishing in dependency order (shared → plugin-sdk → plugin-tools → cli)
+  - After publishing, wait ~30s for npm CDN propagation before running `bun install` in plugins
+  - After using `bun link` for local development, clean up by deleting `node_modules` and running fresh `bun install` to ensure plugins use the published npm versions
+  - The slack plugin's `bun.lock` didn't need updating — bun resolved `^0.0.11` to `^0.0.12` range without lockfile changes since the resolved versions changed but the lockfile was already tracking the old versions
+---
+
+## 2026-02-21 09:05 — US-007
+- Added "Lifecycle hooks" subsection to CLAUDE.md Key Concepts section (after "Tab state machine", before "Dev vs production mode")
+- Documents all 5 hooks: onActivate, onDeactivate, onNavigate, onToolInvocationStart, onToolInvocationEnd
+- Explains that hooks are optional, wired automatically by the IIFE build, and errors are caught/logged
+- Added `lifecycle-hooks.e2e.ts` to the directory structure listing
+- Plugin-agnostic — no individual plugins mentioned
+- Files changed: `CLAUDE.md`
+- All quality checks pass: build, type-check, lint, knip, test (901 pass)
+- **Learnings for future iterations:**
+  - CLAUDE.md directory structure is a representative sample, not exhaustive — add new files only when they represent a significant new category (e.g., lifecycle hooks tests)
+  - The Key Concepts section follows a logical flow: discovery → tool prefixing → tab state → lifecycle hooks → dev mode → hot reload → SDK utilities
+---

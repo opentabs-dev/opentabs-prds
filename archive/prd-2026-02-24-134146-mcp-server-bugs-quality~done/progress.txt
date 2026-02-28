@@ -1,0 +1,68 @@
+## Codebase Patterns
+- `runNpmGlobal` in `platform/mcp-server/src/plugin-management.ts` spawns npm subprocesses with Bun.spawn and uses `proc.exited` to await exit. Always race `proc.exited` against a deadline to prevent hangs.
+- The MCP server uses `@opentabs-dev/shared` for platform utilities like `platformExec('npm')`.
+- Timer cleanup pattern: capture all `setTimeout` return values and `clearTimeout` them on both success and error paths.
+- Fire-and-forget promises (`void someAsync()`) must always have a `.catch()` to prevent unhandled rejections. See `reload.ts` for the canonical pattern.
+- String union validation pattern: use a `Set<UnionType>` constant (e.g., `VALID_CONFIRMATION_SCOPES`) and check `.has()` before casting. Fall back to a safe default and `log.warn` on invalid values.
+- Array deduplication pattern: before `.push()`, use `.some()` to check for equivalent entries. `===` handles `null` correctly (`null === null` is `true`).
+
+# Ralph Progress Log
+PRD: prd-2026-02-24-134146-mcp-server-bugs-quality~running.json
+Started: Tue Feb 24 13:55:40 PST 2026
+---
+
+## 2026-02-24 14:00 - US-001
+- Implemented SIGKILL fallback and timeout guard in `runNpmGlobal` function
+- Files changed: `platform/mcp-server/src/plugin-management.ts`
+- After the 60s SIGTERM timeout, a 5s SIGKILL fallback timer forcefully terminates unresponsive processes
+- `proc.exited` is raced against an overall deadline (60s + 5s + 5s = 70s) so the function never hangs
+- All three timers (SIGTERM, SIGKILL, deadline) are cleaned up on normal exit paths
+- **Learnings for future iterations:**
+  - In Bun, `proc.kill()` sends SIGTERM by default; `proc.kill('SIGKILL')` for forced termination
+  - The stdout/stderr consumption via `new Response(proc.stdout).text()` completes before `proc.exited` in the current flow, so the hang risk is on `proc.exited` specifically
+  - `Promise.race` timeout timers must be captured and cleared on the success path to avoid dangling timers
+---
+
+## 2026-02-24 14:05 - US-002
+- Added `.catch()` to the fire-and-forget `sendSyncFull` promise chain in the WebSocket open handler
+- Files changed: `platform/mcp-server/src/http-routes.ts`
+- The `.catch()` logs the error via `log.warn` and does not re-throw, matching the pattern in `reload.ts`
+- **Learnings for future iterations:**
+  - `log` is imported from `./logger.js` in http-routes.ts
+  - The WebSocket open handler is in `createHandleWsOpen` around line 540 of http-routes.ts
+---
+
+## 2026-02-24 14:10 - US-003
+- Validated ConfirmationScope before casting in `handleConfirmationResponse`
+- Files changed: `platform/mcp-server/src/extension-handlers.ts`
+- Added `VALID_CONFIRMATION_SCOPES` Set constant with the three valid scope values
+- Raw scope string is validated against the set before use; invalid values fall back to `'tool_domain'` with `log.warn`
+- The unsafe `as ConfirmationScope` cast on unvalidated input is replaced with a checked cast
+- **Learnings for future iterations:**
+  - The `ConfirmationScope` type is defined in `state.ts` as `'tool_domain' | 'tool_all' | 'domain_all'`
+  - Pattern for validating string unions: use a `Set<UnionType>` and check `.has()` before casting, with fallback
+  - The `handleConfirmationResponse` function is around line 428 of extension-handlers.ts
+---
+
+## 2026-02-24 14:15 - US-004
+- Added deduplication check before pushing to `state.sessionPermissions` array
+- Files changed: `platform/mcp-server/src/extension-handlers.ts`
+- Before `push()`, uses `.some()` to check if an equivalent rule (same `tool`, `domain`, `scope`) already exists
+- `===` comparison handles `null` fields correctly for `tool_all` (domain=null) and `domain_all` (tool=null) scopes
+- **Learnings for future iterations:**
+  - `SessionPermissionRule` has nullable `tool` and `domain` fields depending on scope
+  - The `isSessionAllowed` function in `permissions.ts` iterates the full array on every browser tool call, so keeping it bounded matters for performance
+---
+
+## 2026-02-24 14:20 - US-005
+- Removed redundant `loadSecret()` call and import from `platform/mcp-server/src/index.ts`
+- Files changed: `platform/mcp-server/src/index.ts`
+- Removed the `import { loadSecret } from './config.js'` import (line 45)
+- Removed the `state.wsSecret = await loadSecret()` call (line 148) and its comment (lines 146-147)
+- `reloadCore` in `reload.ts` (line 204) remains as the single source of truth for loading the WebSocket secret
+- All checks pass: build, type-check, lint, knip, unit tests (2060 pass), E2E tests (357 pass)
+- **Learnings for future iterations:**
+  - `performReload` → `reloadCore` is the reload pipeline; it handles config, plugins, secret, and watchers in one sequence
+  - When removing an import, always verify no other references exist in the file with grep before deleting
+  - `e2eCheckpoint: true` stories require the full Phase 2 suite including `bun run test:e2e`
+---

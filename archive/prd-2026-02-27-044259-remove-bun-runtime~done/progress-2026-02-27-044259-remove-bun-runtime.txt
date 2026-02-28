@@ -1,0 +1,157 @@
+## Codebase Patterns
+- For Node.js spawn with destructured command arrays, use `const [bin = '', ...args] = cmd` to avoid non-null assertion lint errors (the `@typescript-eslint/no-non-null-assertion` rule is enabled).
+- `Readable.toWeb(nodeReadable) as ReadableStream<Uint8Array>` converts Node.js Readable streams to Web ReadableStreams (Node 22+ API).
+- External packages (glob, minimatch) must be imported before node:* packages — that is the project's configured import order.
+- The glob package v11 does NOT re-export minimatch — add minimatch as a separate devDependency when you need pattern matching.
+- When modifying scripts that previously used Bun APIs, the bun-global.d.ts shim in the same directory must be deleted once all Bun APIs are removed from files in that directory.
+- `npm run --prefix <dir> <script>` is the npm equivalent of `bun run --cwd <dir> <script>` for cross-directory script execution.
+- Once tsx is referenced in package.json scripts directly, remove it from knip's ignoreDependencies — knip can find it automatically.
+- `tsc --build --noEmit` (TypeScript 5.9+) can enter a broken state and report TS6310 errors across all packages if run multiple times after the tsbuildinfo files are stale. Fix: `npm run clean && npm run build` resets to a clean state. Always run `npm run build` before `npm run type-check` to ensure fresh tsbuildinfo files.
+- New entry-point .ts files in platform packages (that are not imported by anything) must be added to knip.ts workspace entry list: `'platform/mcp-server': { entry: ['src/**/*.test.ts', 'src/dev-proxy.ts'] }`.
+- `child_process.fork()` creates an IPC channel automatically. The child can call `process.send({ type: 'ready', port })` and the parent receives it via `child.on('message', ...)`.
+- The `func-style` ESLint rule (set to 'expression') disallows function declarations — use `const fn = (): T => ...` everywhere, including in closures where hoisting might seem useful.
+
+# Ralph Progress Log
+PRD: prd-2026-02-27-044259-remove-bun-runtime~running.json
+Started: Fri Feb 27 12:43:17 UTC 2026
+---
+
+## US-001 — DONE (Fri Feb 27 13:07:40 UTC 2026)
+
+Added tsx as root devDependency. Removed bun-types from all package.json files
+(root, shared, plugin-sdk, plugin-tools, mcp-server, cli, create-plugin).
+Updated all tsconfig files to use `"types": ["node"]` instead of `"bun-types"`.
+Created typed bun-global.d.ts shims in each affected directory (scripts/,
+e2e/, platform/shared/src/, platform/mcp-server/src/, platform/cli/src/,
+platform/plugin-sdk/scripts/) to preserve Bun API types for code not yet
+migrated. Updated knip.ts to ignore tsx (not yet referenced in scripts) and
+the plugin-sdk shim file. All quality checks pass: build, type-check, lint,
+knip, test (2081 tests). Commit: 938d251.
+
+## US-002 — DONE (Fri Feb 27 13:20:00 UTC 2026)
+
+Removed isBun runtime detection from all production code.
+
+Files changed:
+- platform/shared/src/index.ts: removed isBun export and runtime detection section
+- platform/shared/src/bun-global.d.ts: deleted (no longer needed)
+- platform/mcp-server/src/index.ts: removed isBun import, createBunServer function, and
+  Bun.serve() references; simplified ServerInstance type to NodeServer only; updated header
+  comments to remove Bun-specific documentation
+- platform/mcp-server/src/bun-global.d.ts: deleted
+- platform/mcp-server/src/resolver.ts: removed isBun import and the if (isBun) block
+  that scanned Bun's global node_modules path; updated function comments
+- platform/mcp-server/src/{mcp-setup,file-watcher,log-buffer,config,extension-protocol,
+  state,reload,shutdown,adapter-files,audit-disk}.ts: updated all 'bun --hot' comments
+  to say 'hot reload' or 'dev mode reload'
+- platform/cli/src/commands/doctor.ts: removed isBun import; simplified checkRuntime
+  to always return Node.js version
+- platform/cli/src/bun-global.d.ts: deleted
+
+All quality checks pass: build, type-check, lint, knip, test (2081 tests). Commit: 80adb00.
+
+**Learnings for future iterations:**
+- The bun-global.d.ts shims created in US-001 are in specific directories: scripts/,
+  e2e/, and platform/plugin-sdk/scripts/ are NOT yet removed (will be done in US-003).
+- The arrow-body-style ESLint rule requires single-expression arrow functions to omit
+  braces: `const fn = (): T => expr` not `const fn = (): T => { return expr; }`.
+- When deleting files tracked by git, use `git rm` (not just `rm`) so they get staged.
+---
+
+## US-003 — DONE (Fri Feb 27 13:35:00 UTC 2026)
+
+Migrated all build scripts from Bun APIs to Node.js APIs.
+
+Files changed:
+- scripts/check-bun-version.ts: deleted (no longer needed)
+- scripts/bun-global.d.ts: deleted (all scripts migrated)
+- platform/plugin-sdk/scripts/bun-global.d.ts: deleted (migrated)
+- scripts/dev.ts: Bun.spawn → node:child_process spawn + Readable.toWeb(),
+  Bun.file → readFile, Bun.env → process.env, ChildProcess for children array
+- scripts/dev-mcp.ts: Bun.file.exists() → existsSync, Bun.spawn → spawn
+- scripts/publish.ts: Bun.spawnSync → spawnSync, Bun.argv → process.argv,
+  Bun.file.json()/text() → readFile, Bun.write → writeFile,
+  Bun.file.delete() → unlinkSync, bun.lock → package-lock.json,
+  bun commands → npm commands
+- scripts/clean.ts: Bun.argv → process.argv
+- scripts/plugins.ts: Bun.argv → process.argv, Bun.file.exists() → existsSync,
+  Bun.spawn → spawn, bun commands → npm commands
+- scripts/generate-icons.ts: Bun.file.text() → readFile, Bun.write → writeFile
+- scripts/check-tsconfig-coverage.ts: Bun.file.text() → readFile,
+  Bun.Glob → globSync from glob package, Bun.Glob.match → minimatch
+- platform/plugin-sdk/scripts/generate-icon-names.ts: Bun.write → writeFile
+- package.json: added glob + minimatch devDependencies, removed postinstall script
+- knip.ts: removed plugin-sdk bun-global.d.ts ignore, updated tsx comment
+
+**Learnings for future iterations:**
+- For Node.js spawn with destructured cmd arrays: `const [bin = '', ...args] = cmd`
+  avoids non-null assertion errors. The `@typescript-eslint/no-non-null-assertion`
+  rule is enforced — don't use `bin!`.
+- `Readable.toWeb(stream) as ReadableStream<Uint8Array>` for Web-compatible streams.
+- External packages (glob, minimatch) must be imported before node:* packages per
+  the project's import-x/order config. Let eslint --fix sort them automatically.
+- glob v11 does NOT re-export minimatch. Add minimatch as explicit devDependency.
+- e2e/bun-global.d.ts still exists and will be removed in US-006.
+---
+
+## US-004 — DONE (Fri Feb 27 13:40:00 UTC 2026)
+
+Replaced all bun run/bun install/bunx with npm equivalents in package.json scripts.
+
+Files changed:
+- package.json: remove `"bun": ">= 1.3.9"` from engines; replace `bun scripts/foo.ts` → 
+  `tsx scripts/foo.ts`, `bun run --cwd X` → `npm run --prefix X`, `bunx playwright` →
+  `npx playwright`, `bun install --frozen-lockfile` → `npm ci`, `bun run X` → `npm run X`
+- platform/browser-extension/package.json: build:bundle `bun run build-extension.ts` → 
+  `tsx build-extension.ts`, build:side-panel `bun run build-side-panel.ts && bun run build:tailwind`
+  → `tsx build-side-panel.ts && npm run build:tailwind`
+- platform/plugin-sdk/package.json: generate:icons `bun scripts/generate-icon-names.ts` → 
+  `tsx scripts/generate-icon-names.ts`
+- knip.ts: removed tsx from ignoreDependencies (tsx is now found via package.json scripts)
+- scripts/dev-mcp.ts: error message updated to say `npm run build`
+- scripts/install-extension.ts: comment updated to say `npm run build`
+
+Note: `bun --hot` invocations in scripts/dev.ts and scripts/dev-mcp.ts were intentionally
+left as-is per PRD — these will be replaced by the proxy dev server in US-005.
+
+All quality checks pass: build, type-check, lint, knip, test (2081 tests). Commit: 9dee4d0.
+
+**Learnings for future iterations:**
+- `npm run --prefix <dir> <script>` is the npm equivalent of `bun run --cwd <dir> <script>`
+- Once tsx is referenced directly in package.json scripts (not just devDependencies), knip
+  can detect it automatically and it no longer needs to be in ignoreDependencies
+- The `bun --hot dist/index.js --dev` command in mcp-server's dev script is intentionally
+  deferred to US-005 (proxy story) - don't remove it in intermediate stories
+---
+
+## US-005 — DONE (Fri Feb 27 14:00:00 UTC 2026)
+
+Built proxy-based dev server for hot reload without Bun.
+
+Files changed:
+- platform/mcp-server/src/dev-proxy.ts: NEW — thin proxy that listens on configured PORT,
+  forks dist/index.js on ephemeral PORT=0, receives actual port via IPC, forwards HTTP via
+  node:http and WebSocket via ws, watches dist/*.js for changes (debounced 300ms), buffers
+  HTTP requests during restart (up to 5s), forwards Sec-WebSocket-Protocol header echo
+- platform/mcp-server/src/index.ts: added IPC port reporting (process.send({ type: 'ready',
+  port })) when OPENTABS_PROXY=1 env var is set
+- platform/mcp-server/package.json: dev script: `bun --hot dist/index.js --dev` → `node dist/dev-proxy.js`
+- scripts/dev.ts: MCP server spawn: `bun --hot ...` → `node platform/mcp-server/dist/dev-proxy.js`
+- scripts/dev-mcp.ts: spawn: `bun --hot ...` → `node [proxyPath]`, checks for dev-proxy.js
+- knip.ts: added src/dev-proxy.ts as entry point for platform/mcp-server workspace
+- platform/mcp-server/CLAUDE.md: updated Dev vs Production Mode and Hot Reload sections
+
+**Learnings for future iterations:**
+- `tsc --build --noEmit` (TypeScript 5.9+) gets into a broken TS6310 state after multiple
+  runs. Fix: `npm run clean && npm run build` before `npm run type-check`.
+- New standalone entry-point files (not imported by anything) must be added to knip.ts
+  workspace entry list or knip reports them as unused files.
+- `child_process.fork()` creates an IPC channel automatically; child uses `process.send()`
+  to communicate back to parent.
+- `func-style: ['error', 'expression']` — no function declarations anywhere, including
+  inside closures. Use `let settled = false` pattern to prevent double-invocation in
+  async callbacks.
+- The `wss.on('headers', ...)` event in the ws package fires synchronously during
+  handleUpgrade — this is the correct injection point for custom headers like
+  Sec-WebSocket-Protocol in a WebSocket proxy.
+---

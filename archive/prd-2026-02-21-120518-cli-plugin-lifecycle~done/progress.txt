@@ -1,0 +1,72 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-120518-cli-plugin-lifecycle~running.json
+Started: Sat Feb 21 12:05:19 PST 2026
+---
+
+## Codebase Patterns
+- The `updateCommand` field is defined in both `platform/shared/src/index.ts` (HealthResponse type) and `platform/mcp-server/src/state.ts` (OutdatedPlugin type) — both use plain strings
+- Test fixtures referencing `updateCommand` exist in `reload.test.ts` and `extension-protocol.test.ts` — update them when format changes
+- Prettier auto-formats object literals that exceed line length — account for this when making string values longer
+- Commander subcommand actions receive `(arg, options, command)` — use `command.optsWithGlobals()` to access global flags like `--port`
+- `normalizePluginName` and `notifyServer` are reusable helpers in `plugin.ts` for install/remove commands
+- `Bun.spawn` with `stdio: ['inherit', 'inherit', 'inherit']` pipes npm output in real-time; `await proc.exited` gets exit code
+- `localPlugins` in config.json stores filesystem paths (relative to config dir), not package names — to match by name, resolve the path and read its package.json
+- Config helpers in `platform/cli/src/config.ts`: `atomicWriteConfig`, `getLocalPluginsFromConfig`, `resolvePluginPath` for safe config mutation and path resolution
+- `colorTabState` is exported from `status.ts` and can be reused by other commands that display tab state
+- Sibling imports (`./status.js`) must come before parent imports (`../config.js`) per eslint import-x/order rules — use `bun run lint:fix` if unsure
+- `npm list -g --json --depth=0` returns JSON with a `dependencies` object keyed by package name — useful for offline npm plugin scanning
+
+## 2026-02-21 12:08 - US-001
+- Changed `updateCommand` in `version-check.ts` from `bun update ${pkgName}` to `npm update -g ${pkgName}`
+- Updated test fixtures in `reload.test.ts` and `extension-protocol.test.ts` to use `npm update -g` format
+- Verified `OnboardingState.tsx` and `plugin.ts` already used `npm install -g` — no changes needed
+- Searched entire codebase for `bun update` and `bun install -g` — no remaining occurrences
+- Files changed: `platform/mcp-server/src/version-check.ts`, `platform/mcp-server/src/reload.test.ts`, `platform/mcp-server/src/extension-protocol.test.ts`
+- **Learnings for future iterations:**
+  - Only `version-check.ts` needed the actual change — OnboardingState.tsx and plugin.ts already used npm
+  - Prettier auto-formats when object literals become too long after string value changes
+---
+
+## 2026-02-21 12:12 - US-002
+- Added `opentabs plugin install <name>` subcommand in `platform/cli/src/commands/plugin.ts`
+- Implemented `normalizePluginName` helper: shorthand "slack" → "opentabs-plugin-slack", scoped names and full names pass through
+- Implemented `notifyServer` helper: checks /health, then POST /reload with Bearer auth if server is running; non-fatal on failure
+- `handlePluginInstall` spawns `npm install -g <pkg>` with inherited stdio, reports exit code on failure
+- Updated search footer to reference `opentabs plugin install <name>` instead of `npm install -g <package-name>`
+- Commander action uses `(name, _options, command) => command.optsWithGlobals()` pattern to access global `--port` flag
+- Files changed: `platform/cli/src/commands/plugin.ts`
+- **Learnings for future iterations:**
+  - The `notifyServer` helper can be reused directly by the `remove` command (US-003) since it's already extracted
+  - `normalizePluginName` is also shared — both install and remove need the same name expansion logic
+  - Commander subcommand `.action()` receives `(arg, opts, command)` — the `command` parameter is needed for `optsWithGlobals()`
+---
+
+## 2026-02-21 12:17 - US-003
+- Added `opentabs plugin remove <name>` subcommand in `platform/cli/src/commands/plugin.ts`
+- Reused existing `normalizePluginName` and `notifyServer` helpers (as predicted by US-002 learnings)
+- Implemented `removeFromLocalPlugins`: resolves each localPlugins entry path, reads its package.json, checks if `name` matches the package being removed, filters out matches, saves atomically via `atomicWriteConfig`
+- `handlePluginRemove` spawns `npm uninstall -g <pkg>` with inherited stdio, reports exit code on failure
+- Added imports for `atomicWriteConfig`, `getLocalPluginsFromConfig`, `resolvePluginPath` from config.js and `join` from node:path
+- Registered `remove` subcommand with help text and examples matching install's format
+- Files changed: `platform/cli/src/commands/plugin.ts`
+- **Learnings for future iterations:**
+  - `localPlugins` entries are filesystem paths (relative to config dir), not package names — matching requires reading each entry's package.json to compare the `name` field
+  - Import order matters: `picocolors` must come before `node:path` per eslint import-x/order rules
+  - When Commander action callbacks have short bodies, prettier inlines them; when they span multiple lines, prettier wraps them — watch for formatting inconsistencies between similar registrations
+---
+
+## 2026-02-21 12:20 - US-004
+- Added `opentabs plugin list` subcommand in `platform/cli/src/commands/plugin.ts`
+- Two modes: server-running (fetches /health for live plugin data with tab state) and offline (reads config + scans npm globals)
+- Server mode: shows plugins with displayName, source, tab state, tool count, SDK version warnings, and failed plugins
+- Offline mode: reads local plugin package.json + dist/tools.json for basic info, scans `npm list -g --json --depth=0` for npm plugins
+- Deduplicates local vs npm entries (local takes precedence), shows version info in offline mode
+- Supports `--json` flag for machine-readable output (different shapes for server vs offline mode)
+- Imported `colorTabState` from `./status.js` for consistent tab state coloring, `isConnectionRefused` from config, `parsePort` for `--port` option
+- Files changed: `platform/cli/src/commands/plugin.ts`
+- **Learnings for future iterations:**
+  - Sibling imports (`./status.js`) must come before parent imports (`../config.js`) per eslint import-x/order — `bun run lint:fix` handles this automatically
+  - `Bun.spawn` with `stdout: 'pipe'` + `new Response(proc.stdout).text()` is the pattern for capturing subprocess output
+  - The health endpoint's `pluginDetails` includes `source`, `sdkVersion`, `tabState`, `toolCount` — sufficient for a rich plugin list
+  - `isConnectionRefused` from config.ts checks `TypeError` with `cause.code === 'ECONNREFUSED'` — the pattern for detecting server-not-running
+---

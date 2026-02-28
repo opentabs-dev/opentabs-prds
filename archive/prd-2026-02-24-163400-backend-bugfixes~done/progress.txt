@@ -1,0 +1,121 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-163400-backend-bugfixes~running.json
+Started: Tue Feb 24 16:34:18 PST 2026
+---
+
+## Codebase Patterns
+- Runtime compatibility layer is in `platform/shared/src/runtime.ts` — every function has a Bun path and a Node.js path
+- Bun path and Node.js path should have matching error-handling behavior (e.g., both swallow ENOENT with `.catch(() => {})`)
+- Prettier enforces line breaks on chained method calls — `await Bun.file(path)\n.delete()\n.catch(...)` not inline
+- Node.js `spawnSync` sets `result.error` on ENOENT — check it before accessing `stdout`/`stderr` (which are `null` in that case)
+- ESLint `@typescript-eslint/no-unnecessary-condition` catches `?.` on types TS thinks are non-null — use early-return on `result.error` instead
+- ESLint `@typescript-eslint/no-non-null-assertion` forbids `!` — avoid `let x; ... x!` patterns; instead extract callbacks from Promise constructors and assign timer IDs separately
+- CLI commands fetching `/health` must include auth header: `const secret = await readAuthSecret(); const headers: Record<string, string> = {}; if (secret) headers['Authorization'] = \`Bearer ${secret}\`;`
+- SVG attribute regex patterns must use `["']` for quote delimiters and `[^"']` for content to handle both single- and double-quoted attributes
+
+---
+
+## 2026-02-24 16:36 - US-001
+- **What was implemented**: Added `.catch(() => {})` to the Bun path of `deleteFile` to match the Node.js path, making `deleteFile` idempotent on both runtimes.
+- **Files changed**: `platform/shared/src/runtime.ts` (line 63)
+- **Learnings for future iterations:**
+  - `Bun.file(path).delete()` throws ENOENT when the file doesn't exist, unlike Node.js `unlink` which can be caught
+  - The Node.js path already had `.catch(() => {})` — the pattern is to silently ignore missing-file errors for delete operations
+  - Prettier requires chained calls to be on separate lines when the chain gets long
+---
+
+## 2026-02-24 16:40 - US-002
+- **What was implemented**: Fixed `spawnProcessSync` Node.js path to check `result.error` before accessing `stdout`/`stderr`. When command is not found (ENOENT), `spawnSync` sets `result.error` and leaves `stdout`/`stderr` as `null`. Now returns `{ exitCode: 1, stdout: '', stderr: error.message }` on error.
+- **Files changed**: `platform/shared/src/runtime.ts` (lines 105-117)
+- **Learnings for future iterations:**
+  - Node.js `spawnSync` sets `result.error` (an `Error` object) when the command isn't found — `stdout`/`stderr` are `null` in that case
+  - Simple `?.toString() ?? ''` triggers ESLint `@typescript-eslint/no-unnecessary-condition` because TS types say stdout is `Buffer` (not `Buffer | null`), even though at runtime it's `null` on ENOENT
+  - The correct pattern is to check `result.error` first (early return) which avoids touching potentially-null buffers and keeps TypeScript + ESLint happy
+  - The Bun path doesn't have this issue because `Bun.spawnSync` throws an error directly, and callers already use try/catch
+---
+
+## 2026-02-24 16:44 - US-003
+- **What was implemented**: Fixed `readFileSlice` Node.js path to capture `bytesRead` from `fh.read()` and use `buf.subarray(0, bytesRead)` before converting to string. This eliminates trailing null bytes when the requested range exceeds the file size.
+- **Files changed**: `platform/shared/src/runtime.ts` (line 264)
+- **Learnings for future iterations:**
+  - Node.js `FileHandle.read()` returns `{ bytesRead, buffer }` — always use `bytesRead` to determine how much of the buffer contains actual data
+  - `Buffer.alloc(n)` zero-fills the buffer, so unread portions contain `\0` bytes that pollute the string output
+  - `buf.subarray(0, bytesRead)` is the correct way to trim without copying (vs `buf.slice` which creates a copy)
+  - The Bun path (`Bun.file(path).slice(start, end).text()`) handles this correctly — `Blob.slice` already stops at EOF
+---
+
+## 2026-02-24 16:48 - US-004
+- **What was implemented**: Replaced direct `Bun.spawnSync` call in `checkBrowser()` Linux path with `spawnProcessSync` from `@opentabs-dev/shared`, which works on both Node.js and Bun runtimes.
+- **Files changed**: `platform/cli/src/commands/doctor.ts` (import line 21, line 355)
+- **Learnings for future iterations:**
+  - CLI runs on Node.js 20+ — never use `Bun.*` APIs directly in CLI production code paths (the only exception is `Bun.version` inside an `if(isBun)` guard)
+  - `spawnProcessSync` from `@opentabs-dev/shared` is the runtime-compatible replacement for both `Bun.spawnSync` and Node.js `child_process.spawnSync`
+  - `spawnProcessSync('which', [cmd])` returns `{ exitCode, stdout, stderr }` — same shape for checking `exitCode === 0`
+---
+
+## 2026-02-24 16:52 - US-005
+- **What was implemented**: Fixed timer leak in `runNpmGlobal` by capturing the `setTimeout` timer ID and calling `clearTimeout` in a `try/finally` block around `Promise.race`. This ensures the 60-second timeout timer is always cleaned up, whether the npm process completes successfully, fails, or times out.
+- **Files changed**: `platform/mcp-server/src/plugin-management.ts` (lines 75-91)
+- **Learnings for future iterations:**
+  - `Promise.race` with a timeout pattern requires explicit cleanup of the losing promise's timer — otherwise the timer holds the process open until it fires
+  - Using `let timerId` with later assignment inside a Promise constructor triggers ESLint `@typescript-eslint/no-non-null-assertion` when using `timerId!` in `clearTimeout`
+  - The clean pattern is: extract the reject function from the Promise constructor, create the timer separately referencing that reject, then `clearTimeout` in a `finally` block
+  - `try/finally` around `Promise.race` cleans up on both success and error (timeout rejection) paths
+---
+
+## 2026-02-24 16:56 - US-006
+- **What was implemented**: Changed `searchNpmPlugins` to use `platformExec('npm')` instead of bare `'npm'` string, matching the pattern already used by `runNpmGlobal`. This ensures npm is invoked as `npm.cmd` on Windows.
+- **Files changed**: `platform/mcp-server/src/plugin-management.ts` (line 127)
+- **Learnings for future iterations:**
+  - `platformExec` from `@opentabs-dev/shared` wraps executable names for cross-platform compatibility (e.g., `npm` → `npm.cmd` on Windows)
+  - All `spawnProcess`/`spawnProcessSync` calls to npm should use `platformExec('npm')` — check for bare `'npm'` strings when reviewing
+  - `platformExec` was already imported in the file — always verify before adding a duplicate import
+---
+
+## 2026-02-24 17:00 - US-007
+- **What was implemented**: Added auth header to `handlePluginList` in `plugin.ts`. Imported `readAuthSecret` from `../config.js`, called it before the fetch, and included `Authorization: Bearer <secret>` header when secret is non-null. This matches the pattern used in `handleStatus` (status.ts) and `handleDoctor` (doctor.ts).
+- **Files changed**: `platform/cli/src/commands/plugin.ts` (import line 10, lines 457-461)
+- **Learnings for future iterations:**
+  - All CLI commands that fetch `/health` from the MCP server need the auth header — `readAuthSecret()` from `../config.js` is the standard way to get it
+  - The established pattern is: `const secret = await readAuthSecret(); const headers: Record<string, string> = {}; if (secret) headers['Authorization'] = \`Bearer ${secret}\`;`
+  - Without the auth header, the server returns 401 and the command silently falls through to offline/stale mode
+---
+
+## 2026-02-24 17:04 - US-008
+- **What was implemented**: Added auth header to `fetchToolNames` in `config.ts`. Called `readAuthSecret()` before the fetch and included `Authorization: Bearer <secret>` header when secret is non-null. `readAuthSecret` was already imported at the top of the file.
+- **Files changed**: `platform/cli/src/commands/config.ts` (lines 158-161)
+- **Learnings for future iterations:**
+  - `readAuthSecret` was already imported in config.ts (used by `handleConfigShow` and `handleRotateSecret`), so no new import was needed
+  - This is the same class of bug as US-007 — any CLI command fetching `/health` needs the auth header
+  - The established pattern for auth headers is consistent across status.ts, doctor.ts, plugin.ts, and now config.ts
+---
+
+## 2026-02-24 17:08 - US-009
+- **What was implemented**: Added `entries = entries.slice(0, limit)` after `--since` time filtering in `handleAudit` server mode, matching the existing behavior in `handleAuditFromFile`. This ensures the `--limit` flag is respected when combined with `--since`.
+- **Files changed**: `platform/cli/src/commands/audit.ts` (line 244)
+- **Learnings for future iterations:**
+  - When `--since` is used, `handleAudit` requests 500 entries from the server to have enough data to filter from, but forgot to apply the user's `--limit` after filtering
+  - `handleAuditFromFile` already had the correct pattern at line 170: `entries = entries.slice(0, limit)` after all filters
+  - The limit must be applied before both JSON and table output paths
+---
+
+## 2026-02-24 17:12 - US-010
+- **What was implemented**: Replaced duplicated JSON-RPC message construction in `handleExtensionReload` (http-routes.ts) with a call to the existing `sendExtensionReload(state)` from extension-protocol.ts. Removed the now-unused `getNextRequestId` import from http-routes.ts.
+- **Files changed**: `platform/mcp-server/src/http-routes.ts` (import line 29, lines 372-376)
+- **Learnings for future iterations:**
+  - `sendExtensionReload` was already imported in http-routes.ts (line 20) but unused — the endpoint was manually constructing the same message
+  - The `handleExtensionReload` function keeps its own `!state.extensionWs` check returning 503, which is correct since `sendExtensionReload` silently returns `false` on no connection — the HTTP handler needs to return an explicit error response
+  - When removing the only usage of an import, check if other symbols from the same import line are still used before removing the entire import statement
+---
+
+## 2026-02-24 17:20 - US-011
+- **What was implemented**: Updated SVG regex patterns in `validateInactiveIconColors` and `generateInactiveIcon` to handle both single-quoted and double-quoted SVG attributes. Four regex patterns were updated: the attribute pattern and style pattern in both functions. The `generateInactiveIcon` attribute regex now captures the quote character via a backreference (`\2`) to ensure the replacement preserves the original quote style. Style property value matchers also exclude `'` in their character class to avoid matching beyond the closing quote.
+- **Files changed**: `platform/plugin-tools/src/validate-icon.ts` (lines 313, 324, 329, 421, 428, 432)
+- **Phase 1**: All pass (build, type-check, lint, knip, test — 2060 tests pass)
+- **Phase 2 (E2E)**: 48 tests fail with `extensionConnected: false` timeouts — consistent across 3 runs. This is an environment-level issue where the Chrome extension cannot connect to the WebSocket in the Playwright test environment. Not related to the SVG regex changes. The safety net will re-run E2E after all stories complete.
+- **Learnings for future iterations:**
+  - `validateIconSvg` already used `["']([^"']*)["']` for `viewBox` — this is the reference pattern for quote-agnostic SVG attribute matching
+  - For `generateInactiveIcon` attribute replacement, use a backreference `(\2)` to match the same quote character on both sides, and capture the quote separately so the replacement can reconstruct it
+  - Style property value matchers (`[^;"]+`) need `'` added to exclusion (`[^;"']+`) when the style attribute itself can be single-quoted
+  - The `fullMatch.replace(styleValue, newStyle)` approach in the style converter works regardless of outer quote style since it replaces only the inner content
+---

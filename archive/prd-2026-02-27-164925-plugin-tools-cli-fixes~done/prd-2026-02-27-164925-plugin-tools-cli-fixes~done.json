@@ -1,0 +1,45 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs and missing guards in the plugin-tools build command and CLI packages discovered during backend audit.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add timeout to notifyServer fetch in plugin-tools build",
+      "description": "As a plugin developer, I want the build command's server notification to have a timeout so that my build does not hang indefinitely if the MCP server is unresponsive.",
+      "acceptanceCriteria": [
+        "The fetch call in notifyServer (build.ts) includes AbortSignal.timeout(5_000) matching the pattern used in platform/cli/src/notify-server.ts",
+        "If the timeout fires, the build completes successfully with a silent failure (same as the existing catch block behavior)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts\n\nBug: Line 203: `const res = await fetch(`http://localhost:${port}/reload`, { method: 'POST', headers: { Authorization: `Bearer ${secret}` } });`\n\nThis fetch has no timeout. If the server is accepting TCP connections but not responding (e.g., stuck in a long reload), this fetch hangs forever, blocking the entire build process. In watch mode, this means the developer's terminal is frozen until they Ctrl+C.\n\nCompare with the equivalent function in platform/cli/src/notify-server.ts line 40 which correctly uses `signal: AbortSignal.timeout(5_000)`.\n\nFix: Add `signal: AbortSignal.timeout(5_000)` to the fetch options:\n```\nconst res = await fetch(`http://localhost:${port}/reload`, {\n  method: 'POST',\n  headers: { Authorization: `Bearer ${secret}` },\n  signal: AbortSignal.timeout(5_000),\n});\n```"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix onNavigate monkey-patch chain breaking on out-of-order teardown",
+      "description": "As a plugin developer, I want the navigation hook teardown to be safe when multiple plugins define onNavigate on the same tab so that tearing down one plugin does not break other plugins' navigation hooks.",
+      "acceptanceCriteria": [
+        "The generated IIFE wrapper for onNavigate uses a safe restoration pattern that does not corrupt other plugins' monkey-patches on teardown",
+        "If history.pushState or history.replaceState was changed by another plugin after the current plugin's patch, the teardown does NOT restore the original (pre-patch) function, which would break the other plugin's hook",
+        "Instead, teardown only restores if the current function reference still matches the plugin's own wrapper",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts\n\nBug: Lines 790-819. When a plugin defines onNavigate, the IIFE wrapper monkey-patches history.pushState and history.replaceState:\n```\nvar origPushState = history.pushState.bind(history);\nvar origReplaceState = history.replaceState.bind(history);\nhistory.pushState = function(...args) { origPushState(...args); onNav(); };\nhistory.replaceState = function(...args) { origReplaceState(...args); onNav(); };\n```\n\nThe teardown (lines 806-819) unconditionally restores the originals:\n```\nhistory.pushState = origPushState;\nhistory.replaceState = origReplaceState;\n```\n\nIf two plugins (A then B) both define onNavigate, the chain is:\n- A patches: origPushState_A = original, history.pushState = A's wrapper\n- B patches: origPushState_B = A's wrapper, history.pushState = B's wrapper\n\nIf A tears down first: history.pushState = origPushState_A (original). This removes B's wrapper entirely — B stops receiving navigation events.\n\nFix: Only restore if the current function is still OUR wrapper. The teardown should check:\n```\nif (history.pushState === ourPushStateWrapper) {\n  history.pushState = origPushState;\n}\nif (history.replaceState === ourReplaceStateWrapper) {\n  history.replaceState = origReplaceState;\n}\n```\n\nThis means the wrapper functions need to be stored in named variables that are accessible in the teardown scope. Adjust the IIFE template accordingly.\n\nThis is the same safe pattern used by browser extensions and userscripts that monkey-patch shared globals."
+    }
+  ]
+}

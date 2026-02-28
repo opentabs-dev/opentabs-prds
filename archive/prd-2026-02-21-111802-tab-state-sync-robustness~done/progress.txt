@@ -1,0 +1,89 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-111802-tab-state-sync-robustness~running.json
+Started: Sat Feb 21 11:18:54 PST 2026
+
+## Codebase Patterns
+- Tab event listeners in background.ts follow a consistent pattern: onUpdated (inject + check), onRemoved (check with removed=true), onReplaced (remove old + inject new + check)
+- The onUpdated status=complete path sequences injection before state check: `injectPluginsIntoTab().then(() => checkTabStateChanges())`
+- checkTabStateChanges(tabId, undefined, true) is the pattern for marking a tab as removed
+- checkTabStateChanges(tabId, { status: 'complete' }) triggers the "page finished loading" path which fetches the tab URL and filters plugins by pattern match
+- Any code path that sends `tab.stateChanged` must update `lastKnownState` cache first (via `updateLastKnownState` or inline `lastKnownState.set`), or deduplication in `checkTabStateChanges` breaks
+- E2E tests using the fixture approach (`test` from `fixtures.js`) get automatic setup/teardown of `mcpServer`, `testServer`, `extensionContext`, `mcpClient` — prefer this over manual setup
+- `setupToolTest` from `helpers.ts` is the standard preamble for fixture-based tests that need a ready plugin tab
+- `expect.poll()` is idiomatic Playwright for polling server endpoints like /health
+---
+
+## 2026-02-21 11:20 - US-001
+- Implemented chrome.tabs.onReplaced listener in background.ts after the existing onRemoved listener
+- The handler: (1) calls checkTabStateChanges for the removed tab with removed=true, (2) fetches the new tab via chrome.tabs.get, (3) injects adapters via injectPluginsIntoTab, (4) calls checkTabStateChanges with status=complete for the new tab
+- Files changed: platform/browser-extension/src/background.ts
+- **Learnings for future iterations:**
+  - chrome.tabs.onReplaced(addedTabId, removedTabId) parameter order: added first, removed second
+  - The removed tab handling and new tab handling run concurrently (removed fires and forgets, new tab awaits injection then check)
+  - All existing imports in background.ts already covered the needed functions (checkTabStateChanges, injectPluginsIntoTab)
+---
+
+## 2026-02-21 11:23 - US-002
+- Exported `updateLastKnownState(pluginName, state)` from `platform/browser-extension/src/tab-state.ts`
+- Called `updateLastKnownState(meta.name, newState.state)` in `handlePluginUpdate` (message-router.ts) after `computePluginTabState` returns and before sending `tab.stateChanged` — matching the cache-then-send pattern used in `checkTabStateChanges` (tab-state.ts:258)
+- Files changed: `platform/browser-extension/src/tab-state.ts`, `platform/browser-extension/src/message-router.ts`
+- **Learnings for future iterations:**
+  - The `lastKnownState` cache in tab-state.ts is the single source of truth for deduplication — any code path that sends `tab.stateChanged` must update this cache first, or subsequent `checkTabStateChanges` calls will produce incorrect suppressions/duplicates
+  - `handlePluginUpdate` is unique in that it sends `tab.stateChanged` directly (bypassing `checkTabStateChanges`), so it must manually sync the cache
+  - No unit test file exists for tab-state.ts — coverage relies on E2E tests
+---
+
+## 2026-02-21 11:27 - US-003
+- Created `e2e/tab-state-sync.e2e.ts` with the navigate-away → closed transition E2E test
+- Test uses Playwright fixtures (`mcpServer`, `testServer`, `extensionContext`, `mcpClient`) for automatic setup/teardown
+- Test flow: opens matching tab → verifies ready → navigates to `https://example.com` → polls /health until closed → verifies tool dispatch returns isError=true
+- Files changed: `e2e/tab-state-sync.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - The Playwright fixture approach (from `fixtures.ts`) is cleaner than manual setup/teardown for tests that follow the standard MCP server + test server + extension + MCP client pattern
+  - `setupToolTest` from `helpers.ts` encapsulates the common preamble (waitForExtensionConnected, open tab, waitForToolResult until ready) — use it instead of manual setup
+  - Navigating to `https://example.com` triggers the navigate-away detection; `chrome://newtab` also works but `example.com` is simpler in Playwright
+  - `expect.poll()` is the idiomatic Playwright pattern for polling server endpoints (vs manual while loops)
+- `openTestAppTab` from helpers.ts opens a second matching tab independently — it waits for adapter injection and returns the page handle
+- After opening additional tabs, call `waitForToolResult` to ensure the adapter is fully ready before proceeding
+---
+
+## 2026-02-21 11:33 - US-004
+- Added multi-tab resilience E2E test to `e2e/tab-state-sync.e2e.ts`
+- Test flow: opens two matching tabs → verifies ready → closes one → verifies still ready → verifies tool dispatch succeeds → closes second → verifies closed
+- Imported `openTestAppTab` and `waitForToolResult` from helpers.ts for the second tab setup
+- Files changed: `e2e/tab-state-sync.e2e.ts`
+- **Learnings for future iterations:**
+  - `openTestAppTab` can be called multiple times to create additional matching tabs — it waits for adapter injection independently
+  - After opening a second tab, call `waitForToolResult` to ensure the adapter is fully ready before proceeding
+  - `expect.poll()` after closing a tab verifies that the extension processes the onRemoved event and recomputes state correctly
+  - The multi-tab state computation in `computePluginTabState` reports 'ready' if ANY matching tab is ready — closing one tab while another remains open keeps the plugin in 'ready' state
+---
+
+## 2026-02-21 11:41 - US-005
+- Added rapid close-and-reopen E2E test to `e2e/tab-state-sync.e2e.ts`
+- Test flow: opens matching tab → verifies ready → closes tab immediately → opens new matching tab (no wait for state to settle) → polls /health until ready → verifies tool dispatch succeeds on new tab → verifies echo content matches
+- The test exercises the pluginLocks serialization in tab-state.ts — the close triggers `checkTabStateChanges` with `removed=true`, and the new tab's `onUpdated status=complete` fires shortly after; both events must be serialized correctly per-plugin
+- Files changed: `e2e/tab-state-sync.e2e.ts`
+- **Learnings for future iterations:**
+  - The rapid close/reopen pattern does NOT need any special handling — the per-plugin lock serialization in tab-state.ts handles the race naturally
+  - `openTestAppTab` can be called immediately after `page.close()` without waiting — the adapter injection and state checks are independent of the previous tab's cleanup
+  - `waitForToolResult` after `expect.poll()` confirms the state is correct provides an extra layer of confidence that tool dispatch is actually working (not just the health endpoint reporting correctly)
+- Server kill/restart tests MUST use manual setup (not fixtures) because the `mcpServer` fixture creates one server for the test's lifetime — you need to control the server lifecycle yourself
+- `startMcpServer(configDir, true, explicitPort)` accepts an explicit port for server restart scenarios — the extension is hardcoded to connect to the original port
+- After killing the server, allow 8s for the extension to detect disconnection (offscreen pong timeout is 5s + reconnect backoff)
+- A new MCP client must be created for the restarted server (old session is gone with the old process)
+---
+
+## 2026-02-21 11:50 - US-006
+- Added server restart reconnect E2E test to `e2e/tab-state-sync.e2e.ts`
+- Test uses manual setup (not fixtures) to control the server lifecycle: start → kill → restart on same port
+- Test flow: starts MCP server + test server + extension → opens matching tab → verifies ready → kills server → waits 8s for disconnection detection → restarts server on same port → waits for extension reconnect + tab.syncAll → verifies ready state → creates new MCP client → verifies tool dispatch works
+- Added imports for manual setup helpers: `startMcpServer`, `startTestServer`, `createMcpClient`, `cleanupTestConfigDir`, `writeTestConfig`, `readPluginToolNames`, `launchExtensionContext`, `E2E_TEST_PLUGIN_DIR`, plus `fs`, `os`, `path`
+- Added helper imports: `waitForExtensionConnected`, `waitForLog`, `setupAdapterSymlink`
+- Files changed: `e2e/tab-state-sync.e2e.ts`
+- **Learnings for future iterations:**
+  - The server kill/restart pattern follows the same approach as `side-panel-data-flow.e2e.ts` (US-003 connection status test, line 31-87), but focuses on tab state rather than UI
+  - `server.kill()` is safe to call multiple times (idempotent) — the `finally` block can call it even if already killed
+  - The extension's offscreen document has automatic reconnect logic that re-finds the server at the same WebSocket URL, and the background script sends `tab.syncAll` on reconnection to re-sync all tab states
+  - `createMcpClient(port, server2.secret)` must use server2's secret because the restarted server may generate a new secret if the config doesn't persist one
+---

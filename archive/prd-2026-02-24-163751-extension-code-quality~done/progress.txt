@@ -1,0 +1,129 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-163751-extension-code-quality~running.json
+Started: Tue Feb 24 16:38:08 PST 2026
+---
+
+## Codebase Patterns
+- The `sanitizeErrorMessage` function from `sanitize-error.ts` is the standard way to sanitize error messages before sending to the MCP server. It strips file paths, IPs, and URLs.
+- In dispatch-helpers.ts, the catch block at line 174 is the reference pattern for sanitization: `sanitizeErrorMessage(msg)`.
+- `sanitizeErrorMessage` is already imported in both dispatch-helpers.ts (line 4) and browser-commands/helpers.ts (line 3).
+- The offscreen document's message handler switch in offscreen/index.ts must cover every InternalMessage type — either as an active handler or in the no-op documentation list at the bottom.
+- Shared constants (DEFAULT_SERVER_PORT, SERVER_PORT_KEY) live in `platform/browser-extension/src/constants.ts`. Side panel components import from `../../constants.js` — esbuild bundles these cross-directory imports correctly.
+- In network-capture.ts, the `requestIdToRequest` Map bridges `responseReceived` and `loadingFinished` CDP events. When the ring buffer shifts, `evictOldestRequest()` cleans up any stale Map entry referencing the evicted request.
+- The extension bundle (background.js, offscreen/index.js) must NEVER contain `import ... from "node:*"` statements. Chrome's service worker cannot resolve Node.js builtins. Use the `stubNodeBuiltins` esbuild plugin (sideEffects: false + external: true) to enable tree-shaking of unused runtime functions from @opentabs-dev/shared.
+
+## 2026-02-24 16:39 - US-001
+- Sanitized adapter error messages at two unsanitized paths in dispatch-helpers.ts:
+  1. Line 151: `firstError ??= { ... message: sanitizeErrorMessage(result.message) }` — sanitize at storage time
+  2. Line 157: `message: sanitizeErrorMessage(result.message)` — sanitize before sending to server
+- Files changed: platform/browser-extension/src/dispatch-helpers.ts
+- **Learnings for future iterations:**
+  - The `sanitizeErrorMessage` import was already present — no new imports needed for sanitization work in this file
+  - The catch block sanitization at line 174 is the established pattern to follow
+  - Both the "immediate send" and "deferred send via firstError" paths need sanitization — easy to miss the deferred path
+---
+
+## 2026-02-24 16:42 - US-002
+- Sanitized error messages in `extractScriptResult` function in browser-commands/helpers.ts
+  - Wrapped `result.error` with `sanitizeErrorMessage()` at line 105 before sending to MCP server
+  - This was the only unsanitized path in this file — `sendErrorResult` already sanitizes via `sanitizeErrorMessage(toErrorMessage(err))`
+- Files changed: platform/browser-extension/src/browser-commands/helpers.ts
+- **Learnings for future iterations:**
+  - The test file mocks `sanitizeErrorMessage` as identity function `(msg) => msg`, so existing test assertions remain valid after adding sanitization
+  - All error strings from MAIN-world script execution (`chrome.scripting.executeScript`) are trust boundary crossings and must be sanitized
+---
+
+## 2026-02-24 16:45 - US-003
+- Added missing `case 'sp:confirmationTimeout':` to the offscreen document's no-op case list in offscreen/index.ts
+- Verified against the full InternalMessage union in extension-messages.ts — `sp:confirmationTimeout` was the only missing type
+- All other InternalMessage types are either handled actively (ws:send, ws:getState, ws:setUrl, offscreen:getLogs, bg:forceReconnect, port-changed) or already in the no-op list
+- Files changed: platform/browser-extension/src/offscreen/index.ts
+- **Learnings for future iterations:**
+  - The InternalMessage union in extension-messages.ts is the source of truth for all message types in the extension
+  - When adding a new message type to the union, update the offscreen switch statement (either as an active handler or in the no-op documentation list)
+  - The no-op case list serves as documentation — it explicitly lists all message types the offscreen document receives but does not process
+---
+
+## 2026-02-24 16:49 - US-004
+- Eliminated duplicate port constants by removing `DEFAULT_PORT` and `PORT_STORAGE_KEY` from `side-panel/constants.ts`
+- Updated `Footer.tsx` and `EmptyStates.tsx` to import `DEFAULT_SERVER_PORT` and `SERVER_PORT_KEY` from the shared `../../constants.js` module
+- Side-panel-specific constants (`ERROR_DISPLAY_DURATION_MS`, `COUNTDOWN_POLL_INTERVAL_MS`) remain in `side-panel/constants.ts`
+- Files changed:
+  - platform/browser-extension/src/side-panel/constants.ts (removed duplicate definitions)
+  - platform/browser-extension/src/side-panel/components/Footer.tsx (updated imports and references)
+  - platform/browser-extension/src/side-panel/components/EmptyStates.tsx (updated imports and references)
+- **Learnings for future iterations:**
+  - The side panel esbuild bundle handles cross-directory imports (e.g., `../../constants.js`) correctly since everything is bundled together
+  - When `bun run type-check` fails with TS6310 errors about "may not disable emit", run `bun run clean && bun run build` first — stale `.tsbuildinfo` files from a previous `tsc --build` can conflict with `--noEmit`
+  - The side-panel components use `replace_all` rename-safe edits when changing constant names across a file
+---
+
+## 2026-02-24 16:55 - US-005
+- Added `evictOldestRequest` helper to clean up stale `requestIdToRequest` Map entries when the ring buffer evicts the oldest request via `shift()`
+- Applied the helper at all three shift sites: `Network.responseReceived`, `Network.loadingFailed`, and `Network.webSocketCreated`
+- The helper iterates the Map to find and delete entries referencing the shifted object — O(n) on Map size but the Map is small (bounded by in-flight requests between responseReceived and loadingFinished)
+- Files changed: platform/browser-extension/src/network-capture.ts
+- **Learnings for future iterations:**
+  - The `requestIdToRequest` Map in network-capture.ts bridges `responseReceived` and `loadingFinished` events — entries are added in responseReceived and removed in loadingFinished to attach response bodies. Entries can become stale if loadingFinished never fires.
+  - All three shift sites (responseReceived, loadingFailed, webSocketCreated) can evict requests that were added by responseReceived, so all three need cleanup — not just the responseReceived shift site
+  - A helper function (`evictOldestRequest`) avoids duplicating the cleanup logic across three locations
+---
+
+## 2026-02-24 17:00 - US-006
+- Fixed ws:setUrl handler in offscreen/index.ts to return `{ ok: false, reason: '...' }` for rejected URLs instead of misleading `{ ok: true }`
+- Updated four rejection paths:
+  1. Invalid protocol → `{ ok: false, reason: 'Invalid WebSocket protocol' }`
+  2. Malformed URL → `{ ok: false, reason: 'Invalid URL format' }`
+  3. Origin mismatch from ws-info → `{ ok: false, reason: 'WebSocket URL origin mismatch' }`
+  4. Final origin validation fail → `{ ok: false, reason: 'WebSocket URL origin mismatch' }`
+- Success path continues to return `{ ok: true }`
+- Files changed: platform/browser-extension/src/offscreen/index.ts
+- **Learnings for future iterations:**
+  - The current caller in background.ts (line 143) uses fire-and-forget `.catch(() => {})`, so no caller-side changes needed
+  - The `sendResponse` in Chrome extension messages is untyped — callers need to know the response shape by convention
+  - The ws:setUrl handler is async (returns `true` to keep the channel open) — all `sendResponse` calls are inside the async IIFE
+---
+
+## 2026-02-24 17:20 - US-007 (BLOCKED — not committed)
+- Implementation complete: Fixed `--radius` documentation in `platform/browser-extension/CLAUDE.md` to match actual CSS value
+  - Line 36: Changed `--radius: 0.5rem` to `--radius: 0` in prose description
+  - Line 45: Changed table row from `0.5rem` to `0`
+  - Verified all other theme tokens in the table match actual CSS values in styles.css
+- Phase 1 (build, type-check, lint, knip, test) passes cleanly
+- **BLOCKER: Phase 2 E2E tests fail with pre-existing `extensionConnected: false`**
+  - All 48 E2E failures are `waitForHealth timed out after 45000ms` — Chrome extension never connects to MCP server
+  - Identical failures occur with the change stashed (verified by `git stash` + running the same test)
+  - This is a systemic worktree environment issue, not caused by this documentation-only change
+  - The change modifies only CLAUDE.md (no source code, no runtime behavior)
+  - Per ralph rules: cannot commit with failing E2E when `e2eCheckpoint: true`
+- Files changed (uncommitted): platform/browser-extension/CLAUDE.md
+- **Learnings for future iterations:**
+  - E2E tests fail system-wide (not just this worktree) — confirmed by running the same test on the main repo, which also fails identically
+  - Root cause: Chrome 145 (Playwright 1.58.2, chromium-1208) appears to have a regression with MV3 module service workers that import `node:*` builtins as externals
+  - The `dist/background.js` bundle has `import ... from "node:child_process"` etc. at the top level (esbuild `external: ['node:*']` leaves them as-is). Chrome 145 may reject module loading for unresolvable specifiers
+  - Both the worktree AND main repo `dist/background.js` contain identical `node:*` imports — this is by design (shared runtime layer externals), but Chrome 145 may not tolerate it
+  - This affects ALL tests requiring extension connectivity: browser-tools.e2e.ts, analyze-site.e2e.ts, audit-logging.e2e.ts (48 failures)
+  - Only tests that don't require extension connection (7 out of 357) pass
+  - This is NOT fixable within a documentation story — requires investigation into the Playwright/Chrome version or the esbuild external strategy
+---
+
+## 2026-02-25 02:15 - US-007
+- Fixed `--radius` documentation in `platform/browser-extension/CLAUDE.md` to match actual CSS value (`0` not `0.5rem`)
+  - Line 36: Prose description updated from `--radius: 0.5rem` to `--radius: 0`
+  - Line 45: Theme table row updated from `0.5rem` to `0`
+  - Verified all other theme tokens in the table match the actual CSS values in styles.css
+- Fixed pre-existing E2E blocker: `node:*` imports in extension bundle preventing Chrome service worker from loading
+  - Root cause: `external: ['node:*']` in esbuild config left bare `import ... from "node:child_process"` etc. in the output bundle
+  - Chrome's service worker cannot resolve Node.js builtins, so the background script never initialized and the extension never connected
+  - Fix: Replaced `external: ['node:*']` with an esbuild plugin (`stubNodeBuiltins`) that uses `onResolve` with `{ external: true, sideEffects: false }`. This tells esbuild the modules are external but have no side effects, enabling tree-shaking of the unused runtime functions from `@opentabs-dev/shared`
+  - Result: `dist/background.js` and `dist/offscreen/index.js` no longer contain any `node:*` import statements
+  - E2E tests now pass: 356 passed, 1 flaky (passed on retry)
+- Files changed:
+  - platform/browser-extension/CLAUDE.md (documentation fix)
+  - platform/browser-extension/build-extension.ts (esbuild plugin fix)
+- **Learnings for future iterations:**
+  - The `@opentabs-dev/shared` barrel export re-exports `runtime.js` which has top-level `node:*` imports. Any bundler targeting the browser MUST handle these imports — either stub them or tree-shake them away
+  - esbuild's `sideEffects: false` on `onResolve` is the key to enabling tree-shaking of external modules. Without it, esbuild assumes the import statements may have side effects and keeps them
+  - The previous iteration's diagnosis was correct (node:* imports) but the attempted fix was to give up. The correct approach was to fix the esbuild config — a 15-line plugin
+  - Always verify extension bundles don't contain `node:*` imports: `grep 'from "node:' dist/background.js` should return nothing
+---

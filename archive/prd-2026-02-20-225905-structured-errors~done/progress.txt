@@ -1,0 +1,136 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-225905-structured-errors~running.json
+Started: Sat Feb 21 01:56:51 PST 2026
+---
+
+## Codebase Patterns
+- ToolError is defined in `platform/plugin-sdk/src/errors.ts` and re-exported from `index.ts`
+- Type exports use `export type { ... }` from index.ts (separate from value exports)
+- Unit tests for plugin-sdk are in `platform/plugin-sdk/src/index.test.ts`
+- All quality checks must pass: build, type-check, lint, knip, test (937 tests across 38 files)
+- E2E test plugin uses `file:../../platform/plugin-sdk` to reference local SDK before publishing; switch back to `^x.x.x` after publishing
+- Publishing uses `./scripts/publish.sh <version>` which bumps all 4 platform packages in lockstep
+- After publishing, verify npm propagation with `npm info @opentabs-dev/plugin-sdk@<version> version`
+- Plugin dependencies to update: `@opentabs-dev/plugin-sdk` (dependencies) and `@opentabs-dev/plugin-tools` (devDependencies)
+- `readPluginToolNames()` in fixtures.ts reads from dist/tools.json dynamically — new tools are auto-discovered
+- `ToolError(msg, code)` without opts still sets `retryable: false` (default), so it produces structured output (not legacy `[CODE]` format)
+- E2E error tools follow the pattern: one tool per error category, each throws a factory method, zero input/output schemas
+- Dispatch chain: tool-dispatch.ts (extension) → extension-protocol.ts (MCP server) → mcp-setup.ts (MCP server)
+- ToolError fields survive chrome.scripting.executeScript serialization boundary as plain object properties
+- `DispatchError.data` is `Record<string, unknown>` — already flexible enough for structured fields
+- `formatStructuredError` helper in mcp-setup.ts handles both legacy and structured error formats
+- Use `String(booleanVar)` in template literals to satisfy `@typescript-eslint/restrict-template-expressions`
+- Avoid `!` non-null assertions in tests — use `as RegExpMatchArray` type assertion after truthy expect instead
+
+---
+
+## 2026-02-21 09:58 - US-001
+- Extended ToolError with optional `opts` parameter: `{ retryable?: boolean; retryAfterMs?: number; category?: ErrorCategory }`
+- Added `ErrorCategory` type and `ToolErrorOptions` interface to `errors.ts`
+- Exported `ErrorCategory` and `ToolErrorOptions` types from `index.ts`
+- `retryable` defaults to `false`, `retryAfterMs` and `category` default to `undefined`
+- Files changed:
+  - `platform/plugin-sdk/src/errors.ts` — added fields, opts parameter, types
+  - `platform/plugin-sdk/src/index.ts` — added type re-exports
+  - `platform/plugin-sdk/src/index.test.ts` — added 7 new tests for opts, defaults, categories, all-fields
+- **Learnings for future iterations:**
+  - Existing ToolError tests in `index.test.ts` are minimal (2 tests) — new tests verify backward compat by checking defaults
+  - The `readonly` fields on ToolError are enforced at compile-time by TypeScript; runtime tests just verify values are set
+  - All 6 `ErrorCategory` values should be tested in a loop for completeness
+---
+
+## 2026-02-21 10:04 - US-002
+- Propagated structured error fields (retryable, retryAfterMs, category) through the full dispatch chain
+- Three layers updated:
+  1. **tool-dispatch.ts** (browser extension): Catch block now extracts retryable, retryAfterMs, category from ToolError and includes them in the data object. Only includes fields that are actually present (type-checked).
+  2. **mcp-setup.ts** (MCP server): Added `formatStructuredError` helper. When structured fields are present, formats as `[ERROR code=X category=Y retryable=Z retryAfterMs=N] message` with a machine-readable JSON block. When only code is present (legacy), keeps backward-compatible `[CODE] message` format.
+  3. **extension-protocol.ts** (MCP server): No changes needed — `DispatchError.data` is already `Record<string, unknown>`, flexible enough for the new fields.
+- Updated `ToolResult` type in tool-dispatch.ts to include optional structured fields in `data`
+- Files changed:
+  - `platform/browser-extension/src/tool-dispatch.ts` — extended catch block and ToolResult type
+  - `platform/mcp-server/src/mcp-setup.ts` — added formatStructuredError helper, updated error formatting
+  - `platform/mcp-server/src/extension-protocol.test.ts` — 2 new tests for structured error data propagation
+  - `platform/mcp-server/src/mcp-setup-dispatch.test.ts` — 4 new tests: full structured fields, partial fields, retryable-only, legacy code-only format
+- **Learnings for future iterations:**
+  - `DispatchError.data` is already `Record<string, unknown>` so no type changes needed in extension-protocol.ts
+  - The `firstError` type in handleToolDispatch must also be updated to carry the structured data fields
+  - In tests, avoid `!` non-null assertions — use `as RegExpMatchArray` after a truthy assertion instead
+  - `@typescript-eslint/restrict-template-expressions` forbids booleans in template literals — use `String()` wrapper
+---
+
+## 2026-02-21 10:07 - US-003
+- Added six static factory methods to ToolError class in `errors.ts`
+- Factory methods: `auth()`, `notFound()`, `rateLimited()`, `validation()`, `timeout()`, `internal()`
+- `notFound()` accepts optional custom code (e.g., `'CHANNEL_NOT_FOUND'`), defaults to `'NOT_FOUND'`
+- `rateLimited()` accepts optional `retryAfterMs` parameter
+- `rateLimited()` and `timeout()` set `retryable: true`; all others set `retryable: false`
+- Files changed:
+  - `platform/plugin-sdk/src/errors.ts` — added 6 static factory methods
+  - `platform/plugin-sdk/src/index.test.ts` — added 8 new tests in a `factory methods` describe block
+- All 937 tests pass, 0 failures
+- **Learnings for future iterations:**
+  - Factory methods are straightforward one-liners that delegate to the constructor — no need for complex logic
+  - Tests should verify all 5 fields (message, code, category, retryable, retryAfterMs) for each factory to ensure full coverage
+  - The `notFound` factory's optional code parameter tests both the default and custom code paths
+---
+
+## 2026-02-21 10:45 - US-004
+- Added 6 error category tools to e2e-test plugin: `error_auth`, `error_rate_limited`, `error_not_found`, `error_validation`, `error_timeout`, `error_internal`
+- Each tool throws the corresponding `ToolError` factory method with realistic error messages
+- Updated `plugins/e2e-test/package.json` to use `file:../../platform/plugin-sdk` (local SDK with factory methods)
+- Created `e2e/structured-errors.e2e.ts` with 7 E2E tests covering full dispatch chain
+- Tests verify: human-readable prefix (`[ERROR code=X category=Y retryable=Z]`), machine-readable JSON block, all field values
+- Tests cover all 6 error categories plus the default `ToolError(msg, code)` behavior
+- Files changed:
+  - `plugins/e2e-test/src/tools/error-auth.ts` — new tool throwing ToolError.auth()
+  - `plugins/e2e-test/src/tools/error-rate-limited.ts` — new tool throwing ToolError.rateLimited(msg, 5000)
+  - `plugins/e2e-test/src/tools/error-not-found.ts` — new tool throwing ToolError.notFound()
+  - `plugins/e2e-test/src/tools/error-validation.ts` — new tool throwing ToolError.validation()
+  - `plugins/e2e-test/src/tools/error-timeout.ts` — new tool throwing ToolError.timeout()
+  - `plugins/e2e-test/src/tools/error-internal.ts` — new tool throwing ToolError.internal()
+  - `plugins/e2e-test/src/index.ts` — registered 6 new error tools
+  - `plugins/e2e-test/package.json` — changed plugin-sdk dependency to file: reference
+  - `plugins/e2e-test/bun.lock` — updated lockfile
+  - `e2e/structured-errors.e2e.ts` — 7 new E2E tests
+- All 255 E2E tests pass, all 937 unit tests pass
+- **Learnings for future iterations:**
+  - The e2e-test plugin uses the published SDK by default; for local SDK features not yet published, use `file:../../platform/plugin-sdk`
+  - `ToolError(msg, code)` without opts STILL produces structured output because `retryable` defaults to `false` (a boolean), which the extension serializes — the "legacy" `[CODE]` format only occurs for errors from OLD SDK versions that lack the `retryable` field entirely
+  - `parseErrorJson()` regex pattern for extracting JSON block: `/```json\n(.+?)\n```/s` (dotall flag needed for multiline JSON)
+  - E2E test pattern for error tools: call tool, assert `isError`, assert string contains in human-readable prefix, parse and assert JSON block
+---
+
+## 2026-02-21 10:55 - US-005
+- Published all 4 platform packages at v0.0.14: shared, plugin-sdk, plugin-tools, cli
+- Used `./scripts/publish.sh 0.0.14` which handles version bumping and dependency order
+- Verified npm propagation with `npm info @opentabs-dev/plugin-sdk@0.0.14 version`
+- Updated both plugins (slack, e2e-test) to depend on `^0.0.14` for plugin-sdk and plugin-tools
+- Switched e2e-test plugin from `file:../../platform/plugin-sdk` back to `^0.0.14` (published version)
+- Rebuilt both plugins successfully (`bun install && bun run build`)
+- Files changed:
+  - `platform/shared/package.json` — version bumped to 0.0.14
+  - `platform/plugin-sdk/package.json` — version bumped to 0.0.14
+  - `platform/plugin-tools/package.json` — version bumped to 0.0.14
+  - `platform/cli/package.json` — version bumped to 0.0.14
+  - `plugins/slack/package.json` — updated @opentabs-dev deps to ^0.0.14
+  - `plugins/e2e-test/package.json` — switched from file: to ^0.0.14
+  - `plugins/e2e-test/bun.lock` — updated lockfile
+- All quality checks pass: build, type-check, lint, knip, test (937 unit tests), test:e2e (254 E2E tests)
+- **Learnings for future iterations:**
+  - The publish script bumps ALL 4 packages in lockstep even if only one changed — this keeps versions aligned
+  - Plugin `file:` references must be switched back to `^x.x.x` after publishing to avoid development artifacts leaking into the repo
+  - npm propagation is fast (< 30 seconds) — `npm info` can verify immediately after publish
+  - The publish script also updates cross-references between platform packages (shared → plugin-sdk → plugin-tools → cli)
+---
+
+## 2026-02-21 11:00 - US-006
+- Added "Structured errors" paragraph to CLAUDE.md under the "Key Concepts" section, between "Plugin logging" and "SDK utilities"
+- Documents: ToolError constructor with opts, ErrorCategory type, all 6 factory methods, dispatch chain propagation, MCP error response format (human-readable prefix + JSON block)
+- Kept documentation concise (single paragraph), plugin-agnostic, and pattern-focused per CLAUDE.md guidelines
+- Files changed:
+  - `CLAUDE.md` — added structured errors key concept paragraph
+- All quality checks pass: build, type-check, lint, knip, test (937 tests)
+- **Learnings for future iterations:**
+  - CLAUDE.md documentation additions should be placed logically within existing sections, not appended at the end
+  - Keep key concept descriptions to a single paragraph — the code and tests are the real reference
+---

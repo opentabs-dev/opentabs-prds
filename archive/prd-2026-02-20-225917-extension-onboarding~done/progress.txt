@@ -1,0 +1,91 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-225917-extension-onboarding~running.json
+Started: Sat Feb 21 06:04:45 PST 2026
+---
+
+## Codebase Patterns
+- Side panel components use the `Empty` composite component from `retro/Empty.tsx` with subcomponents: `Empty.Content`, `Empty.Title`, `Empty.Separator`, `Empty.Description`
+- Design system: Tailwind CSS 4 with CSS custom properties (`--primary`, `--muted`, `--foreground`, etc.) defined in `styles.css`
+- Fonts: `font-head` (Archivo Black) for headings via `Text` component, `font-sans` (Space Grotesk) for body, `font-mono` (Space Mono) for code
+- Flat shadows: `shadow-md` (4px 4px 0 0) with no blur — consistent RetroUI pattern
+- Icons from `lucide-react` — CheckCircle2, Circle, Ghost, ChevronDown, etc.
+- Import ordering is enforced by eslint `import-x/order` — keep alphabetical within groups
+- Side panel state machine in App.tsx: loading → disconnected / onboarding (first-time) / returning-user empty / plugin list, driven by `connected` + `plugins.length` + `hasEverHadPlugins`
+- E2E tests for side panel use `openSidePanel(context)` (from helpers.ts) to navigate to `chrome-extension://<id>/side-panel/side-panel.html`
+- For 0-plugin side panel tests, create a config with `{ localPlugins: [], tools: {} }` and use non-fixture `startMcpServer`/`launchExtensionContext` for full control
+- Fresh extension chrome.storage.local is empty → `hasEverHadPlugins === false` → shows OnboardingState ("Welcome to OpenTabs"), NOT ReturningUserEmptyState ("No Plugins Installed")
+- After the onboarding UI changes (US-001/US-002), any existing test that checks `text=No Plugins` on a fresh 0-plugin extension is broken — must use `text=Welcome to OpenTabs` instead
+- `hasEverHadPlugins` flag is persisted in `chrome.storage.local` and read asynchronously on mount (starts as `null` → shows LoadingState until resolved, preventing flicker)
+- When `loadPlugins()` receives plugins with count > 0, it sets `hasEverHadPlugins = true` in both React state and chrome.storage.local
+- The `Empty` component in EmptyStates.tsx was the old generic empty state — removed since OnboardingState replaces it for US-001
+- `ReturningUserEmptyState` component shows "No Plugins Installed" heading with install instructions (no welcome text or checklist)
+
+## 2026-02-21 — US-001
+- Created `OnboardingState` component in `platform/browser-extension/src/side-panel/components/OnboardingState.tsx`
+- Component shows: "Welcome to OpenTabs" heading, 1-sentence explanation, setup checklist (MCP server running + plugins installed), install command, and search suggestion
+- Checklist uses `CheckCircle2` (yellow/primary) for completed items and `Circle` (muted) for incomplete items
+- Wired into `App.tsx` replacing the old `EmptyState` for the 0-plugins case
+- Removed the now-unused `EmptyState` component from `EmptyStates.tsx`
+- Files changed: `App.tsx`, `EmptyStates.tsx`, new `OnboardingState.tsx`
+- **Learnings for future iterations:**
+  - The `Empty` composite component is the go-to container for state views — use `Empty.Title`, `Empty.Separator`, `Empty.Description` for consistency
+  - Prettier enforces that short `<code>` blocks keep content on one line (not multi-line)
+  - Import ordering must be alphabetical within import groups (eslint `import-x/order`)
+  - The old `EmptyState` was removed since it's no longer used — US-003 will need to create a returning-user empty state (can reuse the `Empty` composite pattern)
+---
+
+## 2026-02-21 — US-002
+- Added `hasEverHadPlugins` state to `App.tsx` — tri-state: `null` (loading from storage), `false` (first-time user), `true` (returning user)
+- Reads `hasEverHadPlugins` from `chrome.storage.local` on mount; `null` shows `LoadingState` to prevent flicker
+- When `loadPlugins()` resolves with `plugins.length > 0`, sets `hasEverHadPlugins = true` in both React state and `chrome.storage.local`
+- Created `ReturningUserEmptyState` component — shows "No Plugins Installed" heading with install/search instructions (no welcome text or checklist)
+- Updated App.tsx state machine: `loading || hasEverHadPlugins === null` → LoadingState, `!connected` → DisconnectedState, `!hasContent && hasEverHadPlugins` → ReturningUserEmptyState, `!hasContent && !hasEverHadPlugins` → OnboardingState, else → PluginList
+- Added `hasEverHadPlugins` to the `sp:getState` response for E2E testability
+- Files changed: `App.tsx`, new `ReturningUserEmptyState.tsx`
+- **Learnings for future iterations:**
+  - `chrome.storage.local.get/set` return Promises that must be marked with `void` to satisfy `@typescript-eslint/no-floating-promises`
+  - When adding a new import between existing imports, ensure no blank line is introduced — the `import-x/order` rule treats blank lines as group separators
+  - The tri-state `null | false | true` pattern is effective for async-initialized flags: `null` means "still loading", which maps cleanly to a loading UI state and prevents flicker
+  - US-003 acceptance criteria are now fully satisfied by this implementation (chrome.storage persistence, hasEverHadPlugins flag, returning-user empty state) — future iteration just needs to mark US-003 as passing
+---
+
+## 2026-02-21 — US-003
+- No code changes needed — all acceptance criteria were already satisfied by the US-002 implementation
+- Verified each criterion against existing code:
+  - `chrome.storage.local` persists `hasEverHadPlugins` flag (App.tsx:64, 78)
+  - Flag set to `true` when plugin count goes from 0 to >0 (App.tsx:62-64)
+  - `ReturningUserEmptyState` shown when `hasEverHadPlugins && !hasContent` (App.tsx:247-249)
+  - "No Plugins Installed" heading with install instruction (ReturningUserEmptyState.tsx)
+  - No welcome text or setup checklist in returning-user state
+  - `chrome.storage.local` survives service worker restarts
+- All quality checks pass: build, type-check, lint, knip, test (1026 tests, 0 failures)
+- **Learnings for future iterations:**
+  - When user stories overlap in scope, a later story may already be fully implemented by an earlier one — verify criteria against existing code before writing new code
+---
+
+## 2026-02-21 — US-004
+- Created `e2e/onboarding.e2e.ts` with three tests covering the onboarding state machine:
+  1. Fresh extension with 0 plugins shows onboarding view with welcome heading, checklist, description, install command, and search suggestion
+  2. Adding a plugin (via config.json modification) transitions side panel from onboarding to plugin list
+  3. Disconnected state shows "Cannot Reach MCP Server" when server stops (not onboarding)
+- Fixed `e2e/side-panel-live-update.e2e.ts` — the "add plugin" test was broken by US-001/US-002 changes: it expected `text=No Plugins` but a fresh extension now shows `text=Welcome to OpenTabs` (OnboardingState, not ReturningUserEmptyState)
+- Files changed: new `e2e/onboarding.e2e.ts`, modified `e2e/side-panel-live-update.e2e.ts`
+- All quality checks pass: build, type-check, lint, knip, test (1026 tests, 0 failures), test:e2e (278 tests, 0 failures)
+- **Learnings for future iterations:**
+  - When UI components change (e.g., onboarding replaces empty state), existing E2E tests that match on the old UI text will break — always check for and fix these regressions
+  - Non-fixture side panel tests use `startMcpServer(configDir, true)` + `launchExtensionContext(server.port)` + `setupAdapterSymlink()` pattern for full control over config
+  - `openSidePanel(context)` navigates to the extension's side panel HTML as a regular page — works in headless Chromium
+  - Playwright `text=` locator does substring matching — be specific enough to avoid false positives between "No Plugins Installed" and "Plugins installed" checklist item
+---
+
+## 2026-02-21 — US-005
+- Added "Side panel empty states" paragraph to CLAUDE.md Key Concepts section, after the "Tab state machine" entry
+- Documents the three 0-plugin states: onboarding (first-time), returning-user empty, disconnected
+- Mentions `hasEverHadPlugins` flag persisted in `chrome.storage.local`
+- Kept high-level per CLAUDE.md guidelines: architecture/patterns only, no component names, no plugin names
+- Files changed: `CLAUDE.md`
+- All quality checks pass: build, type-check, lint, knip, test (1026 tests, 0 failures)
+- **Learnings for future iterations:**
+  - CLAUDE.md Key Concepts section is the right place for state machine documentation — it already has "Tab state machine" as precedent
+  - Keep CLAUDE.md additions plugin-agnostic per the "Keeping CLAUDE.md Up to Date" guidelines at the bottom of the file
+---

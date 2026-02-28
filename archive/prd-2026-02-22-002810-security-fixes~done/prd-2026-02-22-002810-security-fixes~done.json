@@ -1,0 +1,66 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix verified security vulnerabilities found during security audit: connection token leak, SVG XSS via dangerouslySetInnerHTML, and missing SVG sanitization at load time. All fixes are high-reward with zero UX impact.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Remove connectionToken from /health endpoint response",
+      "description": "As a platform operator, I want the connectionToken to never be exposed in API responses so that attackers who obtain the wsSecret cannot also obtain the connectionToken to perform a full extension WebSocket takeover.",
+      "acceptanceCriteria": [
+        "The /health endpoint JSON response does NOT contain a connectionToken field",
+        "The connectionToken is still generated on extension connect (line 543 of http-routes.ts) and sent via sync.full over the WebSocket — this must NOT change",
+        "The connectionToken is still required on subsequent WebSocket upgrades when a live extension is connected — this must NOT change",
+        "Existing tests in platform/mcp-server/src/http-routes.test.ts are updated to verify connectionToken is absent from /health response",
+        "opentabs status CLI command still works (it reads /health but should not depend on connectionToken)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/http-routes.ts, line 333. Currently `connectionToken: state.connectionToken` is included in the authenticated /health response. This is a security flaw: an attacker who has the wsSecret (from config.json or auth.json) can call GET /health to obtain the connectionToken, then use both to replace the legitimate extension's WebSocket connection via the /ws upgrade path (which requires both secret + token). The connectionToken exists specifically to prevent this takeover scenario — it should only be transmitted via the WebSocket sync.full message to the already-authenticated extension. Fix: simply remove the `connectionToken: state.connectionToken` line from the /health response object. Check platform/cli/src/commands/status.ts to ensure the CLI doesn't use this field. Check platform/mcp-server/src/http-routes.test.ts for any tests that assert on connectionToken in health response — update those tests."
+    },
+    {
+      "id": "US-002",
+      "title": "Sanitize plugin SVG icons to prevent XSS via dangerouslySetInnerHTML",
+      "description": "As a user with the side panel open, I want plugin SVG icons to be sanitized before rendering so that a malicious npm plugin cannot execute arbitrary JavaScript in my extension context.",
+      "acceptanceCriteria": [
+        "SVG strings are sanitized before being passed to dangerouslySetInnerHTML in PluginIcon.tsx",
+        "Sanitization strips <script>, <foreignObject>, <use> with external href, event handler attributes (onclick, onload, onerror, etc.), javascript: URIs, and data: URIs in href/xlink:href attributes",
+        "Valid SVG icons (paths, circles, rects, gradients, transforms) render correctly after sanitization",
+        "The sanitization function is a new utility in the browser-extension that runs at render time, NOT at build time",
+        "SVG icons from the test fixtures and storybook stories still render correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/components/PluginIcon.tsx, line 51. The component uses `dangerouslySetInnerHTML={{ __html: svgToRender }}` where svgToRender comes from plugin metadata (iconSvg field in tools.json). The build-time validation in platform/plugin-tools/src/validate-icon.ts checks for <script> and <image> tags and event handlers, BUT: (1) npm-installed plugins can ship pre-built tools.json that bypasses build-time validation entirely, (2) the validator doesn't check for <foreignObject> (which can embed arbitrary HTML), <use> with javascript: or data: URIs, or CSS-based attacks. Fix: Create a sanitizeSvg() function in the browser-extension that uses an allowlist approach — only permit known-safe SVG elements (svg, path, circle, rect, ellipse, line, polyline, polygon, g, defs, clipPath, mask, linearGradient, radialGradient, stop, text, tspan, use with relative refs only) and known-safe attributes (viewBox, d, cx, cy, r, rx, ry, x, y, width, height, fill, stroke, stroke-width, transform, etc.). Use DOMParser to parse the SVG and walk the tree, stripping anything not on the allowlist. Apply this in PluginIcon.tsx before dangerouslySetInnerHTML. Do NOT add any npm dependencies — use browser-native DOMParser. The sanitization runs in the side panel context (has DOM access). Also sanitize iconInactiveSvg through the same path."
+    },
+    {
+      "id": "US-003",
+      "title": "Remove wsSecret echo from /ws-info endpoint response",
+      "description": "As a platform operator, I want the /ws-info endpoint to not echo back the wsSecret so that the secret is not unnecessarily exposed in HTTP response bodies where it could be logged or cached.",
+      "acceptanceCriteria": [
+        "The /ws-info endpoint JSON response does NOT contain a wsSecret field",
+        "The /ws-info endpoint still returns the wsUrl field (ws://host:port/ws)",
+        "The Chrome extension's offscreen document still successfully connects to the WebSocket — it reads the secret from auth.json, not from /ws-info",
+        "Existing tests in platform/mcp-server/src/http-routes.test.ts are updated to verify wsSecret is absent from /ws-info response",
+        "The extension's offscreen/index.ts connection flow still works end-to-end",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/http-routes.ts, line 284. Currently: `...(state.wsSecret ? { wsSecret: state.wsSecret } : {})`. The /ws-info endpoint requires Bearer auth (using the same secret), so the caller already has the secret. Echoing it back in the response body creates unnecessary exposure — HTTP responses can be logged by proxies, cached by middleware, or intercepted. The extension reads the secret from ~/.opentabs/auth.json (via platform/browser-extension/src/offscreen/index.ts readAuthJson function) and passes it in the Sec-WebSocket-Protocol header. It does NOT rely on /ws-info returning the secret. Fix: remove the wsSecret spread from the /ws-info response. Verify by checking platform/browser-extension/src/offscreen/index.ts — look for how the extension uses the /ws-info response. It should only use wsUrl, not wsSecret. Update tests in http-routes.test.ts that check for wsSecret in /ws-info responses."
+    }
+  ]
+}

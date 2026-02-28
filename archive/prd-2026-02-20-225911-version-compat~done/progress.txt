@@ -1,0 +1,107 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-225911-version-compat~running.json
+Started: Sat Feb 21 05:02:12 PST 2026
+---
+
+## Codebase Patterns
+- The `PluginManifestOutput` interface in `platform/plugin-tools/src/commands/build.ts` defines the shape of `dist/tools.json` — add new fields there and in the shared `PluginManifest` type in `platform/shared/src/index.ts`
+- Plugin dist files (`plugins/*/dist/`) are gitignored and not part of the monorepo build — they must be updated separately
+- The build-e2e tests in `platform/plugin-tools/src/commands/build-e2e.test.ts` run the local compiled build command (not the published npm version), so they exercise unreleased changes
+- The `resolveSdkVersion()` function reads from `node_modules/@opentabs-dev/plugin-sdk/package.json` relative to the plugin project directory
+- `generateManifest()` takes an `sdkVersion` parameter and places it as the first field in tools.json
+- The server's SDK version is resolved from `platform/plugin-sdk/package.json` (relative path from mcp-server), following the same `import.meta.url` + dirname pattern used by `version.ts`
+- `LoadedPlugin` and `RegisteredPlugin` both carry `sdkVersion?: string` — flows through from loader → registry unchanged
+- `checkSdkCompatibility()` is a pure function (no side effects) — easy to unit test with arbitrary version pairs
+- For 0.x versions (e.g., 0.0.16), major=0 and minor=0 — the patch version is NOT compared, so all 0.0.x plugins are mutually compatible
+- The `/health` endpoint returns `sdkVersion` at top level (server's version) and per plugin in `pluginDetails[]` (null if missing)
+- `config.getState` includes `sdkVersion` per plugin via `ConfigStatePlugin` type (optional field, spread conditionally)
+- Side panel `PluginCard` uses `Tooltip.Provider`/`Tooltip` from the retro Tooltip component — must be self-contained (Provider inside the trigger area)
+- E2E types in `e2e/fixtures.ts` (HealthResponse, PluginDetail) must be kept in sync with actual `/health` endpoint response structure
+- Tests needing custom plugin configs use `copyE2eTestPlugin()` + standalone `startMcpServer()` (not fixtures) for isolation
+
+## 2026-02-21 13:10 - US-001
+- Implemented SDK version resolution in `opentabs-plugin build` via `resolveSdkVersion()` function
+- Added `sdkVersion` as a top-level field in `PluginManifestOutput` and the generated `dist/tools.json`
+- Added `sdkVersion` optional field to the shared `PluginManifest` type for downstream consumers (MCP server loader)
+- Updated unit tests: `generateManifest()` now requires a second `sdkVersion` parameter
+- Updated build-e2e tests to verify `sdkVersion` is present and is a valid semver string
+- Updated e2e-test and slack plugin `dist/tools.json` with sdkVersion: "0.0.16"
+- Files changed:
+  - `platform/plugin-tools/src/commands/build.ts` — added `resolveSdkVersion()`, updated `PluginManifestOutput`, `generateManifest()`, `runBuild()`
+  - `platform/plugin-tools/src/commands/build.test.ts` — updated `generateManifest` tests for new signature
+  - `platform/plugin-tools/src/commands/build-e2e.test.ts` — added sdkVersion verification
+  - `platform/shared/src/index.ts` — added optional `sdkVersion` field to `PluginManifest`
+- **Learnings for future iterations:**
+  - Plugins use published npm versions of `@opentabs-dev/plugin-tools`, so their `opentabs-plugin build` won't include unreleased platform changes — plugin dist files need to be updated manually or after publishing
+  - The `resolveSdkVersion()` reads the concrete installed version (not the dependency range), which is the correct behavior for compatibility checking
+  - The shared `PluginManifest.sdkVersion` must be optional because old plugins built before this feature won't have the field
+---
+
+## 2026-02-21 13:17 - US-002
+- Created `platform/mcp-server/src/sdk-version.ts` — reads the server's SDK version from `platform/plugin-sdk/package.json` at startup (same `import.meta.url` + dirname pattern as `version.ts`)
+- Added `sdkVersion` field to `LoadedPlugin` interface in `loader.ts` and `RegisteredPlugin` interface in `state.ts`
+- Added `parseMajorMinor()` helper — parses semver string into `[major, minor]` tuple
+- Added `checkSdkCompatibility()` function — compares plugin vs server major.minor, returns `{ compatible, error? }`
+- Integrated SDK version extraction and compatibility check in `loadPlugin()` — reads `sdkVersion` from tools.json manifest object, warns if missing, fails if incompatible
+- Added 17 new unit tests: `parseMajorMinor` (3 tests), `checkSdkCompatibility` (8 tests), `loadPlugin` sdkVersion integration (3 tests via existing describe block)
+- Files changed:
+  - `platform/mcp-server/src/sdk-version.ts` — new file, server SDK version resolution
+  - `platform/mcp-server/src/loader.ts` — `sdkVersion` on `LoadedPlugin`, `parseMajorMinor()`, `checkSdkCompatibility()`, compatibility check in `loadPlugin()`
+  - `platform/mcp-server/src/loader.test.ts` — 17 new tests for version parsing, compatibility checking, and loadPlugin integration
+  - `platform/mcp-server/src/state.ts` — `sdkVersion` on `RegisteredPlugin`
+- **Learnings for future iterations:**
+  - For 0.x semver versions (0.0.X), major=0 and minor=0, so ALL 0.0.x plugins are compatible with each other — the patch number isn't part of the major.minor comparison. This is correct: within 0.0.x, the project hasn't reached any breaking API boundaries yet.
+  - The `sdk-version.ts` module resolves the SDK version at module load time using top-level `await`. This is fine for Bun ESM but would need adjustment for CommonJS or non-ESM bundlers.
+  - The `checkSdkCompatibility` function is intentionally lenient: unparseable versions (either side) result in `compatible: true` to avoid blocking plugins due to version format changes.
+  - The `loadPlugin` function already returns `Result<LoadedPlugin, string>`, so SDK incompatibility naturally becomes a `FailedPlugin` in the discovery pipeline without any changes to `discovery.ts`.
+---
+
+## 2026-02-21 13:25 - US-003
+- Added server-level `sdkVersion` to `/health` endpoint response (imported from `sdk-version.ts`)
+- Added per-plugin `sdkVersion` (or null) to `pluginDetails[]` in `/health` response
+- Added optional `sdkVersion` field to `ConfigStatePlugin` shared type in `platform/shared/src/index.ts`
+- Updated `handleConfigGetState` in `extension-protocol.ts` to conditionally include `sdkVersion` per plugin
+- Updated CLI `status` command to show server SDK version in header and per-plugin "⚠ no SDK version" warning
+- Updated side panel `PluginCard` to show a yellow "SDK" badge with tooltip on plugins missing `sdkVersion`
+- Files changed:
+  - `platform/mcp-server/src/http-routes.ts` — imported `sdkVersion`, added to health response (top-level + per-plugin)
+  - `platform/mcp-server/src/extension-protocol.ts` — added `sdkVersion` to `config.getState` plugin payload
+  - `platform/shared/src/index.ts` — added optional `sdkVersion` to `ConfigStatePlugin`
+  - `platform/cli/src/commands/status.ts` — added SDK version display and per-plugin warnings
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — added yellow SDK warning badge with tooltip
+- **Learnings for future iterations:**
+  - The health endpoint uses `p.sdkVersion ?? null` (explicit null) while `config.getState` uses conditional spread `...(p.sdkVersion ? { sdkVersion: p.sdkVersion } : {})` — the former is better for JSON APIs (explicit absence), the latter avoids breaking existing side panel code that may not expect the field
+  - Side panel already has Tooltip component available in `retro/Tooltip.tsx` — wrap in `Tooltip.Provider` for standalone tooltips
+  - Failed plugins due to SDK incompatibility already appear in the `failedPlugins` list with descriptive error messages — no separate UI treatment needed
+---
+
+## 2026-02-21 13:35 - US-004
+- Created `e2e/sdk-version.e2e.ts` with 4 E2E tests covering the SDK version compatibility pipeline:
+  1. Plugin with matching SDK version loads successfully and tools are callable
+  2. Plugin with too-new SDK version (99.0.0) fails to load with clear error message containing 'SDK', '99.0.0', and 'Rebuild the plugin'
+  3. /health endpoint includes sdkVersion at server level (string) and per-plugin level (string | null)
+  4. Plugin with missing sdkVersion (legacy format, field deleted) loads with warning but tools are still registered
+- Updated `e2e/fixtures.ts`: added `sdkVersion: string` to `HealthResponse`, `sdkVersion: string | null` to `PluginDetail`, exported `PluginDetail` type
+- Tests for incompatible and missing sdkVersion use `copyE2eTestPlugin()` to get an isolated copy, modify `dist/tools.json`, create a custom config directory, and start a standalone MCP server (no hot reload)
+- All 269 E2E tests pass (including 4 new), all unit tests pass, build/type-check/lint/knip all green
+- Files changed:
+  - `e2e/sdk-version.e2e.ts` — new file, 4 E2E tests
+  - `e2e/fixtures.ts` — added sdkVersion to PluginDetail and HealthResponse, exported PluginDetail
+- **Learnings for future iterations:**
+  - Tests that need custom plugin configurations (modified tools.json) should use `copyE2eTestPlugin()` + `createConfigForPlugin()` + `startMcpServer()` (standalone, not fixtures) to avoid interfering with other parallel tests
+  - The `startMcpServer(configDir, false)` variant (no hot reload) is sufficient for SDK version tests since discovery happens at startup
+  - The health endpoint returns `sdkVersion: null` (not undefined) for plugins without sdkVersion — tests should check for null, not undefined
+  - The `HealthResponse` type in fixtures.ts must be kept in sync with the actual `/health` response structure — previous iterations added sdkVersion to the server but not to the E2E types
+---
+
+## 2026-02-21 13:40 - US-005
+- Added "SDK version compatibility" paragraph to CLAUDE.md Key Concepts section
+- Placed between "Structured errors" and "SDK utilities" for logical grouping
+- Covers: what sdkVersion is, where it's embedded (tools.json), when it's checked (discovery time), the compatibility rule (major.minor comparison), mismatch behavior (FailedPlugin), backward compat (old plugins load with warning), and where it's surfaced (health, CLI, side panel)
+- Kept plugin-agnostic per CLAUDE.md guidelines — no specific plugin names mentioned
+- Files changed:
+  - `CLAUDE.md` — added SDK version compatibility paragraph (line 147)
+- **Learnings for future iterations:**
+  - Documentation-only stories are straightforward but still require full quality checks — the pre-commit hook runs prettier and knip
+  - The Key Concepts section in CLAUDE.md is organized by topic (not chronologically), so new paragraphs should be placed near related concepts
+---

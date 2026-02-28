@@ -1,0 +1,105 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix 5 objective defects identified during a full-platform audit: scaffold display name generation, silent adapter hash mismatch, flaky E2E diagnostic sampling, empty wsUrl validation, and silent sync notification failures.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix scaffold display name to use title case instead of naive capitalization",
+      "description": "As a plugin developer, I want the scaffolded plugin's displayName to use proper title case so that the side panel and tool descriptions show a polished name like 'My Plugin' instead of 'My-plugin'.",
+      "acceptanceCriteria": [
+        "displayName fallback on line 173 of scaffold.ts produces space-separated title case: 'my-cool-plugin' → 'My Cool Plugin'",
+        "displayName fallback on line 203 of scaffold.ts uses the same logic",
+        "The toPascalCase function on line 166 is NOT changed (it is correct for class names)",
+        "A new helper like toTitleCase is used or the logic is inlined consistently in both locations",
+        "Existing unit tests in platform/cli/src/scaffold.test.ts still pass",
+        "If no test covers displayName generation, add one that verifies 'my-cool-plugin' → 'My Cool Plugin'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/cli/src/scaffold.ts lines 173 and 203. Current code: `args.name.charAt(0).toUpperCase() + args.name.slice(1)` which for 'my-plugin' produces 'My-plugin'. The fix is to split on hyphens, capitalize each word, and join with spaces: `args.name.split('-').map(p => p.charAt(0).toUpperCase() + p.slice(1)).join(' ')`. This produces human-readable display names ('My Plugin') while the class name continues to use toPascalCase ('MyPlugin'). Extract a toTitleCase helper next to toPascalCase for clarity. Both line 173 and line 203 must be updated identically."
+    },
+    {
+      "id": "US-002",
+      "title": "Throw error on adapter hash mismatch after retry instead of silent warning",
+      "description": "As a platform operator, I want adapter injection to fail loudly when the adapter hash doesn't match after a retry so that I can diagnose broken plugin injections instead of seeing phantom tool availability.",
+      "acceptanceCriteria": [
+        "After the retry on line 144 of iife-injection.ts, if retryMatched is false, the function throws an Error instead of just logging console.warn",
+        "The error message includes the plugin name, expected hash, and actual hash",
+        "The existing console.warn is removed (the thrown error replaces it)",
+        "Promise.allSettled in the caller (injectPluginIntoMatchingTabs) correctly captures the rejection",
+        "No changes to the first-attempt or retry injection logic — only the post-retry failure path changes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/iife-injection.ts lines 144-150. Current code logs a console.warn and continues. Replace lines 145-150 with: `if (!retryMatched) { const actualHash = await readAdapterHash(tabId, pluginName); throw new Error(`Adapter hash mismatch for ${pluginName} after retry: expected ${adapterHash}, got ${String(actualHash)}`); }`. The caller at line ~191 uses Promise.allSettled, so the rejection is safely captured and the tab is excluded from injectedTabIds. This is the correct architectural response — the caller already handles rejected promises."
+    },
+    {
+      "id": "US-003",
+      "title": "Replace wall-clock modulo with elapsed-time tracking for E2E diagnostic collection",
+      "description": "As a developer debugging E2E test failures, I want diagnostics to be collected reliably every ~2 seconds so that timeout errors always include useful diagnostic information.",
+      "acceptanceCriteria": [
+        "The Date.now() % 2000 < 500 check on line 302 of helpers.ts is replaced with elapsed-time tracking",
+        "A variable like lastDiagnosticTime is initialized before the polling loop and updated when diagnostics are collected",
+        "Diagnostics are collected when Date.now() - lastDiagnosticTime >= 2000",
+        "The diagnostic collection logic itself is unchanged — only the sampling condition changes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: e2e/helpers.ts around line 302. The function is waitForAdapterInjection (or similar polling helper). Add `let lastDiagnosticTime = 0;` before the while loop. Replace `if (Date.now() % 2000 < 500)` with `const now = Date.now(); if (now - lastDiagnosticTime >= 2000)` and set `lastDiagnosticTime = now;` inside the block. This guarantees diagnostics are collected every 2 seconds of elapsed time regardless of wall-clock alignment."
+    },
+    {
+      "id": "US-004",
+      "title": "Reject empty-string wsUrl from /ws-info endpoint in offscreen document",
+      "description": "As a user with a misconfigured MCP server, I want a clear error when /ws-info returns an empty wsUrl so that I see an actionable message instead of a cryptic WebSocket connection loop.",
+      "acceptanceCriteria": [
+        "The typeof check on line 298 of offscreen/index.ts also rejects empty strings",
+        "The condition becomes: typeof wsInfo.wsUrl === 'string' && wsInfo.wsUrl !== ''",
+        "When an empty wsUrl is received, a console.warn is logged explaining the server returned an empty URL",
+        "The fallback to rawUrl is used when wsUrl is empty (same as when wsUrl is missing)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts line 298. Current: `if (typeof wsInfo.wsUrl === 'string')`. Change to: `if (typeof wsInfo.wsUrl === 'string' && wsInfo.wsUrl !== '')`. Add a console.warn in an else branch: `console.warn('[opentabs:offscreen] /ws-info returned empty wsUrl, using fallback URL');`. The same pattern should also be checked in background.ts around line 117 where the same /ws-info response is parsed — apply the same empty-string guard there too."
+    },
+    {
+      "id": "US-005",
+      "title": "Log warning when critical sync notifications fail to send to extension",
+      "description": "As a platform operator, I want the MCP server to log when sendSyncFull or sendPluginUpdate fails to reach the extension so that I can diagnose extension desync issues from server logs.",
+      "acceptanceCriteria": [
+        "sendSyncFull (around line 184 of extension-protocol.ts) checks the return value of sendToExtension and logs a warning if false",
+        "sendPluginUpdate (around line 294 of extension-protocol.ts) checks the return value and logs a warning if false",
+        "The log message includes which notification type failed (sync.full vs plugin.update)",
+        "Only a log.warn is added — no error throwing or retry logic (these are non-blocking notifications)",
+        "Other callers of sendToExtension that are responses to extension requests do NOT need the check (they are already in a connected context)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/extension-protocol.ts. For sendSyncFull (~line 184): wrap the sendToExtension call: `const sent = sendToExtension(state, { ... }); if (!sent) log.warn('Failed to send sync.full — extension not connected');`. Same pattern for sendPluginUpdate (~line 294): `const sent = sendToExtension(state, { ... }); if (!sent) log.warn('Failed to send plugin.update — extension not connected');`. The log object is already imported in this file. Do NOT change sendToExtension itself or add checks to response-type callers (those only fire when the extension is connected)."
+    }
+  ]
+}

@@ -1,0 +1,77 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Consolidate plugin status into a single indicator on the PluginIcon. Move outdated info from a separate array onto each ConfigStatePlugin as an optional `update` field. Replace the OutdatedPluginsBadge with a per-plugin update indicator on the PluginIcon. The StatusDot becomes a priority-based multi-purpose indicator: closed (no dot) > unavailable (yellow dot) > update available (ArrowUp icon) > ready (green dot).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Move outdated plugin info onto ConfigStatePlugin in shared types",
+      "description": "As a platform developer, I want outdated plugin info to live on each plugin's state object so that consumers don't need to correlate two separate data structures.",
+      "acceptanceCriteria": [
+        "ConfigStatePlugin in platform/shared/src/index.ts gains an optional `update?: { latestVersion: string; updateCommand: string }` field",
+        "The top-level `outdatedPlugins` array is removed from ConfigStateResult",
+        "ConfigStateResult only has `plugins` and `failedPlugins`",
+        "The OutdatedPlugin type is removed from shared (if it existed there) or no longer referenced",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/shared/src/index.ts. The ConfigStatePlugin interface is at ~line 218. ConfigStateResult is at ~line 242. Add `update?: { latestVersion: string; updateCommand: string }` to ConfigStatePlugin. Remove the `outdatedPlugins` field from ConfigStateResult. This will cause type errors downstream in the MCP server and browser extension — those are fixed in subsequent stories. For this story, focus only on fixing compile errors within the shared package itself and updating any shared tests (platform/shared/src/validation.test.ts). The downstream packages (mcp-server, browser-extension) will have type errors — that's expected and fixed in US-002 and US-003."
+    },
+    {
+      "id": "US-002",
+      "title": "Update MCP server to attach update info per-plugin instead of separate array",
+      "description": "As the MCP server, I want to attach update availability directly on each plugin in the config.getState response so the side panel receives a single unified data structure.",
+      "acceptanceCriteria": [
+        "handleConfigGetState in platform/mcp-server/src/extension-protocol.ts attaches the `update` field to each plugin entry by looking up state.outdatedPlugins by npmPackageName",
+        "The response no longer includes a top-level outdatedPlugins array",
+        "state.outdatedPlugins in platform/mcp-server/src/state.ts remains as the server-side storage (unchanged) — only the wire format to the extension changes",
+        "Extension protocol tests are updated: the test 'includes outdatedPlugins from state' is rewritten to verify update info appears on the matching plugin object instead of a separate array",
+        "All other existing extension-protocol tests still pass",
+        "version-check.ts and version-check.test.ts are unchanged (they write to state.outdatedPlugins which is internal)",
+        "reload.ts and reload.test.ts continue to work (they prune state.outdatedPlugins)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/extension-protocol.ts in handleConfigGetState (~line 754). The server already has state.outdatedPlugins (array of {name, currentVersion, latestVersion, updateCommand}) where `name` is the npm package name (e.g. 'opentabs-plugin-slack'). Each plugin in the registry has `npmPackageName` on the PluginRecord. In handleConfigGetState, build a Map<string, OutdatedPlugin> keyed by npmPackageName from state.outdatedPlugins, then when mapping plugins, look up `p.npmPackageName` in the map and attach `update: { latestVersion, updateCommand }` if found. Remove the `outdatedPlugins` key from the response object. Update extension-protocol.test.ts: rewrite the 'includes outdatedPlugins from state' test to verify that when state.outdatedPlugins has an entry matching a plugin's npmPackageName, the plugin object in the response has an `update` field. Also update the bridge.test.ts in browser-extension if it references `outdatedPlugins` in payloads (lines ~75, 95, 122). The ConfigStateResult type import may need updating since the type changed in US-001."
+    },
+    {
+      "id": "US-003",
+      "title": "Redesign PluginIcon indicator and remove OutdatedPluginsBadge from side panel",
+      "description": "As a user, I want a single consolidated status indicator on each plugin icon that shows the most important state (closed/unavailable/update/ready) so I don't see an ugly badge in the search bar.",
+      "acceptanceCriteria": [
+        "PluginIcon accepts an optional `hasUpdate` boolean prop",
+        "StatusDot is replaced by a priority-based StatusIndicator: closed = no indicator, unavailable = yellow/primary dot (existing behavior), update available on a ready plugin = lucide ArrowUp icon in a small circle at bottom-right, ready with no update = green dot (existing behavior)",
+        "The ArrowUp indicator uses the same position and sizing logic as the existing StatusDot (bottom-right corner of the icon)",
+        "PluginCard passes `hasUpdate={!!plugin.update}` to PluginIcon",
+        "The tooltip on the PluginIcon header (currently shows version + trustTier) also shows 'Update available: {latestVersion}' when plugin.update is set",
+        "OutdatedPluginsBadge component is deleted (OutdatedPluginsBadge.tsx and OutdatedPluginsBadge.stories.tsx)",
+        "All imports and references to OutdatedPluginsBadge are removed from App.tsx, SidePanel.stories.tsx, and any other files",
+        "The `outdatedPlugins` state variable is removed from App.tsx",
+        "showSearchBar logic in App.tsx simplifies to just `totalTools > 5` (no longer depends on outdated plugins)",
+        "The search bar area in App.tsx no longer renders OutdatedPluginsBadge — it only renders the search input (wrapped in the flex container with px-4 pt-4 pb-2)",
+        "The SidePanel.stories.tsx SearchBar component is simplified to just the search input (no OutdatedPluginsBadge prop)",
+        "The ManyToolsWithSearchAndOutdated story is removed from SidePanel.stories.tsx",
+        "PluginIcon.stories.tsx adds stories for: ReadyWithUpdate (ready + hasUpdate=true showing ArrowUp), Unavailable (unchanged), Closed (unchanged), Palette updated to show update state",
+        "PluginCard.stories.tsx adds a TabUnavailable story and a ReadyWithUpdate story showing a plugin with update data",
+        "COPIED_INDICATOR_DURATION_MS in constants.ts is removed if it is no longer used by any component after OutdatedPluginsBadge deletion",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "This is the largest story — it touches the UI layer. Key files:\n\n1. DELETE: platform/browser-extension/src/side-panel/components/OutdatedPluginsBadge.tsx and OutdatedPluginsBadge.stories.tsx\n\n2. EDIT platform/browser-extension/src/side-panel/components/PluginIcon.tsx:\n   - Add `hasUpdate?: boolean` to PluginIconProps\n   - Replace StatusDot with a StatusIndicator component that takes tabState + hasUpdate\n   - Priority: if tabState === 'closed' → no indicator. if tabState === 'unavailable' → yellow/primary dot (same as current). if tabState === 'ready' && hasUpdate → ArrowUp icon from lucide-react in a small circle (bg-accent border-card) at bottom-right. if tabState === 'ready' && !hasUpdate → green success dot (same as current).\n   - The ArrowUp indicator should be a small circle same size as StatusDot, positioned identically, containing a tiny ArrowUp lucide icon.\n\n3. EDIT platform/browser-extension/src/side-panel/components/PluginCard.tsx:\n   - The plugin prop now has optional `update?: { latestVersion: string; updateCommand: string }` from the PluginState type (which is ConfigStatePlugin from shared)\n   - Pass `hasUpdate={!!plugin.update}` to PluginIcon\n   - In the Tooltip.Content for the icon, append update info: `v{version} · {trustTier}` becomes `v{version} · {trustTier} · Update: {latestVersion}` when plugin.update exists\n\n4. EDIT platform/browser-extension/src/side-panel/App.tsx:\n   - Remove import of OutdatedPluginsBadge and OutdatedPlugin type\n   - Remove `outdatedPlugins` state variable\n   - Remove `setOutdatedPlugins` calls (in loadPlugins and connectionState handler)\n   - Simplify showSearchBar: `const showSearchBar = connected && !loading && totalTools > 5;`\n   - The search bar block: remove the `{totalTools <= 5 && <div className='flex-1' />}` line and the `<OutdatedPluginsBadge>` line. The search bar only shows when totalTools > 5 so the input always renders.\n   - The search bar wrapper div should just contain the search input div (no flex gap needed for badge)\n\n5. EDIT platform/browser-extension/src/side-panel/components/SidePanel.stories.tsx:\n   - Remove OutdatedPluginsBadge import and OutdatedPlugin type import\n   - Remove `outdatedPlugins` prop from SearchBar component\n   - Remove OutdatedPluginsBadge from SearchBar render\n   - Remove mockOutdatedPlugins constant\n   - Remove ManyToolsWithSearchAndOutdated story and its demo component\n   - Remove ManyToolsWithSearchAndOutdated from exports\n   - SearchBar just renders the search input in a `div className='px-4 pt-4 pb-2'` with a relative wrapper\n\n6. EDIT platform/browser-extension/src/side-panel/components/PluginIcon.stories.tsx:\n   - Add ReadyWithUpdate story: `{ args: { pluginName: 'slack', displayName: 'Slack', tabState: 'ready', hasUpdate: true, size: 32 } }`\n   - Update Palette story to include an update column\n   - Add to argTypes: `hasUpdate: { control: 'boolean' }`\n\n7. EDIT platform/browser-extension/src/side-panel/components/PluginCard.stories.tsx:\n   - Add TabUnavailable story with `tabState: 'unavailable'`\n   - Add ReadyWithUpdate story with `tabState: 'ready'` and `update: { latestVersion: '0.2.0', updateCommand: 'npm update -g opentabs-plugin-slack@latest' }` in the mockPlugin overrides\n   - Add to exports\n\n8. Check if COPIED_INDICATOR_DURATION_MS is still used after deleting OutdatedPluginsBadge. If nothing else imports it, remove it from constants.ts.\n\nThe PluginState type is `ConfigStatePlugin` from shared — it now has the optional `update` field from US-001, so no type changes needed in the bridge."
+    }
+  ]
+}

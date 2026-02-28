@@ -1,0 +1,114 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Harden the MCP server state, offscreen document, background script, side panel, and extension sync mechanisms by fixing a stale promise chain leak in tab-state, adding early URL validation in the offscreen document, and creating missing unit tests for security-relevant and correctness-critical modules (rate-limiter, sanitize-error, tab-matching port logic, plugin-storage serialization).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Clear pluginLocks on WebSocket disconnect in tab-state.ts",
+      "description": "As a developer, I want the pluginLocks Map cleared on WebSocket disconnect so that stale promise chains from before a disconnect do not survive into the next connection session.",
+      "acceptanceCriteria": [
+        "clearTabStateCache() in tab-state.ts calls pluginLocks.clear() in addition to lastKnownState.clear()",
+        "No other changes to clearTabStateCache behavior",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/tab-state.ts, line 157-159. The clearTabStateCache function currently only clears lastKnownState. Add pluginLocks.clear() on the next line. The pluginLocks Map is defined at line 27. This is safe because: (1) clearTabStateCache is called on disconnect (background.ts line 139), (2) the next connect triggers sendTabSyncAll which starts fresh computations, (3) any in-flight promise chains from before disconnect will complete harmlessly (they write to lastKnownState which is also cleared). The fix is exactly one line added."
+    },
+    {
+      "id": "US-002",
+      "title": "Add early URL validation in offscreen ws:setUrl handler",
+      "description": "As a developer, I want the ws:setUrl handler to validate the incoming URL format before using it, so that invalid URLs are rejected explicitly rather than relying on cascading exception handling.",
+      "acceptanceCriteria": [
+        "ws:setUrl handler in offscreen/index.ts validates rawUrl is a syntactically valid URL with ws: or wss: protocol before attempting fetch",
+        "Invalid URLs cause early return with sendResponse({ ok: true }) and a console.warn",
+        "Valid URLs continue to the existing fetch + isValidWsOrigin logic unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts, line 321-376. At the top of the async IIFE inside the ws:setUrl case (line 321), before line 322 where rawUrl is read, add a try-catch that validates rawUrl with new URL(rawUrl). Check that the protocol is 'ws:' or 'wss:'. If validation fails, log a warning and return sendResponse({ ok: true }) early. This matches the defensive pattern used by isValidWsOrigin at line 42-64 which also validates URL format. Example:\n\ntry {\n  const parsed = new URL(rawUrl);\n  if (parsed.protocol !== 'ws:' && parsed.protocol !== 'wss:') {\n    console.warn(`[opentabs:offscreen] Rejected ws:setUrl with invalid protocol: ${parsed.protocol}`);\n    sendResponse({ ok: true });\n    return;\n  }\n} catch {\n  console.warn('[opentabs:offscreen] Rejected ws:setUrl: invalid URL format');\n  sendResponse({ ok: true });\n  return;\n}\n\nInsert this block right after 'const rawUrl = message.url;' on line 322."
+    },
+    {
+      "id": "US-003",
+      "title": "Add unit tests for tab-matching port logic",
+      "description": "As a developer, I want unit tests for the port-matching logic in matchPattern so that the non-trivial port parsing at lines 34-43 of tab-matching.ts is directly verified and protected from regressions.",
+      "acceptanceCriteria": [
+        "tab-matching.test.ts has new tests covering: pattern with explicit port matches URL with same port, pattern with explicit port does NOT match URL with different port, pattern without port matches any port, localhost with port works correctly, port-only difference is detected",
+        "At least 5 new test cases for port matching",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/tab-matching.test.ts. Add a new describe block 'matchPattern — port matching' with test cases. The matchPattern function is already exported and imported in the test file. Test cases should include:\n1. matchPattern('http://localhost:9516/path', '*://localhost:9516/*') === true\n2. matchPattern('http://localhost:9517/path', '*://localhost:9516/*') === false\n3. matchPattern('http://localhost:9516/path', '*://localhost/*') === true (no port in pattern matches any)\n4. matchPattern('https://example.com/path', 'https://example.com:443/*') === false (URL.port is '' for default ports, pattern port is '443' — they don't match)\n5. matchPattern('http://localhost:3000/', 'http://localhost:3000/*') === true\n\nFollow the existing test patterns in the file — use describe/test from bun:test, direct assertions with expect()."
+    },
+    {
+      "id": "US-004",
+      "title": "Add unit tests for rate-limiter.ts",
+      "description": "As a developer, I want unit tests for the rate limiter so that this security-relevant module is directly verified and changes to rate limits do not silently break protection.",
+      "acceptanceCriteria": [
+        "New file rate-limiter.test.ts exists in platform/browser-extension/src/",
+        "Tests cover: method-specific limits (browser.screenshotTab at 2/s), default limits (20/s), exempt methods (sync.full, extension.reload bypass limiter), window expiration (requests allowed after window passes), boundary conditions (exactly at limit allowed, one over rejected)",
+        "At least 8 test cases",
+        "rate-limiter.test.ts is covered by a tsconfig that tsc --build reaches",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/rate-limiter.test.ts (new file). Import { checkRateLimit } from './rate-limiter.js'. Use jest.useFakeTimers()/jest.useRealTimers() from bun:test to control Date.now() for window expiration tests.\n\nKey test cases:\n1. 'exempt methods always return true' — call checkRateLimit('sync.full') 100 times, all return true\n2. 'method-specific limit: browser.screenshotTab allows 2 per second' — 2 calls return true, 3rd returns false\n3. 'default limit allows 20 per second' — call checkRateLimit('browser.listTabs') 20 times (true), 21st (false)\n4. 'window expiration: requests allowed after window passes' — fill limit, advance time by 1001ms, next call returns true\n5. 'tool.dispatch allows 30 per second' — 30 calls true, 31st false\n6. 'different methods have independent limits' — fill one method, other method still allows\n7. 'exactly at limit is allowed' — the Nth call (where N = maxRequests) returns true\n8. 'one over limit is rejected' — the N+1th call returns false\n\nThe rate-limiter module uses module-level state (methodTimestamps Map), so tests may need to account for state leaking between tests. The sliding window pruning happens lazily on each checkRateLimit call, so advancing time and calling again should work.\n\nNote: The file needs to be included in a tsconfig. Check platform/browser-extension/tsconfig.test.json — it likely includes src/**/*.test.ts already."
+    },
+    {
+      "id": "US-005",
+      "title": "Add unit tests for browser extension sanitize-error.ts",
+      "description": "As a developer, I want unit tests for the browser extension's sanitize-error.ts so that this security-relevant error sanitization function is directly verified.",
+      "acceptanceCriteria": [
+        "New file sanitize-error.test.ts exists in platform/browser-extension/src/",
+        "Tests cover: Windows absolute paths, Unix absolute paths, full URLs, localhost:port, IPv4 addresses, truncation at 500 chars, clean strings pass through unchanged, combined patterns",
+        "At least 8 test cases",
+        "sanitize-error.test.ts is covered by a tsconfig that tsc --build reaches",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/sanitize-error.test.ts (new file). Import { sanitizeErrorMessage } from './sanitize-error.js'.\n\nKey test cases:\n1. 'replaces Windows absolute paths with [PATH]' — 'Error at C:\\Users\\bob\\file.ts' → contains '[PATH]', not 'C:\\'\n2. 'replaces Unix absolute paths with [PATH]' — 'Error at /home/user/project/file.ts' → contains '[PATH]'\n3. 'replaces full URLs with [URL]' — 'Failed to fetch https://api.example.com/v1/data' → contains '[URL]'\n4. 'replaces localhost:port with [LOCALHOST]' — 'Connection refused at localhost:9515' → contains '[LOCALHOST]'\n5. 'replaces IPv4 addresses with [IP]' — 'Cannot reach 192.168.1.1' → contains '[IP]'\n6. 'truncates messages over 500 characters' — pass a 600-char string, result.length <= 500 and ends with '...'\n7. 'clean strings pass through unchanged' — 'Tool execution failed' → exact same string\n8. 'handles message with multiple sensitive values' — message with path + URL + IP → all replaced\n9. 'single segment Unix path is NOT replaced' — '/api' is not replaced (regex requires at least 2 segments)\n\nFollow patterns from existing test files. The MCP server has a similar sanitize-error.ts — check its tests if any exist for pattern inspiration (note: the MCP server's version is out of scope for this audit)."
+    },
+    {
+      "id": "US-006",
+      "title": "Add unit tests for plugin-storage.ts write mutex serialization",
+      "description": "As a developer, I want unit tests verifying the plugin-storage write mutex correctly serializes concurrent operations so that this correctness-critical synchronization mechanism is protected from regressions.",
+      "acceptanceCriteria": [
+        "plugin-storage.test.ts has new tests covering concurrent write serialization",
+        "Tests verify: concurrent storePluginsBatch calls produce correct final state, concurrent store + remove produces correct final state, failing write does not break the mutex chain",
+        "At least 3 new test cases for serialization",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/plugin-storage.test.ts. The existing test file already has Chrome API mocks set up. Add a new describe block 'write mutex serialization'.\n\nThe key invariant to test: when multiple write operations are fired concurrently (without awaiting), they are serialized and the final state reflects all operations in order.\n\nTest cases:\n1. 'concurrent storePluginsBatch calls serialize correctly' — fire storePluginsBatch([pluginA]) and storePluginsBatch([pluginB]) without awaiting, then await both. getAllPluginMeta should contain both plugins.\n2. 'concurrent store then remove serializes correctly' — fire storePluginsBatch([pluginA]) then removePlugin('pluginA') without awaiting, then await both. getAllPluginMeta should NOT contain pluginA.\n3. 'failing chrome.storage.local.set does not break mutex chain' — mock chrome.storage.local.set to reject once, then succeed. Fire two storePluginsBatch calls. The first fails, the second should still succeed. Verify the final state contains only the second batch's data.\n\nThe tests need a mock chrome.storage.local that records set/get calls. The existing mock in the file uses a simple in-memory object. Ensure invalidatePluginCache() is called between tests to reset the in-memory cache.\n\nNote: The serialize function at line 15-22 uses .then(() => {}, () => {}) to swallow errors on the mutex chain — this means a failed write allows subsequent writes to proceed. Test this behavior explicitly."
+    }
+  ]
+}

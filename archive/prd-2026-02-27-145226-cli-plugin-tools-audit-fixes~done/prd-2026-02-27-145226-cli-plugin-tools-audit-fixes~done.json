@@ -1,0 +1,87 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs discovered during a thorough audit of the CLI and plugin-tools packages. Covers missing fetch timeout, Windows compatibility for npm spawns, Linux fs.watch file recreation, and Windows tilde path resolution.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add fetch timeout to notifyServer in plugin-tools build command",
+      "description": "As a plugin developer, I want opentabs-plugin build to never hang indefinitely so that builds always complete even when the MCP server is unresponsive.",
+      "acceptanceCriteria": [
+        "The fetch call in notifyServer includes signal: AbortSignal.timeout(5_000)",
+        "If the server doesn't respond within 5 seconds, the build completes normally (notification is best-effort)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts lines 202-212.\n\nThe `notifyServer` function calls `fetch()` without an `AbortSignal.timeout()`. Every other fetch call in the codebase uses timeouts:\n- platform/cli/src/notify-server.ts uses AbortSignal.timeout(3_000)\n- platform/cli/src/commands/status.ts uses AbortSignal.timeout(5_000)\n- platform/cli/src/commands/doctor.ts uses AbortSignal.timeout(5_000)\n- platform/cli/src/commands/audit.ts uses AbortSignal.timeout(5_000)\n\nFix: Add `signal: AbortSignal.timeout(5_000)` to the fetch options object at line 203."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix missing platformExec for npm spawns in CLI plugin command (Windows)",
+      "description": "As a Windows user, I want opentabs plugin search, install name resolution, and remove to work correctly so that plugin management functions on all supported platforms.",
+      "acceptanceCriteria": [
+        "packageExistsOnNpmAsync uses platformExec('npm') instead of bare 'npm'",
+        "fetchPackageInfo uses platformExec('npm') instead of bare 'npm'",
+        "npmSearchPlugins uses platformExec('npm') instead of bare 'npm'",
+        "All three functions work on Windows (npm.cmd is used via platformExec)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/plugin.ts.\n\nThree functions use bare 'npm' string with spawn/spawnSync:\n1. `packageExistsOnNpmAsync` (line 91): `spawnProcessAsync('npm', ['view', ...])`\n2. `fetchPackageInfo` (line 263): `spawnProcessSync('npm', ['view', ...])`  \n3. `npmSearchPlugins` (line 335): `spawnProcessSync('npm', ['search', ...])`\n\nOther call sites in the same file correctly use `platformExec('npm')` — see lines 161, 235, 243, 501. The `platformExec` function is already imported from `@opentabs-dev/shared` at line 24.\n\nFix: Replace `'npm'` with `platformExec('npm')` in all three locations. The `spawnProcessSync` and `spawnProcessAsync` wrappers accept the command as the first arg, so this is a direct string replacement."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix Windows tilde path resolution in resolveStoredPluginPath",
+      "description": "As a Windows user, I want tilde-prefixed plugin paths (e.g., ~\\my-plugin) to resolve correctly so that plugin path comparisons work on all platforms.",
+      "acceptanceCriteria": [
+        "resolveStoredPluginPath in cli/commands/config.ts handles both ~/ and ~\\ prefixes",
+        "resolvePluginPathForComparison in plugin-tools/commands/build.ts handles both ~/ and ~\\ prefixes",
+        "On Windows, a path stored as ~\\my-plugin resolves to the correct absolute path",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two files have the same function with the same bug:\n\n1. platform/cli/src/commands/config.ts lines 293-297 (`resolveStoredPluginPath`):\n```typescript\nif (storedPath.startsWith('/')) return storedPath;\nif (storedPath.startsWith('~/')) return resolve(homedir(), storedPath.slice(2));\nreturn resolve(configDir, storedPath);\n```\n\n2. platform/plugin-tools/src/commands/build.ts lines 107-111 (`resolvePluginPathForComparison`):\n```typescript\nif (storedPath.startsWith('/')) return storedPath;\nif (storedPath.startsWith('~/')) return resolve(homedir(), storedPath.slice(2));\nreturn resolve(configDir, storedPath);\n```\n\nBoth miss Windows-style tilde paths. On Windows, a path might be stored as `~\\my-plugin`. Fix: add a check for `startsWith('~\\\\')` (escaped backslash) in addition to `startsWith('~/')`. Also handle Windows absolute paths (e.g., `C:\\...`) in config.ts — the build.ts version doesn't check for Windows absolute paths either, but the `resolve()` fallback handles them correctly since `path.resolve` treats drive-letter paths as absolute.\n\nNote: platform/mcp-server/src/config.ts also has `isLocalPathEntry` (line 110-117) which already handles both `~/` and backslash variants correctly — use that as the reference pattern."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix logs follow mode on Linux after log file recreation",
+      "description": "As a Linux user, I want opentabs logs -f to continue tailing after the MCP server restarts and creates a new log file so that I don't need to manually restart the logs command.",
+      "acceptanceCriteria": [
+        "When the log file is deleted and recreated (e.g., server restart), the watcher detects this and resumes tailing the new file",
+        "On Linux (inotify), the watcher recovers from file deletion by watching the parent directory or using a polling fallback",
+        "On macOS, existing behavior is preserved (FSEvents handles file recreation natively)",
+        "Offset resets to 0 when the file is recreated",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/cli/src/commands/logs.ts lines 80-151 (`followFile`).\n\nThe function uses `watch(filePath, ...)` (line 136) which watches a specific file inode. On Linux (inotify), when the file is deleted and recreated, the watcher stops firing events because the original inode no longer exists. The `readNewContent` function (line 86) already handles the case where `statSync` throws (file deleted) by returning early (line 94-96), but the watcher itself never fires again after deletion.\n\nFix approach: Watch the parent directory instead of the specific file. Use `watch(dirname(filePath), ...)` and filter for events on the target filename. This handles file recreation on all platforms because the directory inode persists across file deletion/recreation. When the file reappears, `readNewContent` naturally handles the truncation case (line 98-101 resets offset to 0 when `currentSize < offset`). The cleanup function (line 138-141) should close the directory watcher.\n\nAlternative approach: Use a polling interval as a fallback. After detecting file deletion in `readNewContent`, set up a `setInterval` that checks if the file has reappeared, and if so, recreate the watcher. This is simpler but adds polling latency.\n\nThe parent-directory approach is preferred since it matches how `tail -f` works on Linux."
+    }
+  ]
+}

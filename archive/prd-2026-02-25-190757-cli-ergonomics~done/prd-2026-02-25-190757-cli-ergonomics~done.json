@@ -1,0 +1,147 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Improve OpenTabs CLI user-friendliness and ergonomics — dynamic audit table columns, doctor OpenCode config check, bare command default to status, audit header fix, plugin resolve parallelization, indent function cleanup",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Make bare `opentabs` (no args) run `opentabs status` instead of showing help",
+      "description": "As a user, I want running `opentabs` with no arguments to show server status so that I get immediately useful information without having to remember the `status` subcommand",
+      "acceptanceCriteria": [
+        "Running the CLI with no arguments delegates to the status command handler",
+        "If the server is not running, the status command's 'Server not running' error is shown (not the help text)",
+        "Running `opentabs --help` still shows the full help text with all commands",
+        "Running `opentabs -h` still shows help",
+        "Running `opentabs -V` still shows version",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit `platform/cli/src/cli.ts`. Commander does not have a built-in 'default command' feature, but there are two approaches: (1) Add a `.action()` on the root program that delegates to `handleStatus` when no subcommand is provided, or (2) check `process.argv.length` before parsing and inject 'status' if no subcommand is present. Approach (1) is cleaner — register an action on the root `program` that calls the same `handleStatus` function used by the status command. The action receives options and the command object. Import `handleStatus` (it may need to be exported from `platform/cli/src/commands/status.ts`). The root action is only called when no subcommand matches. Note: Commander calls the root action when no subcommand is provided, so `opentabs --port 3000` with no subcommand would also trigger status on that port — which is desirable behavior."
+    },
+    {
+      "id": "US-002",
+      "title": "Make audit table tool column width dynamic",
+      "description": "As a user, I want the audit table to handle long tool names without breaking alignment so that all columns remain readable regardless of tool name length",
+      "acceptanceCriteria": [
+        "Tool column width is computed as max(header length, longest tool name in the current result set) + 2 padding",
+        "Tool names longer than the previous fixed 30-char limit display correctly without column overlap",
+        "Short tool names still align properly with appropriate padding",
+        "The separator line adjusts to match the total computed row width",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit `platform/cli/src/commands/audit.ts`. Currently `COL_TOOL = 30` is hardcoded at line 91. Change `printAuditTable` to compute the tool column width dynamically: `const colTool = Math.max(COL_TOOL_MIN, ...entries.map(e => e.tool.length)) + 2` where `COL_TOOL_MIN` could be the header text length ('Tool'.length). Then use `colTool` instead of `COL_TOOL` in the header, separator, and row formatting. Keep COL_TIME, COL_STATUS, COL_DURATION as fixed since those values are predictable."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix audit table 'OK' header to say 'Status'",
+      "description": "As a user, I want the audit table status column header to clearly indicate what the column represents so that I can immediately understand the checkmark/cross icons",
+      "acceptanceCriteria": [
+        "The audit table header shows a clearer column name instead of 'OK' (either blank, or a short word that fits the column width)",
+        "The column width COL_STATUS is adjusted if needed to fit the new header",
+        "Checkmark and cross icons still display correctly with proper color coding",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit `platform/cli/src/commands/audit.ts`. At line 92, `COL_STATUS = 4` and the header at line 98 uses `'OK'.padEnd(COL_STATUS)`. The column shows checkmark/cross icons, so the header 'OK' is misleading — it implies a boolean yes/no answer but the checkmark represents 'success'. Options: (1) Keep 'OK' but it's standard in some CLIs, (2) Use empty string '' as header since the icons are self-explanatory and users learn the pattern quickly, (3) Use a single unicode icon in the header as a legend. Option (1) is actually reasonable — 'OK' is a well-understood convention. But the actual issue is that COL_STATUS=4 is barely enough for the icon + padding. Consider widening to accommodate a clearer header. The simplest fix: keep it minimal — 'OK' is fine for this column. Alternatively, widen COL_STATUS to 6 and use header '' (empty) since the green checkmark / red cross are universally understood. The real value of this story is ensuring the table is clean."
+    },
+    {
+      "id": "US-004",
+      "title": "Add OpenCode to doctor MCP client config check",
+      "description": "As a user, I want `opentabs doctor` to check my OpenCode MCP configuration so that it catches missing OpenCode setup alongside Claude Code and Cursor",
+      "acceptanceCriteria": [
+        "Doctor checks for `opencode.json` in the current working directory",
+        "The check looks for an 'opentabs' entry inside the 'mcp' field (matching OpenCode's config format)",
+        "If OpenCode config is found with opentabs configured, doctor reports it as passing",
+        "If no MCP client has opentabs configured (including OpenCode), the existing warning is shown",
+        "Doctor tests in platform/cli/src/commands/doctor.test.ts cover the new OpenCode check",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit `platform/cli/src/commands/doctor.ts`. The `defaultMcpClientLocations()` function at line 235-238 returns an array of client locations. Add OpenCode: `{ name: 'OpenCode', path: join(process.cwd(), 'opencode.json') }`. The `checkMcpClientConfig` function at line 240-268 iterates these locations and checks for an `mcpServers.opentabs` entry. OpenCode's config format is different — it uses `mcp.opentabs` (not `mcpServers.opentabs`). The check at line 249-255 currently only looks for `mcpServers.opentabs`. For OpenCode, add an additional check: if `parsed` has an `mcp` field that is an object containing `opentabs`, that also counts as configured. Update the doctor.test.ts to add test cases for the OpenCode config path and format."
+    },
+    {
+      "id": "US-005",
+      "title": "Parallelize plugin name resolution for shorthand installs",
+      "description": "As a user, I want `opentabs plugin install slack` to resolve the package name faster by checking npm candidates in parallel instead of sequentially",
+      "acceptanceCriteria": [
+        "For shorthand names, both official and community npm candidates are checked concurrently",
+        "The official scope candidate is still preferred over the community one when both exist",
+        "If only one candidate exists, it is used regardless of scope",
+        "If neither candidate exists, the same 'not found' error with tried candidates is shown",
+        "Plugin install for already-qualified names (scoped or prefixed) still works without extra lookups",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit `platform/cli/src/commands/plugin.ts`. Currently `resolvePackageName` at line 102-110 calls `packageExistsOnNpm` sequentially for each candidate. `packageExistsOnNpm` at line 90-93 uses `spawnSync` — this blocks the event loop. To parallelize: (1) Create an async `packageExistsOnNpmAsync` using the existing `spawnProcessAsync` helper (line 51-66), (2) Change `resolvePackageName` to async, (3) Use `Promise.all` to check all candidates concurrently, (4) Return the first candidate by priority that exists. The callers `handlePluginInstall` and `handlePluginRemove` are already async so this is straightforward. Also update `handlePluginSearch`'s direct lookup to use async. Note: `resolvePackageName` is also called from `handlePluginRemove` — update that call site too."
+    },
+    {
+      "id": "US-006",
+      "title": "Clean up the no-op indent function in start.ts",
+      "description": "As a developer, I want the indent function to be simplified since both branches of the ternary produce the same result, making the code clearer",
+      "acceptanceCriteria": [
+        "The indent function at line 149-153 of start.ts is simplified to remove the redundant ternary",
+        "The MCP client config JSON output is unchanged (identical visual output)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Edit `platform/cli/src/commands/start.ts` line 149-153. The current indent function is:\n```\nconst indent = (json: string, prefix: string): string =>\n  json\n    .split('\\n')\n    .map((line, i) => (i === 0 ? `${prefix}${line}` : `${prefix}${line}`))\n    .join('\\n');\n```\nBoth branches of the ternary `(i === 0 ? ... : ...)` produce identical output `${prefix}${line}`. Simplify to:\n```\nconst indent = (json: string, prefix: string): string =>\n  json\n    .split('\\n')\n    .map(line => `${prefix}${line}`)\n    .join('\\n');\n```\nThis is dead logic cleanup — the visual output is unchanged."
+    },
+    {
+      "id": "US-007",
+      "title": "Add `--verbose` flag to `opentabs plugin list` to show tool names",
+      "description": "As a user, I want to see which tools each plugin provides when listing plugins so that I can quickly find the right tool name without having to check documentation",
+      "acceptanceCriteria": [
+        "A new `--verbose` (or `-v`) flag is added to `opentabs plugin list`",
+        "When --verbose is used and the server is running, each plugin entry shows its tool names indented below the plugin line",
+        "Without --verbose, the output is unchanged (just tool count)",
+        "The verbose output works in offline mode too (reading from dist/tools.json for local plugins)",
+        "Help text for `opentabs plugin list` includes the --verbose flag and an example",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "Edit `platform/cli/src/commands/plugin.ts`. For the online path (server running), the health endpoint already returns `pluginDetails` with a `tools` field (array of tool name strings) — see `platform/cli/src/commands/config.ts` line 139-143 for the HealthPluginDetail type that includes `tools: string[]`. Use this data to print tool names when --verbose is set. For the offline path, `readLocalPluginInfo` at line 438-467 already reads `dist/tools.json` — extend it to also return tool names (from the `tools` array in tools.json, each entry has a `name` field). For npm plugins in offline mode, tool names are unavailable — just show the count. Format: indent tool names with 4 extra spaces under each plugin entry, e.g. `      slack_send_message, slack_list_channels`. Add the flag: `.option('-v, --verbose', 'Show tool names for each plugin')`."
+    }
+  ]
+}

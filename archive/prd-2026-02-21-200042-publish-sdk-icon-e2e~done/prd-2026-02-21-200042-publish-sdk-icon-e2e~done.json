@@ -1,0 +1,111 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Update the e2e-test plugin to use custom SVG icons, and add E2E tests verifying the full icon pipeline: build validation, auto-generation, manifest embedding, server discovery, wire protocol, extension storage, and side panel rendering. SDK v0.0.17 was already published with icon support.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add icon.svg to the e2e-test plugin and verify auto-generated inactive icon",
+      "description": "As an E2E test developer, I want the e2e-test plugin to have a custom SVG icon so that the full icon pipeline \u2014 including auto-grayscale generation \u2014 can be tested end-to-end.",
+      "acceptanceCriteria": [
+        "plugins/e2e-test/icon.svg exists \u2014 a simple, valid, square SVG icon (e.g., a colored circle or geometric shape with at least two distinct colors) under 4KB with a square viewBox",
+        "plugins/e2e-test/icon-inactive.svg does NOT exist \u2014 the build should auto-generate the inactive variant",
+        "The icon passes validateIconSvg rules: square viewBox, no <image>, no <script>, no event handlers, under 8KB",
+        "cd plugins/e2e-test && bun run build succeeds and dist/tools.json contains both iconSvg and iconInactiveSvg string fields at the top level",
+        "The iconSvg value in tools.json contains the minified SVG content from icon.svg",
+        "The iconInactiveSvg value in tools.json contains an auto-generated grayscale version where all color values have been converted to luminance-equivalent grays",
+        "The auto-generated iconInactiveSvg passes validateInactiveIconColors (all colors are achromatic)"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "COMPLETED: icon.svg added to plugins/e2e-test/ with three distinct colors (#4F46E5, #FFD700, #fff). Build produces dist/tools.json with both iconSvg and iconInactiveSvg fields. Auto-generated grayscale uses ITU-R BT.709 luminance: #4F46E5\u2192#535353, #FFD700\u2192#d0d0d0, #fff\u2192#ffffff. All validation passes. See commit cb42d6b.\n\nAlso fixed pre-existing E2E auth infrastructure: test extension copies now receive auth.json for WebSocket authentication, and writeTestConfig auto-generates secrets."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E tests for icon build validation and auto-generation",
+      "description": "As a platform developer, I want E2E tests proving that opentabs-plugin build correctly validates SVGs, auto-generates grayscale inactive variants, respects manual overrides, and rejects invalid icons.",
+      "acceptanceCriteria": [
+        "A new file e2e/build-icons.e2e.ts exists with tests using the Playwright test runner",
+        "Test: building a plugin with valid icon.svg (no icon-inactive.svg) succeeds, produces tools.json with both iconSvg and iconInactiveSvg fields, and iconInactiveSvg contains only achromatic colors",
+        "Test: building a plugin with valid icon.svg and valid icon-inactive.svg (manual override) succeeds and produces tools.json with both fields using the provided files (not auto-generated)",
+        "Test: building a plugin with no icon files succeeds and produces tools.json without iconSvg or iconInactiveSvg fields",
+        "Test: building a plugin with icon-inactive.svg but no icon.svg fails with exit code 1 and stderr contains an error message about requiring icon.svg",
+        "Test: building a plugin with a non-square viewBox in icon.svg fails with exit code 1 and stderr mentions viewBox",
+        "Test: building a plugin with an oversized icon.svg (>8KB) fails with exit code 1 and stderr mentions size",
+        "Test: building a plugin with saturated colors in a manual icon-inactive.svg fails with exit code 1 and stderr mentions color",
+        "Test: building a plugin with an <image> element in icon.svg fails with exit code 1 and mentions embedded images",
+        "Test: the auto-generated inactive icon preserves visual structure \u2014 an SVG with 3 distinct colors produces 3 distinct gray values in the output",
+        "Each test creates a minimal temp plugin directory using the createMinimalPlugin helper from e2e/fixtures.ts, writes the appropriate icon files, and runs opentabs-plugin build as a subprocess",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes (the new test file specifically)"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "COMPLETED: Created e2e/build-icons.e2e.ts with 9 Playwright tests covering all acceptance criteria. Tests copy the e2e-test plugin to temp dirs, modify icon files, and run opentabs-plugin build as a subprocess. See commit 5f6972b.\n\nOriginal notes: Look at e2e/build-artifacts.e2e.ts for the existing pattern of testing opentabs-plugin build as a subprocess. It uses createMinimalPlugin() from fixtures.ts which scaffolds a temp plugin directory.\n\nAlso look at platform/plugin-tools/src/commands/build-e2e.test.ts (lines 49-194) for the existing build E2E pattern \u2014 it copies the e2e-test plugin to a temp dir and runs the build.\n\nThe createMinimalPlugin helper (in fixtures.ts around line 167) creates a plugin directory with package.json, src/index.ts, and runs tsc + opentabs-plugin build. You may need to extend it to accept optional icon file content, or write icon files to the temp directory after createMinimalPlugin returns but before running the build.\n\nFor the auto-generation verification test:\n- Create an icon.svg with fill=\"#ff0000\" (red, luminance ~54), fill=\"#00ff00\" (green, luminance ~182), fill=\"#0000ff\" (blue, luminance ~18)\n- After build, parse the iconInactiveSvg and verify three different gray hex values exist\n- This proves the luminance conversion produces distinct grays, not uniform wash\n\nFor the oversized icon test, generate a string longer than 8KB (e.g., an SVG with a very long path data attribute).\n\nFor the non-square viewBox test, use viewBox=\"0 0 32 24\".\n\nFor the saturated color test in manual icon-inactive.svg, use fill=\"#ff0000\".\n\nFor the <image> test, include <image href=\"data:image/png;base64,AAA\"/> in the SVG.\n\nAll tests should use test.describe('plugin icon build validation', ...) for grouping."
+    },
+    {
+      "id": "US-003",
+      "title": "Add E2E tests for icon data flowing through server to side panel",
+      "description": "As a platform developer, I want E2E tests proving that custom SVG icons are correctly loaded by the MCP server, sent to the extension, and visible in the side panel with proper active/inactive rendering.",
+      "acceptanceCriteria": [
+        "A new test file e2e/side-panel-icons.e2e.ts verifies the icon rendering pipeline",
+        "Test: the /health endpoint includes iconSvg in the plugin details for the e2e-test plugin (which has an icon from US-001)",
+        "Test: the side panel renders the e2e-test plugin's custom SVG icon when the plugin tab is in ready state \u2014 the PluginIcon element contains an <svg> element (not a letter avatar span)",
+        "Test: the side panel renders the auto-generated inactive SVG icon when the plugin tab is in closed or unavailable state \u2014 verify an <svg> is present and it differs from the active icon",
+        "Test: a plugin without icons (created via createMinimalPlugin with no icon files) renders a letter avatar in the side panel \u2014 the PluginIcon element contains a text span, not an <svg>",
+        "Tests use the existing fixture infrastructure (mcpServer, extensionContext, backgroundPage, mcpClient) from e2e/fixtures.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes (the new test file specifically)"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "COMPLETED: Created e2e/side-panel-icons.e2e.ts with 4 tests covering the full icon rendering pipeline. Added iconSvg to the /health endpoint's pluginDetails response in http-routes.ts. Added iconSvg to the PluginDetail E2E type in fixtures.ts. See commit ed8dd7e.\n\nTests:\n1. /health includes iconSvg for e2e-test plugin\n2. Plugin with custom icon renders SVG, not letter avatar\n3. Inactive icon differs from active icon when tab state changes\n4. Plugin without icons renders letter avatar fallback\n\nKey patterns learned:\n- Side panel tests must use waitForLog('tab.syncAll received') as the readiness gate, not 'Config watcher: Watching'\n- Health endpoint requires Bearer auth to return pluginDetails (unauthenticated gets minimal response)\n- PluginIcon renders SVG via dangerouslySetInnerHTML inside div.border-border > div.overflow-hidden\n- Inactive state applies opacity-50 class on the container"
+    },
+    {
+      "id": "US-004",
+      "title": "Bump version to 0.0.17 and update cross-references",
+      "description": "As a platform maintainer, I want all platform package versions bumped to 0.0.17 so that the icon-aware SDK can be published.",
+      "acceptanceCriteria": [
+        "All four platform package versions are bumped to 0.0.17: platform/shared/package.json, platform/plugin-sdk/package.json, platform/plugin-tools/package.json, platform/cli/package.json",
+        "Cross-references are updated: plugin-sdk depends on shared ^0.0.17, plugin-tools depends on shared and plugin-sdk ^0.0.17, cli depends on all three ^0.0.17",
+        "The publish script scripts/publish.sh requires no structural changes (it already handles the four packages in the correct dependency order)",
+        "bun run build passes with the new version numbers",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "COMPLETED MANUALLY: All 5 platform packages bumped to 0.0.17 and published to npm (shared, plugin-sdk, plugin-tools, cli, create-plugin). create-opentabs-plugin was renamed to @opentabs-dev/create-plugin and added to the publish pipeline. See commit aec1dbb."
+    },
+    {
+      "id": "US-005",
+      "title": "Update e2e-test plugin to use 0.0.17 packages and verify full E2E suite",
+      "description": "As an E2E test developer, I want the e2e-test plugin to depend on the new 0.0.17 SDK packages so that E2E tests run against the published icon-aware build tooling.",
+      "acceptanceCriteria": [
+        "plugins/e2e-test/package.json has @opentabs-dev/plugin-sdk dependency updated to ^0.0.17",
+        "plugins/e2e-test/package.json has @opentabs-dev/plugin-tools devDependency updated to ^0.0.17",
+        "cd plugins/e2e-test && bun install succeeds",
+        "cd plugins/e2e-test && bun run build succeeds and produces dist/tools.json with iconSvg and iconInactiveSvg fields (from the icon.svg added in US-001)",
+        "The built dist/adapter.iife.js works correctly with existing E2E tests",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes (the full E2E suite, not just the new icon tests)"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "COMPLETED: All acceptance criteria verified — full E2E suite passes (341 tests, 0 failures). Plugin deps at ^0.0.17 with 0.0.17 installed. Plugin builds successfully with iconSvg and iconInactiveSvg in tools.json. Fixed E2E infrastructure issues across three commits: (1) 791b690 — version marker, skip confirmation, auth headers (resolved 82 of 97 failures); (2) 748555c — prevent orphaned E2E test process leaks; (3) d776351 — output sanitization bypass (OPENTABS_SKIP_SANITIZATION), two-click confirmation pattern, auth headers on health polls, secret rotation recovery (401 retry + auth.json symlink in offscreen document), URL change reconnection timing (write auth.json before setMcpServerUrl). All quality checks pass: build, type-check, lint, knip, test, test:e2e."
+    }
+  ]
+}

@@ -1,0 +1,196 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-194305-cli-separation~running.json
+Started: Fri Feb 20 20:00:02 PST 2026
+---
+
+## Codebase Patterns
+- Each platform package has two tsconfigs: main `tsconfig.json` (compiles to dist/) and `tsconfig.test.json` (noEmit, type-checks test files only)
+- Root `tsconfig.json` must reference both tsconfigs for each new package
+- `knip.ts` needs a workspace entry for each new platform package (with test file entries)
+- `eslint.config.ts` needs node globals for server-side platform packages
+- The `platform/*` workspace glob in root `package.json` auto-covers new packages
+- Build command source depends on: @opentabs-dev/plugin-sdk, @opentabs-dev/shared, commander, picocolors, zod
+- CLI entry points use shebang `#!/usr/bin/env bun` and read version from `../package.json`
+- `scaffold.ts` imports `validatePluginName` and `validateUrlPattern` from `@opentabs-dev/plugin-sdk` — so cli still needs plugin-sdk as a dependency even after removing the build command
+- When removing commands from the CLI, scaffold.ts generates package.json with devDep and script references that must be updated simultaneously to avoid test failures
+- The `create-plugin` test `overrideToLocalPackages` must match the scaffolded devDependencies exactly
+- Commander shows commands in registration order — register important commands first for --help display
+- When renaming/removing CLI commands, search all other commands for hint messages referencing the old names
+
+---
+
+## 2026-02-21 - US-001
+- Created `platform/plugin-tools/` directory with full package structure
+- **Files created:**
+  - `platform/plugin-tools/package.json` — @opentabs-dev/plugin-tools with `opentabs-plugin` bin entry
+  - `platform/plugin-tools/tsconfig.json` — references shared and plugin-sdk
+  - `platform/plugin-tools/tsconfig.test.json` — noEmit test type-checking
+  - `platform/plugin-tools/src/cli.ts` — entry point with Commander setup
+  - `platform/plugin-tools/src/commands/build.ts` — copied from cli, updated error messages to reference `opentabs-plugin`
+  - `platform/plugin-tools/src/commands/build.test.ts` — unit tests copied from cli
+  - `platform/plugin-tools/src/commands/build-e2e.test.ts` — E2E tests copied from cli
+  - `platform/plugin-tools/src/commands/index.ts` — barrel export for build command
+- **Files modified:**
+  - `tsconfig.json` — added plugin-tools and plugin-tools/tsconfig.test.json references
+  - `knip.ts` — added `platform/plugin-tools` workspace with test entries
+  - `eslint.config.ts` — added `platform/plugin-tools/**/*.ts` to node globals
+  - `bun.lock` — updated from `bun install`
+- **Learnings for future iterations:**
+  - The build command code is nearly identical between cli and plugin-tools — the only differences are the CLI binary name in help text and error messages
+  - Prettier will flag long template literal strings that differ from the original; the original cli's build.ts was formatted for `opentabs build` which was shorter
+  - `bun install` automatically picks up new workspace packages matching the `platform/*` glob
+---
+
+## 2026-02-21 - US-002
+- Removed `build`, `dev`, and `reload` commands from `@opentabs-dev/cli`
+- **Files deleted:**
+  - `platform/cli/src/commands/build.ts` — moved to plugin-tools in US-001
+  - `platform/cli/src/commands/build.test.ts` — unit tests (duplicated in plugin-tools)
+  - `platform/cli/src/commands/build-e2e.test.ts` — E2E tests (duplicated in plugin-tools)
+  - `platform/cli/src/commands/dev.ts` — dev command (replaced by `start` in US-003)
+  - `platform/cli/src/commands/reload.ts` — reload command (removed entirely)
+- **Files modified:**
+  - `platform/cli/src/commands/index.ts` — removed 3 exports (build, dev, reload)
+  - `platform/cli/src/cli.ts` — removed 3 command registrations
+  - `platform/cli/package.json` — removed `zod` from dependencies (kept `@opentabs-dev/plugin-sdk` for scaffold.ts)
+  - `platform/cli/src/scaffold.ts` — changed scaffold to emit `opentabs-plugin build` scripts and `@opentabs-dev/plugin-tools` devDependency instead of cli
+  - `platform/create-plugin/src/index.test.ts` — updated `overrideToLocalPackages` and assertion to reference `plugin-tools` instead of `cli`
+  - `bun.lock` — updated after removing zod from cli deps
+- **Learnings for future iterations:**
+  - `scaffold.ts` uses `@opentabs-dev/plugin-sdk` at runtime for validation — cannot remove plugin-sdk from cli deps
+  - `zod` was only used by the build command (schema serialization) — safe to remove from cli after build command moved to plugin-tools
+  - Removing CLI commands requires updating scaffold.ts simultaneously since the scaffold generates scripts/devDeps that reference the CLI tools
+  - The create-plugin E2E test installs the scaffolded plugin and runs `bun run build` — must update overrides to match new scaffold devDeps
+---
+
+## 2026-02-21 - US-003
+- Added `opentabs start` command for production-mode MCP server launch
+- Updated all CLI hint messages from `opentabs dev` → `opentabs start` and `opentabs build` → `opentabs-plugin build`
+- **Files created:**
+  - `platform/cli/src/commands/start.ts` — production start command (no --hot, no --dev, no --verbose/--log-level)
+- **Files modified:**
+  - `platform/cli/src/cli.ts` — imported and registered start command (first in registration order)
+  - `platform/cli/src/commands/index.ts` — added `registerStartCommand` export
+  - `platform/cli/src/commands/status.ts` — hint changed from `opentabs dev` to `opentabs start`
+  - `platform/cli/src/commands/doctor.ts` — hints updated: config → `opentabs config init`, server → `opentabs start`, plugin build → `opentabs-plugin build`
+  - `platform/cli/src/commands/doctor.test.ts` — updated test assertions to match new hint text
+  - `platform/cli/src/commands/config.ts` — hint changed from `opentabs dev` to `opentabs config init`
+  - `platform/cli/src/commands/logs.ts` — comment and hint changed from `opentabs dev` to `opentabs start`
+  - `platform/cli/src/commands/plugin.ts` — two hints changed from `opentabs dev` to `opentabs config init`
+- **Learnings for future iterations:**
+  - The old `dev.ts` pattern (resolveServerEntry, isPortInUse, teeStream) is reusable — start.ts is a simplified copy without hot reload and verbose logging
+  - When adding a new command, update all hint messages across other commands that reference the old command name
+  - Commander shows commands in registration order — registering start first makes it appear first in --help
+  - Config creation hints should point to `opentabs config init` rather than a server start command
+---
+
+## 2026-02-21 - US-004
+- Added `@opentabs-dev/plugin-tools` as a dependency of `@opentabs-dev/cli` so `scaffold.ts` can resolve the plugin-tools package version via `import.meta.resolve()` at runtime
+- Added `@opentabs-dev/plugin-tools` to knip's `ignoreDependencies` for cli workspace since it's resolved dynamically, not via static imports
+- **Files modified:**
+  - `platform/cli/package.json` — added `@opentabs-dev/plugin-tools: ^0.0.9` to dependencies
+  - `knip.ts` — added `@opentabs-dev/plugin-tools` to cli workspace `ignoreDependencies`
+  - `bun.lock` — updated after dependency change
+- **Note:** Most US-004 acceptance criteria (scaffold emitting plugin-tools devDep, opentabs-plugin scripts, version resolution) were already implemented in US-002 when scaffold.ts was updated. This story only needed the cli→plugin-tools dependency declaration and knip config.
+- **Learnings for future iterations:**
+  - When a package uses `import.meta.resolve()` to read another package's version at runtime, declare it as a dependency even though there's no static import — otherwise it won't resolve when published to npm
+  - Knip can't trace dynamic `import.meta.resolve()` calls, so add such deps to `ignoreDependencies`
+  - The `create-opentabs-plugin` package correctly depends on `@opentabs-dev/cli` (not plugin-tools) because the scaffold function lives in cli; plugin-tools is a transitive dependency via cli
+---
+
+## 2026-02-21 - US-005
+- Updated both existing plugins (slack, e2e-test) to use `@opentabs-dev/plugin-tools` instead of `@opentabs-dev/cli`
+- **Files modified:**
+  - `plugins/slack/package.json` — devDependencies, overrides, and scripts updated
+  - `plugins/e2e-test/package.json` — devDependencies, overrides, and scripts updated
+  - `plugins/e2e-test/bun.lock` — regenerated after dependency change
+- **Changes in each plugin:**
+  - `devDependencies`: `@opentabs-dev/cli` → `@opentabs-dev/plugin-tools` (with `file:../../platform/plugin-tools`)
+  - `overrides`: `@opentabs-dev/cli` → `@opentabs-dev/plugin-tools` (with `file:../../platform/plugin-tools`)
+  - `scripts.build`: `tsc && opentabs build` → `tsc && opentabs-plugin build`
+  - `scripts.dev`: `tsc --watch --preserveWatchOutput & opentabs build --watch` → `tsc --watch --preserveWatchOutput & opentabs-plugin build --watch`
+- Both plugins build successfully after `bun install`
+- **Learnings for future iterations:**
+  - The slack plugin's `bun.lock` is gitignored (not tracked) while the e2e-test plugin's `bun.lock` is tracked — be aware of this inconsistency
+  - Plugin `overrides` fields must also be updated when changing devDependencies — they control how transitive dependencies resolve in the standalone plugin projects
+  - Using `file:` links in overrides allows local development of plugin-tools before it's published to npm
+---
+
+## 2026-02-21 - US-006
+- Updated `scripts/publish.sh` to include `@opentabs-dev/plugin-tools` in the publish pipeline
+- **Files modified:**
+  - `scripts/publish.sh` — added plugin-tools to version bump loop, cross-reference updates, and publish commands
+- **Changes:**
+  - Version bump loop: added `platform/plugin-tools` alongside shared, plugin-sdk, cli
+  - Cross-reference updates: plugin-tools gets shared + plugin-sdk refs bumped; cli gets plugin-tools ref bumped
+  - Publish order: shared → plugin-sdk → plugin-tools → cli (correct dependency order)
+- **Learnings for future iterations:**
+  - The publish script uses `sed -i ''` (macOS sed) for in-place edits — remember the empty string argument for backup suffix
+  - Cross-reference updates must follow the dependency graph: each package's `@opentabs-dev/*` dependencies get their `^x.y.z` version bumped to match the new version
+  - cli depends on all three other packages (shared, plugin-sdk, plugin-tools), so it publishes last
+---
+
+## 2026-02-21 - US-007
+- Updated CLI description from "develop, build, and manage plugins" to "manage your MCP server and plugins"
+- Reordered command registrations for logical --help display: start, status, doctor, setup, logs, plugin, config
+- **Files modified:**
+  - `platform/cli/src/cli.ts` — description string and command registration order
+- **Learnings for future iterations:**
+  - Commander displays commands in registration order — the order of `registerXxxCommand()` calls directly controls --help output
+  - This was a minimal change (single file, 4 lines changed) since US-002 already removed dev-only commands and US-003 already added the start command
+---
+
+## 2026-02-21 - US-008
+- Updated all stale CLI references across E2E tests, platform code, side panel UI, and plugin docs
+- **Files modified:**
+  - `e2e/iife-injection.e2e.ts` — comment: `opentabs build` → `opentabs-plugin build`
+  - `e2e/strict-csp.e2e.ts` — comment: `opentabs build` → `opentabs-plugin build`
+  - `platform/browser-extension/src/side-panel/components/EmptyStates.tsx` — UI text: `opentabs dev` → `opentabs start`
+  - `platform/shared/src/index.ts` — two JSDoc comments: `opentabs build` → `opentabs-plugin build`
+  - `platform/mcp-server/src/state.ts` — JSDoc comment: `opentabs build` → `opentabs-plugin build`
+  - `platform/mcp-server/src/file-watcher.ts` — code comment: `opentabs build` → `opentabs-plugin build`
+  - `plugins/README.md` — build command description: `opentabs build` → `opentabs-plugin build`
+- E2E fixtures (`e2e/fixtures.ts`) already start the MCP server directly via bun — no changes needed there
+- No references to `opentabs dev` or `opentabs reload` found in E2E test files
+- All quality checks pass: build, type-check, lint, knip, test (835 pass), test:e2e (231 passed, 1 pre-existing flaky)
+- **Learnings for future iterations:**
+  - The side panel's `EmptyStates.tsx` contains user-visible command references that must stay in sync with CLI changes
+  - Comments referencing CLI commands exist in shared/mcp-server/browser-extension — search broadly when renaming CLI commands
+  - E2E tests start the MCP server directly via `bun` spawn, not through the CLI — so CLI command renames don't affect the test fixtures themselves, only comments
+---
+
+## 2026-02-21 - US-009
+- Updated CLAUDE.md to document the two-CLI architecture after CLI separation
+- **Files modified:**
+  - `CLAUDE.md` — updated architecture descriptions, directory structure, starting the server, adding plugins, plugin isolation, and publishing sections
+- **Changes:**
+  - Architecture section: Split "Plugin SDK" description into three: Plugin SDK (base class/factory), Plugin Tools (opentabs-plugin CLI), CLI (opentabs user CLI with command list)
+  - Directory structure: Removed stale `cli.ts # opentabs build CLI` from plugin-sdk, added `plugin-tools/` and `cli/` entries with accurate descriptions
+  - Starting the MCP Server: Added `opentabs start` as the primary production mode command
+  - Adding a New Plugin: Updated `opentabs build` → `opentabs-plugin build`
+  - Plugin Isolation: Updated package list from `shared, plugin-sdk, cli` → `shared, plugin-sdk, plugin-tools`
+  - Publishing: Added `@opentabs-dev/plugin-tools` to published packages list and documented publish order (shared → plugin-sdk → plugin-tools → cli)
+  - Verified no stale references to `opentabs build`, `opentabs dev`, or `opentabs reload` remain
+- All quality checks pass: build, type-check, lint, knip, test (835 pass)
+- **Learnings for future iterations:**
+  - CLAUDE.md is strictly documentation — no quality checks fail from documentation changes alone, but always verify anyway
+  - Grep the file after editing to confirm no stale references remain — easy to miss occurrences in different sections
+---
+
+## 2026-02-21 - US-010
+- Final verification — all quality gates pass, no code changes needed
+- **Verification results:**
+  - `bun run build` — exit 0
+  - `bun run type-check` — exit 0
+  - `bun run lint` — exit 0
+  - `bun run knip` — exit 0
+  - `bun run test` — 835 tests pass, 0 failures
+  - `opentabs --help` — shows only: start, status, doctor, setup, logs, plugin, config
+  - `opentabs-plugin --help` — shows only: build
+  - Searched for stale references (`opentabs build`, `opentabs dev`, `opentabs reload`) in platform/cli/ and platform/ — none found
+  - `platform/plugin-tools/` has clean command set with only `build`
+- **No files changed** — all previous stories left the codebase in a clean state
+- **Learnings for future iterations:**
+  - A "final verification" story is valuable as a gate — it confirms all prior stories compose correctly
+  - When all checks pass with no changes needed, the story is still valuable as documented proof of completion
+---

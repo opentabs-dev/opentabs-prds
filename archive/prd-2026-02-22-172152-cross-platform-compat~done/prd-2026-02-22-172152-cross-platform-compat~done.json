@@ -1,0 +1,209 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix macOS-only and Unix-only code to support macOS, Linux, and Windows. Covers path separators, atomic file writes, POSIX permissions, signal handling, process management, hardcoded paths, symlinks, and shell scripts.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Extract cross-platform helpers module in platform/shared",
+      "description": "As a developer, I want a shared cross-platform utilities module so that all platform packages can reuse consistent cross-platform abstractions instead of each package implementing its own workarounds.",
+      "acceptanceCriteria": [
+        "New file platform/shared/src/cross-platform.ts exports: atomicWrite(path, content, mode?), isWindows(), platformExec(cmd) helpers",
+        "atomicWrite uses tmp-file + rename on POSIX, and write-then-rename with proper error handling on Windows (NTFS rename-over-existing requires unlink-then-rename fallback)",
+        "platformExec(cmd) resolves bare command names: on Windows, appends '.cmd' for npm and '.exe' for bun",
+        "isWindows() returns process.platform === 'win32'",
+        "chmod calls are wrapped to silently no-op on Windows (log a debug warning instead of failing)",
+        "Module is exported from platform/shared/src/index.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "This is the foundation story — later stories will consume these helpers. Create platform/shared/src/cross-platform.ts. The atomicWrite pattern is currently duplicated in 6+ locations (see US-002). The module should handle: (1) atomic file writing with POSIX rename semantics + Windows fallback, (2) chmod that silently succeeds on Windows, (3) command name resolution for Bun.spawn/spawnSync. Use Bun.env or process.platform for platform detection. Keep it simple — no external dependencies."
+    },
+    {
+      "id": "US-002",
+      "title": "Replace all duplicated atomicWrite implementations with shared helper",
+      "description": "As a developer, I want all atomic file write operations to use the shared cross-platform atomicWrite helper so that Windows compatibility is handled in one place.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/config.ts atomicWriteConfig (line 76) uses the shared atomicWrite helper",
+        "platform/cli/src/config.ts atomicWriteConfig (line 61) uses the shared atomicWrite helper",
+        "platform/plugin-tools/src/commands/build.ts atomicWriteConfig (line 40) uses the shared atomicWrite helper",
+        "platform/mcp-server/src/audit-disk.ts rename call (line 38) uses the shared atomicWrite pattern or is wrapped properly",
+        "platform/cli/src/commands/config.ts writeAuthFile (line 363) uses the shared atomicWrite helper",
+        "platform/mcp-server/src/extension-protocol.ts writeAdapterFile (line 92) uses the shared atomicWrite helper",
+        "The local atomicWriteConfig functions are removed (no duplication)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Six locations currently duplicate the atomic write pattern. Import { atomicWrite } from '@opentabs-dev/shared' (or from the relative path within platform/ workspace). Each call currently does: write tmp → chmod 0o600 → rename. The shared helper should accept an optional mode parameter. For audit-disk.ts (line 38), the pattern is simpler (no chmod), but still uses POSIX rename — wrap it with the shared helper. For extension-protocol.ts (lines 108-113), there are two rename calls (source map + adapter file) — both need the helper. Ensure the warn-on-chmod-failure behavior is preserved (the shared helper should accept a logger/warn callback or just console.warn)."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix path separator hardcoding in resolver.ts",
+      "description": "As a developer, I want the plugin path security check to work on Windows so that plugins can be discovered from Windows paths.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/resolver.ts line 53: the '/' literal in `root + '/'` is replaced with `path.sep`",
+        "Import of `sep` from 'node:path' is added",
+        "The isAllowedPluginPath function works for both `/foo/bar` and `C:\\foo\\bar` paths",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/resolver.ts, line 53. Current code: `return allRoots.some(root => realPath.startsWith(root + '/') || realPath === root);`. Fix: import `sep` from 'node:path' and replace `'/'` with `sep`. Also review lines 58-59 where local path prefixes are checked (`'./', '../', '/', '~/'`) — these are string literals in user-facing specifiers (not filesystem paths), so they are correct as-is (users type forward slashes on all platforms). Only the realpath comparison on line 53 is a filesystem operation that needs path.sep."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix Bun.spawn and Bun.spawnSync with bare command names for Windows",
+      "description": "As a developer, I want process spawning to work on Windows where npm is a .cmd wrapper and bun is bun.exe.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/resolver.ts lines 143, 154: Bun.spawnSync calls for 'npm' and 'bun' use cross-platform command resolution",
+        "platform/cli/src/commands/plugin.ts lines 90, 147, 285: Bun.spawn calls for 'npm' use cross-platform command resolution",
+        "platform/cli/src/commands/start.ts line 173: Bun.spawn call for 'bun' uses cross-platform command resolution",
+        "On Windows, 'npm' resolves to 'npm.cmd' and 'bun' resolves to 'bun.exe'",
+        "On Unix, commands remain unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Use the platformExec helper from US-001 (platform/shared/src/cross-platform.ts). Files to edit: (1) platform/mcp-server/src/resolver.ts — lines 143 `Bun.spawnSync(['npm', 'root', '-g'])` and 154 `Bun.spawnSync(['bun', 'pm', '-g', 'bin'])`. (2) platform/cli/src/commands/plugin.ts — lines 90 `Bun.spawn(['npm', 'install', '-g', pkg])`, 147 `Bun.spawn(['npm', 'uninstall', '-g', pkg])`, 285 `Bun.spawn(['npm', 'list', '-g', '--json', '--depth=0'])`. (3) platform/cli/src/commands/start.ts — line 173 `Bun.spawn(['bun', serverEntry])`. Replace the first element of each command array with `platformExec('npm')` or `platformExec('bun')`."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix signal handling (SIGINT/SIGTERM) for Windows compatibility",
+      "description": "As a developer, I want graceful shutdown to work on Windows where SIGTERM is not delivered.",
+      "acceptanceCriteria": [
+        "platform/cli/src/commands/start.ts lines 181-182: SIGTERM handler is wrapped with a Windows-safe alternative",
+        "platform/cli/src/commands/logs.ts lines 117-124: SIGTERM handler is wrapped with a Windows-safe alternative",
+        "platform/plugin-tools/src/commands/build.ts lines 932-933: SIGTERM handler is wrapped with a Windows-safe alternative",
+        "scripts/dev.ts lines 191-198: SIGTERM handler is wrapped with a Windows-safe alternative",
+        "On Windows, 'SIGINT' (Ctrl+C) is the primary shutdown signal; SIGTERM handler is registered only on non-Windows platforms",
+        "On Unix, behavior is unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Pattern: `process.on('SIGINT', cleanup)` works on all platforms (Node.js/Bun translate Ctrl+C to SIGINT on Windows). `process.on('SIGTERM', cleanup)` should be conditional: `if (process.platform !== 'win32') process.on('SIGTERM', cleanup);`. On Windows, also listen for 'SIGHUP' as a fallback (some Windows process managers use it). The kill forwarding in start.ts (line 181-182 `proc.kill('SIGINT')` / `proc.kill('SIGTERM')`) also needs attention: on Windows, `proc.kill()` without arguments calls TerminateProcess, which is the Windows equivalent. Use `proc.kill()` (no signal) on Windows instead of `proc.kill('SIGTERM')`. Add the isWindows() import from shared."
+    },
+    {
+      "id": "US-006",
+      "title": "Fix E2E global teardown to be cross-platform",
+      "description": "As a developer, I want the E2E global teardown to clean up orphaned processes on all platforms, not just Unix.",
+      "acceptanceCriteria": [
+        "e2e/global-teardown.ts no longer uses pgrep or kill shell commands directly",
+        "On Unix, process cleanup uses a Node.js-native approach (or falls back to pgrep/kill)",
+        "On Windows, process cleanup uses tasklist/taskkill or Node.js process.kill()",
+        "The function handles the 'no matching processes' case gracefully on all platforms",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: e2e/global-teardown.ts (27 lines total). Current code uses `pgrep -f 'opentabs-e2e-'` (line 18) and `kill -9` (line 22). Cross-platform approach: use `execSync` with platform-conditional commands. On Unix: keep pgrep + kill. On Windows: `tasklist /FO CSV | findstr opentabs-e2e-` to find PIDs, then `taskkill /PID <pid> /F` to kill. Wrap in try-catch since the commands throw when no processes match. Alternative: use `process.kill(pid, 'SIGKILL')` for the kill step (works cross-platform in Node.js if you have the PID). The key challenge is PID discovery — pgrep has no Windows equivalent without external tools."
+    },
+    {
+      "id": "US-007",
+      "title": "Fix E2E killProcess helper for Windows signal support",
+      "description": "As a developer, I want the E2E killProcess helper to reliably terminate processes on Windows.",
+      "acceptanceCriteria": [
+        "e2e/fixtures.ts killProcess function (lines 330-353) handles Windows where SIGTERM may not work",
+        "On Windows, uses proc.kill() (TerminateProcess) instead of proc.kill('SIGTERM')",
+        "On Unix, behavior is unchanged (SIGTERM → wait → SIGKILL escalation)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "File: e2e/fixtures.ts, lines 330-353. Current flow: SIGTERM (line 346) → timeout → SIGKILL (line 340). On Windows, SIGTERM is unreliable — Node.js translates it to TerminateProcess which is equivalent to SIGKILL (immediate, no graceful shutdown). So on Windows, just call `proc.kill()` (no argument, calls TerminateProcess) immediately — no need for the grace period. Pattern: `if (process.platform === 'win32') { proc.kill(); resolve(); } else { /* existing SIGTERM→SIGKILL flow */ }`."
+    },
+    {
+      "id": "US-008",
+      "title": "Fix E2E symlinks to use junctions on Windows",
+      "description": "As a developer, I want E2E test symlinks to work on Windows without requiring admin privileges.",
+      "acceptanceCriteria": [
+        "e2e/fixtures.ts line 1296: fs.symlinkSync uses 'junction' type on Windows for directory symlinks",
+        "e2e/fixtures.ts line 1306: fs.symlinkSync uses appropriate type on Windows for file symlinks",
+        "e2e/lifecycle.e2e.ts lines 640, 786: fs.symlinkSync uses 'junction' type on Windows",
+        "All other symlink creation in e2e/ tests uses the correct type parameter",
+        "On Unix, symlink behavior is unchanged (no type parameter needed)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "On Windows, directory symlinks require admin privileges, but junctions do not. Node.js fs.symlinkSync accepts a third parameter: 'file', 'dir', or 'junction'. For directories, use 'junction' on Windows. Pattern: `fs.symlinkSync(target, path, process.platform === 'win32' ? 'junction' : undefined)`. Files to edit: e2e/fixtures.ts (lines 1296, 1306), e2e/lifecycle.e2e.ts (lines 640, 786), e2e/strict-csp.e2e.ts (line 494), e2e/helpers.ts (line 67), e2e/build-icons.e2e.ts (line 36), platform/plugin-tools/src/commands/build-e2e.test.ts (line 31). For file symlinks (like auth.json on line 1306), use 'file' on Windows. Consider creating a small helper in e2e/helpers.ts: `crossPlatformSymlink(target, path, type: 'file' | 'dir')`."
+    },
+    {
+      "id": "US-009",
+      "title": "Fix hardcoded /tmp paths in unit tests",
+      "description": "As a developer, I want unit tests to use os.tmpdir() instead of hardcoded /tmp so they pass on Windows.",
+      "acceptanceCriteria": [
+        "platform/shared/src/manifest.test.ts line 17: '/tmp/test-plugin/package.json' replaced with path.join(os.tmpdir(), 'test-plugin', 'package.json')",
+        "platform/mcp-server/src/registry.test.ts line 43: '/tmp/test-plugin' replaced with path.join(os.tmpdir(), 'test-plugin')",
+        "No other hardcoded /tmp paths exist in test files (verify with grep)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Two test files hardcode /tmp. Fix: import os from 'node:os' and path from 'node:path', then use path.join(os.tmpdir(), ...). File 1: platform/shared/src/manifest.test.ts — line 17 `const sourcePath = '/tmp/test-plugin/package.json'` → `const sourcePath = path.join(os.tmpdir(), 'test-plugin', 'package.json')`. File 2: platform/mcp-server/src/registry.test.ts — line 43 `sourcePath: '/tmp/test-plugin'` → `sourcePath: path.join(os.tmpdir(), 'test-plugin')`. These are just string values used as identifiers in test fixtures — they don't need the directories to actually exist."
+    },
+    {
+      "id": "US-010",
+      "title": "Rewrite scripts/publish.sh as a cross-platform TypeScript script",
+      "description": "As a developer, I want the publish script to work on Windows without requiring bash/WSL.",
+      "acceptanceCriteria": [
+        "New file scripts/publish.ts replaces scripts/publish.sh",
+        "The script performs the same operations: version bump, cross-reference update, build, npm publish, changelog generation, git commit and tag",
+        "Uses Bun APIs (Bun.spawn, Bun.file, Bun.write) instead of sed, bash variables, etc.",
+        "scripts/publish.sh is deleted",
+        "The script is executable via 'bun scripts/publish.ts <version>'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "scripts/publish.sh is a 188-line bash script that: (1) verifies npm auth, (2) bumps versions with sed, (3) updates cross-references, (4) builds, (5) publishes 5 packages in order, (6) generates a changelog from git log, (7) commits and tags. Rewrite in TypeScript using Bun APIs. For version bumping, read JSON with Bun.file().json(), modify, write back with Bun.write(). For npm publish, use Bun.spawn(['npm', 'publish', ...]). For git operations, use Bun.spawnSync(['git', ...]). For changelog, parse git log output with regex (replace BASH_REMATCH with JS regex). Keep the same publish order (shared → plugin-sdk → plugin-tools → cli → create-plugin). Ensure the new script is covered by a tsconfig for type-checking (add to tsconfig.configs.json or create tsconfig.scripts.json)."
+    },
+    {
+      "id": "US-011",
+      "title": "Rewrite scripts/dev.ts signal handling for cross-platform support",
+      "description": "As a developer, I want the dev script's process cleanup to work on Windows.",
+      "acceptanceCriteria": [
+        "scripts/dev.ts lines 185-199: cleanup function uses proc.kill() (no signal) on Windows instead of proc.kill('SIGTERM')",
+        "SIGTERM listener is only registered on non-Windows platforms",
+        "SIGINT listener remains on all platforms",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "File: scripts/dev.ts, lines 185-199. Current code sends SIGTERM to all children on cleanup. On Windows, SIGTERM does not exist — use proc.kill() without arguments (calls TerminateProcess). Pattern: `const killSignal = process.platform === 'win32' ? undefined : 'SIGTERM'; for (const child of children) { child.kill(killSignal); }`. Also make the SIGTERM listener conditional: `if (process.platform !== 'win32') process.on('SIGTERM', () => { cleanup(); process.exit(0); });`."
+    }
+  ]
+}

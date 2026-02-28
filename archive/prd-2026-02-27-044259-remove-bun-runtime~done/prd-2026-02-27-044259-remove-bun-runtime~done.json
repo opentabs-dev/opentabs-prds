@@ -1,0 +1,179 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Remove Bun as a runtime dependency. Replace with Node.js + tsx everywhere. Keep npm as package manager. Build a proxy-based dev server for hot reload. After this migration, contributors only need Node.js 22+ and npm — no Bun required.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add tsx dependency and replace bun-types with @types/node in all tsconfigs",
+      "description": "As a contributor, I want the project to use @types/node instead of bun-types so that TypeScript understands Node.js APIs natively without Bun.",
+      "acceptanceCriteria": [
+        "tsx is added as a root devDependency",
+        "@types/node is added as a root devDependency (if not already present)",
+        "bun-types is removed from ALL package.json devDependencies (root, shared, plugin-tools, plugin-sdk, create-plugin, mcp-server, cli, browser-extension)",
+        "ALL tsconfig files replace 'bun-types' with 'node' in their types array (tsconfig.base.json, platform/*/tsconfig.json, platform/browser-extension/tsconfig.test.json, e2e/tsconfig.json)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "tsconfig.base.json has types: ['bun-types'] which propagates to all packages. Change it to types: ['node']. Some tsconfigs override this locally — check each one. The browser-extension/tsconfig.test.json has types: ['bun-types', 'chrome'] — change to ['node', 'chrome']. e2e/tsconfig.json has types: ['node', 'bun-types', 'chrome'] — remove 'bun-types'. After removing bun-types, some files that use Bun.* APIs will have type errors — that's expected and will be fixed in later stories. For now, just ensure the build and type-check still pass (the isBun branches guard the Bun-specific code)."
+    },
+    {
+      "id": "US-002",
+      "title": "Remove isBun from shared and all production code that uses it",
+      "description": "As a contributor, I want all Bun runtime detection removed from production code so there's a single code path (Node.js).",
+      "acceptanceCriteria": [
+        "isBun export is removed from platform/shared/src/index.ts",
+        "platform/mcp-server/src/index.ts: the createBunServer function and the if (isBun) branch are removed. Only createNodeServer remains.",
+        "platform/mcp-server/src/index.ts: ServerInstance type simplified to just NodeServer",
+        "platform/mcp-server/src/resolver.ts: the if (isBun) block that scans Bun's global node_modules is removed",
+        "platform/cli/src/commands/doctor.ts: the if (isBun) branch returning Bun version is removed",
+        "All comments referencing 'bun --hot' in mcp-server source files are updated to reference the new proxy dev server (or just say 'dev mode hot reload')",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The isBun constant is in platform/shared/src/index.ts line 20. It's imported in mcp-server/src/index.ts, mcp-server/src/resolver.ts, and cli/src/commands/doctor.ts. Remove all usages and the export. The createBunServer function in mcp-server/src/index.ts (lines 208-231) can be deleted entirely. The createNodeServer function stays. Comments about bun --hot exist in many mcp-server source files (reload.ts, log-buffer.ts, adapter-files.ts, file-watcher.ts, config.ts, shutdown.ts, state.ts, mcp-setup.ts, audit-disk.ts, extension-protocol.ts). Update these comments to say 'dev mode reload' or 'proxy hot reload' instead of 'bun --hot'."
+    },
+    {
+      "id": "US-003",
+      "title": "Migrate all build scripts from Bun APIs to Node.js APIs",
+      "description": "As a contributor, I want build scripts to use Node.js APIs so they can run with tsx instead of bun.",
+      "acceptanceCriteria": [
+        "scripts/dev.ts uses node:child_process spawn instead of Bun.spawn, process.env instead of Bun.env, node:fs/promises instead of Bun.file",
+        "scripts/dev-mcp.ts uses Node.js APIs instead of Bun APIs",
+        "scripts/publish.ts uses node:fs/promises and node:child_process instead of Bun.file, Bun.write, Bun.spawnSync",
+        "scripts/clean.ts uses process.argv instead of Bun.argv",
+        "scripts/plugins.ts uses node:fs/promises, process.argv, and node:child_process instead of Bun APIs",
+        "scripts/generate-icons.ts uses node:fs/promises instead of Bun.file and Bun.write",
+        "scripts/check-tsconfig-coverage.ts uses node:fs/promises and glob package instead of Bun.file, Bun.Glob",
+        "scripts/check-bun-version.ts is deleted (no longer needed)",
+        "platform/plugin-sdk/scripts/generate-icon-names.ts uses node:fs/promises instead of Bun.write",
+        "glob package is added as a devDependency (for replacing Bun.Glob)",
+        "bun run build passes",
+        "bun run type-check passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Replacement mapping: Bun.file(path).text() → readFile(path, 'utf-8'), Bun.file(path).json() → JSON.parse(readFile(path, 'utf-8')), Bun.file(path).exists() → access(path).then(()=>true).catch(()=>false) or existsSync, Bun.write(path, content) → writeFile(path, content), Bun.file(path).delete() → unlink(path), Bun.spawn → spawn from node:child_process, Bun.spawnSync → spawnSync from node:child_process, Bun.env → process.env, Bun.argv → process.argv, Bun.Glob → glob npm package. The scripts/dev.ts file also spawns 'bun' commands — change to 'npx tsx' or 'node' as appropriate. The 'bun --hot' invocation in dev.ts and dev-mcp.ts will be replaced by the proxy dev server in a later story."
+    },
+    {
+      "id": "US-004",
+      "title": "Replace all bun run/bun install/bunx with npm equivalents in package.json scripts",
+      "description": "As a contributor, I want all package.json scripts to use npm/npx/tsx instead of bun so the project runs without Bun installed.",
+      "acceptanceCriteria": [
+        "Root package.json: all scripts use 'npm run', 'npx', or 'tsx' instead of 'bun run', 'bunx', or 'bun'",
+        "Root package.json: engines field requires node >= 22 instead of bun >= 1.3.9",
+        "Root package.json: 'bun' and 'bun-types' removed from devDependencies",
+        "All platform/*/package.json: scripts use 'npm run', 'npx', or 'tsx' instead of 'bun run' or 'bun'",
+        "platform/browser-extension/package.json: build:bundle and build:side-panel use 'tsx' instead of 'bun run'",
+        "platform/plugin-sdk/package.json: generate:icons uses 'tsx' instead of 'bun'",
+        "The dev script spawns 'tsx' for .ts files instead of 'bun'",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Key replacements in root package.json: 'bun run tsc' → 'tsc' (tsc is in node_modules/.bin), 'bun scripts/foo.ts' → 'tsx scripts/foo.ts', 'bunx playwright test' → 'npx playwright test', 'bun install --frozen-lockfile' → 'npm ci'. The workspaces field in package.json is already npm-compatible (same syntax). After this story, 'npm run build' should work. The dev scripts (dev, dev:mcp) may still reference bun --hot — that gets fixed in the proxy story."
+    },
+    {
+      "id": "US-005",
+      "title": "Build proxy-based dev server for hot reload without Bun",
+      "description": "As a contributor, I want a Node.js proxy that holds HTTP/WebSocket connections while restarting the MCP server worker on code changes, replacing bun --hot.",
+      "acceptanceCriteria": [
+        "A new file platform/mcp-server/src/dev-proxy.ts exists that implements the proxy",
+        "The proxy listens on the configured port, accepts HTTP and WebSocket connections",
+        "The proxy forks the MCP server as a child process and forwards requests via IPC",
+        "When the worker process dies or is restarted, client connections are held by the proxy",
+        "File changes in platform/mcp-server/dist/ trigger a worker restart (using node:fs.watch or chokidar)",
+        "scripts/dev.ts and scripts/dev-mcp.ts spawn the proxy instead of 'bun --hot'",
+        "platform/mcp-server/package.json dev script uses the proxy",
+        "npm run dev:mcp starts the proxy and hot reload works (edit server code → tsc rebuild → proxy restarts worker → connections preserved)",
+        "npm run build passes",
+        "npm run type-check passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The proxy architecture: a thin Node.js process holds all TCP connections (HTTP for MCP Streamable HTTP, WebSocket for extension). It forks the actual MCP server as a child process. Communication between proxy and worker is via IPC (process.send/process.on('message')). On code change detection (fs.watch on dist/), the proxy kills the worker and spawns a new one. Client connections survive because the proxy process never restarts. The existing globalThis-based hot state pattern in mcp-server can be simplified since the worker gets a clean process on every restart. The proxy should be ~100-150 lines. Use node:http for HTTP proxying and the ws package (already a dependency) for WebSocket proxying."
+    },
+    {
+      "id": "US-006",
+      "title": "Migrate E2E test infrastructure from Bun to Node",
+      "description": "As a contributor, I want E2E tests to run entirely on Node.js so Bun is not needed for testing.",
+      "acceptanceCriteria": [
+        "e2e/fixtures.ts spawns 'node' (with the proxy or --watch) instead of 'bun --hot' for the MCP server",
+        "e2e/test-server.ts uses node:http createServer instead of Bun.serve()",
+        "e2e/strict-csp-test-server.ts uses node:http createServer instead of Bun.serve()",
+        "e2e/analyze-site-test-server.ts uses node:http createServer instead of Bun.serve()",
+        "e2e/build-icons.e2e.ts uses 'npx tsx' instead of 'bun' for CLI invocation",
+        "e2e/global-setup.ts error messages reference 'npm' instead of 'bun'",
+        "All Bun-related comments in e2e/ files are updated",
+        "npm run test:e2e passes (all 357 E2E tests)",
+        "npm run build passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "notes": "The three test servers (test-server.ts, strict-csp-test-server.ts, analyze-site-test-server.ts) each use Bun.serve() with fetch handlers. Convert to node:http createServer with a request handler. The Bun.serve() response model (return new Response()) differs from Node's (res.writeHead + res.end). The e2e/fixtures.ts file spawns the MCP server — it needs to use the dev proxy from US-005 or node --watch. The hot reload tests specifically test that connections survive code changes — this now tests the proxy behavior. The e2e/fixtures.ts wrapper file pattern (append comment to trigger reload) needs updating for the proxy approach."
+    },
+    {
+      "id": "US-007",
+      "title": "Migrate CI, Dockerfile, and Ralph scripts from Bun to Node/npm",
+      "description": "As a contributor, I want CI, Docker, and the Ralph worker infrastructure to use Node.js and npm so Bun is fully removed from the toolchain.",
+      "acceptanceCriteria": [
+        ".github/workflows/ci.yml uses actions/setup-node@v4 instead of oven-sh/setup-bun@v2",
+        "CI uses npm ci instead of bun install --frozen-lockfile",
+        "CI uses npm run instead of bun run for all commands",
+        "CI cache key uses package-lock.json instead of bun.lock",
+        ".ralph/Dockerfile removes Bun installation section and relies on Node.js (already in base image)",
+        ".ralph/ralph.sh uses npm install and npm run instead of bun install and bun run",
+        ".ralph/worker.sh uses npm run instead of bun run for quality checks",
+        ".ralph/perfect-docs.sh qualityChecks use npm run instead of bun run",
+        ".ralph/RALPH.md references npm instead of bun throughout",
+        ".claude/skills/ralph/__SKILL__.md references npm instead of bun in quality check templates",
+        "bun.lock is deleted (package-lock.json is generated by npm install)",
+        "npm run build passes",
+        "npm run check passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "The Dockerfile base image (node:24) already has Node.js and npm. Remove the Bun installation lines (ENV BUN_INSTALL, curl bun.sh). The ralph.sh setup_script currently does 'bun install --frozen-lockfile && bun run build' — change to 'npm ci && npm run build'. The worker.sh quality checks do 'bun run build && bun run type-check && bun run lint && bun run knip && bun run test && bun run test:e2e' — change all to 'npm run'. Delete bun.lock files (root, plugins/e2e-test, plugins/slack, docs). Run npm install to generate package-lock.json. The consumer.sh in opentabs-prds also has bun references — but that's a separate repo and will be updated separately."
+    },
+    {
+      "id": "US-008",
+      "title": "Update all documentation (CLAUDE.md, README, CONTRIBUTING, docs site, package CLAUDE.md files)",
+      "description": "As a contributor, I want all documentation to reference Node.js/npm instead of Bun so the docs match the actual toolchain.",
+      "acceptanceCriteria": [
+        "Root CLAUDE.md: all commands use npm instead of bun, tech stack section says Node.js instead of Bun, runtime compatibility section updated, isBun documentation removed",
+        "README.md: prerequisites say Node.js 22+ instead of Bun, all commands use npm",
+        "CONTRIBUTING.md: all commands use npm, 'Bun-first APIs' guidance removed, replaced with Node.js API guidance",
+        "docs/content/docs/install/index.mdx: updated for npm",
+        "docs/content/docs/contributing/dev-setup.mdx: updated for npm and proxy dev server",
+        "docs/content/docs/contributing/architecture.mdx: updated to remove Bun.serve() references",
+        "docs/content/docs/contributing/publishing.mdx: updated for npm",
+        "docs/content/docs/reference/configuration.mdx: updated for npm",
+        "platform/mcp-server/CLAUDE.md: updated to reference proxy dev server instead of bun --hot",
+        "platform/cli/CLAUDE.md: updated for npm",
+        "e2e/CLAUDE.md: updated to remove Bun-specific API warning",
+        ".ralph/CLAUDE.md: updated for npm",
+        "All 'bun' references in docs/components/illustrations.tsx updated",
+        "npm run build passes",
+        "npm run build:docs passes (if the docs build works)"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "This is a documentation-only story. The key files are: CLAUDE.md (root — the main contributor guide, very extensive bun references), README.md, CONTRIBUTING.md, and the docs site MDX files. The CLAUDE.md runtime compatibility section (around line 287) currently explains isBun and the dual-runtime model — this should be simplified to say 'Node.js 22+ is the runtime for everything. tsx is used to run TypeScript files directly.' The test section should say vitest instead of bun:test. Remove the isBun documentation entirely."
+    }
+  ]
+}

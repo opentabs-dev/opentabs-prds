@@ -1,0 +1,222 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Improve plugin SDK ergonomics: typed prompt args, structured fetch errors, ToolError factory codes, auto displayName/icon defaults, indeterminate progress, internal API cleanup, typed getPageGlobal, storage removal utils, resource schemas, prompt literal types, fetchJSON validation.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add Zod-based typed arguments to definePrompt",
+      "description": "As a plugin developer, I want definePrompt to use Zod schemas for argument type safety, matching defineTool's pattern.",
+      "acceptanceCriteria": [
+        "definePrompt accepts an optional 'args' field with a z.object() schema (in addition to existing 'arguments' array for metadata)",
+        "When 'args' schema is provided, the render function receives a typed object instead of Record<string, string>",
+        "The PromptDefinition generic infers the args type from the Zod schema",
+        "Existing prompts using 'arguments' array and Record<string, string> continue to work (backward compatible)",
+        "The e2e-test plugin's prompt is updated to use the new typed pattern",
+        "build.ts generatePromptsManifest extracts argument metadata from the Zod schema when 'args' is provided",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts. The current PromptDefinition (lines 71-101) has:\n- arguments?: PromptArgument[]\n- render: (args: Record<string, string>) => Promise<PromptMessage[]>\n\nAdd a generic version:\n```typescript\ninterface PromptDefinition<TArgs extends z.ZodObject<z.ZodRawShape> = z.ZodObject<z.ZodRawShape>> {\n  name: string;\n  description: string;\n  args?: TArgs;\n  arguments?: PromptArgument[];  // kept for backward compat and metadata\n  render: (args: TArgs extends z.ZodObject<z.ZodRawShape> ? z.infer<TArgs> : Record<string, string>) => Promise<PromptMessage[]>;\n}\n```\n\nUpdate definePrompt to be generic:\n```typescript\nconst definePrompt = <TArgs extends z.ZodObject<z.ZodRawShape>>(config: PromptDefinition<TArgs>): PromptDefinition<TArgs> => config;\n```\n\nWhen args schema is provided, the build command can auto-generate the 'arguments' metadata from the schema (extracting field names, descriptions from .describe()).\n\nAlso update platform/plugin-tools/src/commands/build.ts generatePromptsManifest to extract argument metadata from the Zod schema if present.\n\nUpdate the e2e-test plugin's prompt to use the new pattern as a proof of concept."
+    },
+    {
+      "id": "US-002",
+      "title": "Add structured ErrorCategory to fetchFromPage errors",
+      "description": "As a plugin developer, I want fetch utility errors to include proper ErrorCategory metadata for consistent structured error handling.",
+      "acceptanceCriteria": [
+        "fetchFromPage timeout errors have category: 'timeout', retryable: true",
+        "fetchFromPage HTTP errors (non-ok status) have category: 'internal', retryable: false by default",
+        "fetchFromPage HTTP 401/403 errors have category: 'auth', retryable: false",
+        "fetchFromPage HTTP 429 errors have category: 'rate_limit', retryable: true, with retryAfterMs from Retry-After header if present",
+        "fetchFromPage HTTP 404 errors have category: 'not_found', retryable: false",
+        "fetchFromPage network errors have category: 'internal', retryable: true",
+        "All ToolError instances thrown by fetch utilities use the ToolError static factory methods",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/fetch.ts. The fetchFromPage function (lines 22-55) currently creates ToolError instances manually without category metadata. Replace with factory methods:\n\n1. Timeout (AbortError/TimeoutError): `throw ToolError.timeout(...)` instead of `new ToolError(..., 'timeout')`\n2. Network error: `throw ToolError.internal(...)` with retryable hint — since internal() sets retryable: false, add a custom call: `new ToolError(msg, 'network_error', { category: 'internal', retryable: true })`\n3. HTTP errors: switch on status code:\n   - 401/403: `throw ToolError.auth(...)`\n   - 404: `throw ToolError.notFound(...)`\n   - 429: `throw ToolError.rateLimited(msg, retryAfterMs)` — parse Retry-After header\n   - Other: `throw ToolError.internal(...)` or `new ToolError(msg, 'http_error', { category: 'internal' })`\n\nAlso update fetchJSON and postJSON if they have their own error handling."
+    },
+    {
+      "id": "US-003",
+      "title": "Add custom code parameter to ToolError factory methods",
+      "description": "As a plugin developer, I want to use factory methods with custom error codes instead of falling back to the constructor.",
+      "acceptanceCriteria": [
+        "All ToolError factory methods accept an optional second parameter for a custom error code: ToolError.auth('msg', 'custom_code')",
+        "When custom code is provided, it overrides the default code (e.g., 'AUTH_ERROR' becomes 'custom_code')",
+        "When custom code is omitted, the default code is used (backward compatible)",
+        "ToolError.notFound already accepts code as second param — verify consistency",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/errors.ts. The factory methods (lines 40-68) currently hardcode the error code:\n\n```typescript\nstatic auth(message: string): ToolError {\n  return new ToolError(message, 'AUTH_ERROR', { category: 'auth' });\n}\n```\n\nChange each to accept optional code:\n```typescript\nstatic auth(message: string, code?: string): ToolError {\n  return new ToolError(message, code ?? 'AUTH_ERROR', { category: 'auth' });\n}\n```\n\nApply the same pattern to: auth, rateLimited, validation, timeout, internal. notFound already has this pattern. Ensure the type signature is consistent across all factories."
+    },
+    {
+      "id": "US-004",
+      "title": "Auto-derive displayName and default icon for tools",
+      "description": "As a plugin developer, I want displayName to be auto-derived from the tool name and icon to have a sensible default, reducing boilerplate.",
+      "acceptanceCriteria": [
+        "When displayName is omitted from defineTool, it is auto-derived from name: 'send_message' -> 'Send Message'",
+        "When displayName is explicitly provided, the explicit value is used (override)",
+        "When icon is omitted from defineTool, it defaults to 'wrench'",
+        "When icon is explicitly provided, the explicit value is used (override)",
+        "The ToolDefinition interface makes displayName and icon optional",
+        "The build command (opentabs-plugin build) applies the defaults when generating tools.json if not present",
+        "Existing plugins with explicit displayName and icon continue to work unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Two files need changes:\n\n1. platform/plugin-sdk/src/index.ts — ToolDefinition interface (around line 107). Make displayName and icon optional:\n```typescript\ndisplayName?: string;\nicon?: LucideIconName;\n```\n\n2. platform/plugin-tools/src/commands/build.ts — in the tool validation and manifest generation. When a tool has no displayName, derive it: name.split('_').map(w => w[0].toUpperCase() + w.slice(1)).join(' '). When a tool has no icon, default to 'wrench'.\n\nUpdate validatePlugin to not require displayName and icon. Update generateToolsManifest to apply defaults.\n\nThe auto-derivation function: 'send_message' -> 'Send Message', 'get_user_profile' -> 'Get User Profile'. Split on underscore, capitalize first letter of each word, join with spaces."
+    },
+    {
+      "id": "US-005",
+      "title": "Support indeterminate progress reporting",
+      "description": "As a plugin developer, I want to report progress messages without knowing the total count for indeterminate operations.",
+      "acceptanceCriteria": [
+        "context.reportProgress({ message: 'Processing...' }) works without progress/total fields",
+        "When progress and total are omitted, the MCP notification is sent with progress: 0, total: 0 (or -1) to indicate indeterminate",
+        "The ProgressOptions type makes progress and total optional",
+        "Existing tools that provide progress and total continue to work unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts. The ProgressOptions interface (around line 18) currently requires progress and total:\n```typescript\ninterface ProgressOptions {\n  progress: number;\n  total: number;\n  message?: string;\n}\n```\n\nMake progress and total optional:\n```typescript\ninterface ProgressOptions {\n  progress?: number;\n  total?: number;\n  message?: string;\n}\n```\n\nIn the adapter IIFE wrapper (platform/plugin-tools/src/commands/build.ts), when dispatching the progress event, default missing progress/total to 0:\n```typescript\nprogress: opts.progress ?? 0,\ntotal: opts.total ?? 0,\n```\n\nAlso check the extension and MCP server progress handling to ensure they handle progress=0/total=0 gracefully."
+    },
+    {
+      "id": "US-006",
+      "title": "Remove _setLogTransport from public API exports",
+      "description": "As a plugin developer, I don't want to see internal functions in my IDE autocomplete.",
+      "acceptanceCriteria": [
+        "_setLogTransport is not exported from @opentabs-dev/plugin-sdk public API",
+        "The function is still accessible via globalThis.__openTabs._setLogTransport for the adapter IIFE runtime",
+        "Plugin developers importing from '@opentabs-dev/plugin-sdk' do not see _setLogTransport in autocomplete",
+        "The build command (opentabs-plugin build) continues to work since it accesses _setLogTransport via globalThis, not import",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts. Find the line that re-exports _setLogTransport (around line 255-265 in the log re-exports section). Remove it from the export list.\n\nThe _setLogTransport function is registered on globalThis.__openTabs._setLogTransport in platform/plugin-sdk/src/log.ts itself (at the bottom of the file). The adapter IIFE accesses it via globalThis, not via import. So removing it from the public exports has no effect on runtime behavior.\n\nAlso check if knip flags it as unused after removal — it might need to be marked differently since it's used via globalThis. If knip flags it, add a @public JSDoc tag or add it to knip's ignore list."
+    },
+    {
+      "id": "US-007",
+      "title": "Add typed generic overload to getPageGlobal",
+      "description": "As a plugin developer, I want getPageGlobal to support a generic type parameter so I don't need 'as' casts everywhere.",
+      "acceptanceCriteria": [
+        "getPageGlobal<T>(path) returns T | undefined instead of unknown",
+        "Existing calls without a type parameter still return unknown (backward compatible)",
+        "Example usage: getPageGlobal<string>('TS.boot_data.api_token') returns string | undefined",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/page-state.ts. Change the function signature from:\n```typescript\nexport const getPageGlobal = (path: string): unknown => {\n```\nTo:\n```typescript\nexport const getPageGlobal = <T = unknown>(path: string): T | undefined => {\n```\n\nChange the return type from `unknown` to `T | undefined`. The implementation stays the same — the cast happens at the type level only. The final return should cast: `return current as T | undefined;`\n\nAlso update the existing `return undefined` early returns to match the return type."
+    },
+    {
+      "id": "US-008",
+      "title": "Add removeLocalStorage and removeSessionStorage utilities",
+      "description": "As a plugin developer, I want storage removal utilities that follow the same try-catch pattern as the getters.",
+      "acceptanceCriteria": [
+        "removeLocalStorage(key) removes a key from localStorage, returns void, catches SecurityError",
+        "removeSessionStorage(key) removes a key from sessionStorage, returns void, catches SecurityError",
+        "Both are exported from @opentabs-dev/plugin-sdk",
+        "Both follow the same try-catch pattern as existing getLocalStorage/getSessionStorage",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/storage.ts. Add two functions following the pattern of setLocalStorage:\n\n```typescript\nexport const removeLocalStorage = (key: string): void => {\n  try {\n    localStorage.removeItem(key);\n  } catch {\n    // SecurityError in sandboxed iframes\n  }\n};\n\nexport const removeSessionStorage = (key: string): void => {\n  try {\n    sessionStorage.removeItem(key);\n  } catch {\n    // SecurityError in sandboxed iframes\n  }\n};\n```\n\nExport them from platform/plugin-sdk/src/index.ts in the storage re-exports section."
+    },
+    {
+      "id": "US-009",
+      "title": "Fix prompt message literal type inference",
+      "description": "As a plugin developer, I want PromptMessage types to infer correctly without needing 'as const' casts.",
+      "acceptanceCriteria": [
+        "PromptMessage role field accepts 'user' | 'assistant' literal union without needing 'as const'",
+        "PromptMessage content type field accepts 'text' literal without needing 'as const'",
+        "Returning { role: 'user', content: { type: 'text', text: '...' } } from render() type-checks without casts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts. The PromptMessage interface (around line 80-85) likely uses string types instead of literal unions. Check the current definition and change to:\n\n```typescript\ninterface PromptMessage {\n  role: 'user' | 'assistant';\n  content: {\n    type: 'text';\n    text: string;\n  };\n}\n```\n\nIf the fields already use literal types, the issue might be in the render function return type — TypeScript sometimes widens literals in object literals. The fix would be to ensure the return type annotation uses the literal types.\n\nCheck the e2e-test plugin's prompt to see where 'as const' casts are used and verify they're no longer needed after the fix."
+    },
+    {
+      "id": "US-010",
+      "title": "Add optional Zod schema validation to fetchJSON",
+      "description": "As a plugin developer, I want fetchJSON to optionally validate the response against a Zod schema for runtime type safety.",
+      "acceptanceCriteria": [
+        "fetchJSON<T>(url, init?, schema?) accepts an optional third parameter: a Zod schema",
+        "When schema is provided, the parsed JSON is validated against it; on failure, throws ToolError.validation",
+        "When schema is provided, the return type is inferred from the schema (not the generic T)",
+        "When schema is omitted, behavior is unchanged (returns T with unchecked cast, backward compatible)",
+        "postJSON gets the same optional schema parameter",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/fetch.ts. Add overloaded signatures for fetchJSON:\n\n```typescript\nexport async function fetchJSON<T extends z.ZodType>(url: string, init: FetchFromPageOptions | undefined, schema: T): Promise<z.infer<T>>;\nexport async function fetchJSON<T>(url: string, init?: FetchFromPageOptions): Promise<T>;\nexport async function fetchJSON(url: string, init?: FetchFromPageOptions, schema?: z.ZodType): Promise<unknown> {\n  const response = await fetchFromPage(url, init);\n  const data: unknown = await response.json();\n  if (schema) {\n    const result = schema.safeParse(data);\n    if (!result.success) {\n      throw ToolError.validation(`Invalid response from ${url}: ${result.error.message}`);\n    }\n    return result.data;\n  }\n  return data;\n}\n```\n\nDo the same for postJSON. Import z from 'zod'."
+    },
+    {
+      "id": "US-011",
+      "title": "Add optional schema to defineResource for content type safety",
+      "description": "As a plugin developer, I want defineResource to accept a Zod schema for the resource content, providing type safety on read() return values.",
+      "acceptanceCriteria": [
+        "defineResource accepts an optional 'schema' field with a Zod type for the content",
+        "When schema is provided, the read() function return type is typed based on the schema",
+        "When schema is omitted, behavior is unchanged (backward compatible)",
+        "The schema is for documentation/type-safety purposes — no runtime validation is added in the dispatch path",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts. Add a generic to ResourceDefinition:\n\n```typescript\ninterface ResourceDefinition<TContent extends z.ZodType = z.ZodType> {\n  uri: string;\n  name: string;\n  description: string;\n  mimeType: string;\n  schema?: TContent;\n  read: (uri: string) => Promise<ResourceContent>;\n}\n```\n\nUpdate defineResource to be generic:\n```typescript\nconst defineResource = <TContent extends z.ZodType>(config: ResourceDefinition<TContent>): ResourceDefinition<TContent> => config;\n```\n\nThis is primarily for documentation and autocomplete — the schema provides a typed contract that developers can reference but the runtime dispatch path doesn't validate it."
+    }
+  ]
+}

@@ -1,0 +1,110 @@
+## Codebase Patterns
+- The `void (async () => { ... })()` IIFE pattern in background.ts is used for fire-and-forget async work in Chrome extension event handlers. Add `.catch()` to the end of the IIFE call: `void (async () => { ... })().catch((err: unknown) => console.warn('[opentabs] ...', err));`
+- Chrome extension error log messages use the pattern `console.warn('[opentabs] <description>:', err)`
+- `tsc --build --noEmit` can fail with TS6310 due to stale build artifacts. Run `bun run clean` (from root) to clear tsbuildinfo files, then `bun run build`, and re-run `bun run type-check`. This resolves the issue without any tsconfig changes.
+
+# Ralph Progress Log
+PRD: prd-2026-02-25-190156-browser-extension-bugs~running.json
+Started: Thu Feb 26 03:02:56 UTC 2026
+---
+
+## 2026-02-26 - US-001
+- Added `.catch((err: unknown) => console.warn('[opentabs] onInstalled failed:', err))` to the `onInstalled` IIFE in background.ts
+- Added `.catch((err: unknown) => console.warn('[opentabs] onStartup failed:', err))` to the `onStartup` IIFE in background.ts
+- Files changed: `platform/browser-extension/src/background.ts`
+- **Learnings for future iterations:**
+  - The IIFE pattern `void (async () => { ... })()` can have `.catch()` chained directly: `void (async () => { ... })().catch(...)`
+  - The `void` operator applies to the `.catch()` return value (also a Promise), so this syntax is valid
+  - The sequential `await` calls inside the IIFE maintain the correct dependency ordering — if the first fails, subsequent calls don't execute
+---
+
+## 2026-02-26 - US-002
+- Updated port validation in background.ts from `portChange.newValue > 0` to require `Number.isInteger()` AND `>= 1` AND `<= 65535`
+- Files changed: `platform/browser-extension/src/background.ts`
+- **Learnings for future iterations:**
+  - The old validation `> 0` allowed fractional values (0.5) and out-of-range values (99999)
+  - The fixed validation uses `Number.isInteger()` + bounds check `>= 1 && <= 65535` matching the valid TCP port range
+  - Prettier reformatted the multi-condition if to split across lines (3 conditions on separate lines)
+---
+
+## 2026-02-26 - US-003
+- Added `chrome.windows.onRemoved.addListener` inside the `if (canToggle)` block in side-panel-toggle.ts to clean up stale window IDs when windows are closed
+- Files changed: `platform/browser-extension/src/side-panel-toggle.ts`
+- **Learnings for future iterations:**
+  - Prettier requires arrow function single parameters without parentheses in this codebase (e.g., `windowId => {...}` not `(windowId) => {...}`)
+  - The `canToggle` guard (`'onOpened' in chrome.sidePanel`) ensures Chrome 141+ API usage — all new listeners that depend on these APIs should be inside this block
+  - `chrome.windows.onRemoved` fires when a window is removed, even if `onClosed` from side panel didn't fire
+---
+
+## 2026-02-26 - US-004
+- Added `lastDisconnectReason = undefined;` in `disconnectAndReconnect` after `backoffMs = INITIAL_BACKOFF_MS` reset
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - `disconnectAndReconnect` is called from `ws:setUrl`, `port-changed`, and `bg:forceReconnect` handlers — it resets backoff state, so it's the right place to also reset `lastDisconnectReason`
+  - The variable `lastDisconnectReason` is declared later in the file (line 157), but `disconnectAndReconnect` is a function declaration that closes over the module-scoped variable — fine because the function is called at runtime, not at parse time
+  - The fix is a single line addition; Prettier/lint had no issues with it
+---
+
+## 2026-02-26 - US-005
+- Added `const PENDING_REQUEST_TTL_MS = 60_000;` constant near the top of network-capture.ts
+- Added TTL-based pruning loops inside the `Network.requestWillBeSent` handler (after `!requestId || !request` guard, before setting new entry)
+- Both `pendingRequests` (Partial<CapturedRequest>) and `requestIdToRequest` (CapturedRequest) are pruned based on `timestamp` field
+- Files changed: `platform/browser-extension/src/network-capture.ts`
+- **Learnings for future iterations:**
+  - The `CapturedRequest.timestamp` field is `number` (required), but `pendingRequests` stores `Partial<CapturedRequest>` so `timestamp` is `number | undefined` in that context — requires undefined guard
+  - Deleting from a Map while iterating with `for...of` is safe in JavaScript — entries not yet visited that are deleted will simply be skipped
+  - Pruning both maps together in the same event handler avoids the need for a separate periodic cleanup interval
+  - `requestIdToRequest` entries reference completed requests (already in `state.requests`), so TTL pruning here doesn't remove captured data — just the lookup entry used for `loadingFinished` response body attachment
+---
+
+## 2026-02-26 - US-006
+- Added `if (timestamps.length === 0) { methodTimestamps.delete(method); }` after the filter in `checkRateLimit` to prune empty map keys
+- Added `getTrackedMethodCount` export to rate-limiter.ts for test introspection
+- Added three tests in the new `stale key pruning` describe block verifying key deletion and map size behavior
+- Files changed: `platform/browser-extension/src/rate-limiter.ts`, `platform/browser-extension/src/rate-limiter.test.ts`
+- **Learnings for future iterations:**
+  - `tsc --build --noEmit` can fail with stale TS6310 artifacts from prior builds; fix by running `bun run clean` (root) then `bun run build`, then re-run `bun run type-check`
+  - The reject path (`timestamps.length >= maxRequests`) is unreachable when timestamps filter to empty (0 < maxRequests is always true), so the `delete` call only matters for the allow path — it deletes the stale key and then the allow path re-adds `[now]`
+  - Knip's `'src/**/*.test.ts'` entry points for browser-extension mean test-only exports (like `getTrackedMethodCount`) are recognized as used and won't be flagged as unused
+---
+
+## 2026-02-26 - US-007
+- Added interval-clearing logic to `CountdownBar.useEffect`: when `newRemaining === 0`, calls `clearInterval(id)` to stop the timer
+- Restructured the `useEffect` to declare `const id = setInterval(update, ...)` BEFORE calling `update()`, so `id` is in-scope when `update` runs
+- Extracted `newRemaining` local variable inside `update` to avoid computing `Math.max(0, timeoutMs - elapsed)` twice
+- Files changed: `platform/browser-extension/src/side-panel/components/ConfirmationDialog.tsx`
+- **Learnings for future iterations:**
+  - Referencing a `const` inside a closure that is declared later in the same block is fine in JS (closures capture bindings, not values), and TypeScript does NOT flag this as a TDZ error for closures
+  - ESLint's `prefer-const` fires when a `let` is assigned exactly once — the solution is to restructure so `const id = setInterval(...)` is declared first, then `update()` is called after, ensuring `id` is initialized before `update` runs
+  - `clearInterval(id)` inside `setInterval`'s own callback is the idiomatic pattern for self-canceling timers
+---
+
+## 2026-02-26 - US-008
+- Added `setToolFilter('');` in the disconnect (`else`) branch of the `sp:connectionState` handler in App.tsx, alongside the other state resets (setPlugins, setFailedPlugins, setActiveTools, setPendingConfirmations)
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - The disconnect handler in App.tsx resets multiple pieces of state — always check if new state variables need to be reset there too
+  - The change is a single-line addition inside the existing `else` branch on line 111-117 — minimal, surgical fix
+  - All Phase 1 checks (build, type-check, lint, knip, test) passed immediately with no further changes needed
+---
+
+## 2026-02-26 - US-009
+- Added `.catch(() => { setLoading(false); })` to the `getConnectionState()` call in the initial `useEffect` of App.tsx
+- Restructured the promise chain: extracted `.then(...)` and `.catch(...)` onto separate lines for readability
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - When chaining `.then().catch()` onto a multi-line `.then()` callback, Prettier reformats the chain onto its own indentation level — ensure the chain is readable and lint-compliant
+  - The `.catch()` handler here only sets `setLoading(false)` — it does NOT set `setConnected(false)` because `connected` already defaults to `false` in `useState(false)`
+  - This prevents the side panel from getting stuck in infinite loading state if the Chrome runtime is unavailable (e.g., extension context invalidated)
+---
+
+## 2026-02-26 - US-010
+- Added `const originalTools = plugin.tools;` capture before the optimistic update in `handleToggleTool`
+- Changed the `.catch()` handler from `updatePluginTools(tools => tools.map(t => (t.name === toolName ? { ...t, enabled: !newEnabled } : t)))` to `updatePluginTools(() => originalTools)` — matching the safe pattern already used by `handleToggleAll`
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginCard.tsx`
+- **Learnings for future iterations:**
+  - The old revert used `!newEnabled` which is stale under rapid toggling — if the user toggled again before the server responded, the revert would apply the wrong state
+  - Capturing `originalTools` before the optimistic update gives a stable snapshot to revert to, regardless of intermediate state changes
+  - `updatePluginTools(() => originalTools)` replaces the entire tools array for that plugin, which is safe since `originalTools` is a closure over the correct pre-update state
+  - The `handleToggleAll` pattern (lines 44-51) was the reference implementation — always look for existing safe patterns in the same file before implementing a revert strategy
+---

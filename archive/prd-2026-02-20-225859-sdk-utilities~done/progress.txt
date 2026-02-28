@@ -1,0 +1,169 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-225859-sdk-utilities~running.json
+Started: Fri Feb 20 23:36:59 PST 2026
+---
+
+## Codebase Patterns
+- The plugin-sdk uses function expressions (arrow functions) per ESLint `func-style` rule — never `function` declarations
+- Import order is enforced by `import-x/order`: local imports (./), then bun: built-ins, then external packages
+- `Element.textContent` is typed as `string` (not `string | null`) in bun-types — no null guard needed
+- `expect(promise).rejects.toThrow()` in bun:test does NOT need `await` — bun handles it internally
+- happy-dom: use `GlobalWindow` (not `Window`) when assigning `document` to `globalThis` — `Window`'s document loses internal `this.window` linkage causing `TypeError: undefined is not a constructor` in `SelectorParser`
+- happy-dom MutationObserver: use `queueMicrotask()` (not `setTimeout()`) to schedule DOM mutations in tests — `setTimeout` mutations don't trigger the observer reliably
+- ToolError is in its own file (platform/plugin-sdk/src/errors.ts) to avoid circular imports — SDK utility modules import from errors.ts, and index.ts re-exports from it
+- ESLint `no-unnecessary-condition` doesn't track that `await` yields control — a variable checked before `await` will be narrowed as if it didn't change. Use object-wrapped state (`{ settled: false }`) or remove the post-await guard entirely (Promise resolve/reject are idempotent)
+- `AbortController.abort()` without arguments sets `signal.reason` to a `DOMException` (name: 'AbortError') — it's an `instanceof Error`, so don't test for custom "retry: aborted" message; test for `DOMException` with `AbortError` name instead
+- In retry-style tests, use `Promise.resolve()` / `Promise.reject()` instead of `async () =>` to satisfy `@typescript-eslint/require-await`
+- For SDK modules that need ToolError: import from `./errors.js`, NOT from `./index.js` (circular dependency)
+- Bun's `Server` type requires a generic parameter — use `ReturnType<typeof Bun.serve>` instead of `Server` to avoid type errors
+- `response.json()` returns `any` — cast with `as T` to satisfy `@typescript-eslint/no-unsafe-assignment`
+- `server.port` is `number | undefined` — use `String(server.port)` in template literals to satisfy `@typescript-eslint/restrict-template-expressions`
+- `RequestInit.headers` is `HeadersInit` (can be `string[][]`) — spreading it in an object triggers `@typescript-eslint/no-misused-spread`. Use `Object.fromEntries(new Headers(h).entries())` to normalize
+- `server.stop()` returns void — prefix with `void` in afterAll to satisfy `@typescript-eslint/no-floating-promises`
+- `bun test platform/` does NOT recurse into plugin-sdk — run `bun test platform/plugin-sdk/` separately to verify SDK tests
+- `globalThis.localStorage` and `globalThis.sessionStorage` are readonly — use `Object.defineProperty(globalThis, 'localStorage', { value: ..., configurable: true, writable: true })` to assign happy-dom's storage in tests
+- For cookie tests, override `document.cookie` via `Object.defineProperty(win.document, 'cookie', { get: () => ..., configurable: true })` since happy-dom's cookie handling is limited
+- ESLint `@typescript-eslint/no-unnecessary-type-parameters` forbids generics used only once — return `unknown` and let callers cast with `as` at the call site
+- ESLint `eqeqeq` forbids `== null` — use explicit `=== null || === undefined` checks
+- For happy-dom tests needing `window.location`, pass `url` to `GlobalWindow` constructor and assign `globalThis.window` from the instance
+- E2E test tools: the `openTestAppTab` helper accepts any URL path (not just root) — use `${testServer.url}/sdk-test` for pages with specific test fixtures
+- Prettier in e2e-test plugin: no parens on single arrow function params (`async params =>` not `async (params) =>`)
+- The regex in build-e2e.test.ts for zeroing the tools array must handle multi-line arrays: use `\[\s*echo` not `\[echo`
+
+## 2026-02-21 - US-001
+- Implemented DOM utilities: waitForSelector, waitForSelectorRemoval, querySelectorAll, getTextContent, observeDOM
+- Files changed:
+  - platform/plugin-sdk/src/dom.ts (new) — all 5 DOM utility functions
+  - platform/plugin-sdk/src/dom.test.ts (new) — 13 unit tests using happy-dom GlobalWindow
+  - platform/plugin-sdk/src/index.ts — added re-exports for DOM utilities and types
+  - platform/plugin-sdk/package.json — added happy-dom devDependency
+  - bun.lock — updated with happy-dom
+- **Learnings for future iterations:**
+  - happy-dom `GlobalWindow` must be used instead of `Window` for global DOM assignment — `Window`'s querySelector chain breaks because `this.window` becomes undefined in SelectorParser
+  - MutationObserver in happy-dom tests: schedule DOM mutations with `queueMicrotask()` rather than `setTimeout()` for reliable observer notification
+  - ESLint enforces function expressions (arrow) — all exports use `export const fn = (...) => ...`
+  - `bun-types` types `Element.textContent` as `string` (non-nullable), so `?.` or `?? null` guards trigger `@typescript-eslint/no-unnecessary-condition`
+---
+
+## 2026-02-21 - US-002
+- Implemented fetch utilities: fetchFromPage, fetchJSON, postJSON
+- Extracted ToolError into its own module (errors.ts) to avoid circular imports between fetch.ts → index.ts → fetch.ts
+- Files changed:
+  - platform/plugin-sdk/src/errors.ts (new) — ToolError class extracted from index.ts
+  - platform/plugin-sdk/src/fetch.ts (new) — all 3 fetch utility functions
+  - platform/plugin-sdk/src/fetch.test.ts (new) — 17 unit tests using a lightweight Bun.serve() test server
+  - platform/plugin-sdk/src/index.ts — moved ToolError to re-export from errors.ts, added fetch re-exports
+- **Learnings for future iterations:**
+  - SDK utility modules must import ToolError from `./errors.js` (not `./index.js`) to avoid circular dependencies since index.ts re-exports from utility modules
+  - Bun's `Server` type requires a generic argument — use `ReturnType<typeof Bun.serve>` for cleaner type annotations
+  - `RequestInit.headers` (`HeadersInit`) can be `string[][]` — spreading arrays in objects triggers `@typescript-eslint/no-misused-spread`. Normalize with `Object.fromEntries(new Headers(h).entries())`
+  - `response.json()` returns `any` in Bun types — must cast to satisfy `@typescript-eslint/no-unsafe-assignment`
+  - `server.port` is `number | undefined` — wrap in `String()` for template literals to avoid `@typescript-eslint/restrict-template-expressions`
+  - `server.stop()` is typed as returning something — prefix with `void` in afterAll callbacks to satisfy `@typescript-eslint/no-floating-promises`
+---
+
+## 2026-02-21 - US-005
+- Implemented timing utilities: retry, sleep, waitUntil
+- Files changed:
+  - platform/plugin-sdk/src/timing.ts (new) — retry with backoff + AbortSignal, sleep, waitUntil with polling
+  - platform/plugin-sdk/src/timing.test.ts (new) — 15 unit tests covering success, failure, backoff, abort, polling, timeout
+  - platform/plugin-sdk/src/index.ts — added re-exports for timing utilities and types (RetryOptions, WaitUntilOptions)
+- **Learnings for future iterations:**
+  - ESLint `no-unnecessary-condition` doesn't understand that `await` yields control flow — a boolean variable checked before an `await` is narrowed as if unchanged after. Workaround: use object-wrapped state or remove the guard (Promise resolve/reject are idempotent, so calling resolve() twice is safe).
+  - `AbortController.abort()` without arguments sets `signal.reason` to a `DOMException` (name: 'AbortError', extends Error). Don't test for a custom message like "retry: aborted" — that path is only taken when `reason` is NOT an Error. Instead test for `DOMException` with name `AbortError`.
+  - In tests, use `() => Promise.resolve(value)` / `() => Promise.reject(error)` instead of `async () => value` to avoid `@typescript-eslint/require-await` lint errors.
+  - For asserting array element values, destructure with a type assertion (`const [a, b, c] = arr as [number, number, number]`) instead of non-null assertions (`arr[0]!`) to avoid `@typescript-eslint/no-non-null-assertion`.
+---
+
+## 2026-02-21 - US-003
+- Implemented storage utilities: getLocalStorage, setLocalStorage, getSessionStorage, getCookie
+- Files changed:
+  - platform/plugin-sdk/src/storage.ts (new) — all 4 storage utility functions with try-catch safety wrappers
+  - platform/plugin-sdk/src/storage.test.ts (new) — 12 unit tests using happy-dom GlobalWindow
+  - platform/plugin-sdk/src/index.ts — added re-exports for storage utilities
+- **Learnings for future iterations:**
+  - `globalThis.localStorage` and `globalThis.sessionStorage` are readonly properties in Bun's runtime — direct assignment (`globalThis.localStorage = ...`) throws `TypeError: Attempted to assign to readonly property`. Must use `Object.defineProperty(globalThis, 'localStorage', { value: ..., configurable: true, writable: true })` to set them in tests.
+  - For cookie tests in happy-dom, override `document.cookie` via `Object.defineProperty(win.document, 'cookie', { get: () => ..., configurable: true })` to provide controlled cookie strings.
+  - `getCookie` uses `startsWith(prefix)` matching with `name=` prefix — this correctly handles cookie names that are prefixes of other cookie names (e.g., `token` vs `token_v2`).
+  - When testing "throws on access" scenarios for storage, override the property with a getter that throws, then restore after the test.
+---
+
+## 2026-02-21 - US-004
+- Implemented page state utilities: getPageGlobal, getCurrentUrl, getPageTitle
+- Files changed:
+  - platform/plugin-sdk/src/page-state.ts (new) — all 3 page state utility functions
+  - platform/plugin-sdk/src/page-state.test.ts (new) — 11 unit tests using happy-dom GlobalWindow
+  - platform/plugin-sdk/src/index.ts — added re-exports for page state utilities
+- **Learnings for future iterations:**
+  - ESLint `@typescript-eslint/no-unnecessary-type-parameters` forbids generic type parameters used only once (e.g., `<T>` appearing only in return type). For `getPageGlobal`, return `unknown` instead and let callers use `as` at the call site.
+  - ESLint `eqeqeq` forbids `== null` loose equality — use `=== null || === undefined` explicitly instead.
+  - For happy-dom tests that need `window.location`, set the `url` option in the `GlobalWindow` constructor: `new GlobalWindow({ url: 'https://example.com/page?q=1' })`.
+  - To test `getCurrentUrl`, assign `globalThis.window` from the happy-dom `GlobalWindow` instance.
+---
+
+## 2026-02-21 - US-006
+- Implemented E2E tests for SDK utilities through the full dispatch chain
+- Created 5 new tools in the e2e-test plugin that exercise SDK utilities:
+  - sdk-wait-for-selector.ts: uses sdk.waitForSelector on a delayed DOM element
+  - sdk-fetch-json.ts: uses sdk.fetchJSON to call the test server API
+  - sdk-get-local-storage.ts: uses sdk.getLocalStorage to read a value set by the test page
+  - sdk-get-page-global.ts: uses sdk.getPageGlobal to read a nested window property
+  - sdk-retry.ts: uses sdk.retry + sdk.fetchJSON to call a flaky endpoint that fails 3 times
+- Extended test server with /sdk-test page (delayed element, localStorage, globals), /api/flaky, /api/sdk-fetch-test
+- Created e2e/sdk-utilities.e2e.ts with 7 test cases covering all SDK tools
+- Used file:../../platform/plugin-sdk in e2e-test plugin for local SDK dependency (before publish)
+- Fixed pre-existing regex bug in build-e2e.test.ts (multi-line tools array broke the no-tools test)
+- Files changed:
+  - e2e/test-server.ts — added SDK_TEST_HTML, /sdk-test route, /api/flaky, /api/sdk-fetch-test endpoints, flakyCallCount state
+  - e2e/sdk-utilities.e2e.ts (new) — 7 E2E test cases for SDK utilities
+  - plugins/e2e-test/package.json — changed SDK dep to file: protocol
+  - plugins/e2e-test/bun.lock — updated lockfile
+  - plugins/e2e-test/src/index.ts — registered 5 new SDK test tools
+  - plugins/e2e-test/src/tools/sdk-wait-for-selector.ts (new)
+  - plugins/e2e-test/src/tools/sdk-fetch-json.ts (new)
+  - plugins/e2e-test/src/tools/sdk-get-local-storage.ts (new)
+  - plugins/e2e-test/src/tools/sdk-get-page-global.ts (new)
+  - plugins/e2e-test/src/tools/sdk-retry.ts (new)
+  - platform/plugin-tools/src/commands/build-e2e.test.ts — fixed regex for multi-line tools array
+- **Learnings for future iterations:**
+  - When the e2e-test plugin's tools array format changes (single-line → multi-line), the regex in build-e2e.test.ts that zeroes out the tools array must also be updated. The regex `tools\s*=\s*\[\s*echo[\s\S]*?\];` (with `\s*` after `\[`) handles both formats.
+  - E2E test tools for SDK utilities need to navigate to a specific page that provides the test fixtures (DOM elements, localStorage values, globals). The adapter is injected on any page matching `http://localhost/*`, so the /sdk-test page works out of the box.
+  - The `openTestAppTab` helper from e2e/helpers.ts can accept any URL path on the test server, not just the root — use `${testServer.url}/sdk-test` for specific test pages.
+  - The /api/flaky endpoint uses a counter in server state that resets via POST /control/reset. The flaky count is NOT reset by auth changes or error mode toggles — only by explicit reset.
+  - Prettier in the e2e-test plugin enforces no parentheses on single-parameter arrow functions: `async params => {` not `async (params) => {`.
+---
+
+## 2026-02-21 - US-007
+- Published all @opentabs-dev platform packages at v0.0.11 (shared → plugin-sdk → plugin-tools → cli)
+- Verified npm propagation (npm view confirmed 0.0.11 available immediately)
+- Updated e2e-test plugin: reverted file: protocol to ^0.0.11 for plugin-sdk, bumped plugin-tools to ^0.0.11
+- Updated slack plugin: bumped plugin-sdk and plugin-tools to ^0.0.11
+- Rebuilt both plugins successfully with the published npm versions
+- All quality checks pass: build, type-check, lint, knip, test (901/901), test:e2e (239/239)
+- Files changed:
+  - platform/shared/package.json — version bumped to 0.0.11
+  - platform/plugin-sdk/package.json — version bumped to 0.0.11, shared dep updated
+  - platform/plugin-tools/package.json — version bumped to 0.0.11, deps updated
+  - platform/cli/package.json — version bumped to 0.0.11, deps updated
+  - plugins/e2e-test/package.json — plugin-sdk ^0.0.11 (was file: protocol), plugin-tools ^0.0.11
+  - plugins/e2e-test/bun.lock — lockfile updated
+  - plugins/slack/package.json — plugin-sdk ^0.0.11, plugin-tools ^0.0.11
+- **Learnings for future iterations:**
+  - The publish script (scripts/publish.sh) handles everything: version bumping, cross-reference updates, rebuild, and npm publish in dependency order. Just pass the version number.
+  - npm propagation was instantaneous in this case — no retry needed, but the PRD warns about 30s-2min delays.
+  - When reverting file: protocol deps back to npm versions, `bun install` resolves and downloads from the registry cleanly.
+---
+
+## 2026-02-21 - US-008
+- Documented all SDK utility functions in CLAUDE.md under the "Key Concepts" section
+- Added 42 lines covering all 5 utility categories: DOM, Fetch, Storage, Page State, Timing
+- Each function listed with signature, return type, and one-sentence description
+- Included a brief usage example showing how utilities compose in a tool handler
+- Kept documentation plugin-agnostic per CLAUDE.md guidelines
+- Files changed:
+  - CLAUDE.md — added "SDK utilities" section after "Hot reload" in Key Concepts
+- **Learnings for future iterations:**
+  - CLAUDE.md guidelines explicitly require plugin-agnostic documentation — use generic examples, never reference specific plugins by name
+  - The "Key Concepts" section uses bold text for concept names (e.g., **SDK utilities**:), not markdown headings — follow this pattern
+  - Keep additions concise (~40-50 lines) as CLAUDE.md warns against excessive detail that wastes context
+---

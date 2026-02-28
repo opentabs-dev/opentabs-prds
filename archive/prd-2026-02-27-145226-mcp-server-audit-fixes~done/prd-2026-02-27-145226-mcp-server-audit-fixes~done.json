@@ -1,0 +1,131 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource leaks, dead code, and missing guards discovered during a thorough audit of the MCP server backend. Covers event-loop-blocking spawnSync calls, dead error-handling code in adapter file cleanup, config save mutex that silently swallows write errors, missing network capture cleanup in analyze-site, and Windows compatibility for npm spawns.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Replace event-loop-blocking spawnSync in version-check.ts with async spawn",
+      "description": "As a platform user, I want the MCP server to remain responsive during plugin update checks so that tool calls and health checks are not blocked for 10+ seconds while npm queries run.",
+      "acceptanceCriteria": [
+        "fetchLatestVersion uses async child_process.spawn (or execFile) instead of spawnSync",
+        "checkForUpdates is async and runs npm view queries concurrently with Promise.allSettled",
+        "The server event loop is never blocked by version checking",
+        "fetchLatestVersion also uses platformExec('npm') instead of bare 'npm' string for Windows compatibility",
+        "Existing unit tests in version-check.test.ts pass (update mocks from spawnSync to the new async spawn pattern)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/mcp-server/src/version-check.ts. The function `fetchLatestVersion` (line 25) uses `spawnSync('npm', ['view', ...])` which blocks the Node.js event loop. `checkForUpdates` (line 79) calls this sequentially for each npm plugin. With 5 plugins and 2s registry latency each, the server is completely unresponsive for ~10s. This is called from `performReload` (platform/mcp-server/src/reload.ts line 379) which is already async.\n\nAdditionally, line 27 uses bare `spawnSync('npm', ...)` without `platformExec('npm')` — on Windows, `npm` must be invoked as `npm.cmd` via `platformExec`. Compare with platform/mcp-server/src/resolver.ts line 163 which correctly uses `platformExec('npm')`.\n\nThe `checkForUpdates` caller in reload.ts (line 378-382) needs to become `await checkForUpdates(state)`. The function signature changes from sync to async. Update the test file (platform/mcp-server/src/version-check.test.ts) to mock the new async spawn instead of spawnSync."
+    },
+    {
+      "id": "US-002",
+      "title": "Replace event-loop-blocking spawnSync in searchNpmPlugins with async spawn",
+      "description": "As a platform user, I want the MCP server to remain responsive during plugin search requests so that all other WebSocket messages and HTTP requests continue to be handled.",
+      "acceptanceCriteria": [
+        "searchNpmPlugins in plugin-management.ts is async and uses the existing spawnAsync helper instead of spawnSync",
+        "handlePluginSearch in extension-handlers.ts awaits the now-async searchNpmPlugins",
+        "The server event loop is never blocked during npm search",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/plugin-management.ts line 151. `searchNpmPlugins` uses `spawnSync(platformExec('npm'), ['search', ...])` which blocks the event loop. The same file already has an async `spawnAsync` helper (line 64) and `runNpmGlobal` (line 97) that demonstrate the correct async pattern with timeout. Convert `searchNpmPlugins` to use `spawnAsync` with a timeout (e.g., 30s) similar to `runNpmGlobal`.\n\nThe caller chain: extension-protocol.ts line 401 calls `handlePluginSearch` (extension-handlers.ts line 489) which calls `searchNpmPlugins` (line 501). `handlePluginSearch` needs to become async and the call in extension-protocol.ts needs `await`. Check that the dispatch handler in extension-protocol.ts (around line 401) properly awaits the result."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix dead error-handling code in adapter file cleanup functions",
+      "description": "As a platform maintainer, I want adapter file deletion failures to be properly detected and logged so that stale files don't silently accumulate on disk.",
+      "acceptanceCriteria": [
+        "cleanupStaleAdapterFiles: the .catch(() => {}) is removed from unlink calls inside Promise.allSettled, so rejections are properly captured by allSettled",
+        "cleanupStaleExecFiles: same fix — remove .catch(() => {}) from unlink calls inside Promise.allSettled",
+        "writeAdapterFile old-file cleanup: same fix — remove .catch(() => {}) from unlink calls inside Promise.allSettled",
+        "The warning log on rejection in cleanupStaleAdapterFiles (line 137) is now reachable",
+        "cleanupStaleExecFiles log accurately reports the count of successfully deleted files (not total attempted)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/adapter-files.ts. Three locations have the same pattern: `Promise.allSettled(files.map(f => unlink(...).catch(() => {})))`. The `.catch(() => {})` converts all rejections into fulfilled promises with `undefined`, making the `allSettled` result always 'fulfilled' — so the `result.status === 'rejected'` check is dead code.\n\nLine 74: `writeAdapterFile` old file cleanup — remove `.catch(() => {})`. If you want to continue ignoring individual failures here, use `Promise.all(...).catch(() => {})` at the outer level instead, or just let allSettled handle it.\n\nLine 132: `cleanupStaleAdapterFiles` — remove `.catch(() => {})` so the warning on line 137 becomes reachable.\n\nLine 219: `cleanupStaleExecFiles` — remove `.catch(() => {})` and update the log message on line 220 to count actual successes (filter `result.status === 'fulfilled'`) rather than logging total count.\n\nExisting tests in adapter-files.test.ts may need updates if they rely on the current behavior."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix config save mutex that silently swallows write errors",
+      "description": "As a platform user, I want config save failures to be propagated to callers so that I'm notified when my configuration changes fail to persist.",
+      "acceptanceCriteria": [
+        "When atomicWriteConfig fails (e.g., disk full), the caller of saveConfig receives the rejection",
+        "When atomicWriteConfig fails, the caller of saveToolConfig receives the rejection",
+        "The mutex chain does not deadlock after a failed write — subsequent writes proceed normally",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/mcp-server/src/config.ts lines 303-318 (saveConfig) and 330-363 (saveToolConfig).\n\nThe bug: `state.configWriteMutex` is assigned to the `.catch()` chain. Inside the `.catch()` handler, `state.configWriteMutex` is reset to `Promise.resolve()` (line 313), then the error is re-thrown. Due to microtask ordering, when the `await state.configWriteMutex` on line 317 executes, `state.configWriteMutex` has already been reassigned to `Promise.resolve()` by the catch handler — so the `await` resolves successfully even though the write failed. The re-thrown error from the `.catch()` becomes an unhandled rejection.\n\nFix approach: Capture the promise chain in a local variable and await that, rather than re-reading the mutable `state.configWriteMutex`. For example:\n```\nconst writePromise = (async () => { await prev; ... })();\nstate.configWriteMutex = writePromise.catch(() => { /* reset mutex only */ state.configWriteMutex = Promise.resolve(); });\nawait writePromise; // This preserves the rejection for the caller\n```\nApply the same fix to both `saveConfig` and `saveToolConfig`. Check config.test.ts for tests that may cover the error path."
+    },
+    {
+      "id": "US-005",
+      "title": "Add network capture cleanup to analyze-site error path",
+      "description": "As a platform user, I want the analyze-site tool to clean up network capture resources even when intermediate steps fail so that CDP debugger sessions don't leak.",
+      "acceptanceCriteria": [
+        "disableNetworkCapture is called in the finally block of analyzeSite, before closeTab, wrapped in its own try-catch",
+        "If getNetworkRequests throws, network capture is still disabled before the tab is closed",
+        "The existing happy-path behavior is unchanged",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts lines 825-1012.\n\nNetwork capture is enabled at line 827 and disabled at line 952. If `getNetworkRequests` at line 943 throws, line 952 is never reached. The finally block (line 1005) only closes the tab.\n\nFix: Move `disableNetworkCapture` into the finally block before the closeTab call (line 1007-1011). Wrap it in its own try-catch so a failure to disable capture doesn't prevent tab cleanup:\n\n```typescript\nfinally {\n  try {\n    await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId });\n  } catch {\n    // Best-effort cleanup\n  }\n  try {\n    await dispatchToExtension(state, 'browser.closeTab', { tabId });\n  } catch {\n    // Best-effort cleanup\n  }\n}\n```\n\nAlso remove the `disableNetworkCapture` call at line 952 since it's now in the finally block. Keep the getNetworkRequests call at its current location."
+    },
+    {
+      "id": "US-006",
+      "title": "Fix analyze-site race: enable network capture before page navigation",
+      "description": "As a platform user, I want analyze-site to capture early page-load network requests (auth token exchanges, initial data fetches) so that API and auth detection is complete.",
+      "acceptanceCriteria": [
+        "analyzeSite opens the tab to about:blank first (or uses a similar strategy to delay navigation)",
+        "Network capture is enabled before the target URL is loaded",
+        "Early page-load API calls are captured by the network monitor",
+        "The existing detection modules and wait behavior work unchanged",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts lines 807-833.\n\nCurrently: openTab(url) at line 813, then enableNetworkCapture at line 827. Requests made between tab open and capture enable are lost.\n\nFix approach: Open the tab to `about:blank` instead of the target URL, enable network capture on the blank tab, then navigate to the target URL using `browser.navigateTab`. This ensures the CDP debugger is attached before any requests fire.\n\nChange:\n1. Line 813: `dispatchToExtension(state, 'browser.openTab', { url: 'about:blank' })` \n2. After enableNetworkCapture (line 830): add `await dispatchToExtension(state, 'browser.navigateTab', { tabId, url })`\n3. The wait timer (line 833) should start after navigation, not after capture enable"
+    }
+  ]
+}

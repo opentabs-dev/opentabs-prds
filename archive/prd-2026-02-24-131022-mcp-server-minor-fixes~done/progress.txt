@@ -1,0 +1,44 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-131022-mcp-server-minor-fixes~running.json
+Started: Tue Feb 24 13:10:35 PST 2026
+---
+
+## Codebase Patterns
+- reload.test.ts needs npm auto-discovery isolation: set `(globalThis as Record<string, unknown>).__opentabs_global_paths__ = []` in beforeEach and call `resetGlobalPathsCache()` in afterEach to prevent real globally-installed npm plugins from being discovered during tests.
+- The globalThis key `__opentabs_global_paths__` caches global node_modules directories. Setting it to `[]` makes auto-discovery skip scanning. Setting it to `null` (via `resetGlobalPathsCache()`) forces re-evaluation from shell commands.
+- The create-plugin install test (`index.test.ts`) can be flaky due to bun symlink race conditions when run in parallel with other tests — passes when run alone.
+- E2E tests use `OPENTABS_SKIP_NPM_DISCOVERY=1` env var (via `skip-npm-discovery.ts`) to prevent globally-installed npm plugins from polluting test isolation. The env var follows the same pattern as `OPENTABS_SKIP_CONFIRMATION` and `OPENTABS_SKIP_SANITIZATION`.
+
+## 2026-02-24 13:15 PST - US-001
+- Removed stray `/**` comment opener on line 67 of platform/mcp-server/src/loader.ts
+- Fixed pre-existing test isolation issue in platform/mcp-server/src/reload.test.ts where globally-installed npm plugins were being discovered during tests, causing `performConfigReload > returns plugin count and duration` to fail (expected 1 plugin, got 2)
+- Files changed: platform/mcp-server/src/loader.ts, platform/mcp-server/src/reload.test.ts
+- **Learnings for future iterations:**
+  - reload.test.ts was not isolated from real npm plugins — all three describe blocks needed `__opentabs_global_paths__` set to `[]` in beforeEach
+  - The `resetGlobalPathsCache()` export from resolver.ts is available for test cleanup
+  - create-plugin's install test has an intermittent EEXIST failure with bun symlinks in worktree environments — it's a known bun issue, not a code bug
+---
+
+## 2026-02-24 13:18 PST - US-002
+- Replaced module-level `let initialized = false` with globalThis-based pattern in platform/mcp-server/src/audit-disk.ts
+- Added `INITIALIZED_KEY = '__opentabs_audit_initialized__'` const following the same convention as `__opentabs_log_buffers__`, `__opentabs_global_paths__`, `__opentabs_reload_guard__`
+- Updated `_resetInitialized()` test helper to reset the globalThis key instead of the module variable
+- Files changed: platform/mcp-server/src/audit-disk.ts
+- **Learnings for future iterations:**
+  - The globalThis pattern for hot-reload-safe state is: define a `const KEY = '__opentabs_<name>__' as const`, then use `(globalThis as Record<string, unknown>)[KEY]` to read/write
+  - All existing tests pass without modification — the `_resetInitialized()` API contract is unchanged
+---
+
+## 2026-02-24 13:30 PST - US-003
+- Replaced O(n*m) `Array.from().some()` with O(n+m) `Set.has()` lookup in `pruneStaleState`'s outdatedPlugins filter in platform/mcp-server/src/reload.ts
+- Pre-builds `npmPkgNames` Set from registry plugins, then uses `Set.has()` for O(1) lookup per filter iteration
+- Fixed pre-existing E2E test isolation issue: globally-installed npm plugins (e.g., Slack) were being discovered via npm auto-discovery in E2E tests, causing 13 tests to fail consistently
+  - Created `platform/mcp-server/src/skip-npm-discovery.ts` with `OPENTABS_SKIP_NPM_DISCOVERY=1` env var support
+  - Modified `platform/mcp-server/src/discovery.ts` to conditionally skip `discoverGlobalNpmPlugins()` when the flag is set
+  - Added `OPENTABS_SKIP_NPM_DISCOVERY: '1'` to E2E fixture env vars in `e2e/fixtures.ts`
+- Files changed: platform/mcp-server/src/reload.ts, platform/mcp-server/src/discovery.ts, platform/mcp-server/src/skip-npm-discovery.ts (new), e2e/fixtures.ts
+- **Learnings for future iterations:**
+  - E2E tests are NOT isolated from npm auto-discovery without `OPENTABS_SKIP_NPM_DISCOVERY=1` — any globally-installed opentabs plugin will be found
+  - The `skip-npm-discovery.ts` module follows the exact same pattern as `skip-confirmation.ts` and `dev-mode.ts`
+  - `type-check` can fail after `build` with TS6310 errors due to stale incremental state — `bun run clean && bun run build` resolves it
+---

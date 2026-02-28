@@ -1,0 +1,166 @@
+# Ralph Progress Log
+PRD: prd-2026-02-22-172152-cross-platform-compat~running.json
+Started: Sun Feb 22 17:21:59 PST 2026
+---
+
+## Codebase Patterns
+- Platform shared package (`platform/shared`) is the lowest-level dependency — used by plugin-sdk, plugin-tools, cli, and mcp-server
+- Atomic write pattern now centralized in `platform/shared/src/cross-platform.ts` via `atomicWrite(path, content, mode?)`. All callers use thin wrappers like `atomicWriteConfig(path, content) => atomicWrite(path, content, 0o600)`
+- Barrel exports in platform/shared/src/index.ts — new modules must be re-exported from here
+- ESLint import-x/order rule enforces local imports before external packages — when adding `@opentabs-dev/shared` imports, place them after local `.js` imports
+- E2E tests run under Playwright's Node.js runner, not Bun — use Node.js APIs in e2e/ directory
+- The e2e-test plugin (`plugins/e2e-test`) must be installed and built for build-e2e tests to pass. Run `cd plugins/e2e-test && bun install && bun run build` before running `bun run test`
+- The `/ws-info` endpoint intentionally does NOT return wsSecret — the extension gets the secret from auth.json. E2E test helpers that need the secret for WebSocket auth must use the already-known secret (mcpServer.secret)
+- Pre-commit hooks run prettier, eslint, and knip on staged files
+- Signal handling pattern: `process.on('SIGINT', cleanup)` works on all platforms; `process.on('SIGTERM', cleanup)` must be conditional (`process.platform !== 'win32'`)
+- On Windows, `child.kill()` (no signal) calls TerminateProcess; `child.kill('SIGTERM')` is unreliable
+- `isWindows()` from `@opentabs-dev/shared` or `process.platform === 'win32'` — use `isWindows()` in platform packages that already import from shared, `process.platform` in standalone contexts (scripts/, plugin-tools)
+- `symlinkCrossPlatform(target, linkPath, type)` from `e2e/fixtures.ts` — on Windows uses `'junction'` for directories (no admin needed) and `'file'` for files; on Unix passes `undefined`. All E2E symlink calls use this helper.
+- `e2e/fixtures.ts` uses the `import-x/exports-last` ESLint rule — all exports must be at the end of the file, never inline `export const`. Define as `const`, then add to the `export { ... }` block.
+
+## 2026-02-22 - US-001
+- Created `platform/shared/src/cross-platform.ts` with: `atomicWrite`, `isWindows`, `platformExec`, `safeChmod`
+- Exported all four helpers from `platform/shared/src/index.ts`
+- Fixed pre-existing E2E failures: `fetchWsInfo` in `e2e/fixtures.ts` expected server to return `wsSecret` in `/ws-info` response, but server intentionally omits it. Fixed helper to pass through the caller-provided secret.
+- Fixed E2E test `/ws-info returns URL and secret as separate fields` → renamed to `/ws-info returns URL without leaking the secret` and updated assertions
+- Built e2e-test plugin (was missing `dist/` and `node_modules/`) which fixed 6 pre-existing unit test failures in `build-e2e.test.ts`
+- Files changed: `platform/shared/src/cross-platform.ts` (new), `platform/shared/src/index.ts`, `e2e/fixtures.ts`, `e2e/lifecycle.e2e.ts`
+- **Learnings for future iterations:**
+  - The `plugins/e2e-test` plugin needs to be installed+built before running unit tests — it's not part of the workspace build
+  - E2E WebSocket tests were broken because `fetchWsInfo` expected server to return the secret, but the server never does — always use the known secret from test fixtures
+  - knip runs as part of the pre-commit hook, so unused exports are caught before commit
+---
+
+## 2026-02-22 - US-002
+- Replaced all six duplicated atomicWrite implementations with the shared `atomicWrite` helper from `@opentabs-dev/shared`
+- `platform/mcp-server/src/config.ts`: Local `atomicWriteConfig` reduced to a thin wrapper calling `atomicWrite(path, content, 0o600)`. `writeAuthFile` now uses `atomicWrite` directly.
+- `platform/cli/src/config.ts`: Same thin wrapper pattern, removed `chmod`/`rename`/`unlink` imports
+- `platform/plugin-tools/src/commands/build.ts`: Same thin wrapper pattern, removed `chmod`/`rename`/`unlink` imports
+- `platform/mcp-server/src/audit-disk.ts`: Replaced inline `chmod` + catch pattern with `safeChmod` from shared
+- `platform/cli/src/commands/config.ts`: `writeAuthFile` now uses `atomicWrite` directly, removed `chmod`/`rename`/`unlink` imports
+- `platform/mcp-server/src/extension-protocol.ts`: `writeAdapterFile` and `writeExecFile` now use `atomicWrite` (no mode), removed `rename` import
+- Files changed: 6 files, net -83 lines (27 insertions, 110 deletions)
+- **Learnings for future iterations:**
+  - ESLint import-x/order enforces local `.js` imports before external `@opentabs-dev/*` packages — `bun run lint:fix` handles reordering automatically
+  - The `atomicWriteConfig` function is still exported by `platform/cli/src/config.ts` for use by CLI commands — it's now a thin wrapper, not removed
+  - `audit-disk.ts` uses `appendFile` + `safeChmod` (not `atomicWrite`) because it appends rather than writes — the shared `safeChmod` is the right helper there
+  - `writeAdapterFile` and `writeExecFile` don't need the `mode` parameter since adapter files don't require restrictive permissions
+---
+
+## 2026-02-22 - US-003
+- Fixed path separator hardcoding in `platform/mcp-server/src/resolver.ts`
+- Imported `sep` from `node:path` and replaced `root + '/'` with `root + sep` in `isAllowedPluginPath`
+- Files changed: `platform/mcp-server/src/resolver.ts` (2 lines changed)
+- **Learnings for future iterations:**
+  - The `isLocalPath` function checks user-facing specifier prefixes (`./`, `../`, `/`, `~/`) — these are intentionally forward-slash only since users type forward slashes on all platforms. Only filesystem path comparisons (realpath results) need `path.sep`.
+  - E2E tests have some flaky tests related to timing (waitForHealth timeouts, lifecycle hooks) — these are pre-existing and pass on retry
+---
+
+## 2026-02-22 - US-004
+- Updated all `Bun.spawn` and `Bun.spawnSync` calls with bare `'npm'` or `'bun'` commands to use `platformExec()` from `@opentabs-dev/shared`
+- `platform/mcp-server/src/resolver.ts`: Two `Bun.spawnSync` calls (npm root -g, bun pm -g bin) now use `platformExec('npm')` and `platformExec('bun')`
+- `platform/cli/src/commands/plugin.ts`: Three `Bun.spawn` calls (npm install -g, npm uninstall -g, npm list -g) now use `platformExec('npm')`
+- `platform/cli/src/commands/start.ts`: One `Bun.spawn` call (bun serverEntry) now uses `platformExec('bun')`
+- Files changed: `platform/mcp-server/src/resolver.ts`, `platform/cli/src/commands/plugin.ts`, `platform/cli/src/commands/start.ts` (3 files, 9 insertions, 7 deletions)
+- **Learnings for future iterations:**
+  - The `platformExec` helper is already exported from `@opentabs-dev/shared` (added in US-001) — just import it alongside other shared utilities
+  - Import ordering: `@opentabs-dev/shared` imports go after local `.js` imports but before other external packages like `picocolors`
+  - On Windows, `npm` → `npm.cmd` and `bun` → `bun.exe`; on Unix, commands pass through unchanged
+---
+
+## 2026-02-22 - US-005
+- Fixed signal handling in four files to be Windows-compatible
+- `platform/cli/src/commands/start.ts`: Added `isWindows()` import from shared; wrapped SIGTERM handler in `if (!isWindows())`
+- `platform/cli/src/commands/logs.ts`: Extracted cleanup function; SIGTERM handler conditional on `process.platform !== 'win32'`
+- `platform/plugin-tools/src/commands/build.ts`: SIGTERM handler conditional on `process.platform !== 'win32'`
+- `scripts/dev.ts`: cleanup function uses `child.kill()` (no signal, calls TerminateProcess) on Windows, `child.kill('SIGTERM')` on Unix; SIGTERM listener conditional on non-Windows
+- SIGINT handler stays on all platforms (Node.js/Bun translate Ctrl+C to SIGINT on Windows)
+- Files changed: 4 files, 25 insertions, 14 deletions
+- **Learnings for future iterations:**
+  - `process.on('SIGINT', ...)` works on all platforms — Ctrl+C is translated to SIGINT by Node.js/Bun on Windows
+  - `process.on('SIGTERM', ...)` should be conditional — Windows does not deliver SIGTERM to processes
+  - `proc.kill('SIGTERM')` on Windows actually calls TerminateProcess (immediate, no graceful shutdown) — use `proc.kill()` with no argument on Windows for clarity
+  - Use `isWindows()` from shared when the module already imports from `@opentabs-dev/shared`; use `process.platform === 'win32'` in scripts/standalone contexts
+  - E2E global teardown: PID discovery is platform-specific (pgrep on Unix, wmic on Windows), but killing uses Node.js `process.kill(pid, 'SIGKILL')` which is cross-platform
+  - ESLint `func-style` rule requires function expressions (arrow functions) — `function foo()` declarations are not allowed
+---
+
+## 2026-02-22 - US-006
+- Made E2E global teardown cross-platform by splitting process discovery into platform-specific functions
+- `findPidsUnix`: uses `pgrep -f` for command-line pattern matching, filters out own PID
+- `findPidsWindows`: uses `wmic process where "CommandLine like '...'"` for command-line pattern matching
+- Killing uses Node.js `process.kill(pid, 'SIGKILL')` — cross-platform, no shell commands needed for the kill step
+- Both functions return empty arrays gracefully when no processes match (try-catch around execSync)
+- Files changed: `e2e/global-teardown.ts` (1 file, 56 insertions, 11 deletions)
+- **Learnings for future iterations:**
+  - `pgrep` has no direct Windows equivalent — `wmic process where "CommandLine like '%pattern%'"` is the closest, outputting `ProcessId=<num>` lines in `/format:list` mode
+  - `process.kill(pid, 'SIGKILL')` works cross-platform in Node.js — use it instead of shell `kill -9` for portability
+  - ESLint `func-style` rule in this codebase requires arrow function expressions, not function declarations
+  - Always filter out `process.pid` from discovered PIDs to avoid self-kill
+---
+
+## 2026-02-22 - US-007
+- Fixed `killProcess` helper in `e2e/fixtures.ts` to handle Windows signal support
+- Added a Windows-specific code path: on `process.platform === 'win32'`, calls `proc.kill()` (no argument, calls TerminateProcess) immediately without the SIGTERM→SIGKILL grace period
+- On Unix, behavior is unchanged (SIGTERM → wait → escalate to SIGKILL)
+- Files changed: `e2e/fixtures.ts` (1 file, 14 insertions)
+- **Learnings for future iterations:**
+  - E2E tests run under Playwright's Node.js runner — use `process.platform` for platform checks, not `isWindows()` from shared
+  - On Windows, `proc.kill('SIGTERM')` calls TerminateProcess (immediate, no graceful shutdown) — same as SIGKILL. No grace period needed.
+  - On Windows, `proc.kill()` with no argument also calls TerminateProcess — it's the canonical way to kill on Windows
+  - The E2E `killProcess` helper is used by all server/test-server fixtures for teardown — changes here affect all E2E tests
+---
+
+## 2026-02-22 - US-008
+- Fixed all `fs.symlinkSync` calls in E2E tests and unit tests to use Windows-compatible types
+- Created `symlinkCrossPlatform(target, linkPath, type)` helper in `e2e/fixtures.ts` — uses `'junction'` for directories on Windows (no admin privileges needed), `'file'` for files on Windows, `undefined` on Unix
+- Updated 6 files: `e2e/fixtures.ts` (2 calls: dir + file), `e2e/helpers.ts` (1 call: dir), `e2e/lifecycle.e2e.ts` (2 calls: dir), `e2e/strict-csp.e2e.ts` (1 call: dir), `e2e/build-icons.e2e.ts` (1 call: dir), `platform/plugin-tools/src/commands/build-e2e.test.ts` (1 call: dir, inline conditional since it runs under Bun, not Playwright)
+- Files changed: 6 files, 31 insertions, 9 deletions
+- **Learnings for future iterations:**
+  - `e2e/fixtures.ts` uses `import-x/exports-last` — all exports must be grouped at the end of the file, not inline `export const`
+  - `e2e/helpers.ts` imports from `e2e/fixtures.ts` — putting shared helpers in `fixtures.ts` avoids circular dependency; `helpers.ts` re-exports via its own import
+  - On Windows, directory symlinks require admin privileges, but junctions do not. Use `fs.symlinkSync(target, path, 'junction')` for directories on Windows
+  - For file symlinks on Windows, use `fs.symlinkSync(target, path, 'file')` (works without admin on Windows 10 1703+ with Developer Mode)
+  - `platform/plugin-tools/src/commands/build-e2e.test.ts` runs under Bun (not Playwright) and cannot import from `e2e/` — use inline conditional
+---
+
+## 2026-02-22 - US-009
+- Replaced hardcoded `/tmp` paths with `path.join(os.tmpdir(), ...)` in two unit test files
+- `platform/shared/src/manifest.test.ts`: `sourcePath` now uses `path.join(os.tmpdir(), 'test-plugin', 'package.json')` instead of `'/tmp/test-plugin/package.json'`
+- `platform/mcp-server/src/registry.test.ts`: `sourcePath` in `makePlugin` now uses `path.join(os.tmpdir(), 'test-plugin')` instead of `'/tmp/test-plugin'`
+- Added `import os from 'node:os'` and `import path from 'node:path'` to both files
+- Verified no other hardcoded `/tmp` paths exist in test files via grep
+- Files changed: 2 files, 6 insertions, 2 deletions
+- **Learnings for future iterations:**
+  - These `sourcePath` values are string identifiers used in test fixtures — the directories don't need to actually exist
+  - `os.tmpdir()` returns `/tmp` on macOS/Linux and the Windows temp directory on Windows (e.g., `C:\Users\<user>\AppData\Local\Temp`)
+  - Bun test files use `bun:test` imports and can use Node.js `node:os` and `node:path` modules
+---
+
+## 2026-02-22 - US-010
+- Rewrote `scripts/publish.sh` (188-line bash script) as `scripts/publish.ts` (cross-platform TypeScript)
+- The new script performs all the same operations: npm auth verification, version bumping, cross-reference updating, building, publishing 5 packages in dependency order, changelog generation from conventional commits, and git commit + tag
+- Uses Bun APIs: `Bun.file().json()` for reading package.json, `Bun.write()` for writing, `Bun.spawnSync()` for running git/npm commands
+- Changelog grouping reimplemented with JS regex replacing bash BASH_REMATCH pattern matching
+- Deleted `scripts/publish.sh`
+- Already covered by `tsconfig.scripts.json` (includes `scripts/**/*.ts`) and knip config (entry `scripts/*.ts`)
+- Files changed: `scripts/publish.ts` (new, 333 lines), `scripts/publish.sh` (deleted, 188 lines)
+- **Learnings for future iterations:**
+  - `tsconfig.scripts.json` already covers all `scripts/**/*.ts` files — no need to create new tsconfig for new scripts
+  - ESLint `@typescript-eslint/no-non-null-assertion` disallows `!` — use guard clauses (`if (!val) continue`) instead
+  - ESLint `@typescript-eslint/restrict-template-expressions` catches `string | undefined` in template literals — use fallback (`?? ''` or `?? key`)
+  - Interface types with string index signatures (`[key: string]: T`) satisfy `Record<string, T>` casts; plain interfaces do not
+  - `Bun.spawnSync` with `stdio: ['inherit', 'inherit', 'inherit']` forwards I/O directly; `stdio: ['ignore', 'pipe', 'pipe']` captures output
+  - Conventional commit regex: `/^([a-z]+)(?:\(.+\))?:\s+(.+)$/` parses type, optional scope, and message
+---
+
+## 2026-02-22 - US-011
+- The `scripts/dev.ts` signal handling was already fixed by US-005 (cleanup uses `child.kill()` on Windows, SIGTERM listener conditional on non-Windows, SIGINT on all platforms)
+- Fixed a pre-existing type error in `scripts/publish.ts` line 149: `groups[type]` was `string[] | undefined` under strict TypeScript — replaced `type in groups` check with `const bucket = groups[type]; if (bucket)` pattern
+- All quality checks pass: build, type-check, lint, knip, unit tests (1780 pass), E2E tests (346 pass)
+- Files changed: `scripts/publish.ts` (1 file, 3 insertions, 2 deletions)
+- **Learnings for future iterations:**
+  - TypeScript strict mode treats index signature access `obj[key]` as `T | undefined` even when the type has `[key: string]: T` — use a local variable + truthiness check instead of `key in obj` guard
+  - US-005 already covered `scripts/dev.ts` signal handling changes as part of its broader scope — always check if prior stories already touched the target file
+  - E2E progress timeout tests (35s+ duration) are sensitive to global 600s timeout when other flaky tests consume retry time — they pass reliably in isolation
+---

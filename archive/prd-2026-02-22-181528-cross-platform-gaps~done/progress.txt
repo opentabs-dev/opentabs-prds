@@ -1,0 +1,48 @@
+# Ralph Progress Log
+PRD: prd-2026-02-22-181528-cross-platform-gaps~running.json
+Started: Sun Feb 22 18:15:35 PST 2026
+---
+
+## Codebase Patterns
+- `isLocalPath` in resolver.ts is not exported — test Windows path detection indirectly through `resolvePluginPath` (local paths produce "Path not found"/"outside allowed directories" errors, npm paths produce "Package not found")
+- The e2e-test plugin in `plugins/e2e-test/` must be built before running `bun run test` from root — `build-e2e.test.ts` depends on its compiled `dist/` output. If the dist/ dir is missing, build with `cd plugins/e2e-test && bun install && bun run build`
+- E2E tests have occasional flaky failures due to resource contention (MCP server startup timeouts, socket errors). These pass on retry and are not code bugs.
+
+## 2026-02-22 - US-001
+- Implemented: Fixed `isLocalPath` in resolver.ts to recognize Windows-style paths (backslash `.\\`, `..\\` prefixes and drive letter `C:\`, `D:/` patterns)
+- Files changed:
+  - `platform/mcp-server/src/resolver.ts` — added `.\\`, `..\\` prefix checks and `/^[A-Za-z]:[/\\]/` regex for drive letters
+  - `platform/mcp-server/src/resolver.test.ts` — added 4 tests for Windows path detection (`.\\`, `..\\`, `C:\\`, `D:/`)
+- **Learnings for future iterations:**
+  - The `isLocalPath` function is internal (not exported). To test it, verify behavior through `resolvePluginPath` — local paths get local error messages, npm names get "Package not found"
+  - `plugins/e2e-test/dist/` is gitignored and missing in fresh worktrees. Must `cd plugins/e2e-test && bun install && bun run build` before root `bun run test` will pass (6 tests in build-e2e.test.ts depend on it)
+---
+
+## 2026-02-22 - US-002
+- Implemented: Fixed `isLocalPathEntry` in config.ts to recognize Windows-style paths (identical pattern to US-001)
+- Files changed:
+  - `platform/mcp-server/src/config.ts` — added `.\\`, `..\\` prefix checks and drive letter regex
+  - `platform/mcp-server/src/config.test.ts` — added test for Windows-style path migration from legacy `plugins` array
+- **Learnings for future iterations:**
+  - `isLocalPathEntry` in config.ts is the same logic as `isLocalPath` in resolver.ts. Both functions could be extracted to a shared module to avoid duplication.
+  - Config tests use `OPENTABS_CONFIG_DIR` env var override for test isolation — write config files to the temp dir, not the real `~/.opentabs/`.
+---
+
+## 2026-02-22 - US-003
+- Implemented: Fixed `resolveLocalPath` in resolver.ts to handle `~\` prefix on Windows, and added `~\` to `isLocalPath` detection
+- Files changed:
+  - `platform/mcp-server/src/resolver.ts` — added `~\` prefix check in both `isLocalPath` and `resolveLocalPath`
+  - `platform/mcp-server/src/resolver.test.ts` — added 2 tests: `~\` expansion in home directory paths and `~\` specifier format detection
+- **Learnings for future iterations:**
+  - The `resolveLocalPath` function uses `resolve(homedir(), specifier.slice(2))` — the `slice(2)` works for both `~/` and `~\` since both prefixes are 2 characters
+  - Both `isLocalPath` and `resolveLocalPath` need to be updated in tandem — if `isLocalPath` doesn't recognize a prefix, `resolveLocalPath` never gets called for it
+---
+
+## 2026-02-22 - US-004
+- Implemented: Wrapped `fs.chmodSync` calls in `e2e/fixtures.ts` with `process.platform !== 'win32'` guard so they are skipped on Windows where NTFS ignores POSIX permissions
+- Files changed:
+  - `e2e/fixtures.ts` — added platform check before both `chmodSync` calls (lines 182 and 200) in `createTestConfigDir`
+- **Learnings for future iterations:**
+  - E2E fixtures run under Playwright's Node.js runtime, not Bun — use `process.platform` (not `Bun.env` or other Bun APIs) for platform detection
+  - `fs.chmodSync` on Windows doesn't throw but only affects the read-only flag (write bit) — skipping is cleaner than try-catch since the call is semantically meaningless on NTFS
+---

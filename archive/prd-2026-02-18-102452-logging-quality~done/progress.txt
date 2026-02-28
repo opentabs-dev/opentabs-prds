@@ -1,0 +1,102 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-102452-logging-quality~running.json
+Started: Wed Feb 18 12:54:07 PST 2026
+---
+
+## Codebase Patterns
+- Browser extension log prefixes follow `[opentabs]` or `[opentabs:<context>]` pattern (e.g., `[opentabs:background]`, `[opentabs:offscreen]`)
+- Console calls injected into target tabs via `chrome.scripting.executeScript` (IIFE teardown, tool invocation logs) must also use the `[opentabs]` prefix
+- Use `console.warn` (not `console.error`) for expected lifecycle failures in the browser extension
+- Catch callback parameters must use `: unknown` type annotation (ESLint: `@typescript-eslint/use-unknown-in-catch-callback-variable`)
+- MCP server logger (`platform/mcp-server/src/logger.ts`) is the single formatting point for all server log output — log format is `[opentabs] <ISO timestamp> <message>`
+- Pass raw Error objects to log.error/log.warn — the logger's formatArgs helper extracts message (all levels) and stack (debug only). Never use `err instanceof Error ? err.message : String(err)` in log calls.
+- The `err instanceof Error ? err.message : String(err)` pattern is still valid for constructing error messages for HTTP responses, MCP tool responses, and Error constructors — just not for log calls.
+- Build scripts use `[opentabs:build:<target>]` prefix (e.g., `[opentabs:build:background]`, `[opentabs:build:side-panel]`) — all platform output is filterable with `[opentabs`
+
+## 2026-02-18 12:55 PST - US-001
+- Standardized all log tag prefixes in browser-extension/src/ to use `[opentabs]`
+- Changed `[OpenTabs]` → `[opentabs]` in messaging.ts (2 places), iife-injection.ts (2 places in IIFE-injected teardown), tool-dispatch.ts (1 place in injected tab warning)
+- Changed `[plugin-storage]` → `[opentabs]` in plugin-storage.ts (1 place)
+- Left `[opentabs:background]` and `[opentabs:offscreen]` unchanged (already correct)
+- Files changed: messaging.ts, iife-injection.ts, tool-dispatch.ts, plugin-storage.ts
+- **Learnings for future iterations:**
+  - The IIFE-injected code in iife-injection.ts runs in the target tab's MAIN world — string literals there are not checked by TypeScript imports, only by grep
+  - plugin-storage.ts had a different prefix convention (`[plugin-storage]`) from all other files — inconsistencies like this are easy to miss
+---
+
+## 2026-02-18 13:00 PST - US-002
+- Replaced all 8 bare `.catch(console.error)` handlers in background.ts with contextual `.catch((err: unknown) => console.warn('[opentabs] <context>:', err))` handlers
+- Each handler now identifies the failed operation: tab injection, tab state check, tab sync, offscreen creation, keepalive alarm, plugin reinjection
+- Used `console.warn` (not `console.error`) per convention for expected lifecycle failures
+- Files changed: background.ts
+- **Learnings for future iterations:**
+  - ESLint rule `@typescript-eslint/use-unknown-in-catch-callback-variable` requires `: unknown` type annotation on catch callback parameters — `err` alone is not sufficient
+  - Long `.catch(...)` lines with context messages may need multi-line formatting to satisfy Prettier's line-length rule
+---
+
+## 2026-02-18 13:10 PST - US-003
+- Replaced all 23 bare `.catch(console.error)` handlers in message-router.ts with contextual `.catch((err: unknown) => console.warn('[opentabs] <method> handler failed:', err))` handlers
+- Each handler now includes the JSON-RPC method name (e.g., `sync.full`, `plugin.update`, `browser.listTabs`, `tool.dispatch`, etc.)
+- Used `console.warn` (not `console.error`) per convention for expected lifecycle failures
+- Updated comment in message-router.test.ts (line 514) to reflect the new `.catch(err => console.warn(...))` pattern
+- Note: `browser.getNetworkRequests`, `browser.disableNetworkCapture`, `browser.getConsoleLogs`, and `browser.clearConsoleLogs` handlers are synchronous — they had no `.catch(console.error)` to replace
+- Files changed: message-router.ts, message-router.test.ts
+- **Learnings for future iterations:**
+  - Some browser command handlers are synchronous (return void, not Promise) — they don't need `.catch()` wrappers
+  - Prettier enforces single-line formatting for catch callbacks that fit within the line length limit — multi-line formatting triggers lint errors for shorter lines
+---
+
+## 2026-02-18 13:12 PST - US-004
+- Added ISO 8601 timestamps to all four MCP server logger methods (debug, info, warn, error)
+- Each log line now includes `new Date().toISOString()` between the `[opentabs]` tag and the message
+- Format: `[opentabs] 2026-02-18T14:30:00.123Z <message>`
+- Files changed: platform/mcp-server/src/logger.ts
+- **Learnings for future iterations:**
+  - The logger is the single point of control for MCP server log formatting — all server output flows through it
+  - Unit tests that assert on log output will now include timestamps in the console output (verified: all 688 tests pass)
+---
+
+## 2026-02-18 13:24 PST - US-005
+- Added `formatArgs` helper to logger.ts that detects Error instances as the last argument: shows message at all levels, stack trace at debug level only
+- Updated all 4 logger methods (debug, info, warn, error) to use formatArgs
+- Updated 21 callsites across 7 files to pass raw error objects instead of `err instanceof Error ? err.message : String(err)`:
+  - reload.ts (7 callsites)
+  - extension-protocol.ts (3 callsites — sendToExtension, cleanupStaleAdapterFiles, sendSyncFull)
+  - discovery.ts (5 callsites — all catch blocks in discoverFromNodeModules and discoverFromLocalPaths)
+  - file-watcher.ts (5 callsites — handleIifeChange, handleManifestChange, watchPlugin x2, startConfigWatching)
+  - http-routes.ts (1 callsite — /reload endpoint)
+  - extension-install.ts (1 callsite — ensureExtensionInstalled)
+- Preserved the pattern in non-log contexts: mcp-setup.ts (MCP tool responses), extension-protocol.ts (Error constructors), http-routes.ts (HTTP response bodies)
+- Fixed pre-existing E2E test bug from US-001: tool-dispatch.e2e.ts checked for `[OpenTabs]` (capital letters) but the source was changed to `[opentabs]`
+- Files changed: logger.ts, reload.ts, extension-protocol.ts, discovery.ts, file-watcher.ts, http-routes.ts, extension-install.ts, tool-dispatch.e2e.ts
+- **Learnings for future iterations:**
+  - Not all `err instanceof Error ? err.message : String(err)` callsites are log calls — some construct error messages for HTTP responses, MCP error content, or Error constructors. Only update log callsites.
+  - config.ts and mcp-setup.ts line 407 already used the correct pattern (passing raw err to log) — no changes needed there
+  - E2E tests that check for specific string prefixes must be updated when those prefixes change — the console.warn test was missed during US-001
+  - Three E2E tests (Invocation recording, Sequential tool calls, Concurrent tool dispatch) have a pre-existing "Rate limited: tool.dispatch" failure unrelated to logging changes
+---
+
+## 2026-02-18 13:31 PST - US-006
+- Added 6 log.debug() calls across the tool dispatch path for complete request lifecycle tracing
+- In mcp-setup.ts (4 calls): tool name resolution, input validation, dispatch initiation, and completion with duration
+- In extension-protocol.ts (2 calls): WebSocket send with method/id, and response receipt with label/id/duration
+- All new log lines are strictly debug-level — no output at default info level
+- Used template literals (`${durationMs}ms`) instead of number + string concatenation to satisfy `@typescript-eslint/restrict-plus-operands`
+- The `PendingDispatch.startTs` field already existed, so no type changes were needed
+- Files changed: mcp-setup.ts, extension-protocol.ts
+- **Learnings for future iterations:**
+  - ESLint `@typescript-eslint/restrict-plus-operands` forbids `number + 'string'` — use template literals for combining numbers with unit suffixes
+  - Prettier removes unnecessary parentheses in expressions like `(a - b) + 'ms'` — use template literals to avoid both issues simultaneously
+  - The `PendingDispatch` type already has `startTs` and `label` fields, useful for response-side timing logs
+---
+
+## 2026-02-18 13:37 PST - US-007
+- Standardized build script log prefixes to use `[opentabs:build:<target>]` convention
+- In build-extension.ts: changed `[${label}]` to `[opentabs:build:${label}]` in all 3 console calls (error for bundle failure, error for no output, log for success)
+- In build-side-panel.ts: changed bare `'Side panel build failed:'` to `'[opentabs:build:side-panel] Build failed:'` and `'[side-panel] Built successfully'` to `'[opentabs:build:side-panel] Built successfully'`
+- Build output now shows: `[opentabs:build:background]`, `[opentabs:build:offscreen]`, `[opentabs:build:side-panel]`
+- Files changed: build-extension.ts, build-side-panel.ts
+- **Learnings for future iterations:**
+  - Build scripts live outside `src/` in the browser-extension package — they have their own tsconfig (tsconfig.build-scripts.json)
+  - The `[opentabs:build:<target>]` prefix convention makes all platform output filterable with `[opentabs` in terminal
+---

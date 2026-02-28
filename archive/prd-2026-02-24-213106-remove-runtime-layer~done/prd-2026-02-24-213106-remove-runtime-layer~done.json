@@ -1,0 +1,150 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Remove the redundant runtime compatibility layer (runtime.ts) from @opentabs-dev/shared and replace all usages with plain Node.js APIs. Bun runs Node.js APIs natively, so the dual-runtime wrappers add complexity for zero benefit. Only `isBun` is genuinely needed (for Bun.serve() in dev mode and Bun global path scanning).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Replace runtime imports in platform/shared internals",
+      "description": "As a platform maintainer, I want platform/shared to use plain Node.js APIs instead of its own runtime wrappers, so that the module has no self-referential dependency on runtime.ts",
+      "acceptanceCriteria": [
+        "platform/shared/src/constants.ts uses `process.env` instead of `getEnv` from runtime.ts",
+        "platform/shared/src/constants.ts no longer imports from ./runtime.js",
+        "platform/shared/src/cross-platform.ts uses `writeFile` from node:fs/promises instead of from ./runtime.js",
+        "platform/shared/src/cross-platform.ts no longer imports from ./runtime.js",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Two files to change:\n\n1. platform/shared/src/constants.ts — line 8: `import { getEnv } from './runtime.js';`. Replace with direct `process.env` access. Line 38: `getEnv('OPENTABS_CONFIG_DIR')` → `process.env['OPENTABS_CONFIG_DIR']` (or `process.env.OPENTABS_CONFIG_DIR`). Remove the import line entirely.\n\n2. platform/shared/src/cross-platform.ts — imports `writeFile` from `./runtime.js`. Replace with `import { writeFile } from 'node:fs/promises'`. The runtime writeFile signature is `writeFile(path: string, content: string): Promise<void>` — the Node.js equivalent is `writeFile(path, content, 'utf-8')`. Check that all call sites pass the encoding argument.\n\nDo NOT remove runtime.ts itself yet or change the barrel exports — that happens in US-003 after all consumers are migrated."
+    },
+    {
+      "id": "US-002",
+      "title": "Replace runtime imports in platform/mcp-server",
+      "description": "As a platform maintainer, I want the MCP server to use plain Node.js APIs instead of runtime wrappers, so that the code is simpler and has no unnecessary abstraction layer",
+      "acceptanceCriteria": [
+        "No file in platform/mcp-server/src/ imports readFile, writeFile, fileExists, deleteFile, readJsonFile, getEnv, getArgv, spawnProcess, spawnProcessSync from @opentabs-dev/shared",
+        "platform/mcp-server/src/index.ts still imports isBun from @opentabs-dev/shared (genuinely needed for Bun.serve())",
+        "platform/mcp-server/src/resolver.ts still imports isBun from @opentabs-dev/shared (genuinely needed for Bun global path scanning)",
+        "All replaced usages use the correct Node.js API with proper arguments (e.g., readFile with 'utf-8' encoding)",
+        "Existing functionality is preserved — no behavioral changes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "15 files to update in platform/mcp-server/src/. This is a large mechanical change but each file is straightforward.\n\nReplacement patterns:\n- `readFile(path)` → `import { readFile } from 'node:fs/promises'` then `readFile(path, 'utf-8')`\n- `readJsonFile(path)` → `readFile(path, 'utf-8').then(t => JSON.parse(t) as T)` (or inline: `JSON.parse(await readFile(path, 'utf-8'))`) — be careful with the generic type parameter, readJsonFile was `async <T>(path: string): Promise<T>`\n- `writeFile(path, content)` → `import { writeFile } from 'node:fs/promises'` then `writeFile(path, content, 'utf-8')`\n- `fileExists(path)` → `import { access } from 'node:fs/promises'` then `access(path).then(() => true, () => false)`. Some files alias this as `runtimeFileExists` — replace the alias too.\n- `deleteFile(path)` → `import { unlink } from 'node:fs/promises'` then `unlink(path).catch(() => {})` — preserves the silent-on-missing behavior\n- `getEnv(name)` → `process.env[name]` — no import needed\n- `getArgv()` → `process.argv` — no import needed\n- `spawnProcessSync(cmd, args, opts?)` → needs a helper or inline replacement using `spawnSync` from `node:child_process`. The runtime version returns `{ exitCode: number, stdout: string, stderr: string }`. Node's `spawnSync` returns `{ status, stdout: Buffer, stderr: Buffer }`. Create a local helper or adjust call sites.\n- `spawnProcess(cmd, args, opts?)` → similar to above but async, using `spawn` from `node:child_process`\n\nIMPORTANT: `spawnProcess` and `spawnProcessSync` have a specific return type (`SpawnResult = { exitCode: number, stdout: string, stderr: string }`). The Node.js `spawnSync` returns `{ status: number | null, stdout: Buffer, stderr: Buffer }`. You'll need to either:\n  (a) Create simple utility functions in @opentabs-dev/shared that wrap Node.js spawn APIs with the same return type (but without Bun branching), OR\n  (b) Adjust every call site to use the Node.js API directly.\n\nOption (a) is cleaner — keep `spawnProcess`, `spawnProcessSync`, `spawnStreaming`, `spawnInherit` as utility functions in shared, but implement them using ONLY Node.js APIs (remove the `if (isBun)` branches). This preserves the convenient return type without dual-runtime complexity.\n\nThe `isBun` import MUST be preserved in index.ts (line 58, used for Bun.serve() vs createNodeServer) and resolver.ts (line 183, used for Bun global modules scanning). Only remove the redundant runtime function imports.\n\nFiles to update:\n- config.ts: fileExists, readFile\n- loader.ts: fileExists, readFile, readJsonFile\n- resolver.ts: getEnv, readJsonFile, spawnProcessSync (keep isBun)\n- index.ts: getEnv (keep isBun)\n- extension-install.ts: fileExists, readFile, writeFile\n- adapter-files.ts: deleteFile\n- plugin-management.ts: readFile, readJsonFile, spawnProcess, spawnProcessSync\n- version-check.ts: spawnProcessSync\n- sdk-version.ts: readJsonFile\n- version.ts: readJsonFile\n- skip-npm-discovery.ts: getEnv\n- skip-confirmation.ts: getArgv, getEnv\n- logger.ts: getEnv\n- dev-mode.ts: getArgv, getEnv\n- file-watcher.ts: fileExists (as runtimeFileExists), readFile"
+    },
+    {
+      "id": "US-003",
+      "title": "Replace runtime imports in platform/cli",
+      "description": "As a platform maintainer, I want the CLI to use plain Node.js APIs instead of runtime wrappers, so that the code is simpler and has no unnecessary abstraction layer",
+      "acceptanceCriteria": [
+        "No file in platform/cli/src/ imports readFile, writeFile, fileExists, deleteFile, readJsonFile, getFileSize, readFileSlice, getEnv, spawnProcess, spawnProcessSync, spawnStreaming, spawnInherit from @opentabs-dev/shared",
+        "platform/cli/src/commands/doctor.ts still imports isBun from @opentabs-dev/shared (genuinely needed for runtime label display)",
+        "All replaced usages use the correct Node.js API with proper arguments",
+        "Existing functionality is preserved — no behavioral changes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "12 files to update in platform/cli/src/.\n\nSame replacement patterns as US-002. Additional patterns for CLI-specific functions:\n- `getFileSize(path)` → `import { stat } from 'node:fs/promises'` then `(await stat(path)).size`\n- `readFileSlice(path, start, length)` → `import { open } from 'node:fs/promises'` then open file handle, read into buffer, close. The runtime version returns a UTF-8 string slice.\n- `spawnStreaming(cmd, args, opts?)` → returns `StreamingProcess = { stdout: ReadableStream<Uint8Array>, stderr: ReadableStream<Uint8Array>, kill: () => void, exited: Promise<number> }`. The Node.js version needs `Readable.toWeb()` to convert Node streams to web ReadableStreams. Import `{ Readable } from 'node:stream'`.\n- `spawnInherit(cmd, args, opts?)` → `spawn(cmd, args, { stdio: 'inherit', ...opts })` with a Promise wrapper for the exit code.\n\nIMPORTANT: If US-002 created utility functions in shared for spawn wrappers (option a), reuse them here. The approach must be consistent across US-002 and US-003.\n\nFiles to update:\n- cli.ts: readFile\n- config.ts: fileExists (as runtimeFileExists), readFile\n- parse-port.ts: getEnv\n- scaffold.ts: readJsonFile, writeFile (as runtimeWriteFile)\n- commands/audit.ts: fileExists (as runtimeFileExists), getFileSize, readFile\n- commands/config.ts: deleteFile (as runtimeDeleteFile), fileExists (as runtimeFileExists)\n- commands/doctor.ts: fileExists (as runtimeFileExists), readFile, readJsonFile, spawnProcessSync (keep isBun)\n- commands/logs.ts: getFileSize, readFileSlice\n- commands/plugin.ts: readFile, spawnInherit, spawnProcess, spawnProcessSync\n- commands/start.ts: fileExists (as runtimeFileExists), spawnStreaming\n- commands/update.ts: readFile, spawnProcessSync\n- commands/setup.ts: fileExists (as runtimeFileExists), readFile, writeFile (as runtimeWriteFile)"
+    },
+    {
+      "id": "US-004",
+      "title": "Replace runtime imports in platform/plugin-tools and platform/create-plugin",
+      "description": "As a platform maintainer, I want plugin-tools and create-plugin to use plain Node.js APIs instead of runtime wrappers",
+      "acceptanceCriteria": [
+        "No file in platform/plugin-tools/src/ imports readFile, writeFile, fileExists, deleteFile, getFileSize, getEnv, sha256, spawnProcessSync from @opentabs-dev/shared",
+        "No file in platform/create-plugin/src/ imports readFile from @opentabs-dev/shared",
+        "All replaced usages use the correct Node.js API",
+        "The sha256 replacement uses node:crypto createHash",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "4 files to update:\n\n1. platform/plugin-tools/src/cli.ts: readFile\n2. platform/plugin-tools/src/commands/inspect.ts: fileExists, readFile\n3. platform/plugin-tools/src/commands/build.ts: deleteFile, fileExists, getEnv, getFileSize, readFile, sha256, spawnProcessSync, writeFile (as runtimeWriteFile)\n4. platform/create-plugin/src/index.ts: readFile\n\nFor sha256: `import { createHash } from 'node:crypto'` then `createHash('sha256').update(data).digest('hex')`. This is a one-liner replacement.\n\nSame replacement patterns as US-002/US-003 for all other functions."
+    },
+    {
+      "id": "US-005",
+      "title": "Remove runtime.ts and clean up shared barrel exports",
+      "description": "As a platform maintainer, I want to remove the now-unused runtime.ts file and its exports from the shared barrel, eliminating the unnecessary abstraction layer entirely",
+      "acceptanceCriteria": [
+        "platform/shared/src/runtime.ts is deleted",
+        "platform/shared/src/index.ts no longer re-exports any runtime.ts functions or types (readFile, writeFile, fileExists, deleteFile, readJsonFile, getFileSize, readFileSlice, spawnProcess, spawnProcessSync, spawnStreaming, spawnInherit, getEnv, getArgv, sha256, SpawnResult, SpawnOptions, StreamingProcess)",
+        "If spawn utility wrappers were kept (from US-002), they live in their own file (e.g., platform/shared/src/spawn.ts) using only Node.js APIs with no isBun branching",
+        "isBun is still exported from the barrel (either inline in index.ts or in a tiny dedicated file)",
+        "No file in the entire platform/ directory imports any deleted function from @opentabs-dev/shared",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "This is the cleanup story after all consumers are migrated.\n\n1. Delete platform/shared/src/runtime.ts\n2. Edit platform/shared/src/index.ts — remove the runtime.ts re-export block (lines 19-36 approximately). Keep `isBun` available — either:\n   (a) Inline it: `export const isBun = typeof Bun !== 'undefined';` directly in index.ts, or\n   (b) Move it to a tiny file like platform/shared/src/detect-runtime.ts\n3. If US-002 created spawn utility functions that wrap Node.js child_process with a convenient return type, those should be in their own file (e.g., platform/shared/src/spawn.ts) exported from the barrel. They must use ONLY Node.js APIs — no isBun branching.\n4. Run `grep -r 'from.*runtime' platform/` to verify no stale imports remain.\n5. Check that platform/shared/tsconfig.json still includes all source files (removing runtime.ts should be fine since tsc picks up files via includes).\n\nAlso remove the SpawnResult, SpawnOptions, StreamingProcess type exports from the barrel if they are no longer needed (they may still be needed if spawn utilities were kept)."
+    },
+    {
+      "id": "US-006",
+      "title": "Update test files that mock runtime functions",
+      "description": "As a platform maintainer, I want test files to mock the correct Node.js APIs instead of the now-removed runtime wrappers",
+      "acceptanceCriteria": [
+        "No test file mocks or imports functions from @opentabs-dev/shared that no longer exist in the barrel",
+        "Tests that previously mocked runtime functions (e.g., spawnProcessSync, readFile, fileExists) now mock the equivalent Node.js APIs or the new shared utility functions",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Test files use `bun:test` and `mock.module()` to mock `@opentabs-dev/shared` exports. After removing runtime functions from the barrel, these mocks will break.\n\nSearch for test files that mock runtime functions:\n```\ngrep -r 'mock.module.*shared' platform/*/src/*.test.ts\ngrep -r 'spawnProcessSync\\|readFile\\|fileExists\\|writeFile\\|getEnv' platform/*/src/*.test.ts\n```\n\nEach test must be updated to mock the actual Node.js module instead (e.g., `mock.module('node:child_process', ...)` instead of `mock.module('@opentabs-dev/shared', ...)`).\n\nIf spawn utilities were kept as shared functions (from US-002/US-005), tests can continue to mock `@opentabs-dev/shared` for those specific functions — but the mock shape must match the new exports."
+    },
+    {
+      "id": "US-007",
+      "title": "Update CLAUDE.md files to reflect correct runtime model",
+      "description": "As a platform contributor, I want the documentation to accurately describe the runtime architecture: plain Node.js APIs everywhere, with isBun only for Bun.serve() and Bun global path scanning",
+      "acceptanceCriteria": [
+        "Root CLAUDE.md 'Runtime Compatibility' section no longer references the runtime compatibility layer or runtime.ts",
+        "Root CLAUDE.md 'Runtime Compatibility' section states that production code uses Node.js APIs directly and that Bun runs them natively",
+        "Root CLAUDE.md 'Runtime Compatibility' section mentions isBun is used only in mcp-server/index.ts (Bun.serve) and mcp-server/resolver.ts (Bun global paths)",
+        "Root CLAUDE.md Tech Stack section says: Runtime: Node.js 20+ (production); Bun + npm (development, testing, publishing)",
+        "docs/CLAUDE.md 'Runtime and Tooling Context' section says platform contributors use Bun + npm (not 'and Node.js')",
+        "platform/mcp-server/CLAUDE.md 'Dev vs Production Mode' section remains accurate (Bun.serve for dev, Node HTTP for production)",
+        "No CLAUDE.md file references runtime.ts, getEnv, readFile, or other removed wrapper functions as recommended patterns",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "Files to update:\n\n1. CLAUDE.md (root) — The 'Runtime Compatibility' section (lines 281-298) needs a full rewrite. Remove references to runtime.ts, the three-tier model, and the instruction to use runtime abstractions. Replace with:\n   - Production code uses Node.js APIs directly (node:fs/promises, node:child_process, node:crypto, process.env, process.argv)\n   - Bun runs all Node.js APIs natively, so no compatibility layer is needed\n   - `isBun` (exported from @opentabs-dev/shared) is used in exactly 2 places: mcp-server/index.ts (Bun.serve() for hot reload in dev mode) and mcp-server/resolver.ts (scanning Bun's global node_modules path)\n   - The 'Node.js APIs used directly' subsection can be simplified or removed since ALL code now uses Node.js APIs directly\n   - Update line 43 Tech Stack: `Runtime: Node.js 20+ (production); Bun + npm (development, testing, publishing)`\n   - Line 283: mention contributors need Bun + npm (for registry auth), not Node.js\n\n2. docs/CLAUDE.md — Line 113: change 'built and developed using Bun ... and Node.js' to 'built and developed using Bun'. Line 119: change 'Platform contributors use Bun ... and Node.js' to 'Platform contributors use Bun (for monorepo management, development, testing, and publishing) and npm (for registry authentication)'.\n\n3. platform/mcp-server/CLAUDE.md — The 'Dev vs Production Mode' section (line 50) and 'Hot Reload' section (line 54) are already accurate and should remain as-is. Just verify no references to runtime.ts or wrapper functions exist.\n\n4. platform/shared/CLAUDE.md — if it exists and references runtime.ts, update it.\n\nDo NOT change the commands in any CLAUDE.md (they correctly use `bun run`). Only change the runtime model description."
+    }
+  ]
+}

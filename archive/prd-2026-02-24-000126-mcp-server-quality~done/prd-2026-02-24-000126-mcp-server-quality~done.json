@@ -1,0 +1,132 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Improve MCP server code quality, modularity, and unit test coverage. Addresses findings from a thorough code review: group ServerState fields into logical sub-objects for readability, deduplicate PermissionsConfig type, eliminate tools.json parsing duplication between file-watcher and loader, add dedicated unit tests for extension-handlers confirmation/progress flow, adapter-files exec script wrapping, and mcp-tool-dispatch permission/confirmation paths.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Deduplicate PermissionsConfig type definition",
+      "description": "As a developer, I want a single canonical PermissionsConfig type so that the config and state modules don't drift out of sync",
+      "acceptanceCriteria": [
+        "PermissionsConfig is defined in exactly one file and re-exported by all consumers",
+        "config.ts imports PermissionsConfig from the canonical location instead of defining its own copy",
+        "state.ts imports PermissionsConfig from the canonical location",
+        "No duplicate interface definitions for PermissionsConfig exist in the codebase",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "PermissionsConfig is currently defined in both platform/mcp-server/src/config.ts (lines 29-38) and referenced from state.ts. The type in config.ts is: { trustedDomains: string[], sensitiveDomains: string[], toolPolicy: Record<string, ToolPermission>, domainToolPolicy: Record<string, Record<string, ToolPermission>> }. ToolPermission is also defined in config.ts as 'allow' | 'ask' | 'deny'. The canonical home should be config.ts since that's where the config schema lives — just make sure state.ts imports from config.ts rather than having its own copy. Check permissions.ts which also imports PermissionsConfig from config.ts. Currently state.ts has `import type { PermissionsConfig } from './config.js'` which is correct, but verify that the interface definition in config.ts is the only one and that it is exported properly. The key issue is that config.ts defines PermissionsConfig locally (not exported initially, only via the export type line at the bottom). Make sure the export is clean."
+    },
+    {
+      "id": "US-002",
+      "title": "Eliminate tools.json parsing duplication between file-watcher and loader",
+      "description": "As a developer, I want a single tools.json parser so that manifest format changes only need to be made in one place",
+      "acceptanceCriteria": [
+        "file-watcher.ts does NOT have its own parseToolsJson function",
+        "file-watcher.ts reuses the validateTools function from loader.ts (or a shared extraction)",
+        "The shared parser handles both legacy (array) and current ({ tools: [...] }) formats",
+        "File watcher IIFE and tools.json change handlers still work correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "platform/mcp-server/src/file-watcher.ts has parseToolsJson (lines 227-277) which re-implements the manifest parsing logic from platform/mcp-server/src/loader.ts validateTools (lines 120-183). The difference: file-watcher's version is more lenient (silently skips invalid entries), while loader's version returns an error Result on any invalid entry. For the file-watcher use case, the lenient behavior is correct — it's processing incremental updates where a partially-valid manifest is better than no update. Approach: extract the manifest-array-extraction logic (handling legacy array vs { tools: [...] } format) into a shared helper in loader.ts (e.g. extractToolsArray(raw: unknown): unknown[] | null), then have both validateTools and the file-watcher call it. The file-watcher can keep its lenient per-entry validation while sharing the top-level format detection. Alternatively, have file-watcher call validateTools and just catch/ignore the Result error, falling through to its lenient parsing. The key files are: platform/mcp-server/src/file-watcher.ts (parseToolsJson at line 227) and platform/mcp-server/src/loader.ts (validateTools at line 120). Make sure the file-watcher test (platform/mcp-server/src/file-watcher.test.ts) still passes."
+    },
+    {
+      "id": "US-003",
+      "title": "Add dedicated unit tests for extension-handlers confirmation and progress flows",
+      "description": "As a developer, I want targeted unit tests for handleConfirmationResponse and handleToolProgress so that the complex timeout-reset and session-permission logic is verified independently",
+      "acceptanceCriteria": [
+        "New test file platform/mcp-server/src/extension-handlers.test.ts exists",
+        "Tests cover handleConfirmationResponse: allow_once resolves pending, allow_always adds session permission rule, deny resolves pending, unknown id is ignored, scope variants (tool_domain, tool_all, domain_all) create correct SessionPermissionRule",
+        "Tests cover handleToolProgress: progress forwarded to onProgress callback, timeout timer is reset on progress, MAX_DISPATCH_TIMEOUT_MS absolute ceiling rejects dispatch, missing/invalid dispatchId is ignored",
+        "Tests cover rejectAllPendingConfirmations: all pending confirmations are rejected and cleared",
+        "Tests cover handlePluginLog: valid entries forwarded to callback, invalid entries (wrong types, missing fields) silently dropped",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Create platform/mcp-server/src/extension-handlers.test.ts. All handlers are already exported individually from extension-handlers.ts — they take (state, params, id?, callbacks?) as arguments, making them easy to test. Use createState() for state setup, populate state.pendingConfirmations and state.pendingDispatches directly. For handleToolProgress, set up a PendingDispatch with a known timerId, call handleToolProgress with valid params, and verify: (1) onProgress callback was called, (2) pending.lastProgressTs was updated, (3) the old timerId was cleared and a new one set. For the MAX_DISPATCH_TIMEOUT_MS ceiling test, set pending.startTs to Date.now() - MAX_DISPATCH_TIMEOUT_MS - 1000 so elapsed exceeds the max, then call handleToolProgress and verify the pending dispatch is rejected. For handleConfirmationResponse allow_always, verify state.sessionPermissions gets a new rule with the correct scope. Follow the same test patterns as platform/mcp-server/src/extension-protocol.test.ts — no module mocking, direct state manipulation, explicit assertions."
+    },
+    {
+      "id": "US-004",
+      "title": "Add unit tests for adapter-files exec script wrapping and cleanup",
+      "description": "As a developer, I want tests for writeExecFile and cleanupStaleExecFiles so that the security-critical user code wrapping and file cleanup logic is verified",
+      "acceptanceCriteria": [
+        "New test file platform/mcp-server/src/adapter-files.test.ts exists",
+        "Tests cover writeExecFile: wraps user code in IIFE, uses JSON.stringify for code escaping, result file exists in adapters dir",
+        "Tests cover writeExecFile with async code: the wrapper handles promise results",
+        "Tests cover writeExecFile with malicious code: closing braces/parens don't break wrapper (Function constructor isolation)",
+        "Tests cover writeAdapterFile: writes IIFE to adapters dir, rewrites sourceMappingURL when sourceMap provided",
+        "Tests cover cleanupStaleExecFiles: removes __exec-*.js files, leaves adapter files untouched",
+        "Tests cover cleanupStaleAdapterFiles: removes .js files for plugins not in current set, keeps current plugins",
+        "Tests use temp directories (mkdtempSync) with OPENTABS_CONFIG_DIR override, same pattern as config.test.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Create platform/mcp-server/src/adapter-files.test.ts. The key pattern from existing tests: set OPENTABS_CONFIG_DIR env var to a mkdtempSync result, then the getAdaptersDir() function will resolve to <tmpdir>/extension/adapters/. The functions to test are all exported from adapter-files.ts. For writeExecFile, create a state via createState() (ensure adaptersDirReady: false so ensureAdaptersDir creates the directory), call writeExecFile(state, 'test-id', 'return 42'), then read the output file and verify it contains the IIFE wrapper with JSON.stringify('return 42') embedded. For the malicious code test, use code like '});alert(1);//' and verify the output wraps it safely inside new Function(). For cleanupStaleExecFiles, write a few __exec-*.js files manually with Bun.write(), then call cleanupStaleExecFiles() and verify they're deleted. For cleanupStaleAdapterFiles, write plugin1.js and plugin2.js, then call cleanupStaleAdapterFiles(new Set(['plugin1'])) and verify plugin2.js is deleted but plugin1.js remains. Use afterEach/afterAll to clean up temp dirs."
+    },
+    {
+      "id": "US-005",
+      "title": "Extract HTTP route handlers from monolithic createHandleFetch closure",
+      "description": "As a developer, I want each HTTP route handler to be a named, individually testable function so that the 300+ line createHandleFetch closure is readable and routes can be tested in isolation",
+      "acceptanceCriteria": [
+        "Each route (/ws, /ws-info, /health, /audit, /reload, /extension/reload, /mcp) is extracted into a named function",
+        "createHandleFetch delegates to these named functions based on URL path",
+        "The named functions accept RouteDeps (or a subset) as parameters for dependency injection",
+        "Existing http-routes.test.ts tests still pass without modification",
+        "computeAuditSummary remains a standalone function (it's already extracted)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/http-routes.ts, createHandleFetch (lines 192-511) is a single closure that handles all routes. Extract each route block into a named function: handleWsUpgrade, handleWsInfo, handleHealth, handleAudit, handleReload, handleExtensionReload, handleMcp. Each takes the same RouteDeps (or a subset) plus req and bunServer. The main createHandleFetch then becomes a simple router that matches url.pathname and delegates. Keep the host header validation and CORS check at the top of createHandleFetch since they apply to all routes. The exported API doesn't change — createHandlers still returns HotHandlers. The extracted functions should be module-level (not exported unless http-routes.test.ts needs direct access). The MCP session handling in handleMcp is the most complex (POST/GET/DELETE sub-routing with transport management) — keep the sub-routing logic together in handleMcp rather than splitting further."
+    },
+    {
+      "id": "US-006",
+      "title": "Group ServerState fields into logical sub-objects for readability",
+      "description": "As a developer, I want ServerState's 35+ fields organized into logical groups so that it's clear which fields are related and the interface is easier to understand",
+      "acceptanceCriteria": [
+        "ServerState fields are grouped into sub-objects: fileWatching (entries, timers, generation, configWatcher, configLastSeenMtime, mtimePollTimerId, mtimeLastPollAt, mtimePollDetections, mtimePollDetectionTimestamps), audit (log, diskInitialized is in audit-disk.ts so just auditLog stays)",
+        "createState() initializes the grouped fields in the new structure",
+        "All references to the moved fields are updated (file-watcher.ts, reload.ts, shutdown.ts, http-routes.ts, index.ts)",
+        "The _schemaVersion is bumped to 4",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "This is a significant refactor touching many files. The goal is to group the file-watching-related fields on ServerState into a single sub-object. Currently these fields are flat on ServerState: fileWatcherEntries, fileWatcherTimers, fileWatcherGeneration, configWatcher, configLastSeenMtime, mtimePollTimerId, mtimeLastPollAt, mtimePollDetections, mtimePollDetectionTimestamps. Group them under state.fileWatching = { entries, timers, generation, configWatcher, configLastSeenMtime, mtimePollTimerId, mtimeLastPollAt, mtimePollDetections, mtimePollDetectionTimestamps }. Define a FileWatchingState interface. Update createState() to initialize fileWatching. All consumers (file-watcher.ts is the main one, plus reload.ts's stopFileWatching calls, shutdown.ts, and http-routes.ts /health endpoint) must be updated. The /health endpoint reads fileWatcherEntries, mtimeLastPollAt, mtimePollDetections — update to state.fileWatching.*. Bump STATE_SCHEMA_VERSION from 3 to 4. The index.ts hot-reload patching (lines 118-134) will auto-patch the new top-level key. This is the last story and must be an e2eCheckpoint."
+    }
+  ]
+}

@@ -1,0 +1,103 @@
+# Ralph Progress Log
+PRD: prd-2026-02-23-230213-mcp-server-modularity-refactor~running.json
+Started: Mon Feb 23 23:02:46 PST 2026
+---
+
+## Codebase Patterns
+- Platform packages are in platform/, plugins in plugins/
+- extension-protocol.ts is the main WebSocket protocol module; extracted file I/O into adapter-files.ts
+- Functions that only depend on config/logger/shared (no ServerState) are good extraction candidates
+- Re-export extracted functions from the original module to maintain existing import paths for callers
+- knip checks for unused exports, so only re-export what callers actually import
+- sendToExtension is defined in extension-handlers.ts and imported by extension-protocol.ts (shared utility)
+- McpCallbacks type is exported from extension-handlers.ts and re-exported from extension-protocol.ts for existing callers
+- handleExtensionMessage stays in extension-protocol.ts as a thin router delegating to handler functions
+- mcp-tool-dispatch.ts contains handleBrowserToolCall and handlePluginToolCall; mcp-setup.ts re-exports sanitizeOutput from it
+- import-x/exports-last rule requires all export statements at the end of the file — define as non-exported const, then export at bottom
+- Re-exporting types requires `export type { Foo }` at the bottom, not inline `export type` re-export statements at the top
+- New fields on ServerState are auto-patched on hot reload (index.ts fills missing keys from createState() defaults) — no STATE_SCHEMA_VERSION bump needed for additions
+- browser-tool-names.ts contains the static BROWSER_TOOL_NAMES array; browser-tools/index.ts validates it matches actual definitions at module load time
+- import-x/order rule: parent imports (`../`) must come before sibling imports (`./`), but after external package imports
+- When moving a module-level flag to ServerState, propagate the state parameter through all intermediate functions that use the flag (e.g., ensureAdaptersDir → writeExecFile → callers)
+
+## 2026-02-24 - US-001
+- Extracted adapter and exec file I/O from extension-protocol.ts into new adapter-files.ts
+- Files changed:
+  - Created: platform/mcp-server/src/adapter-files.ts (ensureAdaptersDir, writeAdapterFile, cleanupStaleAdapterFiles, writeExecFile, deleteExecFile, cleanupStaleExecFiles, timeoutRace, ADAPTER_WRITE_TIMEOUT_MS, EXEC_FILE_PREFIX, adaptersDirReady)
+  - Modified: platform/mcp-server/src/extension-protocol.ts (imports from adapter-files.ts, re-exports the 4 functions used by external callers)
+- **Learnings for future iterations:**
+  - extension-protocol.ts re-exports writeAdapterFile, writeExecFile, deleteExecFile, cleanupStaleExecFiles so existing callers (browser-tools/execute-script.ts, browser-tools/analyze-site/index.ts, reload.ts, extension-protocol.test.ts) don't need import path changes
+  - ADAPTER_WRITE_TIMEOUT_MS, EXEC_FILE_PREFIX, timeoutRace are NOT re-exported from extension-protocol.ts because they were never externally exported and knip would flag them
+  - The adaptersDirReady flag is a module-level let in adapter-files.ts — it intentionally resets on bun --hot reload
+  - All 1798 tests pass with zero modifications to test files
+---
+
+## 2026-02-24 - US-002
+- Extracted extension WebSocket message handlers from extension-protocol.ts into new extension-handlers.ts
+- Files changed:
+  - Created: platform/mcp-server/src/extension-handlers.ts (sendToExtension, sendJsonRpcError, sendPluginManagementError, serializePluginForExtension, McpCallbacks, WireTabMapping, parseTabMapping, VALID_LOG_LEVELS, handleTabSyncAll, handleTabStateChanged, handleConfigGetState, handleConfigSetToolEnabled, handleConfigSetAllToolsEnabled, handlePluginSearch, handlePluginInstall, handlePluginUpdateFromRegistry, handlePluginRemove, handlePluginCheckUpdates, handleToolProgress, handlePluginLog, handleConfirmationResponse, rejectAllPendingConfirmations)
+  - Modified: platform/mcp-server/src/extension-protocol.ts (now imports handlers from extension-handlers.ts, reduced to ~400 lines with dispatch mechanics + thin router + DispatchError)
+- **Learnings for future iterations:**
+  - sendToExtension is the shared low-level send utility — defined in extension-handlers.ts, imported by extension-protocol.ts
+  - McpCallbacks type is re-exported from extension-protocol.ts (via `export type { McpCallbacks }`) so existing callers (http-routes.ts) don't need import path changes
+  - handleExtensionMessage remains in extension-protocol.ts as a thin router — it parses JSON, handles ping/dispatch responses, then delegates to imported handler functions
+  - extension-protocol.ts went from ~1094 lines to ~400 lines (dispatch mechanics, router, DispatchError)
+  - All 1798 tests pass with zero modifications to test files
+---
+
+## 2026-02-24 - US-003
+- Extracted handleBrowserToolCall and handlePluginToolCall from mcp-setup.ts tools/call handler into new mcp-tool-dispatch.ts
+- Files changed:
+  - Created: platform/mcp-server/src/mcp-tool-dispatch.ts (sanitizeOutput, formatZodError, resolveToolDomain, truncateParamsPreview, formatStructuredError, handleBrowserToolCall, handlePluginToolCall, ToolCallResult, RequestHandlerExtra)
+  - Modified: platform/mcp-server/src/mcp-setup.ts (thin dispatcher in tools/call handler, imports from mcp-tool-dispatch.ts, re-exports sanitizeOutput and RequestHandlerExtra)
+- **Learnings for future iterations:**
+  - The tools/call handler in mcp-setup.ts is now a thin dispatcher: check browser tool → handleBrowserToolCall, else → checkToolCallable + handlePluginToolCall
+  - sanitizeOutput is re-exported from mcp-setup.ts for backward compatibility (test files import it from there)
+  - RequestHandlerExtra type is re-exported from mcp-setup.ts (used by test files)
+  - import-x/exports-last rule requires ALL export statements (including re-exports and export type) at the end of the file — no inline `export const` or top-of-file re-exports
+  - Both handleBrowserToolCall and handlePluginToolCall accept explicit parameters (state, toolName, args, extra) rather than relying on closure scope
+  - mcp-setup.ts went from ~840 lines to ~400 lines (server factory, tools/list, resource/prompt handlers, thin tools/call dispatcher)
+  - All 1798 tests pass with zero modifications to test files
+---
+
+## 2026-02-24 - US-004
+- Moved rate-limit state from http-routes.ts module scope to ServerState
+- Files changed:
+  - Modified: platform/mcp-server/src/state.ts (added endpointCallTimestamps field to ServerState interface and createState())
+  - Modified: platform/mcp-server/src/http-routes.ts (checkEndpointRateLimit now accepts state parameter, removed module-level Map, updated 3 callers)
+- **Learnings for future iterations:**
+  - New Map/Set fields on ServerState are auto-patched on hot reload by the index.ts patching loop (iterates over createState() defaults and fills missing keys) — no STATE_SCHEMA_VERSION bump needed for new fields
+  - checkEndpointRateLimit is a private function within createHandleFetch closure scope — state is available from the deps parameter
+  - Test fixtures using createState() automatically get the new field with the default value (empty Map) — no test changes needed
+  - All 1798 tests pass with zero modifications to test files
+---
+
+## 2026-02-24 - US-005
+- Extracted BROWSER_TOOL_NAMES constant to break loader.ts → browser-tools dependency
+- Files changed:
+  - Created: platform/mcp-server/src/browser-tool-names.ts (static BROWSER_TOOL_NAMES array with all 37 browser tool name strings)
+  - Modified: platform/mcp-server/src/loader.ts (imports BROWSER_TOOL_NAMES from browser-tool-names.ts instead of browserTools from browser-tools/index.ts; removed derived const)
+  - Modified: platform/mcp-server/src/browser-tools/index.ts (imports BROWSER_TOOL_NAMES and validates at module load time that static list matches actual tool definitions)
+- **Learnings for future iterations:**
+  - loader.ts only needed the browser tool name strings (for prompt injection detection in checkBrowserToolReferences) — importing the full barrel pulled in Zod schemas and handler implementations unnecessarily
+  - reload.ts still imports browserTools from browser-tools/index.ts — that's the legitimate runtime dependency for `state.browserTools = browserTools` on hot reload
+  - browser-tools/index.ts now has a load-time consistency check: throws if BROWSER_TOOL_NAMES and actual tool definitions diverge
+  - import-x/order rule: parent path imports (`../browser-tool-names.js`) must come before sibling path imports (`./analyze-site.js`) — placing them after the type import caused a lint error
+  - All 1798 tests pass with zero modifications to test files
+---
+
+## 2026-02-24 - US-006
+- Moved adaptersDirReady flag from adapter-files.ts module scope to ServerState
+- Files changed:
+  - Modified: platform/mcp-server/src/state.ts (added adaptersDirReady field to ServerState interface and createState())
+  - Modified: platform/mcp-server/src/adapter-files.ts (ensureAdaptersDir now accepts state parameter, writeExecFile now accepts state parameter, removed module-level let)
+  - Modified: platform/mcp-server/src/extension-protocol.ts (pass state to ensureAdaptersDir in sendSyncFull and sendPluginUpdate)
+  - Modified: platform/mcp-server/src/browser-tools/execute-script.ts (pass state to writeExecFile)
+  - Modified: platform/mcp-server/src/browser-tools/analyze-site/index.ts (pass state to writeExecFile)
+  - Modified: platform/mcp-server/src/browser-tools/execute-script.test.ts (updated mock signature to include state parameter)
+- **Learnings for future iterations:**
+  - writeExecFile needed state propagated through it because it calls ensureAdaptersDir internally — changing ensureAdaptersDir's signature cascades to writeExecFile's signature and all its callers
+  - Browser tool handlers receive `(args, state)` from defineBrowserTool, so state is always available in handler scope
+  - The execute-script.test.ts mock needed its type signature updated since writeExecFile gained a leading state parameter
+  - All 1798 unit tests + 355 E2E tests pass (1 flaky, exit 0)
+---

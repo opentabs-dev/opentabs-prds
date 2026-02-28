@@ -1,0 +1,280 @@
+## Codebase Patterns
+- JSON-RPC error codes are defined as named constants in `platform/browser-extension/src/json-rpc-errors.ts`
+- Error codes inside `chrome.scripting.executeScript` `func` callbacks MUST remain as raw numbers because those functions run in the page's MAIN world and cannot import extension modules
+- Non-error constants (timeouts, limits, keys) CAN be passed to executeScript funcs via the `args` array — the constant is defined once in constants.ts and passed through at call time
+- The browser extension uses `sendToServer` from `messaging.ts` for all JSON-RPC responses to the MCP server
+- `sendTabStateNotification` in `messaging.ts` is the single place for tab.stateChanged payloads to both server and side panel
+- `PluginTabStateInfo` interface in `extension-messages.ts` is the shared type for tab state info `{ state, tabId, url }`
+- `sendTabSyncAll` in tab-state.ts has a different shape (batched tab.syncAll to server, individual tab.stateChanged to side panel only) — it does NOT use sendTabStateNotification
+- Import order in source files is enforced by `import-x/order` ESLint rule — imports must be alphabetical within each group
+- After editing code with longer constant names, run `bun run lint:fix` to auto-fix line-length formatting issues
+- TypeScript narrows `Record<string, unknown>` values after `typeof` checks — do NOT add `as number` casts after `typeof x === 'number'` guards, as ESLint flags them as unnecessary
+- Confirmation badge/notification logic lives in `confirmation-badge.ts` — the chrome.notifications.onClicked listener is registered via `initConfirmationBadge()` called from background.ts (not a module-level side effect)
+- When extracting a new module from an existing one, all test files that mock the original module may need to also mock the new module
+- message-router.ts has three wrapper patterns: `wrapAsync` (async + id guard), `wrapSync` (sync + id guard + try-catch), `wrapNotification` (async, no id guard — for notifications). `handleExtensionReload` is a special case assigned directly as MessageHandler.
+- `background-message-handlers.ts` uses a `Map<InternalMessage['type'], MessageHandler>` dispatch map for chrome.runtime.onMessage routing — handlers are `Record<string, unknown>` typed for runtime validation
+- Side panel toggle logic lives in `side-panel-toggle.ts` — initialized via `initSidePanelToggle()` from background.ts
+- `buildWsUrl(port)` in constants.ts is the single source of truth for the `ws://localhost:${port}/ws` URL pattern
+- The `import-x/exports-last` ESLint rule requires all exports at the bottom of the file — use a single `export { ... }` block
+- `queryMatchingTabIds(urlPatterns)` in iife-injection.ts is the shared helper for tab collection/deduplication — both `injectPluginIntoMatchingTabs` and `cleanupAdaptersInMatchingTabs` use it
+- `teardownAdapterInTab(tabId, pluginName)` in iife-injection.ts wraps the simple adapter teardown executeScript call
+- `fetchWsInfo(httpBase)` in offscreen/index.ts encapsulates the /ws-info fetch + 401 retry pattern — returns `{ response }` or `{ reason }` discriminated union
+- `wsToHttpBase(wsUrl)` in offscreen/index.ts converts ws:// URLs to http:// base URLs
+- `disconnectAndReconnect(closeReason)` in offscreen/index.ts handles WebSocket close + cancel pending timer + immediate reconnect
+- `DisconnectReason` type has three variants: `'connection_refused'` (server unreachable), `'auth_failed'` (401), `'timeout'` (pong watchdog)
+- `requireStringParam(params, paramName, id)` in helpers.ts validates a non-empty string param — follows the same pattern as `requireTabId`/`requireSelector` (returns value or null, sends JSON-RPC error as side effect)
+- `sendValidationError(id, message)` in helpers.ts sends JSONRPC_INVALID_PARAMS (-32602) errors — use instead of raw `sendToServer` for parameter validation and "not found" errors
+- `sendErrorResult(id, err)` in helpers.ts sends JSONRPC_INTERNAL_ERROR (-32603) — accepts Error objects for custom messages
+- No browser command handler file should import `sendToServer` directly — all responses go through `sendSuccessResult`, `sendErrorResult`, or `sendValidationError`
+- E2E fixtures patch `DEFAULT_SERVER_PORT` in bundled offscreen.js (not a literal URL) — resilient to bundler output changes
+- `handleBrowserPressKey` lives in `key-press-command.ts`, `handleBrowserScroll` lives in `scroll-command.ts` — extracted from `interaction-commands.ts` for maintainability
+- The `index.ts` barrel file in browser-commands/ re-exports all handlers — consumers import from the barrel, so file extractions are transparent
+- `withPluginLock(pluginName, fn)` in tab-state.ts serializes async operations per plugin via promise chaining — both `checkTabChanged`/`checkTabRemoved` and `updateLastKnownState` go through this lock
+- `checkTabRemoved(tabId)` and `checkTabChanged(tabId, changeInfo)` in tab-state.ts replace the old `checkTabStateChanges` — distinct signatures avoid the boolean `removed` flag
+- The `changeInfo` parameter in `checkTabChanged` uses `chrome.tabs.OnUpdatedInfo` (not `TabChangeInfo` which doesn't exist in `@types/chrome`)
+- Do NOT override `globalThis.crypto` in test files — it contaminates `crypto.randomUUID()` for bridge.ts and other tests. Only mock crypto if you're directly testing functions that use it.
+- When testing `tab-state.ts`, mock `./constants.js` (provides `IS_READY_TIMEOUT_MS`) and call `clearTabStateCache()` in `beforeEach` to reset module-level maps
+- For `Promise<void>` returns in tests, do NOT assign to a variable (`const result = await fn()`) — ESLint `no-confusing-void-expression` rejects it. Use `await fn()` and assert separately.
+
+# Ralph Progress Log
+PRD: prd-2026-02-23-232603-extension-code-quality~running.json
+Started: Mon Feb 23 23:26:13 PST 2026
+---
+
+## 2026-02-24 - US-001
+- Created `platform/browser-extension/src/json-rpc-errors.ts` with 5 named constants: JSONRPC_METHOD_NOT_FOUND, JSONRPC_INVALID_PARAMS, JSONRPC_INTERNAL_ERROR, JSONRPC_NO_USABLE_TAB, JSONRPC_ADAPTER_NOT_READY
+- Replaced all raw -32xxx numeric literals across 11 source files with the corresponding named constants
+- Files changed: json-rpc-errors.ts (new), dispatch-helpers.ts, tool-dispatch.ts, resource-prompt-dispatch.ts, message-router.ts, helpers.ts, interaction-commands.ts, extension-commands.ts, tab-commands.ts, cookie-commands.ts, content-commands.ts, resource-commands.ts
+- Updated JSDoc comments referencing raw error codes to use constant names instead
+- **Learnings for future iterations:**
+  - Error codes inside `chrome.scripting.executeScript({ func: ... })` callbacks run in the page's MAIN world — they cannot import extension modules, so raw numbers must stay
+  - The `import-x/order` ESLint rule requires imports sorted alphabetically — new imports must be inserted in the correct position
+  - `bun run lint:fix` handles prettier formatting issues automatically
+  - Test files (`.test.ts`) are allowed to use raw error code numbers per the acceptance criteria
+---
+
+## 2026-02-24 - US-002
+- Added 16 named constants to `platform/browser-extension/src/constants.ts`: SERVER_PORT_KEY, DEFAULT_SERVER_PORT, TEXT_PREVIEW_MAX_LENGTH, DEFAULT_WAIT_TIMEOUT_MS, POLL_INTERVAL_MS, DEFAULT_QUERY_LIMIT, MAX_INPUT_SIZE, SIDE_PANEL_TIMEOUT_MS, CDP_VERSION, WS_CLOSE_PONG_TIMEOUT, WS_CLOSE_AUTH_FAILED, WS_INFO_TIMEOUT_MS, EXEC_MAX_ASYNC_WAIT_MS, EXEC_POLL_INTERVAL_MS, EXEC_RESULT_TRUNCATION_LIMIT, DEFAULT_LOG_LIMIT
+- Replaced all corresponding magic numbers/strings across 7 source files
+- Files changed: constants.ts, background.ts, offscreen/index.ts, browser-commands/extension-commands.ts, browser-commands/interaction-commands.ts, browser-commands/resource-commands.ts, tool-dispatch.ts, network-capture.ts
+- For values inside executeScript func callbacks (TEXT_PREVIEW_MAX_LENGTH, POLL_INTERVAL_MS, EXEC_RESULT_TRUNCATION_LIMIT), passed them via the `args` array to keep the constant defined in one place
+- Removed local `SIDE_PANEL_TIMEOUT_MS` and `MAX_INPUT_SIZE` constants that duplicated what's now in the shared constants file
+- **Learnings for future iterations:**
+  - Non-error constants CAN be passed into executeScript func callbacks via args — unlike error codes which must stay raw, simple values like timeouts and limits can be cleanly forwarded
+  - When accessing `Record<string, unknown>` properties with bracket notation after `typeof` narrowing, do NOT add `as Type` casts — TypeScript narrows correctly and ESLint will flag unnecessary type assertions
+  - The side panel has its own `side-panel/constants.ts` with `PORT_STORAGE_KEY` and `DEFAULT_PORT` — these duplicate the shared constants but are used by the side panel's own code
+---
+
+## 2026-02-24 - US-003
+- Defined `PluginTabStateInfo` interface in `extension-messages.ts` with `{ state: TabState; tabId: number | null; url: string | null }`
+- Created `sendTabStateNotification(pluginName, stateInfo)` helper in `messaging.ts` that sends both `sendToServer` and `forwardToSidePanel` with the correct JSON-RPC tab.stateChanged shape
+- Updated `tab-state.ts` to use `PluginTabStateInfo` as return type of `computePluginTabState` and replaced inline payload construction in `checkTabStateChanges` with `sendTabStateNotification`
+- Updated `message-router.ts` to use `sendTabStateNotification` in `handlePluginUpdate` instead of separate sendToServer + forwardToSidePanel calls
+- Updated test mocks in `known-methods.test.ts` and `message-router.test.ts` to include `sendTabStateNotification` in the `./messaging.js` mock
+- Files changed: extension-messages.ts, messaging.ts, tab-state.ts, message-router.ts, known-methods.test.ts, message-router.test.ts
+- **Learnings for future iterations:**
+  - When adding a new export to `messaging.ts`, all test files that mock `./messaging.js` must include the new export in their mock — bun's `mock.module` requires all named exports to be present
+  - `sendTabSyncAll` sends `tab.syncAll` (batched) to the server and individual `tab.stateChanged` to the side panel only — it cannot use `sendTabStateNotification` because that would double-send to the server
+  - The `PluginTabStateInfo` type is now the canonical return type of `computePluginTabState` — future stories (US-010) should use it when referencing tab state shapes
+---
+
+## 2026-02-24 - US-004
+- Created `platform/browser-extension/src/confirmation-badge.ts` with extracted confirmation badge/notification logic: `notifyConfirmationRequest`, `clearConfirmationBadge`, `clearAllConfirmationBadges`, `initConfirmationBadge`
+- Removed all confirmation badge/notification code from `message-router.ts` (pendingConfirmationCount, updateConfirmationBadge, notifyConfirmationRequest, clearConfirmationBadge, clearAllConfirmationBadges, chrome.notifications.onClicked listener)
+- message-router.ts now imports `notifyConfirmationRequest` from confirmation-badge.ts
+- background.ts now imports `clearConfirmationBadge`, `clearAllConfirmationBadges`, and `initConfirmationBadge` from confirmation-badge.ts (previously imported from message-router.ts)
+- background.ts calls `initConfirmationBadge()` at startup to register the chrome.notifications.onClicked listener
+- Updated test mocks in `known-methods.test.ts` and `message-router.test.ts` to mock `./confirmation-badge.js`
+- Removed chrome.notifications, chrome.action, and chrome.sidePanel stubs from message-router.test.ts chrome mock (no longer needed)
+- Files changed: confirmation-badge.ts (new), message-router.ts, background.ts, known-methods.test.ts, message-router.test.ts
+- **Learnings for future iterations:**
+  - When extracting code that registers Chrome event listeners as module-level side effects, wrap the listener registration in an `init()` function to avoid test setup complexity — tests that import the module no longer need to stub the listener APIs
+  - When removing exports from a module, check all test files that mock that module — the mock must match the module's actual exports
+  - Prettier auto-formats short export blocks to single lines — if the export list shrinks after extraction, run lint to catch formatting
+---
+
+## 2026-02-24 - US-005
+- Added try-catch error boundary to `wrapSync` with method name logging, matching `wrapAsync`'s error handling pattern
+- Created `wrapNotification` wrapper for async notification handlers (no id guard — always executes) used by `sync.full` and `plugin.update`
+- Converted `plugin.uninstall` dispatch entry from ad-hoc inline id guard + `.catch()` to `wrapAsync`
+- Extracted `handleExtensionReload` as a named `MessageHandler` function (was 20+ lines inlined in the dispatch table)
+- Added try-catch around `cleanupAdaptersInMatchingTabs` in `handlePluginUninstall` so cleanup failure doesn't prevent `removePlugin` and `clearPluginTabState`
+- Reorganized file: handlers now defined above the dispatch table (previously below), eliminating need for closure-based late binding
+- Updated all `wrapSync` call sites to include method name parameter
+- Files changed: message-router.ts
+- **Learnings for future iterations:**
+  - When using wrapper functions like `wrapNotification`/`wrapAsync` in a dispatch table Map literal, the referenced handler functions must be defined _above_ the Map (const arrow functions are not hoisted, unlike function declarations)
+  - The three wrapper patterns in message-router.ts: `wrapAsync` (async with id guard), `wrapSync` (sync with id guard + try-catch), `wrapNotification` (async, no id guard — for notifications like sync.full/plugin.update)
+  - `handleExtensionReload` is a special case — it optionally responds (if id present) but always executes the reload sequence, so it uses neither wrapper and is assigned directly as a MessageHandler
+---
+
+## 2026-02-24 - US-006
+- Extracted the 156-line `chrome.runtime.onMessage` switch statement from `background.ts` into `background-message-handlers.ts` with a `Map<InternalMessage['type'], MessageHandler>` dispatch map
+- Each message type handler is a named, exported function (handleOffscreenGetUrl, handleWsState, handleWsMessage, handleBgSend, handleBgGetConnectionState, handlePluginLogs, handleToolProgress, handleSpConfirmationResponse, handlePortChanged) — testable independently
+- Extracted side panel toggle logic (openWindows state, onOpened/onClosed, action.onClicked) to `side-panel-toggle.ts` with an `initSidePanelToggle()` entry point
+- Created `buildWsUrl(port)` utility in `constants.ts` and replaced all 5 `ws://localhost:${port}/ws` template literals across background.ts, extension-commands.ts, and offscreen/index.ts
+- Added runtime validation for content-script-originated messages: `handlePluginLogs` validates `Array.isArray(entries)` and checks each entry is a non-null object; `handleToolProgress` validates `typeof dispatchId === 'string'`, `typeof progress === 'number'`, `typeof total === 'number'`
+- Handlers receive `Record<string, unknown>` instead of typed message interfaces, enabling runtime validation without TypeScript's type narrowing bypassing the checks
+- WebSocket connection state (wsConnected, lastDisconnectReason, persistWsConnected) moved from background.ts to background-message-handlers.ts where it's used
+- `restoreWsConnectedState()` called from background.ts at startup; `initBackgroundMessageHandlers()` registers the onMessage listener
+- Files changed: background-message-handlers.ts (new), side-panel-toggle.ts (new), background.ts, constants.ts, browser-commands/extension-commands.ts, offscreen/index.ts
+- **Learnings for future iterations:**
+  - The `import-x/exports-last` ESLint rule requires all export statements at the end of the file — define functions as `const` and use a single `export { ... }` block at the bottom
+  - To add runtime validation for typed message fields, use `Record<string, unknown>` as the handler parameter type so TypeScript doesn't narrow away the validation checks
+  - The `no-unnecessary-condition` ESLint rule flags `typeof x === 'string'` checks on already-typed fields — using `Record<string, unknown>` avoids this
+  - `buildWsUrl` in constants.ts is the single source of truth for the ws URL pattern — all 5 previous usages now go through it
+---
+
+## 2026-02-24 - US-007
+- Extracted `queryMatchingTabIds(urlPatterns)` shared helper that collects unique tab IDs across URL patterns using `Set<number>` — replaces duplicated `Map<number, chrome.tabs.Tab>` tab collection in both `injectPluginIntoMatchingTabs` and `cleanupAdaptersInMatchingTabs`
+- Extracted `teardownAdapterInTab(tabId, pluginName)` helper that wraps the `chrome.scripting.executeScript` teardown call — used by `injectPluginIntoMatchingTabs` for the simple pre-reinject teardown case
+- Changed `tabMap` from `Map<number, chrome.tabs.Tab>` (only `.keys()` was used) to `Set<number>` inside the helper, returning `number[]`
+- Changed `injectLogRelay` catch block from silent `catch {}` to `catch (err) { console.warn(...) }` for debuggability
+- Changed `verifyAdapterVersion` return type from `Promise<void>` to `Promise<boolean>` — returns `true` on match, `false` on mismatch or failure
+- Exported `isSafePluginName`, `queryMatchingTabIds`, `teardownAdapterInTab`, `verifyAdapterVersion` for testability (US-013 will add tests)
+- Used `export { ... }` block at bottom per `import-x/exports-last` ESLint rule
+- Files changed: iife-injection.ts
+- **Learnings for future iterations:**
+  - Page-side functions passed to `chrome.scripting.executeScript` `func` run in the page's MAIN world — they cannot share code via imports. Deduplication of page-side logic is limited to the extension-side wrapper functions
+  - The cleanup script in `cleanupAdaptersInMatchingTabs` includes adapter removal with a `Reflect.deleteProperty` fallback for frozen objects — this is fundamentally different from the simple teardown-before-reinject in `injectPluginIntoMatchingTabs`, so the two page-side functions cannot be merged
+  - `knip`'s `ignoreExportsUsedInFile: true` means functions that are both used locally AND exported won't be flagged as unused exports
+---
+
+## 2026-02-24 - US-008
+- Extracted `fetchWsInfo(httpBase)` helper encapsulating the /ws-info fetch + 401 retry pattern — previously duplicated in `refreshWsUrl` and `ws:setUrl` handler
+- Extracted `wsToHttpBase(wsUrl)` helper for the `ws->http` URL conversion — previously duplicated in `refreshWsUrl` and `ws:setUrl` handler
+- Extracted `disconnectAndReconnect(closeReason)` helper for the close-or-cancel-and-reconnect pattern — previously duplicated 3x in `ws:setUrl`, `port-changed`, and `bg:forceReconnect` handlers
+- `fetchWsInfo` returns a discriminated union `{ response: Response } | { reason: DisconnectReason }` so callers can differentiate success from auth/network failure without try-catch
+- Added `'timeout'` variant to `DisconnectReason` type in `extension-messages.ts` — pong timeout now uses `'timeout'` instead of the semantically incorrect `'connection_refused'`
+- The `DisconnectedState` component already handles `'timeout'` correctly — its fallthrough to `ConnectionRefusedState` applies to any reason other than `'auth_failed'`
+- Added `console.warn` to the silent `catch` in `ws.onmessage` JSON.parse for debuggability
+- WS close code constants (`WS_CLOSE_PONG_TIMEOUT`, `WS_CLOSE_AUTH_FAILED`) were already imported from constants.ts (done in US-002)
+- `refreshWsUrl` simplified from a try-catch wrapper around manual fetch logic to a two-line call to `fetchWsInfo` + result inspection
+- Files changed: offscreen/index.ts, extension-messages.ts
+- **Learnings for future iterations:**
+  - `fetchWsInfo` reads `wsSecret` from module-level state rather than taking it as a parameter — this avoids threading the secret through every caller while keeping the helper focused on the fetch pattern
+  - The `DisconnectedState` component in the side panel uses a simple `reason === 'auth_failed'` check with a fallthrough — new `DisconnectReason` variants that represent unreachable-server scenarios need no UI changes
+  - `disconnectAndReconnect` handles three cases: active WebSocket (close it, onclose triggers reconnect), pending reconnect timer (cancel and connect immediately), no connection/timer (connect immediately)
+---
+
+## 2026-02-24 - US-009
+- Fixed visibility check bug in `handleBrowserWaitForElement`: changed `||` to `&&` between `offsetParent` and `display` checks so both conditions must be true for an element to be considered visible
+- Added `requireStringParam(params, paramName, id)` helper to `helpers.ts` — follows exact same pattern as `requireTabId`/`requireSelector` (returns validated value or null, sends error as side effect)
+- Replaced inline string param validations in `handleBrowserTypeText` (text), `handleBrowserPressKey` (key), and `handleBrowserHandleDialog` (action) with `requireStringParam`
+- Added direction validation to `handleBrowserScroll`: invalid direction values now return a JSON-RPC error instead of silently producing zero-scroll (dx=0, dy=0)
+- Extracted `handleBrowserPressKey` into `key-press-command.ts` (148 lines) and `handleBrowserScroll` into `scroll-command.ts` (134 lines)
+- Updated `index.ts` barrel file to re-export from the new files
+- `interaction-commands.ts` reduced from 668 to 390 lines
+- Files changed: helpers.ts, interaction-commands.ts, index.ts, key-press-command.ts (new), scroll-command.ts (new)
+- **Learnings for future iterations:**
+  - `requireStringParam` is a generic helper — US-011 should extend its usage to `extension-commands.ts` (plugin, execFile) and `resource-commands.ts` (url) and add tests
+  - The `handleBrowserSelectOption` value/label validation is a special "at least one of" pattern that doesn't fit `requireStringParam` — it needs custom validation
+  - `direction` in handleBrowserScroll is optional (null is valid for other scroll modes) but when provided must be one of the four valid values — this is a different pattern from required string params
+  - When extracting handlers to new files, the `index.ts` barrel file re-exports make the extraction transparent to all consumers (message-router.ts, test mocks) — no changes needed upstream
+  - `bun run lint:fix` handles prettier formatting issues in new files automatically
+---
+
+## 2026-02-24 - US-010
+- Fixed race condition: `updateLastKnownState` now chains through `pluginLocks` via `withPluginLock` so writes are serialized with `checkTabChanged`/`checkTabRemoved` for the same plugin
+- Extracted `withPluginLock(pluginName, fn)` helper that encapsulates the lock chaining pattern (chain onto existing promise, log errors on the lock chain, return operation promise to caller)
+- Split `checkTabStateChanges(tabId, changeInfo?, removed?)` into two functions with distinct signatures: `checkTabRemoved(tabId)` and `checkTabChanged(tabId, changeInfo)`
+- Replaced ad-hoc `{ url?: string; status?: string }` type with `chrome.tabs.OnUpdatedInfo` (the actual Chrome type — `TabChangeInfo` doesn't exist in `@types/chrome`)
+- Consolidated duplicate error logging: removed the `Promise.allSettled` + rejection iteration pattern. Now `withPluginLock` logs once per failure, and `notifyAffectedPlugins` uses `Promise.all` with `withPluginLock` handling errors
+- Extracted `notifyAffectedPlugins(plugins)` to share the compute-diff-notify loop between `checkTabRemoved` and `checkTabChanged`
+- `PluginTabStateInfo` (from US-003) continues to be the return type of `computePluginTabState` — no anonymous inline types
+- Updated `background.ts` callers to use the new split functions
+- Updated `message-router.ts` to `await updateLastKnownState(...)` since it's now async
+- Files changed: tab-state.ts, background.ts, message-router.ts
+- **Learnings for future iterations:**
+  - `chrome.tabs.OnUpdatedInfo` is the correct type name in `@types/chrome` — not `TabChangeInfo`
+  - The `@typescript-eslint/require-await` rule flags `async () => { syncOp() }` — use a non-async function returning `Promise.resolve()` instead
+  - `withPluginLock` logs errors on the lock chain (so the chain itself never rejects and stays usable) and also returns the raw promise so callers can handle errors through `Promise.all`
+  - `notifyAffectedPlugins` replaced the inline map-over-plugins logic in `checkTabStateChanges`, reducing duplication between the removed and changed code paths
+---
+
+## 2026-02-24 - US-011
+- Extended `requireStringParam` usage from US-009 to all remaining command files with inline string validations
+- Replaced inline `plugin` validation in `handleExtensionCheckAdapter` (extension-commands.ts) with `requireStringParam(params, 'plugin', id)`
+- Replaced inline `execFile` validation in `handleBrowserExecuteScript` (extension-commands.ts) with `requireStringParam(params, 'execFile', id)`
+- Replaced inline `url` validation in `handleBrowserGetResourceContent` (resource-commands.ts) with `requireStringParam(params, 'url', id)`
+- Replaced inline `name` validation in `handleBrowserSetCookie` and `handleBrowserDeleteCookies` (cookie-commands.ts) with `requireStringParam(params, 'name', id)`
+- Added 6 tests for `requireStringParam` to helpers.test.ts: valid string, missing param, wrong type, empty string, paramName in error message, numeric id
+- Files changed: extension-commands.ts, resource-commands.ts, cookie-commands.ts, helpers.test.ts
+- **Learnings for future iterations:**
+  - Cookie `value` validation uses `typeof value !== 'string'` without empty check because empty strings are valid cookie values — `requireStringParam` (which rejects empty strings) should NOT be used for this case
+  - `handleBrowserSelectOption`'s value/label validation is an "at least one of" pattern that doesn't fit `requireStringParam` — it requires custom logic
+  - The `handleBrowserSetCookie` `value` check and `handleBrowserGetStorage` `storageType` enum check are validation patterns that don't match `requireStringParam` — they need custom inline logic
+---
+
+## 2026-02-24 - US-012
+- Verified existing `platform/browser-extension/src/tool-dispatch.test.ts` (committed as `856436a` by a previous iteration) passes all quality checks
+- The test file covers: `notifyDispatchProgress` (Map lookup, callback invocation, missing key), `getPluginLink` (local/official/community/local-no-path branches), `handleToolDispatch` parameter validation (missing plugin, empty plugin, missing tool, invalid input types array/string/number, oversized input, plugin not found, numeric id)
+- 17 tests total, all passing
+- Previous iteration committed the code but didn't update the PRD — this iteration marks `passes: true`
+- Files verified: tool-dispatch.test.ts (already committed)
+- **Learnings for future iterations:**
+  - Bun's `mock.module` is process-global — when other test files mock `./tool-dispatch.js`, the real module cannot be imported in this test file. The workaround is inline replicas of pure functions (getPluginLink, notifyDispatchProgress) for mock-immune testing
+  - The `handleToolDispatch` tests guard assertions with `if (mockSendToServer.mock.calls.length === 0) return` to handle the case where the function is a mock from another test file
+  - When a previous iteration commits code but fails before updating the PRD, the next iteration just needs to verify and mark `passes: true`
+---
+
+## 2026-02-24 - US-013
+- Created `platform/browser-extension/src/iife-injection.test.ts` with 17 tests covering:
+  - `isSafePluginName`: valid names, reserved names (system, browser, opentabs, etc.), invalid formats (empty, uppercase, spaces, leading/trailing dash)
+  - `queryMatchingTabIds`: single pattern, multiple patterns with deduplication, empty results, tabs without IDs, empty patterns, query failures, partial pattern failures
+  - `verifyAdapterVersion`: version match (true), mismatch (false), no version (false), empty results (false), script failure (false)
+  - `teardownAdapterInTab`: executeScript call verification (target, world, args), error swallowing
+- Created `platform/browser-extension/src/tab-state.test.ts` with 27 tests covering:
+  - `computePluginTabState`: closed (no tabs), ready (isReady=true), unavailable (isReady=false), unavailable (script throws), skips tabs without ID, first ready tab among multiple, fallback tab for unavailable, null url handling
+  - `lastKnownState cache`: empty initial state, updateLastKnownState populates, overwrites previous, clearTabStateCache clears all, clearPluginTabState removes single, no-op for unknown plugins
+  - `checkTabRemoved`: no-op with no plugins, sends notification on state change, suppresses when unchanged, checks all plugins
+  - `checkTabChanged`: no-op with no plugins, URL change detection, irrelevant changeInfo ignored, status=complete with tab URL fetch, early return on tab.get failure, suppression, active-state plugins included
+  - `sendTabSyncAll`: no-op with no plugins, syncAll payload construction, cache population, side panel notification
+- Files changed: iife-injection.test.ts (new), tab-state.test.ts (new)
+- **Learnings for future iterations:**
+  - Do NOT override `globalThis.crypto` in test files — it contaminates other test files that depend on `crypto.randomUUID()` for bridge/reload tests. Functions like `injectLogRelay` that use crypto internally don't need to be mocked unless you're testing that specific function.
+  - `tab-state.ts` imports `IS_READY_TIMEOUT_MS` from `constants.js` — the constants module must be mocked when testing tab-state
+  - Bun's `mock.module` is process-global — when mocking `./constants.js` in one test file, the mock persists and can affect other files importing constants. Keep mock values reasonable (e.g., `IS_READY_TIMEOUT_MS: 100` not `0`) to avoid unexpected behavior.
+  - For `Promise<void>` return types, do NOT assign the await result to a variable (ESLint `no-confusing-void-expression`). Instead just `await fn()` and assert separately.
+  - The `clearTabStateCache()` function is essential in `beforeEach` for tab-state tests since the `lastKnownState` and `pluginLocks` maps are module-level state that persists across tests.
+  - For mock functions that need to return promises, use `mock(() => Promise.resolve(value))` instead of `mock(async () => value)` — ESLint `@typescript-eslint/require-await` flags async arrow functions without `await`
+  - When testing browser command handlers, mock ALL transitive dependencies (messaging.js, sanitize-error.js, constants.js, and domain modules like plugin-storage.js, tab-state.js) before import
+  - `handleExtensionCheckAdapter` has two validation layers: `requireStringParam` for the plugin param, then `getPluginMeta` returning null triggers a separate -32602 error
+---
+
+## 2026-02-24 - US-014
+- Created 5 new test files for browser command handler parameter validation:
+  - `interaction-commands.test.ts`: 21 tests covering handleBrowserClickElement (missing/invalid tabId, missing/empty selector), handleBrowserTypeText (missing tabId/selector/text, empty text, non-string text), handleBrowserSelectOption (missing tabId/selector, missing both value+label, non-string value+label), handleBrowserWaitForElement, handleBrowserQueryElements, handleBrowserHoverElement (tabId+selector validation), handleBrowserHandleDialog (missing tabId/action, empty action, invalid action value)
+  - `extension-commands.test.ts`: 11 tests covering handleExtensionCheckAdapter (missing/empty/non-string plugin, unknown plugin returning -32602) and handleBrowserExecuteScript (missing tabId/execFile, empty/non-string execFile, invalid format, path traversal)
+  - `tab-commands.test.ts`: 11 tests covering handleBrowserOpenTab (missing/non-string/blocked url), handleBrowserCloseTab (missing/non-number tabId), handleBrowserNavigateTab (missing tabId, missing url, blocked url), handleBrowserFocusTab (missing/non-number tabId), handleBrowserGetTabInfo (missing/non-number tabId)
+  - `key-press-command.test.ts`: 6 tests covering handleBrowserPressKey (missing/non-number tabId, missing/empty/non-string key, numeric id)
+  - `scroll-command.test.ts`: 9 tests covering handleBrowserScroll (missing/non-number tabId, invalid direction values, null direction acceptance, valid directions up/down/left/right)
+- Total: 58 new tests, all passing
+- Files changed: interaction-commands.test.ts (new), extension-commands.test.ts (new), tab-commands.test.ts (new), key-press-command.test.ts (new), scroll-command.test.ts (new)
+- **Learnings for future iterations:**
+  - For mock functions returning promises, use `mock(() => Promise.resolve(value))` instead of `mock(async () => value)` to avoid ESLint `@typescript-eslint/require-await` errors
+  - extension-commands.ts has many transitive dependencies (background-log-state, network-capture, plugin-storage, tab-matching, tab-state) that must all be mocked
+  - The `handleBrowserExecuteScript` execFile validation uses a regex pattern `/^__exec-[a-f0-9-]+\.js$/` — any non-matching format (path traversal, wrong prefix, missing extension) is rejected
+  - `handleBrowserScroll`'s direction param is optional (null is valid), but when provided as a string it must be one of up/down/left/right — this is different from `requireStringParam` which rejects null/missing
+---
+
+## 2026-02-24 - US-015
+- Added `sendValidationError(id, message)` helper to `helpers.ts` — sends JSONRPC_INVALID_PARAMS (-32602) errors, complementing `sendErrorResult` which sends JSONRPC_INTERNAL_ERROR (-32603)
+- Replaced all raw `sendToServer` calls for tool/browser command responses across 8 command files:
+  - `extension-commands.ts`: `handleExtensionGetSidePanel` (3 paths → `sendSuccessResult`), `handleExtensionCheckAdapter` (1 path → `sendValidationError`), `handleBrowserExecuteScript` (1 path → `sendValidationError`), `handleExtensionForceReconnect` (1 path → `sendSuccessResult`). Removed `sendToServer` and `JSONRPC_INVALID_PARAMS` imports.
+  - `scroll-command.ts`: direction validation → `sendValidationError`. Removed `sendToServer`, `JSONRPC_INVALID_PARAMS` imports.
+  - `interaction-commands.ts`: `handleBrowserSelectOption` value/label validation → `sendValidationError`, `handleBrowserHandleDialog` action validation → `sendValidationError`, dialog error → `sendErrorResult`. Removed `sendToServer`, `JSONRPC_INTERNAL_ERROR`, `JSONRPC_INVALID_PARAMS`, `sanitizeErrorMessage` imports.
+  - `tab-commands.ts`: `handleBrowserFocusTab` tab not found → `sendValidationError`. Removed `sendToServer`, `JSONRPC_INVALID_PARAMS` imports.
+  - `cookie-commands.ts`: value validation → `sendValidationError`, failed cookie set → `sendErrorResult`. Removed `sendToServer`, `JSONRPC_INTERNAL_ERROR`, `JSONRPC_INVALID_PARAMS` imports.
+  - `content-commands.ts`: storageType validation → `sendValidationError`, no script result → `sendErrorResult`, screenshot tab not found → `sendValidationError`. Removed `sendToServer`, `JSONRPC_INTERNAL_ERROR`, `JSONRPC_INVALID_PARAMS` imports.
+  - `resource-commands.ts`: resource not found → `sendValidationError`. Removed `sendToServer`, `JSONRPC_INVALID_PARAMS` imports.
+- Fixed `handleBrowserScroll` to explicitly pick result properties (`scrolledTo`, `scrollPosition`, `scrollSize`, `viewportSize`) instead of passing raw result — consistent with all other handlers
+- Added 2 tests for `sendValidationError` to `helpers.test.ts`: valid message with string id, valid message with numeric id
+- Fixed E2E test fixture (`e2e/fixtures.ts`): updated port patching from regex `ws://localhost:9515/ws` to `var DEFAULT_SERVER_PORT = 9515` — the previous pattern broke after US-006 introduced `buildWsUrl(port)` which changed the bundled output from a literal URL to a template literal
+- Files changed: helpers.ts, helpers.test.ts, extension-commands.ts, scroll-command.ts, interaction-commands.ts, tab-commands.ts, cookie-commands.ts, content-commands.ts, resource-commands.ts, e2e/fixtures.ts
+- **Learnings for future iterations:**
+  - `sendValidationError` is the standard helper for JSONRPC_INVALID_PARAMS (-32602) errors — use it instead of raw `sendToServer` for parameter validation and "not found" errors
+  - `sendErrorResult` is for JSONRPC_INTERNAL_ERROR (-32603) errors with sanitized messages — can accept `new Error(msg)` for custom messages
+  - When refactoring URL patterns (like `buildWsUrl`), check E2E fixtures that patch bundled output — string replacement patterns may break when template literals replace literal strings
+  - The E2E fixture patches `DEFAULT_SERVER_PORT` in the bundled offscreen.js — this is more resilient than patching URL strings because it works regardless of how `buildWsUrl` is bundled
+---

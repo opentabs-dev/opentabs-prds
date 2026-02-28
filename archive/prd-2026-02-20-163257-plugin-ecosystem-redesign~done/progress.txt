@@ -1,0 +1,350 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-163257-plugin-ecosystem-redesign~running.json
+Started: Fri Feb 20 16:32:58 PST 2026
+---
+
+## Codebase Patterns
+- Shared types/utilities live in `platform/shared/src/` and are re-exported from `index.ts`
+- The shared package uses `.js` extensions in imports (ESM convention with TypeScript)
+- Prettier enforces single-line exports when they fit, and parenthesized ternaries for multi-line arrow returns
+- Pre-commit hooks run prettier, eslint, and knip — formatting must be correct before committing
+- ESLint `import-x/exports-last` requires all exports at the bottom of the file — declare without `export`, then export at the end
+- ESLint `import-x/order` requires value imports before type imports from the same module
+- ESLint `import-x/order` within node: protocol is alphabetical (e.g., `node:fs/promises` before `node:os`)
+- In barrel files, use separate `export { ... }` and `export type { ... }` lines rather than mixed type/value exports
+- New modules must be reachable from existing import chains or knip will flag them as unused files
+- When accessing `unknown[]` elements, assign to `unknown` before casting to `Record<string, unknown>` — avoids `@typescript-eslint/no-unnecessary-condition` on typeof checks
+- Knip entry `src/**/*.test.ts` makes test files valid entry points — new modules referenced only from tests are reachable
+- When rewriting a module with active consumers, use a `-legacy.ts` sibling to preserve old code until all consumers are migrated
+- File watcher watches `dist/tools.json` and `dist/adapter.iife.js` in the `dist/` directory (not the plugin root)
+- `discovery-legacy.ts` and `manifest-schema.ts` have been deleted — all discovery goes through loader.ts
+- E2E test `expect(logsJoined).not.toContain('error')` is too broad — use specific error patterns to avoid matching "0 error(s)" in informational log messages
+- Test helpers creating plugins must use new format: `package.json` (with `opentabs` field) + `dist/tools.json` + `dist/adapter.iife.js`
+
+---
+
+## 2026-02-20 - US-001
+- Implemented `Result<T, E>` discriminated union type with `Ok<T>` and `Err<E>` interfaces
+- Added factory functions: `ok()`, `err()`
+- Added type guards: `isOk()`, `isErr()`
+- Added utilities: `unwrap()`, `unwrapOr()`, `mapResult()`
+- Files changed:
+  - `platform/shared/src/result.ts` (new)
+  - `platform/shared/src/index.ts` (added re-exports)
+- **Learnings for future iterations:**
+  - The shared package barrel (`index.ts`) uses section comments with `// ---` dividers to organize exports by category
+  - All interfaces use `readonly` properties for immutable data patterns
+  - Prettier reformats multi-line exports to single-line if they fit within line length
+---
+
+## 2026-02-20 - US-002
+- Created `PluginPackageJson` interface representing a plugin's package.json with `name`, `version`, `main`, and `opentabs` fields
+- Created `PluginOpentabsField` interface with `displayName`, `description`, `urlPatterns` (required) and `icon` (optional)
+- Implemented `parsePluginPackageJson(json, sourcePath)` returning `Result<PluginPackageJson, string>` with descriptive validation errors
+- Validation checks: name starts with `opentabs-plugin-` or scoped `@org/opentabs-plugin-*`, opentabs field exists, urlPatterns is non-empty array of strings
+- Existing `ManifestTool` and `PluginManifest` types preserved in index.ts
+- All new types re-exported from `platform/shared/src/index.ts`
+- Files changed:
+  - `platform/shared/src/manifest.ts` (new)
+  - `platform/shared/src/index.ts` (added re-exports)
+- **Learnings for future iterations:**
+  - ESLint `import-x/exports-last` rule requires all exports at the bottom of the file — declare interfaces/consts without `export`, then export them at the end
+  - ESLint `import-x/order` requires value imports before type imports from the same module (e.g., `import { ok, err }` before `import type { Result }`)
+  - Use separate `export { ... }` and `export type { ... }` lines in barrel files rather than mixed `export { type Foo, bar }` to satisfy Prettier's single-line preference
+---
+
+## 2026-02-20 - US-003
+- Created `platform/mcp-server/src/resolver.ts` with `resolvePluginPath(specifier, configDir)` returning `Result<string, string>`
+- Supports local filesystem paths (starting with `./`, `../`, `/`, `~/`) resolved against configDir
+- Supports npm package names via `Bun.resolveSync(specifier + '/package.json', cwd)` then `dirname()` to get directory
+- Security check via `isAllowedPluginPath` — resolved path must be under `homedir()` or `tmpdir()`
+- Handles scoped packages (e.g., `@org/opentabs-plugin-foo`) via the same Bun.resolveSync path
+- Descriptive errors: "Package not found: <name>", "Path outside allowed directories: <path>"
+- Migrated `isAllowedPluginPath`, `safeRealpath`, `getAllowedRoots` from `discovery.ts` into `resolver.ts`
+- Updated `discovery.ts` to import `isAllowedPluginPath` from `resolver.ts` instead of defining its own
+- Updated `discovery.test.ts` to import `isAllowedPluginPath` from `resolver.ts`
+- Files changed:
+  - `platform/mcp-server/src/resolver.ts` (new)
+  - `platform/mcp-server/src/discovery.ts` (imports migrated, duplicated functions removed)
+  - `platform/mcp-server/src/discovery.test.ts` (import updated)
+- **Learnings for future iterations:**
+  - New modules must be reachable from existing import chains or knip will flag them as unused. When extracting code, update callers in the same change.
+  - `import-x/order` expects `node:fs/promises` before `node:os` (alphabetical within node: protocol)
+  - Prettier collapses multi-line boolean expressions (like `a || b || c || d`) to a single line when they fit
+---
+
+## 2026-02-20 - US-004
+- Created `platform/mcp-server/src/loader.ts` with `loadPlugin(dir, trustTier)` returning `Result<LoadedPlugin, string>`
+- `LoadedPlugin` interface with readonly fields: name, version, displayName, description, urlPatterns, trustTier, iife, tools, sourcePath, adapterHash, npmPackageName
+- Reads `package.json` via `Bun.file().json()` and validates via `parsePluginPackageJson` from shared
+- Reads `dist/adapter.iife.js` with existence check, empty check, and 5MB size limit
+- Reads `dist/tools.json` with per-tool field validation (name, displayName, description, icon, input_schema, output_schema)
+- Derives internal plugin name from npm package name via `pluginNameFromPackage` (strips `opentabs-plugin-` prefix, handles scoped packages)
+- Computes `adapterHash` via SHA-256 of IIFE content using Web Crypto API
+- Validates URL patterns via `validateUrlPattern` from shared
+- Checks tool descriptions for browser tool name references (prompt injection detection)
+- All errors are `Result` values with descriptive messages including the source path
+- Created `loader.test.ts` with comprehensive tests (valid load, missing package.json, missing IIFE, empty IIFE, oversized IIFE, missing tools.json, invalid opentabs field, scoped packages, hash computation, invalid URL patterns)
+- Exported `checkBrowserToolReferences`, `pluginNameFromPackage`, `validateTools` alongside `loadPlugin` and `LoadedPlugin` type
+- Files changed:
+  - `platform/mcp-server/src/loader.ts` (new)
+  - `platform/mcp-server/src/loader.test.ts` (new)
+- **Learnings for future iterations:**
+  - ESLint `import-x/order` requires local imports (`./foo.js`) before `node:` imports but after package imports — the ordering is: package imports (value), local imports (value), then type imports
+  - When accessing `unknown[]` elements, assign to a typed `unknown` variable first before casting to `Record<string, unknown>` — otherwise `@typescript-eslint/no-unnecessary-condition` flags the typeof check as always true
+  - Knip entry `src/**/*.test.ts` makes test files valid entry points — new modules referenced only from test files are still considered reachable
+  - Prettier collapses `return err(...)` calls to single lines if they fit within line length — don't break them across lines unnecessarily
+---
+
+## 2026-02-20 - US-005
+- Created `platform/mcp-server/src/registry.ts` with immutable `PluginRegistry` interface
+- `PluginRegistry` has `readonly plugins` (ReadonlyMap), `readonly toolLookup` (ReadonlyMap), `readonly failures` (readonly array)
+- `buildRegistry(loadedPlugins, failures)` constructs a frozen registry with pre-compiled Ajv validators
+- `emptyRegistry()` creates an empty frozen registry for initial state
+- `getPlugin(registry, name)` returns a plugin by internal name or undefined
+- `getTool(registry, prefixedName)` returns `{plugin, tool, lookup}` or undefined for O(1) dispatch
+- `listEnabledTools(registry, state)` returns tools filtered by toolConfig with trust tier prefixes
+- `trustTierPrefix` exported for reuse by other modules
+- `compileToolValidator` moved from `mcp-setup.ts` into registry (validators compiled during registry construction)
+- Created `registry.test.ts` with 22 tests covering: registry construction, tool lookup with prefixed names, Ajv validator compilation, multiple plugins without name collisions, failure preservation, frozen objects, invalid schema handling, empty registry, getPlugin, getTool, listEnabledTools with config filtering and trust tier prefixes
+- Files changed:
+  - `platform/mcp-server/src/registry.ts` (new)
+  - `platform/mcp-server/src/registry.test.ts` (new)
+- **Learnings for future iterations:**
+  - `import-x/order` for type imports: local type imports (`./state.js`) must come before external type imports (`@opentabs-dev/shared`)
+  - Ajv with `{ allErrors: false }` is used for compiled validators to limit combinatorial work from untrusted schemas
+  - `Object.freeze()` on the registry prevents accidental mutation; Maps inside are typed as `ReadonlyMap` for compile-time safety
+  - The existing `ToolLookupEntry` type from `state.ts` is reused in the registry to maintain compatibility with current `mcp-setup.ts` consumers
+---
+
+## 2026-02-20 - US-006
+- Rewrote `platform/mcp-server/src/discovery.ts` from scratch as a ~110-line discovery orchestrator
+- New `discoverPlugins(specifiers, configDir)` returns `DiscoveryResult` with `registry` (PluginRegistry) and `errors` (DiscoveryError[])
+- Four-phase pipeline: resolve specifiers → load plugins → determine trust tier → build registry
+- Uses `Promise.allSettled` for parallel resolution and loading of all specifiers
+- `determineTrustTier(specifier)` uses `isLocalPath` from resolver.ts to distinguish local/npm specifiers
+- Errors from resolution or loading phases are collected and returned alongside successful results
+- Created `discovery-legacy.ts` to preserve the old opentabs-plugin.json-based discovery for backward compatibility
+- Updated `reload.ts` to import `discoverPluginsLegacy` from `discovery-legacy.ts`
+- Updated `file-watcher.ts` to import `loadPluginFromDir` from `discovery-legacy.ts`
+- Updated `discovery.test.ts` to import `checkBrowserToolReferences`/`pluginNameFromPackage` from `loader.ts` and adapted `determineTrustTier` tests for the new specifier-based signature
+- Updated `discovery-load.test.ts` to import `loadPluginFromDir` from `discovery-legacy.ts`
+- Files changed:
+  - `platform/mcp-server/src/discovery.ts` (rewritten)
+  - `platform/mcp-server/src/discovery-legacy.ts` (new — old code preserved for backward compat)
+  - `platform/mcp-server/src/discovery.test.ts` (updated imports and determineTrustTier tests)
+  - `platform/mcp-server/src/discovery-load.test.ts` (updated import)
+  - `platform/mcp-server/src/file-watcher.ts` (updated import)
+  - `platform/mcp-server/src/reload.ts` (updated import)
+- **Learnings for future iterations:**
+  - When rewriting a module with active consumers, move the old code to a `-legacy.ts` file and update imports rather than trying to keep both old and new code in the same file
+  - The `isLocalPath` function from `resolver.ts` is the canonical way to distinguish local path specifiers from npm package names — reuse it for trust tier determination
+  - `Promise.allSettled` with null returns is a clean pattern for parallel operations where individual failures shouldn't abort the whole batch — fulfilled+null results are filtered in a second pass
+  - Later stories (US-009 reload.ts, US-012 file-watcher.ts, US-020 cleanup) will remove the legacy file once all consumers are migrated
+---
+
+## 2026-02-20 - US-007
+- Unified `config.plugins` to accept both npm package names and local filesystem paths
+- Removed `npmPlugins` field from `OpentabsConfig` interface
+- Added migration logic in `parseConfigRecord`: if legacy `npmPlugins` array exists in config JSON, merges entries into `plugins` and logs a migration notice
+- Removed `npmPlugins` from `ServerState` interface and `createState()` initializer
+- Updated `reload.ts` to pass empty array to `discoverPluginsLegacy` for npm allowlist (npm packages now in unified `plugins`)
+- Updated `saveToolConfig` to no longer preserve `npmPlugins` field
+- Updated default config creation to exclude `npmPlugins`
+- Rewrote config tests: replaced 4 npmPlugins-specific tests with 4 migration-focused tests (merge, filter non-strings, absent field, default config)
+- Files changed:
+  - `platform/mcp-server/src/config.ts` (interface change, migration logic, default config, saveToolConfig)
+  - `platform/mcp-server/src/config.test.ts` (4 tests rewritten)
+  - `platform/mcp-server/src/state.ts` (removed npmPlugins field)
+  - `platform/mcp-server/src/reload.ts` (removed state.npmPlugins assignment, empty npm allowlist)
+- **Learnings for future iterations:**
+  - `discovery-legacy.ts` still references `config.npmPlugins` in log message strings — these are just log text, not field access, and will be cleaned up when the legacy file is deleted in US-020
+  - The resolver (US-003) already distinguishes local paths from npm package names by prefix, so the unified plugins array works transparently
+  - `reload.ts` now passes `[]` as the npm allowlist to `discoverPluginsLegacy` — the legacy npm-scanning discovery is effectively disabled; all plugins must be explicitly listed in `config.plugins`
+---
+
+## 2026-02-20 - US-008, US-010, US-011, US-012, US-013
+- Replaced three separate `ServerState` fields (`plugins`, `toolLookup`, `failedPlugins`) with a single `registry: PluginRegistry` swapped atomically
+- Moved `PluginRegistry` interface from `registry.ts` to `state.ts` to avoid circular dependency (registry.ts already imports from state.ts)
+- Changed `PluginRegistry` to use `RegisteredPlugin` (from state.ts) instead of `LoadedPlugin` (from loader.ts) for backward compat with legacy discovery
+- Created `EMPTY_REGISTRY` frozen constant for `createState()` initialization
+- Bumped `STATE_SCHEMA_VERSION` from 1 to 2
+- Replaced `rebuildToolLookups` (which compiled Ajv validators + cached browser tools) with `rebuildCachedBrowserTools` (browser tools only — plugin tool validators now in registry)
+- Moved `trustTierPrefix` export from `mcp-setup.ts` to `registry.ts`
+- Updated all 9 source files and 9 test files (18 total) across mcp-server package
+- Test files: replaced `state.plugins.set(...)` + `rebuildToolLookups(state)` patterns with `state.registry = buildRegistry([...], [])`
+- Files changed:
+  - `platform/mcp-server/src/state.ts` (PluginRegistry interface, registry field, EMPTY_REGISTRY, schema version bump)
+  - `platform/mcp-server/src/registry.ts` (import PluginRegistry from state.ts, use RegisteredPlugin)
+  - `platform/mcp-server/src/mcp-setup.ts` (remove rebuildToolLookups, add rebuildCachedBrowserTools, use state.registry)
+  - `platform/mcp-server/src/reload.ts` (atomic registry swap via buildRegistry)
+  - `platform/mcp-server/src/extension-protocol.ts` (state.registry.plugins)
+  - `platform/mcp-server/src/file-watcher.ts` (state.registry.plugins, registry rebuilds)
+  - `platform/mcp-server/src/http-routes.ts` (state.registry.plugins/toolLookup/failures)
+  - `platform/mcp-server/src/version-check.ts` (state.registry.plugins)
+  - `platform/mcp-server/src/discovery.ts` (import PluginRegistry from state.ts, fix template literal)
+  - 9 test files updated with buildRegistry patterns
+- **Learnings for future iterations:**
+  - `ReadonlyMap` prevents `.set()` but `.get()` returns the same mutable object — plugin properties can still be mutated in-place (file-watcher uses this for IIFE/manifest hot reload)
+  - `import-x/exports-last` requires ALL statements to be exports once exports begin — a non-exported `const` between exported items triggers the rule. Solution: export everything or restructure
+  - `LoadedPlugin` is structurally a subtype of `RegisteredPlugin` (has all required fields plus `description` and `readonly` modifiers), so `buildRegistry([...LoadedPlugin[]], [])` type-checks without casts
+- Test helper `createPluginDir` in reload.test.ts now uses the new package.json + tools.json format (not opentabs-plugin.json)
+---
+
+## 2026-02-20 - US-009
+- Simplified `reloadCore` in `reload.ts` to use the new `discoverPlugins` orchestrator from `discovery.ts`
+- Replaced `discoverPluginsLegacy` import with `discoverPlugins` — reload.ts no longer imports from `discovery-legacy.ts`
+- Removed manual path resolution logic (`isAbsolute`/`resolve` imports, `resolvedPaths` tracking) — the resolver handles this internally
+- Core flow is now: `loadConfig()` → `discoverPlugins(config.plugins, configDir)` → atomic `state.registry = registry` swap
+- Extracted `pruneStaleState()` helper for tabMapping, activeDispatches, toolConfig, and outdatedPlugins pruning
+- For file watcher pending paths: uses `state.registry.failures.map(f => f.path)` instead of pre-resolved paths
+- Updated `reload.test.ts` `createPluginDir` helper to create new format: `package.json` (with `opentabs` field) + `dist/tools.json` + `dist/adapter.iife.js` instead of `opentabs-plugin.json`
+- Files changed:
+  - `platform/mcp-server/src/reload.ts` (simplified reloadCore, new discoverPlugins import, pruneStaleState helper)
+  - `platform/mcp-server/src/reload.test.ts` (createPluginDir updated to new plugin format)
+- **Learnings for future iterations:**
+  - `discoverPlugins` takes raw specifiers (local paths or npm names) and a configDir — the resolver handles path resolution internally, so callers don't need to pre-resolve paths
+  - `DiscoveryResult.errors` contains `{specifier, error}` entries for logging, while `registry.failures` contains `{path, error}` entries for file watching — they serve different purposes
+  - Remaining consumers of `discovery-legacy.ts`: `file-watcher.ts` (uses `loadPluginFromDir` for individual plugin hot reload) and `discovery-load.test.ts` — will be cleaned up in US-020
+---
+
+## 2026-02-21 - US-014
+- What was implemented: Updated CLI `opentabs build` command to generate `dist/tools.json` (tools array only) instead of `opentabs-plugin.json`. Added `validatePackageJson()` that validates the `opentabs` field in package.json via `parsePluginPackageJson` from shared. Updated scaffold template to include `opentabs` field and `main` field in generated package.json. Updated `plugin list`, `plugin add`, and `doctor` commands to read from `package.json` + `dist/tools.json` instead of `opentabs-plugin.json`. Updated e2e-test plugin's package.json with `opentabs` field and `main` field.
+- Files changed:
+  - `platform/cli/src/commands/build.ts` (generateManifest → generateToolsJson, added validatePackageJson, writes dist/tools.json)
+  - `platform/cli/src/commands/build-e2e.test.ts` (verify dist/tools.json instead of opentabs-plugin.json)
+  - `platform/cli/src/commands/doctor.ts` (check dist/tools.json instead of opentabs-plugin.json)
+  - `platform/cli/src/commands/doctor.test.ts` (updated test fixtures for new format)
+  - `platform/cli/src/commands/plugin.ts` (readManifest reads from package.json + dist/tools.json, handlePluginAdd checks dist/tools.json)
+  - `platform/cli/src/commands/plugin.test.ts` (createMinimalPlugin creates package.json + dist/tools.json)
+  - `platform/cli/src/scaffold.ts` (generatePackageJson includes opentabs field, main field, files: ['dist'])
+  - `platform/create-plugin/src/index.test.ts` (verify dist/tools.json and package.json opentabs field)
+  - `plugins/e2e-test/package.json` (added opentabs field, main field, removed opentabs-plugin.json from files)
+- **Learnings for future iterations:**
+  - `parsePluginPackageJson` from shared validates the `opentabs` field structure — use it in CLI and MCP server to avoid duplicating validation logic
+  - When moving helper functions used by newly-positioned code (like `toTitleCase` used by `generatePackageJson`), they must be defined before they're used since `const` functions are not hoisted
+  - The scaffold template's `generatePackageJson` now needs `urlPattern` as an argument since it includes `opentabs.urlPatterns` in the generated package.json
+  - US-015 (scaffold update) was partially done here because US-014's build changes required scaffold to produce valid package.json — the scaffold now generates the opentabs field
+  - References to `opentabs-plugin.json` still exist in mcp-server's `file-watcher.ts`, `discovery-legacy.ts`, and their tests — these will be cleaned up in US-020
+---
+
+## 2026-02-21 - US-015
+- Added `generateReadme()` function to `platform/cli/src/scaffold.ts` that generates a README.md for scaffolded plugins
+- README documents: project structure tree, package.json `opentabs` field configuration, development commands, and how to add tools
+- README is customized per-plugin with the plugin's name, displayName, description, and urlPattern
+- Scaffold now writes `README.md` to the project directory alongside other generated files
+- Added test for README existence in the `scaffolds a valid plugin project` test
+- Added dedicated `README.md explains the package.json opentabs field` test verifying key content
+- Most US-015 acceptance criteria were already satisfied by US-014 (package.json opentabs field, main field, no opentabs-plugin.json, .gitignore, files array) — only the README was missing
+- Files changed:
+  - `platform/cli/src/scaffold.ts` (added generateReadme function and README.md write in scaffoldPlugin)
+  - `platform/create-plugin/src/index.test.ts` (added README existence check and content verification test)
+- **Learnings for future iterations:**
+  - E2E tests are currently broken because the e2e-test plugin hasn't been rebuilt with the new CLI (US-017) — `dist/tools.json` is missing, causing all plugin-dependent E2E tests to fail with "file missing or invalid JSON"
+  - The E2E failures are pre-existing on main and not caused by scaffold changes — verified by stashing changes and running E2E tests on clean main
+  - The `generateReadme` function follows the same pattern as `generatePluginIndex` and `generateExampleTool` — takes `ScaffoldArgs` and `urlPattern`, returns a string
+---
+
+## 2026-02-21 - US-016
+- Migrated slack plugin from `opentabs-plugin.json` to `package.json` `opentabs` field
+- Added `main: "dist/adapter.iife.js"` and `opentabs` field with displayName, description, urlPatterns to `plugins/slack/package.json`
+- Deleted `plugins/slack/opentabs-plugin.json` (1,591 lines of generated manifest)
+- Updated `files` array to `["dist"]` (removed `opentabs-plugin.json` reference)
+- Updated `@opentabs-dev/cli` and `@opentabs-dev/plugin-sdk` dependencies to `file:` references pointing to local platform packages (needed because published versions don't have `dist/tools.json` generation yet)
+- Added `overrides` block to ensure transitive dependencies also resolve to local packages
+- Rebuilt plugin: `dist/tools.json` now contains all 22 tool definitions with schemas
+- `src/index.ts` unchanged — runtime properties (name, displayName, description, urlPatterns) already match package.json values
+- Files changed:
+  - `plugins/slack/package.json` (added opentabs field, main field, file: deps, overrides)
+  - `plugins/slack/opentabs-plugin.json` (deleted)
+- **Learnings for future iterations:**
+  - Published `@opentabs-dev/cli@0.0.9` still generates `opentabs-plugin.json` — local `file:` overrides are needed until a new version is published with US-014 changes
+  - The `overrides` field in package.json is needed for Bun to resolve transitive `@opentabs-dev/*` dependencies to local packages (same pattern used in create-plugin tests)
+  - The plugin class `src/index.ts` still needs runtime properties (name, version, displayName, etc.) even though they duplicate package.json — these are used by `isReady()`, adapter registration, and tool dispatch
+  - After all migrations are done, a `scripts/publish.sh` run is needed to publish the updated CLI so plugins can use registry versions instead of file: references
+---
+
+## 2026-02-21 - US-017, US-018, US-019, US-020 (batch)
+- **US-017**: Migrated e2e-test plugin to package.json manifest — added `file:` deps/overrides, rebuilt plugin (dist/tools.json with 6 tools), deleted opentabs-plugin.json
+- **US-018**: Updated E2E test fixtures — `readPluginToolNames()` reads dist/tools.json, `createMinimalPlugin()` creates package.json + dist/tools.json instead of opentabs-plugin.json
+- **US-019**: Updated all 8 references in hot-reload-dynamic.e2e.ts to modify dist/tools.json instead of opentabs-plugin.json. Updated adapterHash test in tool-dispatch.e2e.ts to read from IIFE embedded hash. Fixed overly-broad error assertion in hot-reload test.
+- **US-020**: Deleted `manifest-schema.ts`, `manifest-schema.test.ts`, `discovery-legacy.ts`, `discovery-load.test.ts`. Updated file-watcher.ts to: watch dist/tools.json (not opentabs-plugin.json), use loadPlugin from loader.ts (not loadPluginFromDir from discovery-legacy.ts), parse tools.json directly (not via parseManifest from manifest-schema.ts).
+- Files changed:
+  - `plugins/e2e-test/package.json` (file: deps, overrides)
+  - `plugins/e2e-test/opentabs-plugin.json` (deleted)
+  - `plugins/e2e-test/bun.lock` (updated from file: deps)
+  - `platform/mcp-server/src/file-watcher.ts` (migrated to dist/tools.json)
+  - `platform/mcp-server/src/file-watcher.test.ts` (migrated to handleToolsJsonChange)
+  - `platform/mcp-server/src/manifest-schema.ts` (deleted)
+  - `platform/mcp-server/src/manifest-schema.test.ts` (deleted)
+  - `platform/mcp-server/src/discovery-legacy.ts` (deleted)
+  - `platform/mcp-server/src/discovery-load.test.ts` (deleted)
+  - `e2e/fixtures.ts` (readPluginToolNames + createMinimalPlugin updated)
+  - `e2e/hot-reload-dynamic.e2e.ts` (8 manifest refs → tools.json)
+  - `e2e/tool-dispatch.e2e.ts` (adapterHash reads from IIFE)
+- **Learnings for future iterations:**
+  - US-017/018/019/020 are tightly coupled — deleting opentabs-plugin.json from a plugin breaks E2E tests, file watcher, and hot-reload tests simultaneously. These should be done as a batch.
+  - The file watcher now uses a single dist/ directory watcher for both tools.json and adapter.iife.js changes (previously had separate watchers for plugin root + dist/)
+  - `createMinimalPlugin` must create `package.json` with npm-style name (`opentabs-plugin-<name>`) since `parsePluginPackageJson` validates the naming convention
+  - Log message "0 error(s)" matches `not.toContain('error')` — use specific error patterns like `[ERROR]`, `Error:`, or `ECONNREFUSED` instead
+---
+
+## 2026-02-21 - US-021
+- Added structured error reporting across the plugin discovery pipeline
+- **Resolver**: Added local path existence check — missing directories get a clear `Path not found: <path>` error with actionable hint instead of failing later in the loader with a confusing "Failed to read package.json" error
+- **Shared types**: Added `ConfigStateFailedPlugin` type and `failedPlugins` field to `ConfigStateResult` for the side panel wire protocol
+- **State**: Added `discoveryErrors` field to `ServerState` to persist discovery errors across reloads for config.getState
+- **Extension protocol**: `handleConfigGetState` now includes `failedPlugins` array in the response, mapping from `state.discoveryErrors`
+- **Health endpoint**: Added `discoveryErrors` alongside existing `failedPlugins` for debugging (specifier-level vs path-level context)
+- **Reload logging**: Improved error summary — now logs `N plugin(s) failed to load:` followed by indented per-specifier errors
+- **Side panel UI**: Created `FailedPluginCard` component showing specifier, error message with destructive styling; integrated into `PluginList` and `App`; failed plugins hidden during tool filter
+- Files changed:
+  - `platform/mcp-server/src/resolver.ts` (added stat check for local paths)
+  - `platform/mcp-server/src/state.ts` (added discoveryErrors field)
+  - `platform/mcp-server/src/reload.ts` (store errors on state, improved logging)
+  - `platform/mcp-server/src/extension-protocol.ts` (include failedPlugins in config.getState)
+  - `platform/mcp-server/src/http-routes.ts` (expose discoveryErrors on /health)
+  - `platform/shared/src/index.ts` (added ConfigStateFailedPlugin type, failedPlugins field)
+  - `platform/browser-extension/src/side-panel/bridge.ts` (added FailedPluginState type)
+  - `platform/browser-extension/src/side-panel/App.tsx` (failedPlugins state, pass to PluginList)
+  - `platform/browser-extension/src/side-panel/components/PluginList.tsx` (render FailedPluginCard)
+  - `platform/browser-extension/src/side-panel/components/FailedPluginCard.tsx` (new)
+- **Learnings for future iterations:**
+  - `ConfigStateResult` is the wire type for side panel — adding fields here requires updating both the MCP server response (extension-protocol.ts) and the side panel consumer (App.tsx)
+  - Discovery errors need to be stored on `ServerState` (not just logged) because `config.getState` can be called at any time by the side panel, not just during the reload that produced the errors
+  - The `??` operator on a non-optional field triggers `@typescript-eslint/no-unnecessary-condition` — don't add fallbacks for fields that are always present in the type
+---
+
+## 2026-02-21 - US-022
+- Updated CLAUDE.md documentation to reflect the new plugin format
+- Replaced 4 references to `opentabs-plugin.json` with the new `package.json` opentabs field and `dist/tools.json` structure
+- Updated Plugin SDK description: CLI generates `dist/tools.json` instead of `opentabs-plugin.json`
+- Updated directory structure: added `resolver.ts`, `loader.ts`, `registry.ts` to mcp-server; replaced `opentabs-plugin.json` with `dist/` in plugin tree; updated file descriptions for `discovery.ts`, `state.ts`, `file-watcher.ts`
+- Rewrote plugin discovery key concept: now describes the four-phase pipeline (resolve → load → trust tier → registry) with unified `plugins` array
+- Updated "Adding a New Plugin" section: added step 2 for `package.json` opentabs field configuration, updated build step to mention `dist/tools.json` output, updated register step to mention npm package names
+- Updated file watcher section: watches `dist/` for `tools.json` and `adapter.iife.js` changes
+- Verified: zero references to `opentabs-plugin.json` or `npmPlugins` remain in CLAUDE.md
+- Files changed:
+  - `CLAUDE.md` (6 sections updated)
+- **Learnings for future iterations:**
+  - CLAUDE.md is a documentation-only change — no code changes needed, so only `build`, `type-check`, `lint`, `knip`, and `test` need to pass (no E2E needed for this story)
+  - The CLAUDE.md should remain plugin-agnostic per its own guidelines — describe patterns, not specific plugin inventories
+---
+
+## 2026-02-21 - US-023
+- Final cleanup and verification of the plugin ecosystem redesign
+- Removed orphaned `npmPlugins?: string[]` field from `OpentabsConfig` interface in `e2e/fixtures.ts`
+- Condensed `discovery.ts` from 109 lines to 86 lines (under 100) by trimming verbose doc comments
+- Extracted `createFileWatcherCallbacks` from `reloadCore` in `reload.ts`, reducing `reloadCore` from 99 lines to 42 lines (under 50)
+- Verified: zero references to `opentabs-plugin.json` in platform/ code
+- Verified: remaining `npmPlugins` references are legitimate (config.ts migration code, config tests, and local variable names in version-check.ts)
+- Verified: no references to `discovery-legacy` or `manifest-schema` remain
+- All quality checks pass: build, type-check, lint, knip, test (833 unit), test:e2e (231 E2E)
+- Files changed:
+  - `e2e/fixtures.ts` (removed orphaned npmPlugins field)
+  - `platform/mcp-server/src/discovery.ts` (condensed comments)
+  - `platform/mcp-server/src/reload.ts` (extracted createFileWatcherCallbacks, simplified reloadCore)
+- **Learnings for future iterations:**
+  - Extracting closures from large functions (like fileWatcherCallbacks from reloadCore) is an effective way to reduce function size without changing behavior — the extracted function closes over the same state/session references
+  - The "tools.json rewrite preserves all tools" E2E test is flaky due to file watcher timing sensitivity — it sometimes fails on first attempt but passes on retry
+---

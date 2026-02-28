@@ -1,0 +1,112 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Clean up MCP server code: remove dead code, DRY up repeated patterns, extract helpers for JSON-RPC error responses, npm subprocess execution, and plugin metadata serialization. Improves modularity and testability.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Remove dead listEnabledTools from registry.ts",
+      "description": "As a developer, I want dead code removed so the codebase stays lean and avoids confusion about which function to use.",
+      "acceptanceCriteria": [
+        "listEnabledTools function is removed from platform/mcp-server/src/registry.ts",
+        "listEnabledTools is removed from the export list in registry.ts",
+        "Unused imports (isToolEnabled, ServerState) are removed from registry.ts",
+        "The listEnabledTools test block and makeState helper are removed from platform/mcp-server/src/registry.test.ts",
+        "The listEnabledTools import is removed from registry.test.ts, ServerState type import removed if unused",
+        "getEnabledToolsList in platform/mcp-server/src/mcp-setup.ts remains the sole implementation (it handles both plugin + browser tools)",
+        "No other files import listEnabledTools",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "listEnabledTools in platform/mcp-server/src/registry.ts:161-180 is dead code — it only lists plugin tools and is never imported by production code. getEnabledToolsList in platform/mcp-server/src/mcp-setup.ts:769-796 supersedes it (handles plugin tools + browser tools). The test block in registry.test.ts:248-336 should be entirely removed. After removing listEnabledTools, the imports `isToolEnabled` and type `ServerState` become unused in registry.ts and should be cleaned up."
+    },
+    {
+      "id": "US-002",
+      "title": "Extract sendJsonRpcError helper in extension-protocol.ts",
+      "description": "As a developer, I want a shared helper for sending JSON-RPC error responses so the repeated boilerplate is eliminated and error responses are consistent.",
+      "acceptanceCriteria": [
+        "A sendJsonRpcError(state, id, code, message) helper is added to platform/mcp-server/src/extension-protocol.ts near sendToExtension",
+        "At least 10 occurrences of sendToExtension(state, { jsonrpc: '2.0', error: { code, message }, id }) are replaced with sendJsonRpcError calls",
+        "Specifically replaced in: handleTabStateChanged, handleConfigSetToolEnabled (4 occurrences), handleConfigSetAllToolsEnabled (3 occurrences), handlePluginSearch, handlePluginInstall, handlePluginUpdateFromRegistry, handlePluginRemove, and the Method not found fallback",
+        "Complex error patterns with extra data fields (e.g., plugin management catch blocks) are NOT replaced by this simple helper",
+        "All existing extension-protocol tests pass without modification",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "There are ~14 occurrences of the pattern `sendToExtension(state, { jsonrpc: '2.0', error: { code: -326XX, message: '...' }, id })` in platform/mcp-server/src/extension-protocol.ts. Add a helper right after the existing sendToExtension function (around line 82): `const sendJsonRpcError = (state: ServerState, id: string | number, code: number, message: string): void => { sendToExtension(state, { jsonrpc: '2.0', error: { code, message }, id }); };`. Only replace simple cases where the error object has just code+message. Leave the complex catch blocks that include `data` field untouched for now."
+    },
+    {
+      "id": "US-003",
+      "title": "Extract sendPluginManagementError helper in extension-protocol.ts",
+      "description": "As a developer, I want the repeated error-extraction-and-send pattern in plugin management catch blocks consolidated into a single helper.",
+      "acceptanceCriteria": [
+        "A sendPluginManagementError(state, id, err) helper is added to platform/mcp-server/src/extension-protocol.ts",
+        "The helper extracts code, message, data, and retryAfterMs from the error object and sends a JSON-RPC error response",
+        "The catch blocks in handlePluginSearch, handlePluginInstall, handlePluginUpdateFromRegistry, handlePluginRemove, and handlePluginCheckUpdates are replaced with calls to sendPluginManagementError",
+        "All existing extension-protocol tests pass without modification",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "There are 5 catch blocks in extension-protocol.ts (handlePluginSearch ~line 1050, handlePluginInstall ~line 1081, handlePluginUpdateFromRegistry ~line 1112, handlePluginRemove ~line 1160, handlePluginCheckUpdates ~line 1181) that all extract code/message/data from the caught error and send a JSON-RPC error. Extract a helper: `const sendPluginManagementError = (state: ServerState, id: string | number, err: unknown): void => { const code = typeof (err as Record<string, unknown>).code === 'number' ? (err as { code: number }).code : -32603; const message = err instanceof Error ? err.message : 'Unknown error'; const rawData = (err as Record<string, unknown>).data; const data = typeof rawData === 'object' && rawData !== null ? (rawData as Record<string, unknown>) : undefined; const retryAfterMs = typeof (err as Record<string, unknown>).retryAfterMs === 'number' ? (err as { retryAfterMs: number }).retryAfterMs : undefined; const errorData = { ...(data ?? {}), ...(retryAfterMs !== undefined ? { retryAfterMs } : {}) }; const hasData = Object.keys(errorData).length > 0; sendToExtension(state, { jsonrpc: '2.0', error: { code, message, ...(hasData ? { data: errorData } : {}) }, id }); };`. Place it near the other helpers before the plugin management handler section."
+    },
+    {
+      "id": "US-004",
+      "title": "Extract runNpmGlobal helper in plugin-management.ts",
+      "description": "As a developer, I want the repeated npm subprocess spawn+timeout+collect pattern extracted into a shared helper so the three npm operations (install, update, uninstall) are DRY.",
+      "acceptanceCriteria": [
+        "A runNpmGlobal(command, packageName) helper is added to platform/mcp-server/src/plugin-management.ts",
+        "The helper spawns npm with the given command and package, applies the 60s timeout, collects stdout/stderr, and returns { exitCode, stdout, stderr }",
+        "On non-zero exit, the helper throws an error with code -32603 and data containing { stderr, stdout }",
+        "installPlugin, updatePlugin, and removePlugin use the new helper instead of inline Bun.spawn",
+        "All existing plugin-management tests pass without modification",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "There are 3 nearly identical patterns in platform/mcp-server/src/plugin-management.ts at lines 178, 297, and 478. Each does: Bun.spawn([platformExec('npm'), COMMAND, '-g', pkg], { stdout: 'pipe', stderr: 'pipe' }) + setTimeout for kill + collect stdout/stderr + check exit code + throw on failure. Extract a helper like: `const runNpmGlobal = async (command: string, packageName: string): Promise<{ stdout: string; stderr: string }> => { ... }`. The helper should throw an error with code -32603 and data: { stderr, stdout } on non-zero exit. The callers (installPlugin, updatePlugin, removePlugin) then become: `const { stdout, stderr } = await runNpmGlobal('install', pkg);` or equivalent. The variable `stdout` may be unused in some callers after this refactor — if so, destructure only `stderr` or use `_stdout` to satisfy lint."
+    },
+    {
+      "id": "US-005",
+      "title": "Extract serializePluginForExtension helper in extension-protocol.ts",
+      "description": "As a developer, I want the repeated plugin metadata serialization pattern extracted into a shared helper so changes to the wire format happen in one place.",
+      "acceptanceCriteria": [
+        "A serializePluginForExtension(plugin, state) helper is added to platform/mcp-server/src/extension-protocol.ts",
+        "The helper produces the { name, version, displayName, urlPatterns, trustTier, sourcePath, adapterHash, iconSvg?, iconInactiveSvg?, tools: [...] } wire format",
+        "sendSyncFull, sendPluginUpdate, and handleConfigGetState all use the new helper",
+        "The serialized output is identical to what was previously inlined (verified by existing tests)",
+        "All existing extension-protocol tests pass without modification",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "There are 3 places in platform/mcp-server/src/extension-protocol.ts that serialize plugin metadata with the same shape: sendSyncFull (~line 218), sendPluginUpdate (~line 476), and handleConfigGetState (~line 793). All produce: { name, version, displayName, urlPatterns, trustTier, sourcePath, adapterHash, iconSvg?, iconInactiveSvg?, tools: p.tools.map(t => ({ name, displayName, description, icon, iconSvg?, iconInactiveSvg?, enabled: isToolEnabled(...) })) }. handleConfigGetState adds extra fields (tabState, source, sdkVersion, update) but the tool serialization is identical. Extract the common core and let handleConfigGetState spread the extra fields on top. The helper should accept the plugin and state, and return the serialized object. Place it near sendToExtension. Note: handleConfigGetState sorts plugins by name before serializing — that's caller logic, not the helper's concern."
+    }
+  ]
+}

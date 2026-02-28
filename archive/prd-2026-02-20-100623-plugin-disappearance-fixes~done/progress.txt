@@ -1,0 +1,113 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-100623-plugin-disappearance-fixes~running.json
+Started: Fri Feb 20 10:06:27 PST 2026
+---
+
+## Codebase Patterns
+- Config retry: readConfigWithRetry in config.ts handles transient file unavailability with exponential backoff (3 retries, 100ms/200ms/400ms)
+- Config parsing: parseConfigRecord extracts and validates typed fields from raw JSON records
+- Atomic writes: atomicWriteConfig writes to .tmp then renames — use this pattern for all config writes
+- Config write serialization: saveConfig and saveToolConfig use state.configWriteMutex to prevent concurrent read-modify-write races
+- reloadCore catch block: preserves previous state on any error (config load or discovery), ensuring plugins never disappear on transient failures
+- File watcher callbacks: FileWatcherCallbacks interface in file-watcher.ts — add new callbacks here when extending watcher behavior (e.g., onPluginDiscovered)
+- Pending plugin watching: startFileWatching accepts resolvedPluginPaths to watch paths that failed initial discovery; uses loadPluginFromDir for reattempt
+- statSync for sync dir checks: file-watcher.ts uses statSync from node:fs for directory existence checks in synchronous context (startFileWatching is sync)
+- CLI atomic writes: platform/cli/src/config.ts exports `atomicWriteConfig` for all CLI commands that write config.json
+
+## 2026-02-20 10:08 - US-001
+- Verified that the implementation was already complete on the current branch
+- Key changes from the diff: FALLBACK_CONFIG removed, readConfigWithRetry added with retry+backoff, parseConfigRecord extracted, loadConfig throws on persistent failure, saveToolConfig added for read-modify-write tool persistence
+- Files changed: platform/mcp-server/src/config.ts, platform/mcp-server/src/http-routes.ts
+- All quality checks pass: build, type-check, lint, knip, test (824 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The PRD noted partial fixes may exist — always check git diff to understand what's already been done before writing code
+  - The saveToolConfig function (US-002) was implemented alongside US-001 since it reuses readConfigWithRetry and parseConfigRecord helpers
+  - US-002's acceptance criteria are likely already met by this commit — next iteration should verify and mark as passing
+---
+
+## 2026-02-20 10:12 - US-002
+- Verified that saveToolConfig was already implemented in the US-001 commit (config.ts:218-250)
+- All acceptance criteria confirmed met:
+  1. saveToolConfig exists at config.ts:218-250 — reads disk, updates only tools, writes back atomically
+  2. onToolConfigPersist at http-routes.ts:48-52 calls saveToolConfig(state, { ...state.toolConfig })
+  3. Reads current config from disk via readConfigWithRetry, preserves plugins/secret/npmPlugins
+  4. Uses state.configWriteMutex (config.ts:224)
+  5. Logs warning and returns early if config is unreadable (config.ts:231-234)
+- No code changes needed — all work was done in US-001 commit
+- All quality checks pass: build, type-check, lint, knip, test (824 tests, 0 failures)
+- **Learnings for future iterations:**
+  - When PRD notes suggest a story may already be implemented alongside a prior story, always verify first before writing any code
+  - saveToolConfig and saveConfig are both serialized through the same configWriteMutex on state
+---
+
+## 2026-02-20 10:17 - US-003
+- Implemented file watcher support for pending plugin paths (configured but failed initial discovery)
+- Added `onPluginDiscovered` callback to `FileWatcherCallbacks` interface
+- Added `handlePendingPluginChange` function that attempts `loadPluginFromDir` on file changes
+- Added `watchPendingPlugin` function that watches plugin dir and dist/ for manifest/IIFE changes
+- Modified `startFileWatching` to accept `resolvedPluginPaths` parameter, watch both loaded and pending paths
+- Modified `reloadCore` in reload.ts to hoist `resolvedPaths` and pass it to `startFileWatching`
+- Added `onPluginDiscovered` callback in reload.ts that rebuilds tool lookups, notifies MCP clients, and syncs extension
+- Updated test file to include `onPluginDiscovered` in `noopCallbacks`
+- Files changed: platform/mcp-server/src/file-watcher.ts, platform/mcp-server/src/file-watcher.test.ts, platform/mcp-server/src/reload.ts
+- All quality checks pass: build, type-check, lint, knip, test (824 tests, 0 failures)
+- **Learnings for future iterations:**
+  - When adding a new callback to FileWatcherCallbacks, also update the noopCallbacks in file-watcher.test.ts
+  - loadPluginFromDir from discovery.ts handles name derivation for local plugins internally (reads manifest, strips prefix)
+  - startFileWatching is sync so directory checks use statSync, not async stat
+  - Pending plugin watchers use a single debounce key (`pluginDir:pending`) shared between manifest and IIFE watchers to coalesce events
+---
+
+## 2026-02-20 10:21 - US-004
+- Changed `handlePluginAdd` and `handlePluginRemove` in `platform/cli/src/commands/plugin.ts` to use atomic writes
+- Added `atomicWriteConfig` helper to `platform/cli/src/config.ts` (same write-to-tmp + rename pattern as mcp-server's config.ts)
+- Updated guidance messages from "Restart the MCP server to pick up the new plugin." to "The MCP server will detect the change automatically."
+- Added validation warnings when plugin directory exists but is missing `opentabs-plugin.json` or `dist/adapter.iife.js`
+- Files changed: platform/cli/src/commands/plugin.ts, platform/cli/src/config.ts
+- All quality checks pass: build, type-check, lint, knip, test (824 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The CLI has its own `atomicWriteConfig` in `platform/cli/src/config.ts` — US-005 should use this same helper for config.ts commands and scaffold.ts
+  - Plugin validation is non-fatal (warnings only) — the path is still added even if artifacts are missing, since the user may build later
+---
+
+## 2026-02-20 10:24 - US-005
+- Updated `handleConfigInit` in `platform/cli/src/commands/config.ts` to use `atomicWriteConfig` instead of `Bun.write`
+- Updated `handleConfigSet` in `platform/cli/src/commands/config.ts` to use `atomicWriteConfig` instead of `Bun.write`
+- Updated `autoRegisterPlugin` in `platform/cli/src/scaffold.ts` to use `atomicWriteConfig` instead of `Bun.write`
+- All three sites now follow the same atomic write pattern: write to .tmp then rename
+- Leveraged the existing `atomicWriteConfig` helper from `platform/cli/src/config.ts` (added in US-004)
+- Files changed: platform/cli/src/commands/config.ts, platform/cli/src/scaffold.ts
+- All quality checks pass: build, type-check, lint, knip, test (824 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The `atomicWriteConfig` helper in `platform/cli/src/config.ts` was already implemented in US-004 — reuse it instead of reimplementing the pattern
+  - Three config write sites in the CLI: handleConfigInit, handleConfigSet, autoRegisterPlugin — all now use atomic writes
+---
+
+## 2026-02-20 10:28 - US-006
+- Added `FailedPlugin` interface to `state.ts` with `path` and `error` fields
+- Added `failedPlugins: FailedPlugin[]` to `ServerState` interface and `createState()`
+- Modified `discoverFromLocalPaths` in `discovery.ts` to collect failures alongside results, returning `{ results, failures }`
+- Modified `discoverPlugins` to return `DiscoveryOutcome` (`{ plugins, failures }`) instead of just `Map<string, RegisteredPlugin>`
+- Updated `reloadCore` in `reload.ts` to destructure the new return type and store failures on `state.failedPlugins`
+- Added `failedPlugins: state.failedPlugins` to the `/health` endpoint response in `http-routes.ts`
+- Files changed: platform/mcp-server/src/state.ts, platform/mcp-server/src/discovery.ts, platform/mcp-server/src/reload.ts, platform/mcp-server/src/http-routes.ts
+- All quality checks pass: build, type-check, lint, knip, test (824 tests, 0 failures)
+- **Learnings for future iterations:**
+  - `discoverFromLocalPaths` handles three failure modes: path outside allowed dirs, directory not found, missing manifest — plus catch-all for `loadPluginFromDir` errors
+  - npm plugin failures from `discoverFromNodeModules` are not tracked in `failedPlugins` — only local paths are, since npm failures are less actionable for users
+  - The `DiscoveryOutcome` type is internal to discovery.ts (not exported) — callers only see it via the return type of `discoverPlugins`
+---
+
+## 2026-02-20 10:32 - US-007
+- Changed scaffolded dev script from `bun run build --watch` to `tsc --watch --preserveWatchOutput & opentabs build --watch`
+- The old script ran tsc once then exited, leaving opentabs build --watch with no source of dist/ changes
+- The new script backgrounds tsc in watch mode so it continuously recompiles source → dist/, while opentabs build --watch detects dist/ changes and rebuilds the IIFE
+- `--preserveWatchOutput` prevents tsc from clearing the terminal on each recompilation
+- Updated existing plugin package.json files (slack, e2e-test) for consistency
+- Files changed: platform/cli/src/scaffold.ts, plugins/slack/package.json, plugins/e2e-test/package.json
+- All quality checks pass: build, type-check, lint, knip, test (824 tests, 0 failures)
+- **Learnings for future iterations:**
+  - Plugin dev scripts need both tsc and opentabs build running concurrently — backgrounding tsc with `&` is the simplest approach
+  - The `--preserveWatchOutput` flag is important to prevent tsc from clearing terminal output that opentabs build produces
+  - When updating the scaffold template, also update existing plugins (slack, e2e-test) for consistency
+---

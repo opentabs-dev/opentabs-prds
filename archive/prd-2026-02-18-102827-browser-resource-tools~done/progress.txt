@@ -1,0 +1,61 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-102827-browser-resource-tools~running.json
+Started: Wed Feb 18 13:38:02 PST 2026
+## Codebase Patterns
+- When adding a new browser tool, touch 6 files: (1) browser-tools/<tool>.ts, (2) browser-tools/index.ts, (3) browser-commands.ts, (4) message-router.ts, (5) message-router.test.ts, (6) offscreen/index.ts ALLOWED_METHODS
+- browser-commands.ts uses `import-x/exports-last` — all non-export statements (interfaces, types, helper functions) must go BEFORE the first `export const`
+- message-router.test.ts mocks browser-commands.js — new handlers must be added to: (a) mock variable, (b) mock.module call, (c) resetRoutingMocks, (d) beforeEach mockResolvedValue, (e) routing test
+- CDP debugger management pattern: check isCapturing(tabId) to reuse existing session, otherwise attach/detach in try/finally
+- CDP types (CdpFrame, CdpResource, CdpFrameResourceTree) are defined at file scope in browser-commands.ts for reuse across handlers
+- browser-tools/index.ts imports are alphabetically sorted — insert new imports in sort order
+- CDP Page.getResourceContent requires a frameId — must walk Page.getResourceTree to find the owning frame first
+- CDP Page.getResourceTree only reports external sub-resources (loaded via src=), not the main document or inline scripts — test pages must load external resources for resource tool E2E tests
+- After adding new browser extension handlers, must delete .tsbuildinfo files to force a clean rebuild — stale incremental build cache causes the bundler to omit new code
+---
+
+## 2026-02-18 13:38 - US-001
+- Implemented browser_list_resources tool using CDP Page.getResourceTree
+- Files changed:
+  - platform/mcp-server/src/browser-tools/list-resources.ts (new)
+  - platform/mcp-server/src/browser-tools/index.ts
+  - platform/browser-extension/src/browser-commands.ts
+  - platform/browser-extension/src/message-router.ts
+  - platform/browser-extension/src/message-router.test.ts
+  - platform/browser-extension/src/offscreen/index.ts
+- **Learnings for future iterations:**
+  - Bun's mock.module for browser-commands.js must include ALL exported functions — missing any causes SyntaxError at import time
+  - The import formatting for multi-name imports must use multi-line format (prettier rule)
+  - 3 E2E tests (dispatch-resilience concurrent, invocation recording, sequential tools) are pre-existing flaky failures due to rate limiting — not related to changes
+---
+
+## 2026-02-18 13:57 - US-002
+- Implemented browser_get_resource_content tool using CDP Page.getResourceContent
+- Tool reads content of a specific page resource by URL, with frameId lookup via Page.getResourceTree
+- Handles base64 decoding for text MIME types, content truncation, and error reporting for missing resources
+- Files changed:
+  - platform/mcp-server/src/browser-tools/get-resource-content.ts (new)
+  - platform/mcp-server/src/browser-tools/index.ts
+  - platform/browser-extension/src/browser-commands.ts
+  - platform/browser-extension/src/message-router.ts
+  - platform/browser-extension/src/message-router.test.ts
+  - platform/browser-extension/src/offscreen/index.ts
+- **Learnings for future iterations:**
+  - Helper functions (non-export const) in browser-commands.ts MUST be placed before the first `export const` due to `import-x/exports-last` lint rule
+  - Import order in browser-tools/index.ts is alphabetical — new imports must be inserted in sort order (e.g., `get-resource-content` after `get-page-html`)
+  - CDP Page.getResourceContent requires a frameId — must walk the resource tree first to find which frame owns the resource
+  - Text MIME type detection should cover `text/*` prefix plus specific `application/*` types (javascript, json, xml, etc.)
+---
+
+## 2026-02-18 14:25 - US-003
+- Added 7 comprehensive E2E tests for browser_list_resources and browser_get_resource_content
+- Added external /test-script.js endpoint to test server and loaded it from main page
+- Added 'browser_list_resources' and 'browser_get_resource_content' to BROWSER_TOOL_NAMES in helpers.ts
+- Files changed:
+  - e2e/browser-tools.e2e.ts (added 'Browser tools — resource inspection' test describe block)
+  - e2e/helpers.ts (added tool names to BROWSER_TOOL_NAMES array)
+  - e2e/test-server.ts (added /test-script.js endpoint + script tag in main page)
+- **Learnings for future iterations:**
+  - CDP Page.getResourceTree only reports external sub-resources loaded via src= attributes — NOT the main document itself, NOT inline scripts/styles. Test pages must include external <script src="..."> for resource tests
+  - Stale .tsbuildinfo files can cause incremental tsc builds to skip newly added browser extension code, resulting in the bundler omitting new methods. Delete all .tsbuildinfo files and rebuild after adding new browser-commands handlers
+  - Pre-existing E2E flaky failures (dispatch-resilience concurrent, invocation recording, sequential tools) are due to rate limiting — not related to resource tool changes
+---

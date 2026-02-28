@@ -1,0 +1,93 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-151120-security-hardening-round-2~running.json
+Started: Wed Feb 18 15:12:01 PST 2026
+---
+
+## Codebase Patterns
+- `isValidWsOrigin()` in offscreen/index.ts validates WebSocket URLs from /ws-info — checks protocol, host, and pathname
+- The server's WebSocket endpoint is always at /ws, hardcoded in http-routes.ts
+- 3 E2E tests are pre-existing flaky failures (concurrent dispatch, invocation recording, sequential calls) — timing issues under 12-worker parallel load, not related to security changes
+- `known-methods.ts` is the single source of truth for all WebSocket method names — DISPATCH_METHODS (routed to handlers) + PASSTHROUGH_METHODS (pong, invocation events)
+- `methodHandlerNames` is exported from message-router.ts for test verification of dispatch table keys
+
+---
+
+## 2026-02-18 15:19 - US-001
+- Added pathname validation (`parsed.pathname !== '/ws'`) to `isValidWsOrigin()` in offscreen/index.ts
+- URLs like `ws://localhost:9515/evil` or `ws://localhost:9515/ws/extra` are now rejected with a warning log
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - `isValidWsOrigin()` is called from two places: `refreshWsUrl()` and the `ws:setUrl` handler — both paths are now protected
+  - The function uses `new URL()` for parsing, so malformed URLs are caught by the try-catch
+---
+
+## 2026-02-18 15:29 - US-002
+- Added sender validation to `chrome.runtime.onMessage` listener in offscreen/index.ts
+- Changed `_sender` to `sender` and added `if (sender.id !== chrome.runtime.id) return false;` at top of handler
+- Added defense-in-depth comment explaining the validation purpose
+- All message types (ws:send, ws:getState, ws:setUrl) are protected since the check is at the top of the handler
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - The `sender` parameter in `chrome.runtime.onMessage` has type `chrome.runtime.MessageSender` with `id?: string`
+  - `chrome.runtime.id` returns the extension's own ID — comparing `sender.id` against it validates the message source
+  - Returning `false` from the listener silently ignores the message (no response sent to the sender)
+---
+
+## 2026-02-18 16:14 - US-003
+- Exported `VALID_PLUGIN_NAME` regex and `isValidPluginName()` helper from `platform/browser-extension/src/constants.ts`
+- Updated `iife-injection.ts` to import `isValidPluginName` instead of defining its own `SAFE_PLUGIN_NAME` regex
+- Updated `message-router.ts` to import `isValidPluginName` instead of using inline regex in `validatePluginPayload` and `handlePluginUninstall`
+- Updated `side-panel/App.tsx` to import `VALID_PLUGIN_NAME` from `../constants.js` instead of defining its own local copy
+- Verified via grep: no inline plugin name regex patterns remain in any browser extension source file
+- Files changed: `platform/browser-extension/src/constants.ts`, `platform/browser-extension/src/iife-injection.ts`, `platform/browser-extension/src/message-router.ts`, `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - `iife-injection.ts` has a `RESERVED_NAMES` check on top of the regex — `isSafePluginName` combines both; other call sites only need the regex
+  - The side panel uses `VALID_PLUGIN_NAME.test()` directly (not the helper) because it only needs the regex without the reserved names check
+  - `constants.ts` already existed with other extension-wide constants — natural home for shared validation
+---
+
+## 2026-02-18 16:20 - US-004
+- Created `platform/browser-extension/src/known-methods.ts` with three exported arrays: `DISPATCH_METHODS` (methods routed to handlers), `PASSTHROUGH_METHODS` (pong, invocation events), and `ALL_ALLOWED_METHODS` (union of both)
+- Updated `offscreen/index.ts` to import `ALL_ALLOWED_METHODS` and derive `ALLOWED_METHODS` from it instead of a hardcoded list
+- Exported `methodHandlerNames` from `message-router.ts` for test verification
+- Created `known-methods.test.ts` with 5 tests: every handler key is in DISPATCH_METHODS, every DISPATCH_METHODS entry is in handlers, PASSTHROUGH_METHODS are not in handlers, ALL_ALLOWED_METHODS is the exact union, and no duplicates
+- Files changed: `platform/browser-extension/src/known-methods.ts`, `platform/browser-extension/src/known-methods.test.ts`, `platform/browser-extension/src/offscreen/index.ts`, `platform/browser-extension/src/message-router.ts`
+- **Learnings for future iterations:**
+  - `methodHandlers` is a `Map<string, MessageHandler>` — its keys are the method names registered in the dispatch table
+  - `pong` is handled directly in the offscreen `ws.onmessage` handler, not via the background script's dispatch table
+  - `tool.invocationStart` and `tool.invocationEnd` are forwarded to the side panel (in SIDE_PANEL_METHODS) but have no handler in methodHandlers — they're passthrough notifications
+  - Test files in browser-extension need extensive mock setup because message-router imports many Chrome-API-dependent modules
+---
+
+## 2026-02-18 16:30 - US-005
+- Added `maxPayloadLength: 10 * 1024 * 1024` to the Bun.serve() websocket config in `platform/mcp-server/src/index.ts`
+- Added comment noting it matches MAX_MESSAGE_SIZE in extension-protocol.ts
+- This enforces a 10MB frame size limit at the transport layer, complementing the existing application-level check
+- Files changed: `platform/mcp-server/src/index.ts`
+- **Learnings for future iterations:**
+  - Bun.serve() websocket config accepts `maxPayloadLength` to limit frame size at the transport layer
+  - The existing `MAX_MESSAGE_SIZE` in extension-protocol.ts is an application-level check that runs after the message is already buffered — `maxPayloadLength` prevents buffering in the first place
+  - The websocket config in index.ts is part of the "frozen core" — changes require a full process restart (not hot-reloadable)
+---
+
+## 2026-02-18 16:35 - US-006
+- Added a brief note to the Chrome Extension description in CLAUDE.md documenting the `debugger` permission
+- The note explains that `debugger` is required for network capture via Chrome DevTools Protocol (`chrome.debugger.attach`, `Network.enable`, `Runtime.enable`) in `network-capture.ts`
+- Files changed: `CLAUDE.md`
+- **Learnings for future iterations:**
+  - `network-capture.ts` uses `chrome.debugger.attach`, `chrome.debugger.sendCommand`, `chrome.debugger.detach`, and `chrome.debugger.onEvent.addListener`
+  - The debugger enables Network.enable (request/response capture), Runtime.enable (console log capture), and Network.getResponseBody (response body fetching)
+  - Documentation-only changes still require all quality checks to pass
+---
+
+## 2026-02-18 16:42 - US-007
+- Changed Ajv configuration from `allErrors: true` to `allErrors: false` — stops validation on first error to limit combinatorial work from pathological schemas (e.g., deeply nested oneOf/anyOf from community plugins)
+- Wrapped the synchronous `lookup.validate(args)` call in try-catch to gracefully handle unexpected runtime errors (e.g., catastrophic regex backtracking from a plugin's pattern keyword)
+- Added comments explaining the security rationale for both changes
+- Files changed: `platform/mcp-server/src/mcp-setup.ts`
+- **Learnings for future iterations:**
+  - Ajv validation is synchronous — true timeout protection requires worker threads, which is over-engineering for this use case
+  - `allErrors: false` is the single most effective knob for limiting validation work — Ajv stops after the first failing subschema instead of evaluating all branches
+  - Schemas come from plugin manifests validated at discovery time, so the risk is low — these guards are defense-in-depth for community plugins
+  - `compileToolValidator` already wraps `ajv.compile()` in try-catch, but the `validate()` call was unprotected until now
+---

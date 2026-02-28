@@ -1,0 +1,150 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-081125-perfect-test-coverage~running.json
+Started: Wed Feb 18 10:02:39 PST 2026
+---
+
+## Codebase Patterns
+- `McpServerInstance` is exported as a type from `mcp-setup.ts` — mock it by capturing handlers in a `Map<unknown, handler>` via `setRequestHandler`, then invoke them directly
+- For async throwing tests in Bun, use `expect(async () => await fn()).toThrow(/pattern/)` — the outer test function must NOT be `async` to avoid the `@typescript-eslint/require-await` lint rule
+- Sync throw pattern: `expect(() => fn()).toThrow(/pattern/)` — see `manifest-schema.test.ts` for examples
+- Test files use `mkdtempSync` + `afterEach`/`afterAll` cleanup for temp directory fixtures
+- `writeFileSync` is used (not Bun APIs) in test files for temp file creation since these are one-off setup calls
+- When `const x = await asyncFn()` is before a `try` block, if the await rejects, the `finally` is never entered — the error propagates directly without entering the try/finally
+- Use optional chaining (`result?.id`) instead of `!` non-null assertions in tests — `@typescript-eslint/no-non-null-assertion` lint rule forbids them
+- To use fake timers in Bun tests, import `jest` from `bun:test` and call `jest.useFakeTimers()` / `jest.useRealTimers()` / `jest.advanceTimersByTime(ms)`
+- To test async promise chains + setTimeout: flush microtasks with `await Promise.resolve()` (repeat for each .then/.catch in the chain), then advance fake timers
+- Access chrome mock objects via `(globalThis as Record<string, unknown>).chrome as { ... }` cast pattern — avoids eslint-disable comments
+- `Response.json()` returns `Promise<any>` — define typed interfaces for response shapes and use `as Promise<T>` to avoid `@typescript-eslint/no-unsafe-*` lint errors
+- Shared types: `TrustTier` is `'official' | 'community' | 'local'`; `ManifestTool` uses `input_schema`/`output_schema` (snake_case, not camelCase)
+
+## 2026-02-18 - US-001
+- Added new test for oversized IIFE (>5MB) rejection in `loadPluginFromDir`
+- Rewrote 3 existing try/catch throwing tests to idiomatic `expect(async () => await fn()).toThrow(/pattern/)` style
+- Removed `async` from outer test functions to satisfy `@typescript-eslint/require-await` lint rule
+- Files changed: `platform/mcp-server/src/discovery-load.test.ts`
+- **Learnings for future iterations:**
+  - Bun's `expect().toThrow()` handles async functions (awaits the returned promise), but the outer test wrapper must not be `async` unless it has its own `await` — otherwise the require-await lint rule fires
+  - Prettier will collapse multiline `.toThrow()` regex arguments onto one line if they fit within the print width
+---
+
+## 2026-02-18 - US-002
+- Added test for `writeExecFile` rejection: verifies error propagates, dispatch and delete are never called
+- Added test for handler success return value: verifies the handler returns `dispatchToExtension`'s result
+- Files changed: `platform/mcp-server/src/browser-tools/execute-script.test.ts`
+- **Learnings for future iterations:**
+  - In execute-script.ts, `writeExecFile` is called BEFORE the `try` block — so if it throws, the `finally` block (which calls `deleteExecFile`) is never entered. This is correct behavior (no file to delete) but differs from what the PRD notes suggest
+  - For Prettier compliance: if `expect(async () => await fn(...)).toThrow(...)` is too long, extract the lambda into a `const fn = ...` variable to keep the line short
+---
+
+## 2026-02-18 - US-003
+- Added 3 tests for `findMatchingTab` in `tab-matching.test.ts`
+  - Returns highest-ranked tab (active+focused) when multiple tabs match
+  - Returns `null` when no tabs match any pattern
+  - Returns `null` when patterns array is empty
+- Added `findMatchingTab` to the import statement alongside existing imports
+- Files changed: `platform/browser-extension/src/tab-matching.test.ts`
+- **Learnings for future iterations:**
+  - The `findMatchingTab` function returns `null` (not `undefined`) when no match — use `toBeNull()` assertion
+  - Avoid `!` non-null assertions in tests — use optional chaining (`result?.id`) to satisfy `@typescript-eslint/no-non-null-assertion` lint rule
+  - The existing `beforeEach` block at the file level sets up Chrome mocks and `queryResults` map, so new describe blocks for related functions can reuse them without additional setup
+---
+
+## 2026-02-18 - US-004
+- Added 2 tests for `extension.reload` routing in `message-router.test.ts`
+  - With valid id: sends `{ reloading: true }` success result, clears wsConnected from session storage, calls `chrome.runtime.reload()` after RELOAD_FLUSH_DELAY_MS
+  - Without id: does not send a response, but still triggers the reload flow
+- Added `afterEach` and `jest` to the `bun:test` import
+- Used fake timers (`jest.useFakeTimers()`) to verify the `setTimeout` in the handler
+- Used microtask flushing (`await Promise.resolve()` x3) to process the `.catch().then()` promise chain
+- Files changed: `platform/browser-extension/src/message-router.test.ts`
+- **Learnings for future iterations:**
+  - `jest` must be explicitly imported from `bun:test` — it's not a global in Bun's test runner
+  - `afterEach` also must be imported from `bun:test` (unlike Jest where it's globally available)
+  - The `extension.reload` handler uses `void promise.catch().then()` pattern — the promise chain resolves via microtasks, but the `setTimeout` inside the `.then()` requires fake timer advancement
+  - Chrome mock objects set up on `globalThis` are NOT reset by the `resetRoutingMocks()` function — individual describe blocks need their own `mockClear()` calls in `beforeEach`
+---
+
+## 2026-02-18 - US-005
+- Added 4 tests for `/health` endpoint: all expected fields, plugin details, hot state fallback values, browser tools in toolCount
+- Added 2 tests for `/ws-info` endpoint: without secret (no auth), with secret (auth configured)
+- Created typed `fetchJson<T>` helper to avoid `any`-typed response bodies and non-null assertions
+- Defined `HealthResponse` and `WsInfoResponse` interfaces for type-safe JSON parsing
+- Used `createHandlers` (already exported) with minimal `RouteDeps` — no mocking needed for these read-only endpoints
+- Files changed: `platform/mcp-server/src/http-routes.test.ts`
+- **Learnings for future iterations:**
+  - `createHandlers` from `http-routes.ts` is already exported and can be used directly in tests with a minimal `RouteDeps` object (state, transports, sessionServers, getHotState)
+  - `Response.json()` returns `Promise<any>` — define typed interfaces and use `as Promise<T>` to avoid unsafe-member-access lint errors
+  - `TrustTier` is `'official' | 'community' | 'local'` (not `'default'`); `ManifestTool` uses `input_schema`/`output_schema` (not `input`/`output`)
+  - Import ordering: type imports from the same module as value imports must be merged or ordered correctly — `type { HotHandlers }` from `./http-routes.js` must come before type imports from `./mcp-setup.js`
+---
+
+## 2026-02-18 - US-006
+- Added 2 tests for disabled tool filtering via `registerMcpHandlers` tools/list handler
+  - Disabled tool is excluded from tools/list response; enabled tools remain
+  - Re-enabling a tool (removing from toolConfig) makes it reappear in tools/list
+- Created `createMockServer` helper that captures handlers registered via `setRequestHandler`
+- Created `getListToolsHandler` helper to extract the tools/list handler from the captured handlers map
+- Files changed: `platform/mcp-server/src/mcp-setup.test.ts`
+- **Learnings for future iterations:**
+  - `registerMcpHandlers` can be tested by mocking `McpServerInstance` — the interface is exported as a type and only requires `setRequestHandler`, `connect`, and `sendToolListChanged`
+  - The tools/list handler reads `state.plugins` and `state.toolConfig` on every call (no caching), so state mutations between calls are immediately reflected in the response
+  - `getListToolsHandler` identifies the tools/list handler by checking for a `tools` property in the return value — this works because the tools/call handler is async and the tools/list handler is sync
+  - `rebuildToolLookups` must be called before `registerMcpHandlers` to populate `state.toolLookup` and `state.cachedBrowserTools`, but the tools/list handler iterates `state.plugins` directly (not `state.toolLookup`)
+- `checkConfigFile` and `checkPlugins` in `doctor.ts` must be exported for testing — add them to the export statement at the bottom of the file
+- `checkConfigFile` uses `getConfigPath()` which reads `OPENTABS_CONFIG_DIR` env var — override it in tests to isolate from real config
+- `checkPlugins` returns `fail()` (fatal) for missing directories, but `warn()` (non-fatal) for missing manifest/IIFE — the PRD acceptance criteria says "warn" for directories but the code uses "fail"
+---
+
+## 2026-02-18 - US-007
+- Exported `checkConfigFile` and `checkPlugins` from `doctor.ts` for testing
+- Added 2 tests for `checkConfigFile`: pass when config exists, warn when missing
+- Added 7 tests for `checkPlugins`: null config, no plugins configured, missing directory (fail), missing manifest (warn), missing IIFE (warn), valid plugin (pass), unreadable manifest fallback to path label
+- Used `OPENTABS_CONFIG_DIR` env var override pattern from `config.test.ts`
+- Used `mkdtempSync` + `afterAll` cleanup for temp directory fixtures
+- Files changed: `platform/cli/src/commands/doctor.ts`, `platform/cli/src/commands/doctor.test.ts`
+- **Learnings for future iterations:**
+  - `checkConfigFile` returns `warn` (not `fail`) when config is missing — the PRD acceptance criteria description is slightly off
+  - `checkPlugins` returns `fail` (fatal) for missing directories, `warn` for missing manifest/IIFE — test the actual code behavior, not the PRD description
+  - The `checkConfigFile` function needs env var isolation per-test when testing the "missing" case — use a try/finally block to restore the env var
+  - `Bun.file(path).json()` in `checkPlugins` catches parse errors silently (falls back to using path as label) — test this edge case
+---
+
+## 2026-02-18 - US-008
+- Exported `convertToolSchemas` from `build.ts` for testing
+- Added 5 tests for `convertToolSchemas` in `build.test.ts`:
+  - Valid Zod object schema converts to JSON Schema with correct structure (properties, required, additionalProperties)
+  - `$schema` key is stripped from both input and output schemas
+  - Input schema using `.transform()` throws with error message containing "cannot use .transform()"
+  - Output schema using `.transform()` throws with error message containing "cannot use .transform()"
+  - Nested objects and arrays convert correctly
+- Created `makeRealTool` helper that builds `ToolDefinition` objects with real Zod schemas (unlike `makeTool` which uses stubs)
+- Files changed: `platform/cli/src/commands/build.ts`, `platform/cli/src/commands/build.test.ts`
+- **Learnings for future iterations:**
+  - `z.toJSONSchema()` in Zod 4 adds a `$schema` key pointing to `https://json-schema.org/draft/2020-12/schema` — `convertToolSchemas` strips this via `delete` before returning
+  - The transform error thrown by `z.toJSONSchema()` says "Transforms cannot be represented in JSON Schema" — `convertToolSchemas` wraps this in its own message containing "cannot use .transform()"
+  - `ToolDefinition` requires `name`, `description`, `input` (ZodObject), `output` (ZodType), and `handle` (async function) — for schema-only tests, `handle` can be a stub returning `Promise.resolve()`
+  - Zod 4's `z.toJSONSchema()` produces `additionalProperties: false` by default for `z.object()` schemas
+---
+
+## 2026-02-18 - US-009
+- Changed `toBeGreaterThanOrEqual(2)` to `toBe(2)` in "re-registers MCP handlers on hot reload" test (line 194)
+  - `registerMcpHandlers` calls `setRequestHandler` exactly twice (tools/list + tools/call)
+- Changed `toBeGreaterThanOrEqual(1)` to `toBe(2)` in "notifies MCP sessions of tool list changes on hot reload" test (line 239)
+  - `sendToolListChanged` is called once from `reloadCore` via `notifyAllClients()` and once from the hot reload path in `performReload`
+  - The PRD notes suggested the exact count was 1, but tracing the code shows it is 2
+- Files changed: `platform/mcp-server/src/reload.test.ts`
+- **Learnings for future iterations:**
+  - Always trace through the full call chain to determine exact counts — `reloadCore` calls `notifyAllClients` at the end of its try block, and `performReload` calls `notifyToolListChanged` again in the hot reload path, resulting in 2 total calls per server
+  - The PRD notes can be inaccurate about exact values — verify by reading the source code carefully before making assertions
+---
+
+## 2026-02-18 - US-010
+- Exported `formatBytes` and `formatTimestamp` from `build.ts` for testing
+- Added 8 tests for `formatBytes`: 0 bytes, bytes below 1024, 1023 boundary, exactly 1024 (KB), kilobytes, 1048575 boundary, exactly 1048576 (MB), megabytes
+- Added 1 test for `formatTimestamp`: verifies output matches HH:MM:SS regex pattern
+- Files changed: `platform/cli/src/commands/build.ts`, `platform/cli/src/commands/build.test.ts`
+- **Learnings for future iterations:**
+  - `formatBytes` has 3 branches: `< 1024` → `N B`, `< 1024*1024` → `N.N KB`, else → `N.N MB` — test each branch plus boundaries
+  - `formatTimestamp` uses `new Date()` internally so the exact value varies — use regex `/^\d{2}:\d{2}:\d{2}$/` to verify format
+  - This follows the same pattern as `formatUptime` tests in `status.test.ts`
+---

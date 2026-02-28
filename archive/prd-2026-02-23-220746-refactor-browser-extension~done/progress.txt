@@ -1,0 +1,133 @@
+# Ralph Progress Log
+PRD: prd-2026-02-23-220746-refactor-browser-extension~running.json
+Started: Mon Feb 23 22:08:11 PST 2026
+---
+
+## Codebase Patterns
+- Import order in browser-extension src: local modules alphabetically, then @opentabs-dev/shared, then type imports
+- Prettier enforces no parens on single-param arrow functions (e.g., `tabId => ...` not `(tabId) => ...`)
+- The ESLint config's `strictTypeChecked` applies globally; non-TS files (like .mjs) need to be in global ignores
+- `mock.module` in bun:test only mocks the module path used at import-time — export signatures must match exactly
+- When mocking modules for dispatch-helpers tests, mock ALL exports from each module (not just the ones under test) to avoid import errors
+- Use `import type` for `DispatchResult` from `dispatch-helpers.js` — it's the shared type for executeOnTab callback return values in tests
+- Avoid non-null assertions (`!`) in test files — ESLint's `strictTypeChecked` forbids them. Use a helper function with `expect().toBeGreaterThanOrEqual()` + explicit null check instead
+- The `DispatchResult` type is now the canonical shared type in `dispatch-helpers.ts` for all three dispatch paths (tool, resource, prompt)
+- When splitting files into subdirectories, sibling imports (`./`) must come before parent imports (`../`) in import-x/order
+- The tsconfig.json in browser-extension includes `src/**/*.ts` so new files in subdirectories are automatically covered
+- The `withDebugger` helper is exported from `resource-commands.ts` and imported by `interaction-commands.ts` for `handleBrowserHandleDialog`
+- The `isCapturing` function from `network-capture.ts` is only needed by `resource-commands.ts` (for `withDebugger`), not by `network-commands.ts` which uses `startCapture`/`stopCapture`/`getRequests`/etc.
+
+## 2026-02-24 - US-001
+- Created `platform/browser-extension/src/dispatch-helpers.ts` with:
+  - `DispatchResult` type (unified from `ToolResult` in tool-dispatch.ts and `DispatchResult` in resource-prompt-dispatch.ts)
+  - `isAdapterNotReady()` — checks for -32002 error code
+  - `requireStringParam()` — validates non-empty string params with -32602 error
+  - `resolvePlugin()` — looks up plugin metadata with -32603 error
+  - `executeWithTimeout()` — wraps chrome.scripting.executeScript with timeout and result extraction
+  - `dispatchWithTabFallback()` — encapsulates the tab iteration loop with TOCTOU recheck, adapter-not-ready fallback, tab-gone detection, and error response routing
+- Refactored `resource-prompt-dispatch.ts`: removed duplicated tab iteration loops from handleResourceRead and handlePromptGet, replaced with dispatchWithTabFallback + executeWithTimeout
+- Refactored `tool-dispatch.ts`: removed duplicated param validation and tab iteration, replaced with requireStringParam + resolvePlugin + dispatchWithTabFallback. Tool-specific progress listener injection/removal and extended timeout logic remain in executeToolOnTab.
+- Fixed pre-existing ESLint issue: `.storybook/chrome-mock.mjs` not covered by tsconfig — added `**/.storybook/**/*.mjs` to ESLint ignores
+- Files changed: dispatch-helpers.ts (new), resource-prompt-dispatch.ts, tool-dispatch.ts, eslint.config.ts
+- **Learnings for future iterations:**
+  - tool-dispatch.ts has unique progress callback + extended timeout logic that cannot be extracted into the shared executeWithTimeout — the progressCallbacks Map and MAX_SCRIPT_TIMEOUT_MS reset are deeply intertwined with the timeout promise
+  - The executeOnTab callback in dispatchWithTabFallback is the right extension point for tool-specific concerns (invocation logging, progress listener injection/removal)
+  - resource-prompt-dispatch.ts no longer imports sendToServer (it goes through dispatch-helpers), but tool-dispatch.ts still needs it for the input validation errors specific to tool dispatch
+---
+
+## 2026-02-24 - US-002
+- Created `platform/browser-extension/src/dispatch-helpers.test.ts` with comprehensive tests for all exported functions:
+  - `requireStringParam`: 5 tests — valid string, missing param, empty string, non-string value, error message includes param name
+  - `resolvePlugin`: 3 tests — success path, plugin not found error, error message includes plugin name
+  - `isAdapterNotReady`: 3 tests — true for -32002, false for success, false for other error codes
+  - `dispatchWithTabFallback`: 8 tests — no matching tabs (-32001), success on matching tab, adapter-not-ready fallback, tab-gone fallback, all tabs fail (first error returned), undefined-ID tabs (-32001), TOCTOU URL recheck, TOCTOU tab closed, non-adapter error immediate return
+- All tests use bun:test with mock.module for chrome APIs and module dependencies (messaging, plugin-storage, tab-matching, sanitize-error)
+- Files changed: dispatch-helpers.test.ts (new)
+- **Learnings for future iterations:**
+  - Import the `DispatchResult` type from dispatch-helpers.js for typing executeOnTab mock callbacks — avoids inline union types that cause prettier formatting issues
+  - Non-null assertion operator (`!`) is forbidden by ESLint strictTypeChecked — use a helper function pattern with explicit null check + throw instead
+  - Import order rule: type imports must be sorted alphabetically relative to each other (`dispatch-helpers.js` before `extension-messages.js`)
+  - Dynamic import formatting: `const { ... } = await import('...')` must be on one line or broken as `const { ... } =\n  await import('...')` — not `await import(\n  '...'\n)`
+---
+
+## 2026-02-24 - US-003
+- Split `platform/browser-extension/src/browser-commands.ts` (2200+ lines) into 7 domain-grouped modules + barrel index:
+  - `browser-commands/tab-commands.ts`: handleBrowserListTabs, handleBrowserOpenTab, handleBrowserCloseTab, handleBrowserNavigateTab, handleBrowserFocusTab, handleBrowserGetTabInfo
+  - `browser-commands/content-commands.ts`: handleBrowserGetTabContent, handleBrowserGetPageHtml, handleBrowserGetStorage, handleBrowserScreenshotTab
+  - `browser-commands/interaction-commands.ts`: handleBrowserClickElement, handleBrowserTypeText, handleBrowserSelectOption, handleBrowserWaitForElement, handleBrowserQueryElements, handleBrowserPressKey, handleBrowserScroll, handleBrowserHoverElement, handleBrowserHandleDialog
+  - `browser-commands/cookie-commands.ts`: handleBrowserGetCookies, handleBrowserSetCookie, handleBrowserDeleteCookies
+  - `browser-commands/network-commands.ts`: handleBrowserEnableNetworkCapture, handleBrowserGetNetworkRequests, handleBrowserDisableNetworkCapture, handleBrowserGetConsoleLogs, handleBrowserClearConsoleLogs
+  - `browser-commands/resource-commands.ts`: handleBrowserListResources, handleBrowserGetResourceContent, CDP helper types/functions (CdpFrame, CdpResource, CdpFrameResourceTree, findFrameForResource, withDebugger, isTextMimeType, TEXT_MIME_PREFIXES, TEXT_MIME_EXACT)
+  - `browser-commands/extension-commands.ts`: handleExtensionGetState, handleExtensionGetLogs, handleExtensionGetSidePanel, handleExtensionCheckAdapter, handleExtensionForceReconnect, handleBrowserExecuteScript
+  - `browser-commands/index.ts`: barrel re-export of all handlers
+- Updated `message-router.ts` import path from `./browser-commands.js` to `./browser-commands/index.js`
+- Updated `message-router.test.ts` mock path from `./browser-commands.js` to `./browser-commands/index.js`
+- Deleted original `browser-commands.ts`
+- Files changed: browser-commands.ts (deleted), browser-commands/ (7 new files + index.ts), message-router.ts, message-router.test.ts
+- **Learnings for future iterations:**
+  - Sibling imports (`./`) must come before parent imports (`../`) per import-x/order rule
+  - Prettier collapses short export lists onto a single line — format accordingly to avoid lint errors
+  - `withDebugger` is shared between resource-commands.ts and interaction-commands.ts (handleBrowserHandleDialog)
+  - `isCapturing` from network-capture.ts is only needed by resource-commands.ts (for withDebugger), not by network-commands.ts
+- `extractScriptResult` must not use a generic type parameter `T` — ESLint's `no-unnecessary-type-parameters` rule forbids type params used only in return position. Return `Record<string, unknown>` and let callers access properties via indexing.
+- All browser command handlers use shared helpers from `browser-commands/helpers.ts`: `requireTabId`, `requireSelector`, `requireUrl`, `extractScriptResult`, `sendErrorResult`, `sendSuccessResult` — no handler has inline validation boilerplate
+- When adding helper imports to a file, preserve existing imports — only add the new ones, don't remove imports still used by non-refactored handlers in the same file
+---
+
+## 2026-02-24 - US-004
+- Created `platform/browser-extension/src/browser-commands/helpers.ts` with:
+  - `requireTabId()` — validates `params.tabId` is a number, sends -32602 error if not
+  - `requireSelector()` — validates `params.selector` is a non-empty string, sends -32602 error if not
+  - `requireUrl()` — validates `params.url` is a string and not a blocked URL scheme, sends -32602 error if not
+  - `extractScriptResult()` — extracts first result from executeScript output, handles null/error cases
+  - `sendErrorResult()` — wraps the catch block pattern (sanitize + send -32603)
+  - `sendSuccessResult()` — sends JSON-RPC 2.0 success response
+- Refactored 5 handlers across 4 submodules:
+  - `handleBrowserClickElement` (interaction-commands.ts) — requireTabId, requireSelector, extractScriptResult, sendSuccessResult, sendErrorResult
+  - `handleBrowserHoverElement` (interaction-commands.ts) — requireTabId, requireSelector, extractScriptResult, sendSuccessResult, sendErrorResult
+  - `handleBrowserCloseTab` (tab-commands.ts) — requireTabId, sendSuccessResult, sendErrorResult
+  - `handleBrowserGetTabContent` (content-commands.ts) — requireTabId, extractScriptResult, sendSuccessResult, sendErrorResult
+  - `handleBrowserGetCookies` (cookie-commands.ts) — requireUrl, sendSuccessResult, sendErrorResult
+- Files changed: helpers.ts (new), interaction-commands.ts, tab-commands.ts, content-commands.ts, cookie-commands.ts
+- **Learnings for future iterations:**
+  - ESLint's `no-unnecessary-type-parameters` forbids generics used only in return position — use concrete return types instead
+  - When partially refactoring a file, keep all existing imports intact — only add new helper imports, don't remove imports still used by non-refactored handlers
+  - `extractScriptResult` returns `Record<string, unknown>` — callers access properties via `.clicked`, `.tagName`, etc. directly since the type is wide enough
+  - The helpers import `sendToServer` from `../messaging.js` and `sanitizeErrorMessage`/`toErrorMessage`/`isBlockedUrlScheme` from upstream — these are the canonical dependencies for validation+error helpers
+---
+
+## 2026-02-24 - US-005
+- Created `platform/browser-extension/src/browser-commands/helpers.test.ts` with comprehensive tests for all 6 exported functions:
+  - `requireTabId`: 3 tests — valid number, missing param, non-number value
+  - `requireSelector`: 4 tests — valid string, missing param, empty string, non-string value
+  - `requireUrl`: 8 tests — valid URL, missing param, non-string, javascript:/data:/file:/chrome:/blob: blocked schemes
+  - `extractScriptResult`: 5 tests — valid result extraction, undefined result, empty array, custom fallback message, result with error field
+  - `sendErrorResult`: 3 tests — Error object, string error, numeric id
+  - `sendSuccessResult`: 4 tests — object result, null result, array result, numeric id
+- Uses bun:test with mock.module for messaging.js and sanitize-error.js dependencies
+- Files changed: helpers.test.ts (new)
+- **Learnings for future iterations:**
+  - The helpers.ts test file follows the same mock.module + await import pattern as dispatch-helpers.test.ts
+  - sanitize-error.js mock passes through the message unchanged (identity function) so tests can assert exact error messages
+  - isBlockedUrlScheme from @opentabs-dev/shared is NOT mocked — the real implementation is used so blocked scheme tests verify actual behavior
+---
+
+## 2026-02-24 - US-006
+- Migrated all remaining browser command handlers across 7 submodules to use shared helpers from `helpers.ts`:
+  - `tab-commands.ts`: handleBrowserListTabs (sendSuccessResult/sendErrorResult), handleBrowserOpenTab (requireUrl), handleBrowserNavigateTab (requireTabId + requireUrl), handleBrowserFocusTab (requireTabId), handleBrowserGetTabInfo (requireTabId)
+  - `content-commands.ts`: handleBrowserGetPageHtml (requireTabId + extractScriptResult), handleBrowserGetStorage (requireTabId), handleBrowserScreenshotTab (requireTabId)
+  - `interaction-commands.ts`: handleBrowserTypeText (requireTabId + requireSelector + extractScriptResult), handleBrowserSelectOption (requireTabId + requireSelector + extractScriptResult), handleBrowserWaitForElement (requireTabId + requireSelector + extractScriptResult), handleBrowserQueryElements (requireTabId + requireSelector + extractScriptResult), handleBrowserPressKey (requireTabId + extractScriptResult), handleBrowserScroll (requireTabId + extractScriptResult), handleBrowserHandleDialog (requireTabId)
+  - `cookie-commands.ts`: handleBrowserSetCookie (requireUrl), handleBrowserDeleteCookies (requireUrl)
+  - `network-commands.ts`: all 5 handlers (requireTabId + sendSuccessResult + sendErrorResult)
+  - `resource-commands.ts`: handleBrowserListResources (requireTabId), handleBrowserGetResourceContent (requireTabId)
+  - `extension-commands.ts`: handleExtensionGetState, handleExtensionGetLogs, handleExtensionCheckAdapter, handleBrowserExecuteScript (requireTabId)
+- Removed unused imports of `sanitizeErrorMessage`, `toErrorMessage`, `isBlockedUrlScheme` where they were replaced by helpers
+- Kept `sendToServer` import where custom validation patterns remain (e.g., `handleBrowserSelectOption`'s value/label check, `handleBrowserHandleDialog`'s inner catch for dialog detection)
+- Net result: -352 lines eliminated (161 added, 513 removed)
+- Files changed: tab-commands.ts, content-commands.ts, interaction-commands.ts, cookie-commands.ts, network-commands.ts, resource-commands.ts, extension-commands.ts
+- **Learnings for future iterations:**
+  - `handleBrowserGetStorage` uses a discriminated union result (`mode: 'single' | 'all'`) that doesn't fit `extractScriptResult` — keep manual result extraction for handlers with custom response shapes
+  - `handleBrowserHandleDialog`'s inner catch inspects error messages for "no dialog" detection — this custom error routing needs `toErrorMessage`/`sanitizeErrorMessage` directly, not `sendErrorResult`
+  - Some handlers have domain-specific validation (execFile regex, action enum, storageType enum) that doesn't fit the generic helpers — keep `sendToServer` import for these
+  - `handleBrowserQueryElements` doesn't return an `error` field from its script (it always returns `{ count, elements }`) so `extractScriptResult`'s error check is harmless but never triggers
+---

@@ -1,0 +1,122 @@
+# Ralph Progress Log
+PRD: prd-2026-02-23-091432-platform-improvements~running.json
+Started: Mon Feb 23 09:34:02 PST 2026
+---
+
+## Codebase Patterns
+- SVG sanitizer is in platform/browser-extension/src/sanitize-svg.ts with tests in sanitize-svg.test.ts
+- The sanitizer uses a tokenize-then-filter approach with strippedDepth tracking for nested element removal
+- The e2e-test plugin (plugins/e2e-test/) must be built before running unit tests — build-e2e.test.ts copies from its dist/ directory
+- Pre-commit hooks run prettier, eslint --fix, and knip
+- Shared constants (DEFAULT_PORT, ADAPTER_FILENAME, TOOLS_FILENAME, config path functions, generateSecret) live in platform/shared/src/constants.ts
+- browser-extension CAN import from @opentabs-dev/shared (uses workspace:* dependency)
+- ESLint import-x/order requires @opentabs-dev/* imports AFTER local ./ imports
+- ESLint import-x/no-duplicates requires merging multiple imports from the same module
+
+## 2026-02-23 09:40 PST - US-001
+- **Implemented**: Fixed SVG sanitizer strippedDepth tracking bug
+- **Root cause**: The closing tag handler inside a stripped subtree only decremented strippedDepth for disallowed elements (line 280-281), but the opening tag handler incremented it for both allowed and disallowed elements (lines 295-296 and 304-305). This mismatch meant allowed elements opened inside a stripped subtree left strippedDepth elevated, causing subsequent content after the stripped subtree to be incorrectly stripped.
+- **Fix**: Simplified the closing tag handler to decrement strippedDepth unconditionally for any closing tag when strippedDepth > 0, matching the opening tag behavior.
+- **Files changed**:
+  - `platform/browser-extension/src/sanitize-svg.ts` — simplified closing tag logic in stripped subtree
+  - `platform/browser-extension/src/sanitize-svg.test.ts` — added 2 test cases for the specific acceptance criteria
+- **Learnings for future iterations:**
+  - The e2e-test plugin must have dist/ and node_modules/ present for build-e2e.test.ts to pass — run `cd plugins/e2e-test && bun install && bun run build` if tests fail with ENOENT errors
+  - knip configuration hints (about ignoreDependencies) are informational and don't cause failure
+---
+
+## 2026-02-23 09:48 PST - US-002
+- **Implemented**: Fixed contradictory browser tool descriptions for screenshot and focus
+- **Root cause**: `focus-tab.ts` description claimed focus was "Required before using browser_screenshot_tab", but `screenshot-tab.ts` correctly states the tab is automatically focused before capture. The two descriptions contradicted each other.
+- **Fix**: Updated `focus-tab.ts` description to say "Useful for bringing a tab to the foreground for visual inspection" instead of claiming prerequisite status for screenshots.
+- **Files changed**:
+  - `platform/mcp-server/src/browser-tools/focus-tab.ts` — updated description to remove false prerequisite claim
+- **Learnings for future iterations:**
+  - Browser tool definitions are in `platform/mcp-server/src/browser-tools/`, one file per tool
+  - Tool descriptions are critical for AI agent usage — contradictions cause agents to make unnecessary calls
+  - No other browser tools reference `focus_tab` as a prerequisite
+---
+
+## 2026-02-23 10:15 PST - US-003
+- **Implemented**: Extracted shared constants into platform/shared/src/constants.ts
+- **What was consolidated**:
+  - `DEFAULT_PORT` (9515): removed from cli/parse-port.ts, plugin-tools/build.ts; replaced hardcoded value in mcp-server/index.ts
+  - `ADAPTER_FILENAME` ('adapter.iife.js'), `ADAPTER_SOURCE_MAP_FILENAME` ('adapter.iife.js.map'), `TOOLS_FILENAME` ('tools.json'): replaced raw string literals in loader.ts, file-watcher.ts, build.ts, inspect.ts, doctor.ts, plugin.ts
+  - `getConfigDir`, `getConfigPath`, `getExtensionDir`, `getLogFilePath`: removed duplicate definitions from cli/config.ts, mcp-server/config.ts, plugin-tools/build.ts
+  - `generateSecret`: removed duplicate from cli/commands/config.ts and mcp-server/config.ts
+- **Files changed**:
+  - `platform/shared/src/constants.ts` — new file with all shared constants
+  - `platform/shared/src/index.ts` — re-exports from constants.ts
+  - `platform/cli/src/config.ts` — imports from shared, re-exports for local consumers
+  - `platform/cli/src/parse-port.ts` — imports DEFAULT_PORT from shared
+  - `platform/cli/src/commands/config.ts` — imports generateSecret from shared
+  - `platform/cli/src/commands/doctor.ts` — uses ADAPTER_FILENAME, TOOLS_FILENAME
+  - `platform/cli/src/commands/plugin.ts` — uses TOOLS_FILENAME
+  - `platform/mcp-server/src/config.ts` — imports getConfigDir, getConfigPath, getExtensionDir, generateSecret from shared
+  - `platform/mcp-server/src/index.ts` — imports DEFAULT_PORT from shared
+  - `platform/mcp-server/src/loader.ts` — uses ADAPTER_FILENAME, TOOLS_FILENAME, ADAPTER_SOURCE_MAP_FILENAME
+  - `platform/mcp-server/src/file-watcher.ts` — uses ADAPTER_FILENAME, TOOLS_FILENAME, ADAPTER_SOURCE_MAP_FILENAME
+  - `platform/plugin-tools/src/commands/build.ts` — uses all artifact filename constants, DEFAULT_PORT, getConfigPath
+  - `platform/plugin-tools/src/commands/inspect.ts` — uses TOOLS_FILENAME
+- **Learnings for future iterations:**
+  - browser-extension already depends on @opentabs-dev/shared as workspace:*, so it can import shared constants
+  - mcp-server/config.ts still defines getExtensionVersionFile and getAdaptersDir locally (they derive from getExtensionDir which is now imported from shared)
+  - Test files use string literals for filenames directly — they don't need to use the constants since they're just test fixtures
+  - ESLint import ordering requires external @opentabs-dev/* imports after local ./relative imports
+- E2E test fixtures use PORT=0 for ephemeral port allocation — PORT validation must allow 0 (OS assigns free port)
+- Shared error utility `toErrorMessage` lives in platform/shared/src/error.ts and is re-exported from index.ts
+- extension-protocol.ts lines 1021/1026 contain the pattern inside string literals (generated JS code) — cannot be replaced with function calls
+- Plugins in plugins/ are standalone and excluded from root tooling — do not modify them when refactoring platform code
+---
+
+## 2026-02-23 10:20 PST - US-004
+- **Implemented**: Added `toErrorMessage(err: unknown): string` to platform/shared and replaced 73 occurrences of `err instanceof Error ? err.message : String(err)` across 22 files
+- **Approach**: Created `platform/shared/src/error.ts` with the utility function, exported from `index.ts`. Replaced all occurrences across mcp-server (18), browser-extension (40), cli (5), plugin-tools (5), plugin-sdk (1), and shared (1) packages. Two occurrences in extension-protocol.ts (lines 1021/1026) were intentionally left unchanged because they are inside string literals containing generated JavaScript code.
+- **Files changed**:
+  - `platform/shared/src/error.ts` — new file with toErrorMessage utility
+  - `platform/shared/src/index.ts` — added re-export
+  - `platform/shared/src/cross-platform.ts` — uses toErrorMessage
+  - `platform/browser-extension/src/browser-commands.ts` — replaced 35 occurrences
+  - `platform/browser-extension/src/tool-dispatch.ts` — replaced 2 occurrences
+  - `platform/browser-extension/src/iife-injection.ts` — replaced 2 occurrences
+  - `platform/browser-extension/src/resource-prompt-dispatch.ts` — replaced 2 occurrences
+  - `platform/browser-extension/src/network-capture.ts` — replaced 1 occurrence
+  - `platform/mcp-server/src/resolver.ts` — replaced 6 occurrences
+  - `platform/mcp-server/src/mcp-setup.ts` — replaced 5 occurrences
+  - `platform/mcp-server/src/extension-protocol.ts` — replaced 1 occurrence (skipped 2 string literals)
+  - `platform/mcp-server/src/http-routes.ts` — replaced 1 occurrence
+  - `platform/mcp-server/src/discovery.ts` — replaced 1 occurrence
+  - `platform/mcp-server/src/audit-disk.ts` — replaced 2 occurrences
+  - `platform/mcp-server/src/version-check.ts` — replaced 1 occurrence
+  - `platform/cli/src/config.ts` — replaced 1 occurrence
+  - `platform/cli/src/commands/audit.ts` — replaced 1 occurrence
+  - `platform/cli/src/commands/start.ts` — replaced 1 occurrence
+  - `platform/cli/src/commands/config.ts` — replaced 1 occurrence
+  - `platform/cli/src/commands/status.ts` — replaced 1 occurrence
+  - `platform/plugin-tools/src/commands/build.ts` — replaced 5 occurrences
+  - `platform/plugin-sdk/src/fetch.ts` — replaced 1 occurrence
+- **Learnings for future iterations:**
+  - `replace_all` in the Edit tool is efficient for bulk replacements of identical patterns within a file
+  - The Read tool "file has been read" state may expire — re-read files if edits fail with "not been read yet"
+  - ESLint `lint:fix` handles both prettier formatting and import reordering — run it after bulk edits
+  - When shortening expressions in template literals, lines may become short enough for prettier to collapse them to single lines
+---
+
+## 2026-02-23 10:50 PST - US-005
+- **Implemented**: Four edge case fixes across four packages
+- **Changes**:
+  1. **PORT validation** (`platform/mcp-server/src/index.ts`): Added `resolvePort()` function that validates `PORT` env var — rejects NaN, negative, fractional, and >65535 values with a clear error message. Allows port 0 (OS-assigned ephemeral port used by E2E test fixtures).
+  2. **Log level case normalization** (`platform/mcp-server/src/logger.ts`): `parseLevel()` now calls `.toLowerCase()` before matching, so `OPENTABS_LOG_LEVEL=DEBUG` or `Debug` works as expected.
+  3. **Stale lock detection** (`platform/plugin-tools/src/commands/build.ts`): When `acquireConfigLock()` encounters an existing lock directory, it checks its mtime. If older than 5 minutes (`STALE_LOCK_THRESHOLD_MS`), the lock is removed with a warning and the build proceeds.
+  4. **maxDelay cap** (`platform/plugin-sdk/src/timing.ts`): `retry()` now accepts `maxDelay` option (default 30s) that clamps the computed exponential backoff delay via `Math.min()`. Added 2 test cases in `timing.test.ts`.
+- **Files changed**:
+  - `platform/mcp-server/src/index.ts` — added resolvePort() with validation
+  - `platform/mcp-server/src/logger.ts` — case-insensitive parseLevel()
+  - `platform/plugin-tools/src/commands/build.ts` — added statSync import, STALE_LOCK_THRESHOLD_MS, stale lock detection in acquireConfigLock
+  - `platform/plugin-sdk/src/timing.ts` — added maxDelay to RetryOptions, clamped delay calculation
+  - `platform/plugin-sdk/src/timing.test.ts` — added 2 tests for maxDelay behavior
+- **Learnings for future iterations:**
+  - E2E test fixtures use `PORT=0` for ephemeral ports — any PORT validation must allow 0
+  - The `lifecycle-hooks.e2e.ts:143` onDeactivate test is flaky (race condition with hot reload timing) — passes on retry
+  - `statSync` must be added to the `node:fs` import when checking lock directory mtime
+---

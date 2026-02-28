@@ -1,0 +1,140 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-173731-platform-ux-fixes~running.json
+Started: Sat Feb 21 21:45:41 PST 2026
+---
+
+## Codebase Patterns
+- `ensureExtensionInstalled()` in reload.ts runs on every startup/hot reload — it's the right place to detect version changes
+- The extension already handles `extension.reload` via message-router.ts dispatch table — reuse existing infrastructure
+- `sendSyncFull()` in http-routes.ts runs on every WebSocket connect — chain deferred work after it via `.then()`
+- Pre-existing build errors in shared/src/index.ts had stray interface fields outside closing braces — always verify shared types compile
+- extension-protocol.ts had duplicate code blocks (stale remnants from previous edits) — always check for and clean up stale duplicates
+- platform/plugin-tools/src/commands/build.ts had uncommitted icon validation changes with dead code after `return` — reverted in US-003 by restoring to HEAD state
+- When staging pre-existing changes alongside your own, verify the staged version passes lint independently (lint-staged only sees the staged snapshot)
+- `ConfigStateResult` in shared already includes `outdatedPlugins` — App.tsx just needs to read it from `fetchConfigState()` result
+- Plugins in `plugins/` depend on published npm packages, not local source — features must be published before the e2e-test plugin can use them
+- The side panel header area (search bar row) is a natural place for persistent badges — use flex layout with `gap-2` to position alongside the search input
+- E2E tests use `platform/browser-extension/` directly (not `~/.opentabs/extension/`) — see `EXTENSION_DIR` in `e2e/fixtures.ts`
+- `.tsbuildinfo` files live at `platform/*/*.tsbuildinfo` (package root), not inside `dist/` directories
+- `platform/browser-extension/icons/` is gitignored — icons are generated from SVG during build
+- macOS ships bash 3.2 — avoid `declare -A` (associative arrays), `mapfile`, and other bash 4+ features in shell scripts
+
+## 2026-02-22 - US-001
+- Implemented server-triggered extension auto-reload on version change
+- Files changed:
+  - `platform/mcp-server/src/extension-install.ts` — `ensureExtensionInstalled()` now returns `{ versionChanged: boolean }`
+  - `platform/mcp-server/src/state.ts` — added `pendingExtensionReload: boolean` to ServerState
+  - `platform/mcp-server/src/extension-protocol.ts` — added `sendExtensionReload()` utility function
+  - `platform/mcp-server/src/reload.ts` — after ensureExtensionInstalled, sends reload or sets pending flag
+  - `platform/mcp-server/src/http-routes.ts` — in createHandleWsOpen, checks pending flag after sync.full
+  - `platform/cli/src/commands/start.ts` — changed message from "Reload the extension..." to "Extension will auto-reload..."
+  - `platform/shared/src/index.ts` — fixed pre-existing syntax errors (stray fields outside interface braces)
+- **Learnings for future iterations:**
+  - shared/src/index.ts had iconSvg/iconInactiveSvg fields dangling outside 4 interfaces — broke tsc build. Always check shared types compile before moving on.
+  - The reload flow sends extension.reload via the same WebSocket as sync.full — use a 500ms delay to let sync.full flush first
+  - state.ts and loader.ts got auto-modified by the lint-staged pre-commit hook to propagate the new ManifestTool fields
+---
+
+## 2026-02-22 - US-002
+- Removed the version mismatch banner from the side panel (no longer needed since US-001 auto-reloads the extension)
+- Files changed:
+  - Deleted `platform/browser-extension/src/side-panel/components/VersionMismatchBanner.tsx`
+  - Deleted `platform/browser-extension/src/side-panel/components/VersionMismatchBanner.stories.tsx`
+  - `platform/browser-extension/src/side-panel/App.tsx` — removed `versionMismatch` state, `SIDE_PANEL_PROTOCOL_VERSION` import, protocolVersion check in loadPlugins, and banner rendering
+  - `platform/browser-extension/src/side-panel/components/SidePanel.stories.tsx` — removed VersionMismatch story and versionMismatch prop from SidePanelShell
+  - `platform/shared/src/index.ts` — removed `SIDE_PANEL_PROTOCOL_VERSION` constant and `protocolVersion` field from `ConfigStateResult`
+  - `platform/mcp-server/src/extension-protocol.ts` — removed `SIDE_PANEL_PROTOCOL_VERSION` import, removed protocolVersion from config.getState response, fixed duplicate code blocks
+  - `platform/browser-extension/src/message-router.ts` — fixed pre-existing formatting issues
+  - `platform/browser-extension/src/types.ts` — included pre-existing icon field additions
+- **Learnings for future iterations:**
+  - extension-protocol.ts had two stale duplicate code blocks (lines 497-503 and 781-793) that caused tsc errors — pre-existing issues from the US-001 iteration's lint-staged auto-modifications
+  - `SIDE_PANEL_PROTOCOL_VERSION` was defined in shared/src/index.ts (not constants.ts) — always grep for the actual location, don't trust the story notes
+  - `protocolVersion` in e2e/fixtures.ts is for the MCP protocol (unrelated to SIDE_PANEL_PROTOCOL_VERSION) — don't confuse the two
+  - platform/plugin-tools/src/commands/build.ts has uncommitted icon validation with `validateIconSvg` import but usage after a `return` — avoid staging this file until it's properly fixed
+---
+
+## 2026-02-22 - US-003
+- Added outdated plugins badge to the side panel header area
+- Files changed:
+  - Created `platform/browser-extension/src/side-panel/components/OutdatedPluginsBadge.tsx` — new component with badge (red pill with count + arrow icon), click-to-open dropdown listing outdated plugins with version info and copyable update commands
+  - `platform/browser-extension/src/side-panel/App.tsx` — added `outdatedPlugins` state from `fetchConfigState()` response, cleared on disconnect, badge rendered in header area alongside search bar
+- Also fixed pre-existing build errors: reverted uncommitted `validateIconSvg` import in `build.ts` and `scaffold.ts` (those files were restored to match HEAD)
+- **Learnings for future iterations:**
+  - `ConfigStateResult` in shared already includes `outdatedPlugins` with `{ name, currentVersion, latestVersion, updateCommand }` — no server changes needed
+  - The lint-staged pre-commit hook may auto-modify files outside your staged set — always check `git status` after commit to detect stale working tree changes
+  - Pre-existing uncommitted changes in `build.ts` and `scaffold.ts` (icon validation) caused build failures — reverting to HEAD resolved them without needing to implement the missing feature
+  - Click-outside handling for the dropdown popover requires `mousedown` (not `click`) to prevent the dropdown from closing and reopening when clicking the toggle button
+---
+
+## 2026-02-22 - US-004
+- Fixed search filter inconsistency between PluginList and PluginCard
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/PluginList.tsx` — added `t.displayName` to the tool filter predicate, matching the same 3-field check (displayName, name, description) that PluginCard.tsx already uses
+- **Learnings for future iterations:**
+  - PluginList filters at the plugin level (which plugins to show) and PluginCard filters at the tool level (which tools to show within a card) — both must use the same field set
+  - Simple one-line fixes still require full quality check suite — all 5 checks passed cleanly
+---
+
+## 2026-02-22 - US-005
+- Improved failed plugin card UX: readable font size, selectable error text, expand/collapse for long errors
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/FailedPluginCard.tsx` — converted from stateless arrow to stateful component with `useState` for expand/collapse toggle; changed error text from `text-[11px]` to `text-xs` (12px); added `select-text` for user-select; added `line-clamp-2` truncation when collapsed; added "Show more"/"Show less" toggle button for errors longer than 100 characters
+- **Learnings for future iterations:**
+  - Tailwind's `line-clamp-2` is built into Tailwind CSS 4 (no plugin needed) and works with `select-text` for copyable truncated text
+  - Import order matters for eslint import-x/order — `lucide-react` sorts before `react` alphabetically
+  - Prettier rules enforce single-line JSX attributes when they fit — avoid multiline attributes for short props
+---
+
+## 2026-02-22 - US-006
+- Fixed tab state hint for unavailable plugins: changed from "Log in to {displayName}" to "Waiting for {displayName} to be ready"
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — updated `TabStateHint` component's unavailable case (line 37) to use generic "Waiting for..." phrasing instead of auth-specific "Log in to..."
+- **Learnings for future iterations:**
+  - Prettier requires short JSX children to stay on the same line as the parent element — wrapping short text across lines triggers a formatting error
+  - The `TabStateHint` component handles three states: `ready` (returns null), `closed` (open tab hint), and the default/unavailable case
+---
+
+## 2026-02-22 - US-007
+- Added `format:check` to the `check` and `check:all` scripts in root package.json
+- Files changed:
+  - `package.json` — inserted `bun run format:check` after `bun run lint` in both `check` and `check:all` scripts
+- **Learnings for future iterations:**
+  - Placing `format:check` after `lint` is intentional: `lint:fix` may reformat code, so checking format after lint ensures no residual formatting issues
+  - This was a minimal, single-file change — all 5 quality checks passed cleanly
+---
+
+## 2026-02-22 - US-008
+- Auto-build e2e-test plugin before E2E tests run
+- Files changed:
+  - `package.json` — added `build:e2e-plugin` script (`cd plugins/e2e-test && bun install --frozen-lockfile && bun run build`) and updated `test:e2e` to run it before Playwright
+  - `plugins/e2e-test/src/tools/no-display-name.ts` — added required `displayName` and `icon` fields so the tool builds with the published `@opentabs-dev/plugin-tools@0.0.16` (which requires these fields, unlike the unpublished source)
+- **Learnings for future iterations:**
+  - The e2e-test plugin depends on **published** npm packages, not local source. Features added to local source (like auto-derivation of displayName/icon) won't work in the plugin until those packages are published.
+  - `bun install --frozen-lockfile` in the build:e2e-plugin script is fast (~8ms) when deps are already installed, so always running it is acceptable
+  - The global-setup.ts safety net check remains unchanged — it provides a clear error message if the plugin build somehow fails silently
+  - Always-build (no conditional timestamp checks) is simpler and more reliable for a plugin build that takes <1s
+---
+
+## 2026-02-22 - US-009
+- Optimized CI with shared build artifacts: build once, share across all dependent jobs
+- Files changed:
+  - `.github/workflows/ci.yml` — restructured from 7 independent jobs to a dependency graph: the `build` job uploads artifacts (`platform/*/dist/`, `*.tsbuildinfo`, `browser-extension/icons/`), and 5 downstream jobs (`type-check`, `lint`, `knip`, `unit-tests`, `e2e-tests`) add `needs: [build]` and download artifacts instead of rebuilding; `format` remains independent
+- **Learnings for future iterations:**
+  - `actions/upload-artifact@v4` uses the least common ancestor of all paths as the artifact root — when uploading files at different directory levels (e.g., `platform/*/dist/` and root `*.tsbuildinfo`), the LCA is the repo root, so `download-artifact` without a `path` restores everything correctly
+  - `.tsbuildinfo` files are at `platform/*/*.tsbuildinfo` (package root, not inside `dist/`) — they must be uploaded separately from `platform/*/dist/`
+  - Generated icons at `platform/browser-extension/icons/` are gitignored and produced by `build:icons` — they must be included in build artifacts since the e2e tests copy the extension from `platform/browser-extension/`
+  - The `build:install-extension` step copies to `~/.opentabs/extension/`, but e2e tests use `platform/browser-extension/` directly (see `fixtures.ts` line 37), so the installed extension directory is not needed in artifacts
+  - Artifact `retention-days: 1` is sufficient since these are ephemeral build outputs only needed within a single CI run
+---
+
+## 2026-02-22 - US-010
+- Added automated changelog generation to the publish script
+- Files changed:
+  - `scripts/publish.sh` — added changelog generation step between publishing and the release commit: collects commits since the last git tag, groups them by conventional commit type (feat → Features, fix → Bug Fixes, etc.), writes a formatted section to CHANGELOG.md (prepends to existing or creates new), and includes CHANGELOG.md in the release commit
+- **Learnings for future iterations:**
+  - macOS ships with bash 3.2 which does NOT support `declare -A` (associative arrays) — use separate variables per group instead
+  - `${RANGE:+"$RANGE"}` is the portable way to conditionally pass a variable as an argument (expands to nothing when empty, avoids passing an empty string)
+  - The `for pair in "Label:$VAR"` pattern breaks with multiline values due to word splitting — use a helper function (`append_group`) instead to safely pass multiline strings as arguments
+  - `release` commit type is skipped in the changelog to avoid listing the previous release commit in the new changelog entry
+  - The `git add CHANGELOG.md` is conditional (`if [ -f CHANGELOG.md ]`) to handle the edge case where no commits exist and the changelog was not generated
+---

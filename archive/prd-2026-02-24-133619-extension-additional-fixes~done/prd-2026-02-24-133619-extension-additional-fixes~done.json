@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two additional code quality issues in the browser extension: a leaked setTimeout in probeTabReadiness, and sendTabSyncAll bypassing the per-plugin lock used by all other writers of lastKnownState.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Cancel probeTabReadiness timeout when executeScript settles first",
+      "description": "As a developer, I want the Promise.race timeout in probeTabReadiness to be cleared when chrome.scripting.executeScript resolves or rejects first, so that no orphaned timers linger after the probe completes.",
+      "acceptanceCriteria": [
+        "The setTimeout timer in probeTabReadiness is cleared (via clearTimeout) when the executeScript promise wins the race",
+        "The setTimeout timer is also cleared when executeScript rejects (tab closed, permission error, etc.)",
+        "When the timeout wins the race (executeScript is slow), the function still returns false as before",
+        "The probeTabReadiness function's external behavior is unchanged — same return values, same timeout duration (IS_READY_TIMEOUT_MS)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/tab-state.ts, lines 51-77. Currently uses a bare Promise.race with an untracked setTimeout:\n\n```ts\nconst results = await Promise.race([\n  chrome.scripting.executeScript({ ... }),\n  new Promise<null>(resolve => setTimeout(() => resolve(null), IS_READY_TIMEOUT_MS)),\n]);\n```\n\nThe fix: extract the timer ID so it can be cleared. A clean pattern is to wrap both competitors in a helper that tracks the timer:\n\n```ts\nlet timerId: ReturnType<typeof setTimeout> | undefined;\ntry {\n  const results = await Promise.race([\n    chrome.scripting.executeScript({ ... }),\n    new Promise<null>(resolve => {\n      timerId = setTimeout(() => resolve(null), IS_READY_TIMEOUT_MS);\n    }),\n  ]);\n  // ... existing result handling ...\n} finally {\n  if (timerId !== undefined) clearTimeout(timerId);\n}\n```\n\nAlternatively, use AbortSignal.timeout if available, but the manual clearTimeout approach is simpler and more consistent with the rest of the codebase. The key constraint is that the external behavior must remain identical — same return type, same timeout value, same logging on timeout."
+    },
+    {
+      "id": "US-002",
+      "title": "Serialize sendTabSyncAll through per-plugin locks",
+      "description": "As a developer, I want sendTabSyncAll to update the lastKnownState cache through the same per-plugin lock mechanism used by notifyAffectedPlugins and updateLastKnownState, so that concurrent tab events cannot interleave with the sync and produce redundant or stale notifications.",
+      "acceptanceCriteria": [
+        "sendTabSyncAll updates lastKnownState for each plugin through withPluginLock, not via direct map operations",
+        "The lastKnownState.clear() call is removed — instead, each plugin's lock callback writes its new state, and plugins that are no longer in the plugin index are cleaned up after the sync",
+        "Concurrent checkTabChanged / checkTabRemoved calls for the same plugin are properly serialized against the sync's cache writes (they wait for the sync's lock to release before reading lastKnownState)",
+        "The tab.syncAll message to the server and the sp:serverMessage forwards to the side panel still happen after all computations complete (not inside the lock callbacks)",
+        "The function's external behavior is unchanged — same payload to the server, same messages to the side panel",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "File: platform/browser-extension/src/tab-state.ts, lines 124-167. Currently, sendTabSyncAll does:\n1. Compute all plugin states in parallel (line 129-131) — this is fine\n2. lastKnownState.clear() (line 144) — this bypasses withPluginLock\n3. lastKnownState.set() in a loop (lines 145-147) — also bypasses withPluginLock\n\nMeanwhile, notifyAffectedPlugins (line 209-227) reads and writes lastKnownState inside withPluginLock. If a Chrome tab event fires during sendTabSyncAll's execution, notifyAffectedPlugins for that plugin could read lastKnownState after clear() but before the sync repopulates it, seeing no previous state and potentially sending a redundant notification.\n\nThe fix: after computing all states, write each plugin's state through withPluginLock:\n\n```ts\n// After computing entries from Promise.allSettled:\nconst pluginNamesInSync = new Set<string>();\nawait Promise.all(\n  entries.map(([pluginName, stateInfo]) => {\n    pluginNamesInSync.add(pluginName);\n    return withPluginLock(pluginName, async () => {\n      lastKnownState.set(pluginName, stateInfo.state);\n    });\n  }),\n);\n// Clean up plugins no longer in the index\nfor (const key of lastKnownState.keys()) {\n  if (!pluginNamesInSync.has(key)) {\n    lastKnownState.delete(key);\n    pluginLocks.delete(key);\n  }\n}\n```\n\nThe cleanup loop replaces the old lastKnownState.clear() — it only removes entries for plugins that no longer exist in the index, rather than clearing everything and repopulating. This avoids the window where the cache is empty.\n\nThe server message (tab.syncAll) and side panel forwarding should remain after the lock writes, outside the lock callbacks, since they are outbound-only and do not read lastKnownState."
+    }
+  ]
+}

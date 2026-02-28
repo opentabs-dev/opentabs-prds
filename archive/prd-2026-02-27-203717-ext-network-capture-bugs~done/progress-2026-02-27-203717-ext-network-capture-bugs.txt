@@ -1,0 +1,39 @@
+# Ralph Progress Log
+PRD: prd-2026-02-27-203717-ext-network-capture-bugs~running.json
+Started: Sat Feb 28 04:37:40 UTC 2026
+---
+
+## Codebase Patterns
+- network-capture.ts maintains three maps per tab: state.requests (completed), state.pendingRequests (in-flight awaiting responseReceived), state.requestIdToRequest (requestId → completed ref, for body attachment)
+- Tests set up chrome stubs before importing the module; capture listener callbacks by replacing vi.fn() with a function that saves the cb variable; use `await import()` after stubs
+- Prettier print width allows single-line type unions like `Foo | undefined` up to ~120 chars; multi-line union declarations get flagged
+- `noUncheckedIndexedAccess` is enabled in tsconfig.base.json — use `toHaveProperty` instead of `arr[0]!.field` to avoid `no-non-null-assertion` lint errors
+- `no-misused-promises` lint rule: mockImplementationOnce callbacks must return void (not a Promise); omit `return Promise.resolve()`
+- To test async sendCommand callbacks: use mockImplementationOnce to capture the callback, invoke it synchronously after setting up the desired state
+
+## 2026-02-28 - US-002
+- Implemented fix: added `if (!state.requests.includes(request)) return;` guard in Network.loadingFinished callback before writing responseBody (platform/browser-extension/src/network-capture.ts:270)
+- Added `runtime: { lastError: undefined }` to the global chrome stub to support testing the callback path
+- Added two tests under `describe('Network.loadingFinished')`:
+  - `sets responseBody on request still in buffer` — verifies normal body fetch path
+  - `does not write responseBody to a request evicted from the buffer` — verifies the guard
+- Files changed: platform/browser-extension/src/network-capture.ts, platform/browser-extension/src/network-capture.test.ts
+- **Learnings for future iterations:**
+  - The race: loadingFinished deletes from requestIdToRequest synchronously, then fires async sendCommand; between the async call and its callback, evictOldestRequest can shift the request from state.requests. The guard checks state.requests membership
+  - `evictOldestRequest` cannot clean up the requestIdToRequest entry for req-1 because loadingFinished already deleted it before the eviction happens; the guard in the async callback is the only defense
+  - `noUncheckedIndexedAccess` in tsconfig.base.json means `arr[0].field` is a type error; use `toHaveProperty('field', value)` instead of `arr[0]!.field`
+  - `no-misused-promises` lint rule: mockImplementationOnce callback must return void, not `Promise.resolve()`; omit the return statement entirely
+  - The evicted request's responseBody cannot be observed via getRequests() (it's orphaned), so the test validates the system invariant (buffer has only non-evicted requests) rather than the orphaned object's state
+---
+
+## 2026-02-28 - US-001
+- Implemented fix: added `state.pendingRequests.clear()` inside the `if (clear)` block in `getRequests()` (platform/browser-extension/src/network-capture.ts:418)
+- Added `capturedOnEventListener` capture in test setup to enable CDP event simulation
+- Added `getRequests` to imports in test file
+- Added unit test `getRequests > clear=true discards in-flight pending requests so they do not appear in subsequent reads` in platform/browser-extension/src/network-capture.test.ts
+- Files changed: platform/browser-extension/src/network-capture.ts, platform/browser-extension/src/network-capture.test.ts
+- **Learnings for future iterations:**
+  - The race condition: requestWillBeSent puts entry in pendingRequests; getRequests(clear=true) was not clearing it; responseReceived would then find it and add a completed request to the (now empty) buffer
+  - Fix is surgical: one line added to the clear block
+  - To test CDP events, the onEvent.addListener mock must capture the callback (not just be vi.fn()); the module import must come after stubs so the listener registration picks up the capturing mock
+---

@@ -1,0 +1,119 @@
+{
+  "project": "OpenTabs Platform — Self-Bootstrap Browser Tools",
+  "description": "Add network request/response body capture and a browser_get_page_html tool so an AI agent has sufficient browser inspection capabilities to autonomously reverse-engineer a webapp's API and create a high-quality OpenTabs plugin without human interaction.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Capture network request bodies (postData) in network capture",
+      "description": "As an AI agent reverse-engineering a webapp, I want to see the request payloads (POST/PUT/PATCH bodies) captured in network traffic so that I can understand what data format the webapp sends to its API endpoints.",
+      "acceptanceCriteria": [
+        "CapturedRequest interface in network-capture.ts includes an optional requestBody field (string | undefined)",
+        "Network.requestWillBeSent handler extracts request.postData and stores it in the pending request",
+        "Completed CapturedRequest objects include requestBody when postData was present",
+        "browser_get_network_requests returns requestBody in its response for requests that had a body",
+        "enable-network-capture.ts tool description mentions that request bodies are captured",
+        "get-network-requests.ts tool description mentions request bodies",
+        "Request bodies exceeding 100KB are truncated with a '... (truncated)' suffix to prevent memory issues",
+        "Existing tests continue to pass without modification",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "The request body data is already available in the CDP Network.requestWillBeSent event as `request.postData`. Edit `platform/browser-extension/src/network-capture.ts` — in the `Network.requestWillBeSent` handler (around line 90), extract `request.postData` as a string and add it to the pending request object. Then in the `Network.responseReceived` handler (around line 104), carry it through to the completed CapturedRequest. Add `requestBody?: string` to the CapturedRequest interface. Truncate at 100KB (102400 chars) to prevent memory issues with large file uploads. No changes needed to the offscreen allowlist or message router since this data flows through the existing getNetworkRequests path."
+    },
+    {
+      "id": "US-002",
+      "title": "Capture network response bodies via Network.getResponseBody",
+      "description": "As an AI agent reverse-engineering a webapp, I want to see response bodies from captured network requests so that I can understand the API response shapes and data structures without manually re-calling each endpoint.",
+      "acceptanceCriteria": [
+        "CapturedRequest interface includes an optional responseBody field (string | undefined)",
+        "network-capture.ts listens for CDP Network.loadingFinished events",
+        "On Network.loadingFinished, calls chrome.debugger.sendCommand(tabId, 'Network.getResponseBody', {requestId}) to fetch the response body",
+        "Response body is stored on the corresponding CapturedRequest",
+        "Response bodies exceeding 100KB are truncated with a '... (truncated)' suffix",
+        "Non-text MIME types (images, fonts, video, audio, wasm) are skipped — responseBody is left undefined for binary content",
+        "Failure to fetch response body (e.g., request was aborted) is handled gracefully — responseBody is left undefined, no crash",
+        "browser_get_network_requests returns responseBody in its response",
+        "get-network-requests.ts tool description mentions response bodies",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "This requires listening to a new CDP event: `Network.loadingFinished`. When this fires, it means the response body is available. Call `chrome.debugger.sendCommand({tabId}, 'Network.getResponseBody', {requestId})` to get it. The response contains `{body: string, base64Encoded: boolean}`. For text content, store `body` directly. For base64-encoded content where the MIME type is text-like (json, html, xml, javascript, css, text/*), decode it. For binary MIME types (image/*, font/*, video/*, audio/*, application/octet-stream, application/wasm), skip body capture entirely. The tricky part: Network.loadingFinished arrives AFTER Network.responseReceived, so the request may already be in the `requests` array. You'll need to either: (a) keep a Map<requestId, index> to find and update completed requests, or (b) delay moving requests from pending to completed until loadingFinished. Approach (a) is simpler. Add a `requestIdToIndex` map alongside pendingRequests. When responseReceived fires, push to requests[] and store the index. When loadingFinished fires, look up the index and set responseBody. Clean up the map entries when requests are shifted out due to maxRequests. Also need to clean up the map in getRequests when clear=true."
+    },
+    {
+      "id": "US-003",
+      "title": "Add browser_get_page_html tool",
+      "description": "As an AI agent inspecting a webapp's structure, I want to get the raw HTML of a page or a specific element so that I can understand the DOM structure, data attributes, and embedded scripts without writing custom JavaScript via execute_script.",
+      "acceptanceCriteria": [
+        "New file platform/mcp-server/src/browser-tools/get-page-html.ts defines the browser_get_page_html tool",
+        "Tool accepts tabId (required), selector (optional, defaults to 'html'), and maxLength (optional, defaults to 200000)",
+        "Tool returns { title, url, html } where html is the outerHTML of the matched element",
+        "HTML exceeding maxLength is truncated with a '... (truncated)' suffix",
+        "Tool is registered in the browser tools index (platform/mcp-server/src/browser-tools/index.ts)",
+        "Extension side: handleBrowserGetPageHtml handler added to browser-commands.ts",
+        "Extension side: 'browser.getPageHtml' added to the dispatch table in message-router.ts",
+        "Extension side: 'browser.getPageHtml' added to ALLOWED_METHODS in offscreen/index.ts",
+        "Tool description explains it returns raw HTML (not just visible text like browser_get_tab_content) and suggests use cases (DOM inspection, understanding page structure, finding data attributes and embedded data)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Follow the exact same pattern as browser_get_tab_content (get-tab-content.ts and its handler in browser-commands.ts). The only difference is using `outerHTML` instead of `innerText`. Key files to edit: (1) Create platform/mcp-server/src/browser-tools/get-page-html.ts using defineBrowserTool, (2) Add to the tools array in platform/mcp-server/src/browser-tools/index.ts, (3) Add handleBrowserGetPageHtml to browser-commands.ts — use chrome.scripting.executeScript with world: 'MAIN', return el.outerHTML, (4) Add 'browser.getPageHtml' entry to methodHandlers map in message-router.ts, (5) Add 'browser.getPageHtml' to ALLOWED_METHODS Set in offscreen/index.ts, (6) Import the new handler in message-router.ts. Default maxLength 200000 (200KB) is higher than get_tab_content's 50000 because HTML is more verbose than text."
+    },
+    {
+      "id": "US-004",
+      "title": "Add browser_get_storage tool for localStorage and sessionStorage",
+      "description": "As an AI agent investigating a webapp's authentication mechanism, I want to read localStorage and sessionStorage entries so that I can quickly discover auth tokens, session data, and app configuration without writing custom JavaScript.",
+      "acceptanceCriteria": [
+        "New file platform/mcp-server/src/browser-tools/get-storage.ts defines the browser_get_storage tool",
+        "Tool accepts tabId (required), storageType ('local' or 'session', defaults to 'local'), and key (optional — if provided, returns just that key's value; if omitted, returns all entries)",
+        "Tool returns { entries: Array<{key: string, value: string}>, count: number } when no key specified",
+        "Tool returns { key: string, value: string | null } when a specific key is requested",
+        "Values exceeding 10000 characters are truncated with '... (truncated)' suffix",
+        "Total response is capped at 500KB to prevent memory issues with large storage",
+        "Extension side: handler, dispatch table entry, and ALLOWED_METHODS entry all added",
+        "Tool description explains it reads web storage (localStorage/sessionStorage) and suggests use cases like finding auth tokens and app configuration",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Follow the same pattern as the other browser tools. Key implementation: use chrome.scripting.executeScript with world: 'MAIN' and a func that reads from `window.localStorage` or `window.sessionStorage`. The func should iterate all entries with a for loop over Object.keys() and return them. Files to create/edit: (1) Create platform/mcp-server/src/browser-tools/get-storage.ts, (2) Add to index.ts tools array, (3) Add handleBrowserGetStorage to browser-commands.ts, (4) Add 'browser.getStorage' to message-router.ts dispatch table, (5) Add 'browser.getStorage' to ALLOWED_METHODS in offscreen/index.ts. The method name on the wire is 'browser.getStorage'."
+    },
+    {
+      "id": "US-005",
+      "title": "Update network capture tool descriptions for discoverability",
+      "description": "As an AI agent, I want the network capture tool descriptions to clearly explain that request/response bodies are captured and how to use the tools for API discovery, so that I know to use these tools when reverse-engineering a webapp.",
+      "acceptanceCriteria": [
+        "browser_enable_network_capture description mentions it captures request bodies (POST data), response headers, and response bodies",
+        "browser_get_network_requests description mentions that each request includes requestBody and responseBody fields when available",
+        "browser_get_network_requests description suggests using urlFilter with '/api' to focus on API calls",
+        "Descriptions are accurate, concise, and helpful for an AI agent trying to understand a webapp's API",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Simple description updates in two files: (1) platform/mcp-server/src/browser-tools/enable-network-capture.ts — update the description string to mention request bodies and response bodies, (2) platform/mcp-server/src/browser-tools/get-network-requests.ts — update description to mention requestBody, responseBody fields and suggest urlFilter usage. These are the defineBrowserTool description fields. Keep descriptions concise but informative. The urlFilter parameter is on enable_network_capture, so the suggestion to filter '/api' should go there."
+    }
+  ]
+}

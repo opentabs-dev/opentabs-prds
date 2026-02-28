@@ -1,0 +1,94 @@
+## Codebase Patterns
+- Platform packages are in platform/, plugins in plugins/
+- File watcher pattern: watch directories (not files) on macOS, debounce at 200ms using `state.fileWatcherTimers`, check `fileWatcherGeneration` to discard stale callbacks
+- `getConfigDir()` reads `OPENTABS_CONFIG_DIR` env var, falling back to `~/.opentabs`
+- `performConfigReload` is the entry point for runtime config reloads (vs `performReload` for full hot reload)
+- `noopCallbacks` in file-watcher.test.ts must include all FileWatcherCallbacks fields
+- `reloadCore` is the shared reload logic — file watchers are always restarted at the end regardless of success/failure
+- `SIDE_PANEL_METHODS` in message-router.ts gates which notifications reach the side panel — async handlers (handleSyncFull, handlePluginUpdate) must call `forwardToSidePanel` directly
+- Side panel App.tsx uses `loadPluginsRef.current()` for stable plugin refetch — new notification handlers should use this ref pattern
+- Config watcher E2E tests don't need browser context — MCP server + MCP client only, making them fast (~500ms)
+- Always wait for `Config watcher: Watching` log before writing config changes in E2E tests
+- Side panel E2E: open as regular tab at `chrome-extension://<id>/side-panel/side-panel.html`, NOT via chrome.sidePanel.open()
+- App.tsx has a ws:message/sync.full fallback for side panel live-updates (forwardToSidePanel doesn't reach regular tabs in headless)
+
+---
+
+## 2026-02-17 - US-001
+- Implemented config.json file watcher in MCP server
+- Files changed:
+  - platform/mcp-server/src/state.ts — added `configWatcher: FSWatcher | null` field to ServerState and createState
+  - platform/mcp-server/src/file-watcher.ts — added `onConfigChanged` to FileWatcherCallbacks, added `startConfigWatching()` function, updated `stopFileWatching()` to close config watcher, exported `startConfigWatching`
+  - platform/mcp-server/src/reload.ts — imported `startConfigWatching`, wired `onConfigChanged` callback to call `performConfigReload`, called `startConfigWatching` alongside `startFileWatching` in `reloadCore`
+  - platform/mcp-server/src/file-watcher.test.ts — added `onConfigChanged` to `noopCallbacks`
+- **Learnings for future iterations:**
+  - The debounce key for config watching is just `'config'` (no directory prefix needed since there's only one config)
+  - `startConfigWatching` is called separately from `startFileWatching` (not merged into it) to maintain single-responsibility
+  - The config watcher is closed in both `stopFileWatching` and at the start of `startConfigWatching` (defensive cleanup)
+---
+
+## 2026-02-17 - US-002
+- Implemented plugins.changed notification to side panel after sync.full and plugin.update
+- Files changed:
+  - platform/browser-extension/src/message-router.ts — added 'plugins.changed' to SIDE_PANEL_METHODS set, added forwardToSidePanel call at end of handleSyncFull and handlePluginUpdate
+  - platform/browser-extension/src/side-panel/App.tsx — added handler for 'plugins.changed' notification that calls loadPluginsRef.current() to refetch plugin list
+- **Learnings for future iterations:**
+  - `SIDE_PANEL_METHODS` controls which JSON-RPC methods are forwarded to the side panel via `forwardToSidePanel` — adding a method here is required for the side panel to receive it
+  - The `handleServerMessage` function in message-router.ts handles forwarding to the side panel based on `SIDE_PANEL_METHODS`, but `handleSyncFull` and `handlePluginUpdate` are async handlers that run outside that flow — so they must call `forwardToSidePanel` directly
+  - The `loadPluginsRef` pattern in App.tsx provides a stable reference to `loadPlugins` that won't cause effect re-runs — new notification handlers should use `loadPluginsRef.current()` rather than `loadPlugins` directly
+  - When adding a new `plugins.changed` handler in App.tsx, place it before `tab.stateChanged` and return early with `sendResponse({ ok: true })` — the existing pattern has each handler returning early
+---
+
+## 2026-02-17 - US-003
+- Added unit tests for config file watcher in platform/mcp-server/src/file-watcher.test.ts
+- Files changed:
+  - platform/mcp-server/src/file-watcher.test.ts — added `describe('config file watcher')` block with 5 tests
+- Tests cover:
+  - `startConfigWatching` sets `configWatcher` on state
+  - `stopFileWatching` closes config watcher and sets it to null
+  - `startConfigWatching` closes previous watcher before creating a new one
+  - Debounce: rapid config.json changes result in only one callback
+  - Stale generation: callback is discarded when `fileWatcherGeneration` changes between trigger and timer fire
+- **Learnings for future iterations:**
+  - Use `OPENTABS_CONFIG_DIR` env var to point `getConfigDir()` at a temp directory for config watcher tests
+  - Save/restore `Bun.env.OPENTABS_CONFIG_DIR` in afterEach to avoid polluting other tests
+  - Config watcher captures `fileWatcherGeneration` at start time — to test stale callback rejection, start watcher at gen 0, write config.json, then bump `state.fileWatcherGeneration++` before debounce fires
+  - FS event delivery + debounce needs ~500ms total wait in tests (macOS FSEvents can be slow)
+---
+
+## 2026-02-17 - US-004
+- Added E2E test for config.json auto-discovery in e2e/config-watcher.e2e.ts
+- Files changed:
+  - e2e/config-watcher.e2e.ts — new file with 4 E2E tests in a single describe block
+- Tests cover:
+  - Empty config → add plugin path → tools auto-appear in tools/list
+  - Config with plugin → remove plugin path → tools auto-disappear
+  - Add second plugin via config → both plugins' tools present
+  - Config watcher survives hot reload and detects subsequent changes
+- **Learnings for future iterations:**
+  - Config watcher E2E tests don't need extension/browser context — only MCP server + MCP client
+  - Wait for `Config watcher: Watching` log before writing config changes (ensures watcher is set up)
+  - `waitForToolList` polling is the best pattern for config watcher tests — avoids timing issues with debounce + FSEvents
+  - `createMinimalPlugin` from fixtures.ts can create lightweight test plugins for multi-plugin config tests
+  - Config watcher tests run fast (~500ms each) since they only need MCP server, not browser
+---
+
+## 2026-02-17 - US-005
+- Added E2E test for side panel live-updates when plugins change
+- Files changed:
+  - e2e/side-panel-live-update.e2e.ts — new file with 2 E2E tests (add plugin, remove plugin)
+  - platform/browser-extension/src/side-panel/App.tsx — added ws:message/sync.full fallback listener so side panel detects plugin changes when opened as a regular extension tab
+  - e2e/tsconfig.json — added "chrome" to types array for chrome.* API type definitions in E2E tests
+  - knip.ts — removed @types/chrome from ignoreDependencies (now detected through tsconfig)
+- Tests cover:
+  - Side panel shows "No plugins installed" → add plugin via config.json → side panel shows "E2E Test" plugin card
+  - Side panel shows "E2E Test" plugin card → remove plugin via config.json → side panel shows "No plugins installed"
+- **Learnings for future iterations:**
+  - Side panel E2E testing: open the side panel by navigating to `chrome-extension://<id>/side-panel/side-panel.html` in a regular tab
+  - `getExtensionId()` extracts the extension ID from the background service worker URL pattern
+  - chrome.runtime.sendMessage from a service worker (forwardToSidePanel) does NOT reliably reach extension pages opened as regular tabs in headless Chromium — this is why the ws:message/sync.full fallback was added to App.tsx
+  - The offscreen document's ws:message broadcasts ARE reliably delivered to all extension contexts (pages and service workers)
+  - Side panel tests need the adapter symlink setup (configDir/extension/adapters → extensionDir/adapters) for the extension to process adapter IIFEs
+  - The `waitForLog(server, 'Config watcher: Watching')` pattern is essential before writing config changes
+  - Side panel `fetchConfigState()` goes through bg:send → MCP server → response via sp:serverMessage (which IS delivered reliably for responses since they're forwarded synchronously in handleServerMessage)
+---

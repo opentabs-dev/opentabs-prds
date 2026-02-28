@@ -1,0 +1,88 @@
+# Ralph Progress Log
+PRD: prd-2026-02-27-145226-mcp-server-audit-fixes~running.json
+Started: Fri Feb 27 22:52:56 UTC 2026
+---
+
+## Codebase Patterns
+- `.catch(() => {})` inside `Promise.allSettled()` maps all rejections to fulfilled results, making any subsequent `result.status === 'rejected'` check dead code. Remove the catch and let allSettled capture rejections directly.
+- `platformExec` from `@opentabs-dev/shared` wraps command names for Windows compatibility (e.g., `npm` → `npm.cmd`). Always use it instead of bare command strings.
+- The `spawnAsync` helper in `plugin-management.ts` (line 64) demonstrates the canonical async spawn pattern with kill handle used in the MCP server.
+- When mocking `child_process.spawn` in tests, use `PassThrough` streams (not `Readable.from`) for stdout/stderr to ensure data listeners are attached before data is pushed. Push data and emit 'close' via `process.nextTick`.
+- `checkForUpdates` in `version-check.ts` is called from both `reload.ts` (performReload) and `plugin-management.ts` (checkPluginUpdates). Both callers are async and must `await` the result.
+- Mutex pattern for serialized async writes: `const p = (async () => { await prev; ... })(); state.mutex = p.catch(() => {}); await p;` — the catch ensures the mutex chain always fulfills (no deadlock), while `await p` propagates errors to the caller.
+
+## 2026-02-27T22:58:00Z - US-001
+- Replaced synchronous `spawnSync` with async `spawn` in `fetchLatestVersion`, adding a 10s timeout per query
+- Made `checkForUpdates` async using `Promise.allSettled` for concurrent npm registry queries
+- Added `platformExec('npm')` for Windows compatibility (was bare `'npm'` string)
+- Updated `reload.ts` and `plugin-management.ts` callers to await the async function
+- Rewrote test mocks from `spawnSync` to async `spawn` pattern using `PassThrough` streams
+- Files changed: `platform/mcp-server/src/version-check.ts`, `platform/mcp-server/src/version-check.test.ts`, `platform/mcp-server/src/reload.ts`, `platform/mcp-server/src/plugin-management.ts`
+- **Learnings for future iterations:**
+  - When changing a function from sync to async, search all callers (use grep for function name) — there may be callers beyond what the PRD notes mention (e.g., `plugin-management.ts` was not in the PRD notes but called `checkForUpdates`)
+  - Lint catches floating promises immediately (`@typescript-eslint/no-floating-promises`), so running lint after changing a function to async quickly reveals missed `await` sites
+  - `Readable.from()` in test mocks is unreliable for `on('data')` patterns because it may emit before listeners attach; use `PassThrough` + `process.nextTick` writes instead
+---
+
+## 2026-02-27T23:02:00Z - US-002
+- Converted `searchNpmPlugins` in `plugin-management.ts` from sync (`spawnSync`) to async using the existing `spawnAsync` helper with a 60s timeout (matching `runNpmGlobal`'s pattern)
+- Removed `spawnSync` import — no longer used in the file
+- Made `handlePluginSearch` in `extension-handlers.ts` async and added `await` to the `searchNpmPlugins` call
+- Updated call site in `extension-protocol.ts` line 401 to use `void handlePluginSearch(...)` (matching the other async plugin management handlers)
+- Files changed: `platform/mcp-server/src/plugin-management.ts`, `platform/mcp-server/src/extension-handlers.ts`, `platform/mcp-server/src/extension-protocol.ts`
+- **Learnings for future iterations:**
+  - No existing unit tests covered `searchNpmPlugins` or `handlePluginSearch`, so no test changes were needed
+  - The `runNpmGlobal` function is the canonical pattern for async npm subprocesses with timeout in this file — new async npm callers should follow it exactly
+  - In `extension-protocol.ts`, all async plugin management handlers use `void handler(...)` to intentionally fire-and-forget (errors are handled internally via `sendPluginManagementError`)
+---
+
+## 2026-02-27T23:05:00Z - US-003
+- Removed `.catch(() => {})` from three `Promise.allSettled` calls in `adapter-files.ts`
+- `writeAdapterFile` old-file cleanup (line 74): removed `.catch(() => {})` — results not inspected, allSettled still swallows individual rejections safely
+- `cleanupStaleAdapterFiles` (line 132): removed `.catch(() => {})` — the existing `result.status === 'rejected'` check and warning log are now reachable
+- `cleanupStaleExecFiles` (lines 219-220): removed `.catch(() => {})`, captured results, changed log to count only fulfilled results (actual successes) instead of total attempted
+- No test changes were needed — existing tests don't test rejection paths and all 2081 tests passed
+- Files changed: `platform/mcp-server/src/adapter-files.ts`
+- **Learnings for future iterations:**
+  - `.catch(() => {})` chained to an individual promise inside `Promise.allSettled()` always produces `status: 'fulfilled'` — any downstream `status === 'rejected'` check is unreachable dead code
+  - The pattern to fix: remove per-item `.catch()`, let `allSettled` capture real rejections; if you truly want to ignore all failures use `.catch(() => {})` on the outer `Promise.all()` call instead
+  - `cleanupStaleExecFiles` had a subtle logic bug: it logged `staleExecFiles.length` (total) instead of actual successes; after the fix it counts `results.filter(r => r.status === 'fulfilled').length`
+---
+
+## 2026-02-27T23:09:00Z - US-004
+- Fixed `saveConfig` and `saveToolConfig` mutex pattern that silently swallowed write errors
+- The bug: `state.configWriteMutex` was reassigned to `Promise.resolve()` inside a `.catch()` handler before re-throwing, so the `await state.configWriteMutex` on the final line always resolved successfully — the re-thrown error became an unhandled rejection
+- Fix: store the write promise in a local `writePromise` variable; set `state.configWriteMutex = writePromise.catch(() => {})` so the mutex chain always fulfills (preventing deadlock); await `writePromise` directly so the caller receives the rejection
+- Added 4 tests verifying error propagation and mutex recovery for both `saveConfig` and `saveToolConfig`
+- Updated comment in `http-routes.ts` call site (was "Error already logged by saveToolConfig" — no longer accurate since logging was removed from the catch handler)
+- Files changed: `platform/mcp-server/src/config.ts`, `platform/mcp-server/src/config.test.ts`, `platform/mcp-server/src/http-routes.ts`
+- **Learnings for future iterations:**
+  - When a promise is stored in a mutable variable and then awaited, be aware that `.catch()` handlers run before the `await` reads the variable — the variable may have been reassigned by the handler
+  - The correct mutex pattern: `const p = (async () => { ... })(); state.mutex = p.catch(() => {}); await p;` — this separates error swallowing (for the chain) from error propagation (for the caller)
+  - To test file write failures, make the parent directory non-writable (`chmod 0o555`) rather than the file itself — on Linux, `rename()` succeeds over a read-only file if the directory is writable
+---
+
+## 2026-02-27T23:12:00Z - US-005
+- Moved `disableNetworkCapture` from the main try block (after `getNetworkRequests`) into the `finally` block before `closeTab`
+- Wrapped `disableNetworkCapture` in its own try-catch in the `finally` block so a capture-disable failure doesn't prevent tab cleanup
+- Removed the old "Step 6: Disable network capture" comment and call at line 952; renumbered subsequent steps (7→6, 8→7, 9→8)
+- No test file changes required — no existing unit tests cover `analyzeSite` directly
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site/index.ts`
+- **Learnings for future iterations:**
+  - `analyzeSite` has a long try/finally block (lines 825–1014); the `finally` already had best-effort `closeTab` — the pattern of wrapping each cleanup step in its own try-catch is established here
+  - Resource cleanup order matters: `disableNetworkCapture` must run before `closeTab` since closing the tab may destroy the CDP session context needed to disable capture
+---
+
+## 2026-02-27T23:17:00Z - US-006
+- Changed `browser.openTab` to open `about:blank` instead of the target URL
+- Enabled network capture on the blank tab before navigating
+- Added `browser.navigateTab` call after enabling capture to navigate to the target URL
+- The wait timer now starts after navigation, so it waits for the target page to load (unchanged from user perspective — it was already after capture enable)
+- Updated the function's JSDoc comment to reflect the new 9-step flow
+- Renumbered inline step comments (5–8) to match the updated flow
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site/index.ts`
+- **Learnings for future iterations:**
+  - `browser.navigateTab` (`dispatchToExtension(state, 'browser.navigateTab', { tabId, url })`) already exists — no extension changes needed
+  - `safeUrl` Zod schema (http/https only) applies only to MCP tool schema validation, not to direct `dispatchToExtension` calls — so using `about:blank` internally is safe
+  - `tsc --build --noEmit` may fail with TS6310 errors when build artifacts are stale; running `tsc --build` (emit mode) first populates the `.d.ts` files, after which `--noEmit` mode passes. This is a TypeScript project references behavior, not a code error.
+---

@@ -1,0 +1,69 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix concrete bugs, resource leaks, and dead code discovered during a thorough audit of the Chrome extension (platform/browser-extension/).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix confirmation badge count permanently stuck when timeoutMs is zero or negative",
+      "description": "As a user, I want the extension badge count to always reflect the actual number of pending confirmations so that I am not confused by a stale badge that never clears.",
+      "acceptanceCriteria": [
+        "When notifyConfirmationRequest receives a confirmation with timeoutMs <= 0, the badge count is not permanently elevated",
+        "Either a background timeout is always set (using a minimum fallback like 30s) OR the badge is decremented immediately when no timeout is configured",
+        "Existing behavior for confirmations with valid timeoutMs > 0 is preserved",
+        "Unit test covers the timeoutMs <= 0 edge case",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/confirmation-badge.ts\n\nThe bug is at lines 37 and 48. `notifyConfirmationRequest()` unconditionally increments `pendingConfirmationCount` on line 37, but the background timeout that calls `clearConfirmationBadge()` (which decrements by 1) is only created when `timeoutMs > 0` (line 48). If a confirmation request arrives with `timeoutMs` of 0 or a negative number, the count is incremented but never decremented — the badge stays elevated permanently until `clearAllConfirmationBadges()` is called on disconnect.\n\nThe fix should ensure every increment has a matching decrement. Two approaches:\n1. Always set a background timeout, using a sensible minimum (e.g., `Math.max(timeoutMs, 30_000)`) so the badge self-clears even for edge-case values.\n2. Skip incrementing the badge when timeoutMs <= 0 (unlikely to happen in practice, but defensive).\n\nApproach 1 is preferred since it matches the existing pattern and the notification/badge should still show for a reasonable time.\n\nTest file: platform/browser-extension/src/confirmation-badge.test.ts — add a test that calls `notifyConfirmationRequest` with `timeoutMs: 0` and verifies the badge is eventually cleared."
+    },
+    {
+      "id": "US-002",
+      "title": "Clear pendingRequests map when getRequests is called with clear=true",
+      "description": "As a developer using browser.getNetworkRequests with clear=true, I want all capture state to be reset so that subsequent reads do not contain stale data from before the clear.",
+      "acceptanceCriteria": [
+        "getRequests(tabId, true) clears state.pendingRequests in addition to state.requests and state.requestIdToRequest",
+        "After clear, a Network.responseReceived event for a previously-pending request does not add an entry to the requests array",
+        "getRequests(tabId, false) does NOT clear pendingRequests (existing behavior preserved)",
+        "Unit test covers the pendingRequests cleanup on clear=true",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/network-capture.ts\n\nThe bug is at lines 397-410. The `getRequests()` function clears `state.requests` (line 407) and `state.requestIdToRequest` (line 408) when `clear=true`, but does not clear `state.pendingRequests` (a Map<string, Partial<CapturedRequest>>). This means in-flight requests that were pending at the time of the clear will still have entries in pendingRequests. When their Network.responseReceived event fires, the handler at line 198 finds the pending entry, creates a completed CapturedRequest, and pushes it to state.requests — but the caller expected a clean slate after the clear.\n\nFix: Add `state.pendingRequests.clear()` alongside the existing clear logic at line 408:\n```typescript\nif (clear) {\n  state.requests = [];\n  state.pendingRequests.clear();\n  state.requestIdToRequest.clear();\n}\n```\n\nTest file: platform/browser-extension/src/network-capture.test.ts — add a test that starts capture, triggers requestWillBeSent (but no responseReceived), calls getRequests(tabId, true), then triggers responseReceived, and verifies the requests array is still empty."
+    },
+    {
+      "id": "US-003",
+      "title": "Remove dead code: teardownAdapterInTab",
+      "description": "As a maintainer, I want dead code removed from the codebase so that it does not confuse future readers or create false test coverage.",
+      "acceptanceCriteria": [
+        "teardownAdapterInTab function is removed from iife-injection.ts",
+        "teardownAdapterInTab is removed from the export list in iife-injection.ts",
+        "The test describe block for teardownAdapterInTab is removed from iife-injection.test.ts",
+        "The vi.fn() mock for teardownAdapterInTab is removed from message-router.test.ts (if present in the mock object)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/iife-injection.ts (lines 259-282)\n\nThe `teardownAdapterInTab` function calls an adapter's teardown() function and is exported (line 547). However, it has ZERO production call sites. The only references are:\n- Its definition and export in iife-injection.ts\n- Tests in iife-injection.test.ts (lines 203-227) that directly test the function\n- A vi.fn() mock in message-router.test.ts (line 198)\n\nThe actual teardown logic used in production is inline in `cleanupAdaptersInMatchingTabs` (lines 453-508), which has its own inline teardown call. The comment at line 379 explicitly says 'we do NOT call teardownAdapterInTab here'.\n\nThis is confirmed dead code. Remove the function, its export, and its test coverage. Check if removing it from message-router.test.ts mock causes any test issues — the mock may be required by the vi.mock factory even if the function is never called in the test."
+    }
+  ]
+}

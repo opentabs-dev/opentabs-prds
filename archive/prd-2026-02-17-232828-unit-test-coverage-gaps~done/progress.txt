@@ -1,0 +1,221 @@
+# Ralph Progress Log
+PRD: prd-2026-02-17-232828-unit-test-coverage-gaps~running.json
+Started: Wed Feb 18 00:54:39 PST 2026
+---
+
+## Codebase Patterns
+- Test files follow `describe`/`test` blocks with `bun:test` imports (`describe`, `expect`, `test`)
+- Test files use `.js` extension in imports (e.g., `'./manifest-schema.js'`) matching ES Module resolution
+- Existing test file at `manifest-schema.test.ts` already existed with basic tests — extend rather than replace
+- Use `as unknown as Record<string, unknown>` for type-casting through `unknown` when TypeScript complains about insufficient overlap
+- Run `bun run lint:fix` to auto-fix Prettier formatting issues before manual fixes
+- `z.looseObject()` in Zod schemas allows extra fields to pass through validation
+- To export functions from a file that uses a single named export statement, add the new names to that export list
+- For picocolors-wrapped strings, test with `toContain(rawString)` rather than exact match (avoids ANSI code brittleness)
+- `DOMException` is available globally in Bun — use `new DOMException(message, name)` for timeout tests
+- ESLint `import-x/consistent-type-specifier-style` requires top-level `import type { X }` — not inline `import { type X }`
+- ESLint `import-x/order` requires value imports from the same module grouped together, before `bun:test` — don't split type/value imports from the same module
+- For Chrome API mocks in browser-extension tests, use `(globalThis as Record<string, unknown>).chrome = { ... }` pattern — avoid deeply nested Record casts
+- Bun's `bun:test` supports Jest-compatible fake timer APIs: `jest.useFakeTimers()`, `jest.advanceTimersByTime(ms)`, `jest.useRealTimers()`
+- `defineBrowserTool` returns the config object directly — access handler as `toolObj.handler(args, state)`
+- For mocking `WsHandle`, provide both `send` and `close` methods even if only `send` is tested
+- ESLint `no-non-null-assertion` forbids `!` — use `as string` (or appropriate type) instead
+- `mock.module` from `bun:test` enables module-level mocking — must be awaited, and the module under test must be imported via `await import()` after the mock is set up
+- **CRITICAL: `mock.module` is process-global** — it replaces modules for ALL test files in the same `bun test` run. Only mock modules that do NOT have their own test files to avoid contamination.
+- For modules with their own test files that a tested module depends on, provide Chrome API stubs via `globalThis.chrome` so the real implementations work during async handler execution
+- For testing error paths, use try/catch with `let caught: Error | undefined` to avoid ESLint `await-thenable` and `no-confusing-void-expression` issues with `expect().rejects.toThrow()`
+- For functions that read from disk (like `loadPluginFromDir`), use real temp directories with `mkdtempSync` — no module mocking needed
+- `scaffoldPlugin` resolves relative to `process.cwd()` — tests must `process.chdir()` and set `OPENTABS_CONFIG_DIR` to isolate
+- `generatePluginIndex` uses `JSON.stringify()` producing double quotes — test URL patterns with `toContain('*://example.com/*')` not with quoted single quotes
+---
+
+## 2026-02-18 - US-001
+- Added comprehensive unit tests for `parseManifest` in `platform/mcp-server/src/manifest-schema.test.ts`
+- Extended existing test file (which had basic tests + description length limit tests) with 14 new test cases
+- Tests cover: missing required fields (name, version, description) with path-specific errors, empty url_patterns/tools arrays, missing tool fields (name, description, input_schema, output_schema), extra fields via looseObject, optional displayName/adapterHash, and sourcePath in error messages
+- Files changed: `platform/mcp-server/src/manifest-schema.test.ts`
+- **Learnings for future iterations:**
+  - The test file already existed from a prior story (US-004/US-005) — always read existing files before writing
+  - TypeScript strict mode rejects `as Record<string, unknown>` on typed interfaces — must cast through `unknown` first
+  - Prettier reformats multiline `.toThrow()` args to single line when they fit — let lint:fix handle it
+---
+
+## 2026-02-18 - US-002
+- Added unit tests for `isConnectionRefused` in `platform/cli/src/config.test.ts`
+- Added 7 test cases in a new `describe('isConnectionRefused')` block
+- Tests cover: TypeError with ECONNREFUSED cause (true), TypeError without cause (false), TypeError with different code (false), non-TypeError Error (false), plain string (false), null (false), undefined (false)
+- Files changed: `platform/cli/src/config.test.ts`
+- **Learnings for future iterations:**
+  - `TypeError` constructor supports `{ cause }` option natively in Bun — no need for `Object.defineProperty` workaround
+  - The existing config.test.ts imports are on a single line — add new imports in alphabetical order
+---
+
+## 2026-02-18 - US-003
+- Exported `formatUptime`, `colorTabState`, and `isTimeout` from `platform/cli/src/commands/status.ts`
+- Created new test file `platform/cli/src/commands/status.test.ts` with 14 test cases across 3 describe blocks
+- `formatUptime` tests: 0s, 30s, 59s boundary, 60s, 90s, 3599s boundary, 3600s, 7200s, 86399s boundary, 86400s, multi-day
+- `colorTabState` tests: 'ready' (green), 'unavailable' (yellow), 'closed' (dim), unknown string (dim)
+- `isTimeout` tests: DOMException TimeoutError (true), DOMException AbortError (false), regular Error (false), non-Error values (false)
+- Files changed: `platform/cli/src/commands/status.ts`, `platform/cli/src/commands/status.test.ts`
+- **Learnings for future iterations:**
+  - `platform/cli/tsconfig.test.json` already covers `src/**/*.test.ts` — subdirectory test files (like `commands/status.test.ts`) are automatically included
+  - The existing `status.ts` uses a single `export { ... }` statement at the bottom — add new exports there
+  - `DOMException` is globally available in Bun, no imports needed
+---
+
+## 2026-02-18 - US-004
+- Exported `checkExtensionConnected`, `checkBunVersion`, and `CheckResult` type from `platform/cli/src/commands/doctor.ts`
+- Created new test file `platform/cli/src/commands/doctor.test.ts` with 5 test cases across 2 describe blocks
+- `checkExtensionConnected` tests: null data (warn), extensionConnected=true (pass), extensionConnected=false (warn), missing extensionConnected field (warn)
+- `checkBunVersion` tests: returns pass with current Bun.version
+- Files changed: `platform/cli/src/commands/doctor.ts`, `platform/cli/src/commands/doctor.test.ts`
+- **Learnings for future iterations:**
+  - The PRD notes described `CheckResult` as `{ status: 'pass'|'warn'|'fail' }` but the actual type uses `{ ok: boolean, fatal: boolean }` — always read the source before writing tests
+  - doctor.ts uses a single export statement `export { registerDoctorCommand }` — add new exports to that same statement, and use `export type { ... }` for type-only exports
+  - The ESLint `import-x/consistent-type-specifier-style` rule requires top-level type-only imports (`import type { X } from ...`) rather than inline (`import { type X }`) — use `lint:fix` to auto-correct
+  - The `import-x/order` rule requires value imports from the same module to be grouped before `bun:test` imports — don't split a module's type import and value import into separate statements
+---
+
+## 2026-02-18 - US-005
+- Exported `determineTrustTier` from `platform/mcp-server/src/discovery.ts` by adding it to the existing export statement
+- Added 6 test cases in a new `describe('determineTrustTier')` block in `platform/mcp-server/src/discovery.test.ts`
+- Tests cover: isLocal=true with package name (local), isLocal=true with null (local), @opentabs-dev scoped (official), unscoped package (community), null package name not local (community), non-opentabs-dev scoped (community)
+- Files changed: `platform/mcp-server/src/discovery.ts`, `platform/mcp-server/src/discovery.test.ts`
+- **Learnings for future iterations:**
+  - discovery.ts uses a single `export { ... }` statement at line 477 — add new exports alphabetically to that list
+  - The existing discovery.test.ts already imports and tests `pluginNameFromPackage` and `checkBrowserToolReferences` — add new imports to the existing import line
+  - `determineTrustTier` is a simple pure function with 3 branches — straightforward to test with no mocking needed
+---
+
+## 2026-02-18 - US-006
+- Created new test file `platform/mcp-server/src/browser-tools/reload-extension.test.ts` with 5 test cases
+- Tests cover: extensionWs is null (error), ws.send succeeds (success with reload signal), ws.send throws (error), nextRequestId increments after send, specific numeric id appears in JSON-RPC message
+- Used `createState()` from state.ts to create real state objects, with mock `WsHandle` objects for the WebSocket
+- Files changed: `platform/mcp-server/src/browser-tools/reload-extension.test.ts`
+- **Learnings for future iterations:**
+  - `defineBrowserTool` returns the config object directly — handler is at `reloadExtension.handler`
+  - `WsHandle` interface requires both `send` and `close` methods — mock both even if only `send` is used
+  - Use `as string` type assertion instead of `!` non-null assertion to satisfy ESLint `no-non-null-assertion` rule
+  - Browser tool handlers take `(args, state)` and return `Promise<unknown>` — the handler for reloadExtension uses synchronous logic wrapped in `Promise.resolve()`
+  - Bun's `bun:test` supports `jest.useFakeTimers()` and `jest.advanceTimersByTime(ms)` for testing timer-based logic
+  - Always call `jest.useRealTimers()` in `afterEach` when using fake timers to avoid leaking into other tests
+---
+
+## 2026-02-18 - US-007
+- Added 6 new tests to `platform/browser-extension/src/side-panel/bridge.test.ts`
+- `setAllToolsEnabled` tests: verifies JSON-RPC message has method `config.setAllToolsEnabled` with `{ plugin, enabled }` params for both enable (true) and disable (false) cases
+- `request timeout` tests: verifies a request that never gets a response rejects after 30000ms with "timed out" message, and that the pending request is cleaned up from the internal map after timeout
+- Used `jest.useFakeTimers()` and `jest.advanceTimersByTime(30_000)` to test the 30-second timeout without actually waiting
+- Files changed: `platform/browser-extension/src/side-panel/bridge.test.ts`
+- **Learnings for future iterations:**
+  - Bun's `bun:test` supports Jest-compatible fake timer APIs (`jest.useFakeTimers()`, `jest.advanceTimersByTime()`, `jest.useRealTimers()`)
+  - The existing bridge.test.ts has utility functions (`cleanupPending`, `expectRejection`, `getLastRequestId`) that simplify writing new test cases — reuse them
+  - `setAllToolsEnabled` follows the same `sendRequest` pattern as `setToolEnabled` — the tests follow the same pattern too
+  - Import `afterEach` and `jest` from `bun:test` when using fake timers
+---
+
+## 2026-02-18 - US-008
+- Added 7 new tests in a `describe('findAllMatchingTabs')` block in `platform/browser-extension/src/tab-matching.test.ts`
+- Tests cover: active+focused ranked first, active-only ranked above focused-only, inactive unfocused ranked last, deduplication across multiple URL patterns, empty result when no tabs match, single tab returned without sorting, skipping patterns that throw errors
+- Set up Chrome API mocks (`chrome.tabs.query`, `chrome.windows.getLastFocused`) in `beforeEach` using `globalThis` cast pattern from plugin-storage.test.ts
+- Files changed: `platform/browser-extension/src/tab-matching.test.ts`
+- **Learnings for future iterations:**
+  - `findAllMatchingTabs` delegates URL matching to `chrome.tabs.query` (not the pure `matchPattern` function), so tests must mock Chrome APIs
+  - The `(globalThis as Record<string, unknown>).chrome = { ... }` pattern (from plugin-storage.test.ts) works for setting up Chrome API mocks
+  - For deeply nested mock types, avoid multi-level `Record<string, Record<...>>` casts — cast to `Record<string, unknown>` at the top level and rebuild the entire mock object
+  - `chrome.tabs.Tab` type requires casting via `as chrome.tabs.Tab` since only `id`, `active`, `windowId` are needed for ranking tests
+  - The ranking logic only activates when >1 tab matches (early return for 0 or 1 tabs) — test the single-tab case separately
+---
+
+## 2026-02-18 - US-009
+- Added 16 unit tests for `EXTENSION_COPY_EXCLUDE_PATTERN` in `platform/shared/src/validation.test.ts`
+- Tests organized into 3 describe blocks: directory-segment exclusions (node_modules, src, .git), tsconfig exclusions (require path separator prefix), and paths that should NOT be excluded
+- Directory-segment tests cover: `node_modules`, `node_modules/foo`, `src`, `src/background.ts`, `.git`, `.git/objects`
+- Tsconfig tests cover: `sub/tsconfig.json`, `sub/tsconfig.base.json`, `sub/tsconfig.test.json` (all require a path separator before `tsconfig`)
+- Non-excluded tests cover: `dist`, `dist/background.js`, `manifest.json`, `icons`, `icons/icon-128.png`, `side-panel`, `side-panel/index.html`
+- Files changed: `platform/shared/src/validation.test.ts`
+- **Learnings for future iterations:**
+  - The `EXTENSION_COPY_EXCLUDE_PATTERN` regex has two alternations: one for directory segments (`node_modules`, `src`, `.git`) that match at start or after separator, and one for `tsconfig*` that requires a leading path separator (`[\\/]tsconfig`)
+  - Root-level `tsconfig.json` (without leading separator) does NOT match the pattern — only subdirectory tsconfig files match. This is how `cpSync` filter works: `relative()` produces paths without leading separators
+  - The existing validation.test.ts already imports multiple items from `./index.js` — Prettier keeps the import on a single line if it fits within the line width
+  - Always verify regex behavior empirically before writing tests — acceptance criteria may be based on assumptions about regex behavior that don't match reality
+---
+
+## 2026-02-18 - US-010
+- Created new test file `platform/mcp-server/src/browser-tools/execute-script.test.ts` with 3 test cases
+- Tests cover: deleteExecFile called with correct filename on success, deleteExecFile called even when dispatchToExtension throws (finally contract), filename from writeExecFile passed as execFile param to dispatchToExtension
+- Used `mock.module` from `bun:test` to mock `../extension-protocol.js` — this is the first use of module mocking in the codebase
+- Used `await import()` after `mock.module` to ensure the mocked dependencies are picked up
+- Files changed: `platform/mcp-server/src/browser-tools/execute-script.test.ts`
+- **Learnings for future iterations:**
+  - `mock.module` from `bun:test` enables module-level mocking — call it before importing the module under test, and use `await import()` (dynamic import) for the module under test
+  - **CRITICAL: `mock.module` is global** — it replaces the module in the process-wide registry, contaminating ALL test files in the same `bun test` run. Only mock modules that do NOT have their own test files.
+  - `mock.module` returns a Promise that must be awaited to satisfy ESLint `@typescript-eslint/no-floating-promises`
+  - For testing error paths with try/catch (instead of `expect().rejects.toThrow()`), use a `let caught: Error | undefined` pattern to avoid ESLint `@typescript-eslint/await-thenable` and `@typescript-eslint/no-confusing-void-expression` issues
+  - The `executeScript` handler uses `void deleteExecFile(filename)` in the finally block — fire-and-forget, so the test just verifies `deleteExecFile` was called (not that its promise was awaited)
+  - Long mock function type annotations should be broken across lines to satisfy Prettier's line width limit
+---
+
+## 2026-02-18 - US-011
+- Added 24 new tests in a `describe('handleServerMessage')` block in `platform/browser-extension/src/message-router.test.ts`
+- Tests organized into 7 describe blocks: sync.full routing, plugin.update routing, plugin.uninstall routing, tool.dispatch routing, browser command routing, unrecognized method handling, side panel forwarding
+- Mocked `messaging.js`, `tool-dispatch.js`, and `browser-commands.js` using `mock.module` — carefully avoided mocking `plugin-storage.js` which has its own test file
+- Provided Chrome API stubs via `globalThis.chrome` so that real `plugin-storage`, `iife-injection`, and `tab-state` modules work during async handler execution
+- Tests verify: sync.full dispatches without error, plugin.update dispatches, plugin.uninstall with/without id, tool.dispatch delegates to handleToolDispatch, all 5 browser commands route correctly, -32601 for unrecognized method with id, side panel forwarding for tab.stateChanged/tool.invocationStart/tool.invocationEnd/plugins.changed, no forwarding for sync.full/tool.dispatch/plugin.update, response messages (id without method) forwarded
+- Files changed: `platform/browser-extension/src/message-router.test.ts`
+- **Learnings for future iterations:**
+  - `mock.module` in Bun is process-global — it replaces modules for ALL test files in the same `bun test` run. Mocking `plugin-storage.js` broke `plugin-storage.test.ts` (24 tests failed). The fix was to only mock modules without their own test files.
+  - For modules you can't mock (they have test files), provide Chrome API stubs at `globalThis.chrome` so their real implementations execute without errors during async handler fire-and-forget calls
+  - `handleServerMessage` calls async handlers via `.catch(console.error)` — for routing tests, verify the synchronous dispatch behavior (which handler is called, side panel forwarding) rather than waiting for async completion
+  - The message-router.test.ts file was restructured from static imports to dynamic `await import()` to support `mock.module` — all existing validatePluginPayload tests were preserved
+---
+
+## 2026-02-18 - US-012
+- Exported `loadPluginFromDir` from `platform/mcp-server/src/discovery.ts` by adding it to the existing export statement
+- Created new test file `platform/mcp-server/src/discovery-load.test.ts` with 7 test cases
+- Tests cover: valid plugin with all fields populated, missing IIFE file throws, empty IIFE file throws, invalid plugin name throws, local plugin derives name from manifest, local plugin strips legacy prefix, npm plugin derives name from package name, manifest name mismatch does not throw
+- Used real temp directories with `mkdtempSync` (same pattern as reload.test.ts)
+- Helper function `writePlugin` creates manifest + IIFE files for each test case
+- Files changed: `platform/mcp-server/src/discovery.ts`, `platform/mcp-server/src/discovery-load.test.ts`
+- **Learnings for future iterations:**
+  - `loadPluginFromDir` reads real files from disk (via `Bun.file()`), so tests must use real temp directories — no module mocking needed
+  - The function calls `validatePluginName` and `validateUrlPattern` from `@opentabs-dev/shared` — invalid names produce descriptive error messages containing "must be lowercase"
+  - For the name mismatch test, the function only logs a warning (via `log.warn`) but does not throw — the name comes from the npm package name, not the manifest
+  - The `try/catch` with `let caught: Error | undefined` pattern (from US-010) avoids ESLint issues with `expect().rejects.toThrow()`
+  - Put `loadPluginFromDir` tests in a separate test file (`discovery-load.test.ts`) to keep the test file focused and avoid making `discovery.test.ts` too large
+---
+
+## 2026-02-18 - US-013
+- Exported `toPascalCase` from `platform/cli/src/scaffold.ts` by adding it to the existing export statement
+- Extended existing `platform/cli/src/scaffold.test.ts` with 8 new test cases (3 for toPascalCase, 5 for scaffoldPlugin)
+- `toPascalCase` tests: 'my-plugin' → 'MyPlugin', 'slack' → 'Slack', 'my-cool-plugin' → 'MyCoolPlugin'
+- `scaffoldPlugin` tests: valid scaffold creates expected files, domain conversion for 'slack.com' and '.slack.com', invalid name throws ScaffoldError, existing directory throws ScaffoldError
+- Used `process.chdir(tmpDir)` in `beforeEach` to control where `scaffoldPlugin` creates projects (since it resolves relative to `process.cwd()`)
+- Set `OPENTABS_CONFIG_DIR` to temp dir to isolate `autoRegisterPlugin` from real config
+- Files changed: `platform/cli/src/scaffold.ts`, `platform/cli/src/scaffold.test.ts`
+- **Learnings for future iterations:**
+  - `scaffoldPlugin` resolves project dir relative to `process.cwd()` — tests must `process.chdir()` to a temp dir and restore in `afterEach`
+  - `autoRegisterPlugin` writes to `~/.opentabs/config.json` — set `OPENTABS_CONFIG_DIR` env var to isolate tests
+  - `generatePluginIndex` uses `JSON.stringify()` which produces double quotes — test with `toContain('*://slack.com/*')` not `toContain("'*://slack.com/*'")`
+  - The `ScaffoldError` class is already exported from scaffold.ts — use `toBeInstanceOf(ScaffoldError)` for error type assertions
+  - Restore env vars in `afterEach`: use `delete Bun.env.VAR` if the original was `undefined` (not `Bun.env.VAR = undefined`)
+---
+
+## 2026-02-18 - US-014
+- Added 2 new test cases to `platform/cli/src/commands/build.test.ts` in the existing 'tools' describe block
+- Test 1: tool name '1tool' (starts with digit) produces a validation error containing 'snake_case'
+- Test 2: tool with both empty name and empty description produces two errors (one for name, one for description)
+- Files changed: `platform/cli/src/commands/build.test.ts`
+- **Learnings for future iterations:**
+  - The `TOOL_NAME_REGEX` is `/^[a-z][a-z0-9]*(_[a-z0-9]+)*$/` — must start with lowercase letter, so digits at start fail
+  - When testing multi-error scenarios, filter errors by keyword and check length rather than checking exact error messages
+---
+
+## 2026-02-18 - US-015
+- No code changes needed — the acceptance criteria were already satisfied by tests added in US-007
+- The `describe('setAllToolsEnabled')` block in `platform/browser-extension/src/side-panel/bridge.test.ts` (lines 218-248) already verifies JSON-RPC method `config.setAllToolsEnabled` with `{ plugin, enabled }` params for both enable and disable cases
+- All quality checks pass without changes
+- Files changed: (none)
+- **Learnings for future iterations:**
+  - When a PRD story's acceptance criteria overlap with a previously completed story, check if the tests already exist before writing new code
+---

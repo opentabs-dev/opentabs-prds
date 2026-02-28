@@ -1,0 +1,94 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-102228-self-bootstrap-browser-tools~running.json
+Started: Wed Feb 18 12:13:08 PST 2026
+---
+
+## Codebase Patterns
+- Network capture state lives in `platform/browser-extension/src/network-capture.ts` — uses a `CapturedRequest` interface and per-tab `CaptureState` stored in a `captures` Map
+- CDP events flow through a single `chrome.debugger.onEvent` listener; new fields on `CapturedRequest` are extracted from CDP event params and carried from `pendingRequests` to the completed `requests` array
+- Response bodies arrive via `Network.loadingFinished` (fires AFTER `Network.responseReceived`), requiring a `requestIdToIndex` map to locate the completed request and attach the body asynchronously via `chrome.debugger.sendCommand` callback
+- Binary MIME types (image/*, font/*, video/*, audio/*, application/octet-stream, application/wasm) are skipped for response body capture
+- When `requests.shift()` drops the oldest entry, all indices in `requestIdToIndex` must be decremented by 1 (entries at index 0 are removed)
+- Tool descriptions live in `defineBrowserTool` calls in `platform/mcp-server/src/browser-tools/*.ts`
+- Body truncation uses a constant `MAX_BODY_LENGTH = 102_400` (100KB) with `'... (truncated)'` suffix
+- The `requestBody` data comes from `request.postData` in CDP `Network.requestWillBeSent` event — no additional CDP commands needed
+- Adding a new browser tool requires 5 touchpoints: (1) `get-*.ts` tool definition, (2) `index.ts` import+array, (3) `browser-commands.ts` handler, (4) `message-router.ts` dispatch table+import, (5) `offscreen/index.ts` ALLOWED_METHODS
+- The `message-router.test.ts` uses `mock.module` to replace entire modules — when adding new exports to `browser-commands.ts`, the mock must also include the new export or the test will fail with "Export not found"
+- Browser tool handlers in `browser-commands.ts` follow a consistent pattern: validate params, `chrome.scripting.executeScript` with `world: 'MAIN'`, extract result, send JSON-RPC response via `sendToServer`
+
+## 2026-02-18 - US-001
+- Added `requestBody?: string` to `CapturedRequest` interface in `network-capture.ts`
+- Added `MAX_BODY_LENGTH` constant (102400 chars) and `truncateBody` helper
+- Extracts `request.postData` in `Network.requestWillBeSent` handler, stores truncated body on pending request
+- Carries `requestBody` through to completed `CapturedRequest` in `Network.responseReceived` handler
+- Updated `enable-network-capture.ts` description to mention request bodies
+- Updated `get-network-requests.ts` description to mention request bodies
+- Files changed: `platform/browser-extension/src/network-capture.ts`, `platform/mcp-server/src/browser-tools/enable-network-capture.ts`, `platform/mcp-server/src/browser-tools/get-network-requests.ts`
+- **Learnings for future iterations:**
+  - `postData` is available directly on the `request` object in `Network.requestWillBeSent` — no additional CDP command needed
+  - The pending → completed flow makes it easy to add new fields: add to pending in `requestWillBeSent`, carry through in `responseReceived`
+---
+
+## 2026-02-18 - US-002
+- Added `responseBody?: string` to `CapturedRequest` interface
+- Added `requestIdToIndex: Map<string, number>` to `CaptureState` for mapping requestId → index in completed requests array
+- Added `isBinaryMime()` helper with `BINARY_MIME_PREFIXES` and `BINARY_MIME_EXACT` to skip binary content
+- Added `Network.loadingFinished` handler that looks up the request by index, skips binary MIME types, and calls `chrome.debugger.sendCommand` for `Network.getResponseBody`
+- Handles base64-encoded responses by decoding with `atob()` for text content
+- Graceful failure handling: `chrome.runtime.lastError` or missing result silently leaves `responseBody` undefined
+- Updated index decrementing in `requests.shift()` path to keep `requestIdToIndex` consistent
+- Clears `requestIdToIndex` on `getRequests(tabId, clear=true)`
+- Updated `enable-network-capture.ts` description to mention response bodies
+- Updated `get-network-requests.ts` description to mention responseBody field
+- Files changed: `platform/browser-extension/src/network-capture.ts`, `platform/mcp-server/src/browser-tools/enable-network-capture.ts`, `platform/mcp-server/src/browser-tools/get-network-requests.ts`
+- **Learnings for future iterations:**
+  - `Network.loadingFinished` fires AFTER `Network.responseReceived` — the request is already in the completed array, so you need an index map to find it
+  - `chrome.debugger.sendCommand` uses a callback-style API (not promises) in MV3 service workers
+  - `Network.getResponseBody` returns `{body, base64Encoded}` — base64 encoding happens for some text content too, so always check the flag
+  - When using array indices as values in a map and the array shifts, all map values must be decremented
+---
+
+## 2026-02-18 - US-003
+- Created `platform/mcp-server/src/browser-tools/get-page-html.ts` — defines `browser_get_page_html` tool using `defineBrowserTool` with `dispatchToExtension`
+- Tool accepts `tabId` (required), `selector` (optional, defaults to `'html'`), `maxLength` (optional, defaults to 200000)
+- Returns `{ title, url, html }` where `html` is the `outerHTML` of the matched element, truncated with `'... (truncated)'` if exceeding `maxLength`
+- Added import and registration in `platform/mcp-server/src/browser-tools/index.ts`
+- Added `handleBrowserGetPageHtml` handler in `platform/browser-extension/src/browser-commands.ts` — uses `chrome.scripting.executeScript` with `world: 'MAIN'`, returns `el.outerHTML`
+- Added `'browser.getPageHtml'` to dispatch table in `message-router.ts` and imported handler
+- Added `'browser.getPageHtml'` to `ALLOWED_METHODS` in `offscreen/index.ts`
+- Updated `message-router.test.ts` — added mock for `handleBrowserGetPageHtml`, mock reset, default implementation, and dispatch routing test
+- Files changed: `platform/mcp-server/src/browser-tools/get-page-html.ts` (new), `platform/mcp-server/src/browser-tools/index.ts`, `platform/browser-extension/src/browser-commands.ts`, `platform/browser-extension/src/message-router.ts`, `platform/browser-extension/src/message-router.test.ts`, `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - When adding a new browser tool, the `message-router.test.ts` mock module must include the new export — Bun's `mock.module` replaces the entire module, so missing exports cause "Export not found" errors
+  - The pattern is very mechanical: copy `get-tab-content.ts` structure, change `innerText` to `outerHTML`, update the method name from `browser.getTabContent` to `browser.getPageHtml`
+  - Default `maxLength` for HTML (200000) is intentionally 4x larger than text content (50000) because HTML markup is far more verbose
+---
+
+## 2026-02-18 - US-004
+- Created `platform/mcp-server/src/browser-tools/get-storage.ts` — defines `browser_get_storage` tool using `defineBrowserTool` with `dispatchToExtension`
+- Tool accepts `tabId` (required), `storageType` (optional, 'local'|'session', defaults to 'local'), `key` (optional — single key or all entries)
+- Returns `{ key, value }` for single-key mode, `{ entries, count }` for all-entries mode
+- Values exceeding 10000 chars are truncated with `'... (truncated)'` suffix; total response capped at 500KB
+- Added import and registration in `platform/mcp-server/src/browser-tools/index.ts`
+- Added `handleBrowserGetStorage` handler in `platform/browser-extension/src/browser-commands.ts` — uses `chrome.scripting.executeScript` with `world: 'MAIN'`, reads from `window.localStorage` or `window.sessionStorage`
+- Added `'browser.getStorage'` to dispatch table in `message-router.ts` and imported handler
+- Added `'browser.getStorage'` to `ALLOWED_METHODS` in `offscreen/index.ts`
+- Updated `message-router.test.ts` — added mock for `handleBrowserGetStorage`, mock reset, default implementation, and dispatch routing test
+- Files changed: `platform/mcp-server/src/browser-tools/get-storage.ts` (new), `platform/mcp-server/src/browser-tools/index.ts`, `platform/browser-extension/src/browser-commands.ts`, `platform/browser-extension/src/message-router.ts`, `platform/browser-extension/src/message-router.test.ts`, `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - The `chrome.scripting.executeScript` `func` runs in the page's MAIN world — it can access `window.localStorage` and `window.sessionStorage` directly
+  - For tools that have two return modes (single key vs all entries), use a `mode` discriminator field in the script result to let the handler know which shape to return
+  - `Object.keys(storage)` works for iterating localStorage/sessionStorage keys — more portable than `storage.key(i)`
+  - Value truncation (10KB per value) and total response cap (500KB) are separate concerns — both are needed to handle pages with many small entries vs pages with a few large entries
+---
+
+## 2026-02-18 - US-005
+- Updated `enable-network-capture.ts` description to explicitly list: request headers, response headers, request bodies (POST/PUT/PATCH data), response bodies, MIME type, and timing
+- Added urlFilter usage suggestion (e.g., "/api" or "graphql") to reduce noise from static assets
+- Updated `get-network-requests.ts` description to explicitly name `requestBody` and `responseBody` fields with explanations of what they contain
+- Added cross-reference to `urlFilter` on `browser_enable_network_capture` for API call filtering
+- Files changed: `platform/mcp-server/src/browser-tools/enable-network-capture.ts`, `platform/mcp-server/src/browser-tools/get-network-requests.ts`
+- **Learnings for future iterations:**
+  - Tool descriptions are the primary way AI agents discover capabilities — being explicit about field names (e.g., `requestBody`, `responseBody`) helps agents know exactly what data is available
+  - Cross-referencing related tools in descriptions (e.g., "use urlFilter on browser_enable_network_capture") improves discoverability of multi-tool workflows
+---

@@ -1,0 +1,219 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix verified bugs across shared runtime, MCP server, CLI, and plugin-tools: crashes on Node.js, missing auth headers, timer leaks, contract violations, and silent data corruption.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix deleteFile throwing on Bun when file does not exist",
+      "description": "As a platform developer, I want deleteFile to be idempotent so that callers do not need try/catch for non-existent files.",
+      "acceptanceCriteria": [
+        "deleteFile does not throw when the target file does not exist under Bun",
+        "The Bun path wraps Bun.file(path).delete() with .catch(() => {}) to match the Node.js path behavior",
+        "The documented contract 'Does not throw if the file does not exist' is upheld on both runtimes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/shared/src/runtime.ts lines 60-67. The Node.js path already has `.catch(() => {})` on the `unlink` call. The Bun path `Bun.file(path).delete()` throws ENOENT when the file does not exist. Fix: add `.catch(() => {})` to the Bun path to match. This function is used in adapter file cleanup and plugin uninstall, so the fix prevents unexpected crashes during normal operation."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix spawnProcessSync crash when command is not found on Node.js",
+      "description": "As a platform developer, I want spawnProcessSync to return a structured error result when the command binary is not found, not crash with a TypeError.",
+      "acceptanceCriteria": [
+        "spawnProcessSync returns { exitCode: 1, stdout: '', stderr: '' } or similar when the command is not found on Node.js",
+        "result.stdout and result.stderr are guarded with optional chaining or nullish coalescing before calling .toString()",
+        "The Bun path is verified to already handle this case (Bun throws, which is caught by callers)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/shared/src/runtime.ts lines 103-112. When Node.js child_process.spawnSync fails to find the command (ENOENT), result.stdout and result.stderr are null (not Buffer). Calling .toString() on null throws TypeError. Fix: use `result.stdout?.toString() ?? ''` and `result.stderr?.toString() ?? ''`. The Bun path at lines 89-101 does not have this issue because Bun throws an error when the command is not found, and callers already wrap spawnProcessSync in try/catch."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix readFileSlice null-byte padding on Node.js",
+      "description": "As a platform developer, I want readFileSlice to return only the actual file content without trailing null bytes when the requested range exceeds the file size.",
+      "acceptanceCriteria": [
+        "readFileSlice uses the bytesRead return value from fh.read to slice the buffer before converting to string",
+        "The returned string contains no trailing null bytes when end exceeds file size",
+        "The Bun and Node.js paths return identical results for the same input",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/shared/src/runtime.ts lines 253-264. The Node.js path allocates Buffer.alloc(length) (zero-filled) and calls fh.read, but ignores the returned bytesRead. When end > file size, the buffer has trailing null bytes. Fix: capture bytesRead from the read result and use buf.subarray(0, bytesRead).toString('utf-8'). The destructuring pattern is `const { bytesRead } = await fh.read(buf, 0, length, start);`."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix Bun.spawnSync usage in CLI doctor command on Linux",
+      "description": "As a CLI user on Linux, I want opentabs doctor to work on Node.js without crashing with ReferenceError.",
+      "acceptanceCriteria": [
+        "The Bun.spawnSync call in checkBrowser() is replaced with spawnProcessSync from @opentabs-dev/shared",
+        "spawnProcessSync is imported at the top of doctor.ts",
+        "The Linux browser detection logic produces the same results as before",
+        "No direct Bun.* API usage remains in doctor.ts production code paths (the Bun.version usage inside if(isBun) guard is acceptable)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/doctor.ts line 355. The checkBrowser() function on the Linux path calls Bun.spawnSync(['which', cmd], ...) directly. The CLI is published to npm and runs on Node.js 20+ where Bun is not defined, so this will throw ReferenceError on Linux. Fix: import { spawnProcessSync } from '@opentabs-dev/shared' and replace with spawnProcessSync('which', [cmd]). Check the result.exitCode === 0 instead of result.exitCode === 0 (same logic). The stdout/stderr handling from SpawnResult is slightly different from Bun.spawnSync — adapt accordingly."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix timer leak in runNpmGlobal on successful npm operations",
+      "description": "As a server operator, I want npm install/update/remove operations to clean up their timeout timers so the server can shut down cleanly.",
+      "acceptanceCriteria": [
+        "The 60-second setTimeout timer in runNpmGlobal is cleared after Promise.race resolves (both success and error paths)",
+        "A timer ID variable is captured and clearTimeout is called in both the success continuation and the catch path",
+        "No timer leaks occur on successful npm operations",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/mcp-server/src/plugin-management.ts lines 72-82. The timeoutPromise creates a setTimeout but the timer is never cleared when resultPromise wins the race. Fix: store the timer ID (let timerId: ReturnType<typeof setTimeout>) and call clearTimeout(timerId) after the Promise.race resolves. Use a try/finally or explicit clearTimeout in both the success and error paths. Pattern: create the timeout promise capturing timerId, then after `const result = await Promise.race(...)`, call clearTimeout(timerId)."
+    },
+    {
+      "id": "US-006",
+      "title": "Fix missing platformExec in searchNpmPlugins",
+      "description": "As a server operator on Windows, I want npm search to work by using the correct npm executable name.",
+      "acceptanceCriteria": [
+        "searchNpmPlugins uses platformExec('npm') instead of bare 'npm' string",
+        "The pattern matches runNpmGlobal which already uses platformExec('npm')",
+        "platformExec is already imported in the file (verify, don't add duplicate import)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/mcp-server/src/plugin-management.ts line 120. searchNpmPlugins calls spawnProcessSync('npm', ...) directly, while runNpmGlobal at line 73 uses platformExec('npm'). On Windows, npm is invoked as npm.cmd, and platformExec handles this. Fix: change line 120 from spawnProcessSync('npm', ...) to spawnProcessSync(platformExec('npm'), ...). Verify platformExec is already imported from @opentabs-dev/shared."
+    },
+    {
+      "id": "US-007",
+      "title": "Fix missing auth header in CLI plugin list command",
+      "description": "As a CLI user, I want opentabs plugin list to show live server data when the server is running with authentication enabled.",
+      "acceptanceCriteria": [
+        "handlePluginList reads the auth secret using readAuthSecret() before making the /health request",
+        "The Authorization: Bearer header is included when secret is non-null",
+        "The pattern matches handleStatus in status.ts and handleDoctor in doctor.ts",
+        "readAuthSecret is imported (check if already imported, add if not)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/plugin.ts lines 455-462. handlePluginList fetches /health without an Authorization header. Compare with handleStatus (status.ts line 61) and handleDoctor (doctor.ts line 93) which both include it. Since the MCP server requires auth by default, the /health request returns 401 and the command falls through to offline mode, always showing stale data. Fix: add `const secret = await readAuthSecret();` before the fetch, and add headers: `{ ...(secret ? { Authorization: \\`Bearer \\${secret}\\` } : {}) }`. Check if readAuthSecret is already imported from the config module."
+    },
+    {
+      "id": "US-008",
+      "title": "Fix missing auth header in fetchToolNames for config command",
+      "description": "As a CLI user, I want opentabs config set tools.<name> to validate tool names against the running server.",
+      "acceptanceCriteria": [
+        "fetchToolNames reads the auth secret using readAuthSecret() before making the /health request",
+        "The Authorization: Bearer header is included when secret is non-null",
+        "readAuthSecret is imported at the top of config.ts (check if already imported)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/config.ts lines 156-168. fetchToolNames fetches /health without an Authorization header, same class of issue as US-007. When the server has auth enabled (default), the request fails silently (returns null), and tool name validation in handleSetTool (line 226-231) is silently disabled. Fix: import readAuthSecret from the config module, read the secret, and include it in the fetch headers. Pattern: `const secret = await readAuthSecret(); const headers: Record<string, string> = {}; if (secret) headers['Authorization'] = \\`Bearer \\${secret}\\`;`"
+    },
+    {
+      "id": "US-009",
+      "title": "Fix --limit flag ignored with --since in audit server mode",
+      "description": "As a CLI user, I want opentabs audit --since 1h --limit 20 to respect the limit after time filtering.",
+      "acceptanceCriteria": [
+        "After the --since time filtering block (after line 242), entries is sliced to the user's limit: entries = entries.slice(0, limit)",
+        "The limit is applied before both JSON and table output",
+        "Behavior matches the file mode path in handleAuditFromFile which already applies the limit correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/audit.ts lines 236-248. After fetching 500 entries from the server and filtering by --since timestamp (line 239-242), the code proceeds directly to output without applying the user's --limit. Compare with handleAuditFromFile (line 170) which correctly does `entries = entries.slice(0, limit)`. Fix: add `entries = entries.slice(0, limit);` after the sinceMs filtering block (after line 242), before the JSON output check at line 244."
+    },
+    {
+      "id": "US-010",
+      "title": "Use sendExtensionReload instead of duplicated protocol code in handleExtensionReload",
+      "description": "As a platform developer, I want the extension.reload JSON-RPC message to be sent through a single code path to prevent protocol divergence.",
+      "acceptanceCriteria": [
+        "handleExtensionReload in http-routes.ts calls sendExtensionReload(state) from extension-protocol.ts instead of manually constructing and sending the JSON-RPC message",
+        "sendExtensionReload is imported from extension-protocol.ts",
+        "The duplicate getNextRequestId + JSON.stringify + ws.send code is removed from handleExtensionReload",
+        "The response remains the same: { ok: true, message: 'Reload signal sent to extension' }",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/mcp-server/src/http-routes.ts lines 365-378. handleExtensionReload manually constructs `{ jsonrpc: '2.0', method: 'extension.reload', id }` and sends it via state.extensionWs.send. This duplicates sendExtensionReload() from extension-protocol.ts. If the protocol format changes, only one location would be updated, causing divergence. Fix: import sendExtensionReload from extension-protocol.ts and call it. Note: sendExtensionReload already checks state.extensionWs internally, but handleExtensionReload does its own check at line 372 and returns 503 if not connected. Keep that check, then call sendExtensionReload(state) instead of the manual JSON construction."
+    },
+    {
+      "id": "US-011",
+      "title": "Fix SVG color validation and conversion to handle single-quoted attributes",
+      "description": "As a plugin developer, I want the inactive icon generation to correctly convert colors in SVG attributes regardless of quote style.",
+      "acceptanceCriteria": [
+        "validateInactiveIconColors regex matches both double-quoted and single-quoted fill/stroke/stop-color/flood-color attributes",
+        "generateInactiveIcon regex matches both double-quoted and single-quoted color attributes",
+        "The style attribute regex also handles both quote styles",
+        "Existing double-quote behavior is preserved (no regression)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "File: platform/plugin-tools/src/validate-icon.ts. Multiple regex patterns only match double-quoted SVG attributes. Lines 313, 324 (validateInactiveIconColors) and lines 421, 428 (generateInactiveIcon) use patterns like `fill=\"[^\"]*\"` which miss single-quoted values like `fill='red'`. Note that validateIconSvg at line 266 already handles both with `[\"']([^\"']*)[\"\"]` for viewBox — use that as the reference pattern. Fix: update the regex patterns to use `[\"']` for delimiters and `[^\"']` for content matching. Be careful with the replacement logic in generateInactiveIcon — the fullMatch.replace call at line 438 must correctly handle the matched quote character."
+    }
+  ]
+}

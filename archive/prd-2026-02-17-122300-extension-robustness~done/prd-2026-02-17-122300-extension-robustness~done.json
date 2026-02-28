@@ -1,0 +1,181 @@
+{
+  "project": "OpenTabs Extension Robustness",
+  "description": "Harden the Chrome extension architecture for production reliability: fix offscreen document recovery, fix ws:setUrl reconnection gap, normalize side panel bridge messaging pattern, and add E2E tests for critical untested paths (unavailable tab state in side panel, offscreen recovery, server-side dispatch timeout, malformed WebSocket messages, concurrent timeouts, URL change reconnection).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Keepalive alarm handler re-ensures offscreen document",
+      "description": "As a user, I want the extension to automatically recover its WebSocket connection if Chrome terminates the offscreen document under memory pressure, so that tool dispatch does not silently stop working.",
+      "acceptanceCriteria": [
+        "chrome.alarms.onAlarm listener in background.ts calls ensureOffscreenDocument()",
+        "ensureOffscreenDocument() is called on every alarm tick (already idempotent via try/catch)",
+        "No duplicate offscreen documents are created (ensureOffscreenDocument's existing guard handles this)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/background.ts, lines 170-172. The current alarm handler is empty: `chrome.alarms.onAlarm.addListener(() => { // Alarm fires to keep the service worker alive });`. Change it to call `ensureOffscreenDocument().catch(console.error)` inside the handler. The function is already defined at line 38 and is idempotent — if the offscreen document already exists, createDocument throws and the catch silently absorbs it. The comment should be updated to reflect both purposes: keepalive AND offscreen health check."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix ws:setUrl reconnection gap when disconnected with no pending reconnect",
+      "description": "As a user, I want changing the MCP server URL in settings to trigger a connection attempt even when the extension is currently disconnected and has no pending reconnect timer, so that I don't have to manually reload the extension.",
+      "acceptanceCriteria": [
+        "When ws:setUrl arrives with a new URL, ws is null, and reconnectTimeoutId is null, connect() is called",
+        "When ws:setUrl arrives with the same URL, no reconnect is triggered (existing guard handles this)",
+        "When ws:setUrl arrives while ws is active, the existing close-and-reconnect path works unchanged",
+        "When ws:setUrl arrives while reconnectTimeoutId is set, the existing cancel-and-connect path works unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts, lines 305-321. The ws:setUrl handler's if/else chain currently covers two cases when the URL changes: (1) ws is active → close it (onclose triggers reconnect), (2) ws is null AND reconnectTimeoutId is set → cancel timer and connect immediately. But there's a third case: ws is null AND reconnectTimeoutId is null (all backoff attempts completed or no connection was ever established). Add a final `else { void connect(); }` after the existing `else if (reconnectTimeoutId !== null)` block (line 321), still inside the `if (resolvedUrl !== mcpServerUrl)` check. The backoff is already reset to INITIAL_BACKOFF_MS on line 308."
+    },
+    {
+      "id": "US-003",
+      "title": "Normalize side panel bridge sendRequest to promise-style messaging",
+      "description": "As a developer, I want the side panel bridge to use the same promise-style chrome.runtime.sendMessage pattern as every other message sender in the codebase, so the error handling is consistent and maintainable.",
+      "acceptanceCriteria": [
+        "sendRequest() in bridge.ts uses promise-style chrome.runtime.sendMessage().catch() instead of callback-style",
+        "Error handling behavior is preserved: send failures still reject the pending request promise",
+        "Timeout cleanup on send failure is preserved",
+        "The bridge.test.ts unit tests pass without modification (or are updated to match the new pattern)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/bridge.ts, lines 64-72. Current code: `chrome.runtime.sendMessage({ type: 'bg:send', data }, () => { if (chrome.runtime.lastError) { clearTimeout(timerId); pendingRequests.delete(id); reject(new Error(chrome.runtime.lastError.message)); } });`. Convert to: `chrome.runtime.sendMessage({ type: 'bg:send', data }).catch((err: Error) => { clearTimeout(timerId); pendingRequests.delete(id); reject(err); });`. The callback only checks for send failures (background not listening), which `.catch()` handles equivalently. See messaging.ts lines 7-11 for the codebase pattern. Also check bridge.test.ts to ensure mock patterns still work — the test file mocks chrome.runtime.sendMessage and may need updating if it expects callback-style calls."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: side panel shows unavailable tab state indicator",
+      "description": "As a developer, I want an E2E test verifying the side panel displays the 'unavailable' tab state indicator (distinct from 'closed' and 'ready'), so that regressions in unavailable state rendering are caught.",
+      "acceptanceCriteria": [
+        "New test in e2e/side-panel-data-flow.e2e.ts verifies the unavailable (amber/yellow) state dot appears",
+        "Test opens a matching tab, toggles auth off so isReady returns false, and checks the side panel shows the unavailable indicator",
+        "Test also verifies transition from ready → unavailable → ready when auth is toggled back on",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: e2e/side-panel-data-flow.e2e.ts. Look at the existing test 'tab state dot updates when matching tab opens and closes' for the pattern. It uses setupToolTest() from helpers.ts, opens the side panel page, opens a test app tab, and checks for specific CSS classes on the tab state dot. The test server has an auth toggle endpoint (POST /auth with {enabled: true/false}) that controls whether the plugin's isReady() returns true or false. For the unavailable state: (1) open a matching tab with auth ON (should show ready/green), (2) POST /auth {enabled: false} to disable auth, (3) trigger a tab state recheck (navigate the tab or wait for the next check), (4) verify the side panel shows the unavailable indicator. Check PluginCard.tsx to find the exact CSS class used for the unavailable state dot to know what to assert on."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: server-side DISPATCH_TIMEOUT_MS fires when extension never responds",
+      "description": "As a developer, I want an E2E test verifying the MCP server's 30-second dispatch timeout fires when the extension receives a tool dispatch but never sends a response, so that the server-side safety net is regression-protected.",
+      "acceptanceCriteria": [
+        "New test in e2e/edge-cases.e2e.ts verifies the 30s server-side dispatch timeout",
+        "Test configures a scenario where the extension receives tool.dispatch but the adapter never returns (e.g., infinite promise in tool.handle)",
+        "The MCP server returns a timeout error to the MCP client within ~30-31 seconds",
+        "Subsequent tool calls after the timeout still work correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: e2e/edge-cases.e2e.ts. The existing test 'tool call exceeding SCRIPT_TIMEOUT_MS returns a clean timeout error' uses the test server's slow mode (3s delay) to test the 25s extension-side timeout. For the 30s server-side timeout, we need a scenario where the extension-side timeout does NOT fire but the server-side one does. This is tricky because the extension's 25s timeout fires first. Option: look at whether the e2e-test plugin has a tool that can be configured to never resolve (e.g., a forever_pending tool). If not, consider modifying the test server to add an endpoint that hangs indefinitely, and add a tool to the e2e-test plugin that calls it. Alternatively, use a scenario where the extension's WebSocket send of the response silently fails — but this is harder to simulate. The simplest approach: add a `never_resolve` tool to the e2e-test plugin that returns a promise that never resolves and never rejects. The extension's 25s SCRIPT_TIMEOUT_MS would fire first, but that still sends a timeout error back to the server, resolving the pending dispatch. To truly test the server-side timeout, you'd need the extension to receive the dispatch but the response to never reach the server. Consider: disconnect the WebSocket after the dispatch is sent but before the response arrives. This causes the server's pendingDispatches timeout to fire. Check platform/mcp-server/src/state.ts for DISPATCH_TIMEOUT_MS value (30_000). Note: this test will take ~30s to run, so mark it appropriately."
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: malformed WebSocket messages do not drop the connection",
+      "description": "As a developer, I want E2E tests verifying that malformed JSON-RPC messages sent over the WebSocket are gracefully rejected without dropping the connection, so that the server's defensive parsing is regression-protected.",
+      "acceptanceCriteria": [
+        "New test in e2e/edge-cases.e2e.ts sends invalid JSON over the WebSocket and verifies the connection stays alive",
+        "Test sends a JSON-RPC message with neither method nor id and verifies it is dropped without disconnection",
+        "After sending malformed messages, a valid tool call still succeeds",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: e2e/edge-cases.e2e.ts. The fixtures in e2e/fixtures.ts provide a raw WebSocket connection to the MCP server (see the existing tests in lifecycle.e2e.ts that connect raw WebSockets for ping/pong and auth tests). Pattern: (1) use the existing fixture to get the MCP server URL, (2) open a raw WebSocket to /ws (with token if needed), (3) send malformed payloads: invalid JSON string, valid JSON but not an object, JSON object with neither method nor id, (4) after each, verify the WebSocket is still open, (5) close the raw WebSocket, (6) verify the extension's WebSocket is unaffected by sending a tool call via the MCP client. Check platform/mcp-server/src/extension-protocol.ts handleExtensionMessage() lines 324-337 for the defensive parsing paths being tested."
+    },
+    {
+      "id": "US-007",
+      "title": "E2E test: concurrent tool dispatch timeouts all return clean errors",
+      "description": "As a developer, I want an E2E test verifying that multiple concurrent tool calls that all time out return clean error responses without interfering with each other or breaking subsequent tool calls.",
+      "acceptanceCriteria": [
+        "New test in e2e/edge-cases.e2e.ts sends 3+ concurrent tool calls that all time out",
+        "All timed-out calls return clean error responses with timeout-related error messages",
+        "A subsequent normal tool call after all timeouts complete works correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "File: e2e/edge-cases.e2e.ts. The existing test 'tool call exceeding SCRIPT_TIMEOUT_MS returns a clean timeout error' uses the test server's slow mode with a delay exceeding 25s. For concurrent timeouts, use the same pattern but send 3 calls via Promise.allSettled. The test server's slow mode can be activated with POST /slow?enabled=true&delay=30000 (30s exceeds the 25s SCRIPT_TIMEOUT_MS). After all 3 time out, disable slow mode and verify a normal call works. This test will take ~25s due to the timeout. See the existing concurrent dispatch test 'concurrent tool calls via Promise.all return correct results without interleaving' in the same file for the Promise.allSettled pattern."
+    },
+    {
+      "id": "US-008",
+      "title": "E2E test: URL change while disconnected triggers reconnection",
+      "description": "As a developer, I want an E2E test verifying that changing the MCP server URL via chrome.storage.local while the extension is disconnected triggers a reconnection to the new URL.",
+      "acceptanceCriteria": [
+        "New test in e2e/lifecycle.e2e.ts or e2e/edge-cases.e2e.ts covers the URL change reconnection flow",
+        "Test: start server on port A → connect extension → kill server → change mcpServerUrl to port B → start server on port B → verify extension connects to new server",
+        "After reconnection to new server, a tool call succeeds",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": "File: e2e/lifecycle.e2e.ts (this is a WebSocket lifecycle test). This test depends on US-002 being implemented first (the ws:setUrl fix). Pattern: use the existing fixture architecture to start a second MCP server on a different port. The test fixtures already support dynamic port allocation (PORT=0). Steps: (1) use the standard fixture to start server on port A with extension connected, (2) kill the server subprocess, (3) wait for extension to report disconnected (poll the health endpoint or check logs), (4) start a new server on port B (spawn a new subprocess), (5) set mcpServerUrl in the extension's chrome.storage.local via chrome.scripting.executeScript or the extension's devtools page, (6) wait for the extension to connect to port B, (7) verify a tool call works. This is a complex test that may need a new fixture helper for starting a second server. Check e2e/fixtures.ts for how the mcpServer fixture manages the subprocess lifecycle."
+    },
+    {
+      "id": "US-009",
+      "title": "E2E test: offscreen document recovery via alarm-triggered re-creation",
+      "description": "As a developer, I want an E2E test verifying that if the offscreen document is terminated, the keepalive alarm re-creates it and the WebSocket reconnects.",
+      "acceptanceCriteria": [
+        "New test in e2e/lifecycle.e2e.ts verifies offscreen document recovery",
+        "Test closes the offscreen document (or simulates its termination)",
+        "The keepalive alarm fires within 30 seconds and re-creates the offscreen document",
+        "The WebSocket reconnects and tool calls work after recovery",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": "File: e2e/lifecycle.e2e.ts. This test depends on US-001 being implemented first (alarm handler calls ensureOffscreenDocument). This is the most complex E2E test in this batch. Approach: use the extension's background service worker context to call chrome.offscreen.closeDocument() via chrome.scripting.executeScript on the extension's service worker. Alternatively, Playwright's Chromium DevTools Protocol may allow terminating the offscreen document's context. If direct termination is not possible via Playwright, an alternative approach: add a test-only message type 'test:closeOffscreen' that the background script handles by calling chrome.offscreen.closeDocument(). This test will need to wait up to 30s for the alarm to fire. Check if the fixture's extension context allows accessing the service worker for direct script execution. If this test proves too complex or unreliable due to Playwright limitations with offscreen documents, mark it as requiring manual verification and document the expected behavior."
+    }
+  ]
+}

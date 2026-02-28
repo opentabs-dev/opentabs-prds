@@ -1,0 +1,92 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add opentabs plugin install, remove, and list CLI commands. Unify npm vs bun guidance to consistently use npm.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Unify package manager guidance to npm",
+      "description": "As a user, I want consistent guidance on which package manager to use for plugin management so that I am not confused by conflicting instructions.",
+      "acceptanceCriteria": [
+        "version-check.ts updateCommand uses 'npm update <pkg>' instead of 'bun update <pkg>'",
+        "OnboardingState.tsx install example uses 'npm install -g opentabs-plugin-slack'",
+        "plugin.ts search footer uses 'npm install -g <package-name>'",
+        "No occurrence of 'bun update' or 'bun install -g' in user-facing strings across the codebase (version-check, side panel, CLI output)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Three files need changes:\n1. platform/mcp-server/src/version-check.ts:102 — change `updateCommand: \\`bun update ${pkgName}\\`` to `npm update -g ${pkgName}`\n2. platform/browser-extension/src/side-panel/components/OnboardingState.tsx:34 — already says npm, verify it stays\n3. platform/cli/src/commands/plugin.ts:70 — already says npm, verify it stays\n\nThe key change is in version-check.ts. Search the entire codebase for 'bun update' and 'bun install -g' to catch any other occurrences."
+    },
+    {
+      "id": "US-002",
+      "title": "Add opentabs plugin install command",
+      "description": "As a user, I want to run 'opentabs plugin install <name>' to install a plugin without leaving the CLI.",
+      "acceptanceCriteria": [
+        "Running 'opentabs plugin install opentabs-plugin-slack' executes 'npm install -g opentabs-plugin-slack' as a child process",
+        "Running 'opentabs plugin install slack' auto-expands to 'opentabs-plugin-slack' (convenience shorthand)",
+        "stdout and stderr from npm are piped to the terminal in real-time",
+        "On success, prints a success message with the installed package name",
+        "On npm failure (non-zero exit), prints a clear error message including the npm exit code",
+        "If the MCP server is running (check /health), calls POST /reload to trigger rediscovery after successful install",
+        "Server notification failure is non-fatal — prints a dim hint but does not fail the command",
+        "Help text includes examples: 'opentabs plugin install slack' and 'opentabs plugin install opentabs-plugin-slack'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Add the install subcommand in platform/cli/src/commands/plugin.ts under the existing pluginCmd. The implementation should:\n1. Accept a single argument <name-or-package>\n2. If the name doesn't start with 'opentabs-plugin-' or '@', prepend 'opentabs-plugin-'\n3. Spawn `npm install -g <package>` using Bun.spawn with stdio: ['inherit', 'inherit', 'inherit']\n4. After success, try to notify the server: read secret from config, fetch /health to check if server is running, if running then POST /reload with Bearer auth. Use the existing readConfig and getConfigPath from ../config.js.\n5. The resolvePort helper should be used to determine the server port (requires passing optsWithGlobals through).\n\nThe command registration needs access to the global --port option. Follow the pattern from audit.ts where the action receives (args, command) and calls command.optsWithGlobals().\n\nAlso update the search handler output (line 70) to say: Install a plugin: opentabs plugin install <name>"
+    },
+    {
+      "id": "US-003",
+      "title": "Add opentabs plugin remove command",
+      "description": "As a user, I want to run 'opentabs plugin remove <name>' to uninstall a plugin cleanly.",
+      "acceptanceCriteria": [
+        "Running 'opentabs plugin remove opentabs-plugin-slack' executes 'npm uninstall -g opentabs-plugin-slack'",
+        "Running 'opentabs plugin remove slack' auto-expands to 'opentabs-plugin-slack' (same shorthand as install)",
+        "If the plugin path is in localPlugins in config.json, it is removed from the array and config is saved atomically",
+        "stdout and stderr from npm are piped to the terminal in real-time",
+        "On success, prints a success message",
+        "If the MCP server is running, calls POST /reload to trigger rediscovery after successful removal",
+        "Server notification failure is non-fatal",
+        "Help text includes examples",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Add in platform/cli/src/commands/plugin.ts. Similar pattern to install:\n1. Accept a single argument <name-or-package>\n2. Apply same name normalization (prepend 'opentabs-plugin-' if needed)\n3. Spawn `npm uninstall -g <package>` with inherited stdio\n4. After success, check if the plugin name or path appears in localPlugins in config — if so, remove it and save via atomicWriteConfig from ../config.js\n5. Notify server via POST /reload if running\n\nFor the localPlugins cleanup: read config, filter out entries where the basename or full path matches the package name, write back if changed."
+    },
+    {
+      "id": "US-004",
+      "title": "Add opentabs plugin list command",
+      "description": "As a user, I want to run 'opentabs plugin list' to see all installed plugins, even when the server is not running.",
+      "acceptanceCriteria": [
+        "When server IS running: fetches /health and shows all discovered plugins (npm + local) with name, version, source, tab state, tool count",
+        "When server is NOT running: shows local plugins from config.json with path and basic info from their package.json/tools.json",
+        "When server is NOT running: attempts to scan global node_modules for npm plugins matching opentabs-plugin-* pattern and lists any found",
+        "Output format is clean and readable (similar to opentabs status plugin section)",
+        "Supports --json flag for machine-readable output",
+        "Help text includes examples",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Add in platform/cli/src/commands/plugin.ts. Two modes:\n\n**Server running mode:**\n- Try fetch /health (with 3s timeout). If successful, extract pluginDetails and failedPlugins from the response.\n- Display similarly to status.ts plugin section but as the primary output.\n- Use colorTabState from status.ts (already exported).\n\n**Offline mode (server not running):**\n- Read config via readConfig/getConfigPath to get localPlugins.\n- For each local plugin: try to read package.json for name/version, try to read dist/tools.json for tool count.\n- For npm plugins: use `npm list -g --json --depth=0` to find globally installed packages matching opentabs-plugin-* pattern. Parse the JSON output.\n- Display with a note that tab state is only available when the server is running.\n\nImport resolvePort from parse-port.js. Import isConnectionRefused from config.js."
+    }
+  ]
+}

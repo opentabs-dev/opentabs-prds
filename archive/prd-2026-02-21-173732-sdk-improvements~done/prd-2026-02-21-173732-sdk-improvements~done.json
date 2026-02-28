@@ -1,0 +1,141 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "SDK improvements: add setSessionStorage, add deleteJSON/patchJSON/putJSON, add typed waitForSelector generic, strengthen ResourceDefinition schema connection, fix prompt type erasure, fix getPageGlobal branded type, add hasEverHadPlugins reset confirmation.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add setSessionStorage utility",
+      "description": "As a plugin developer, I want a setSessionStorage utility to match the existing get/remove/set pattern for localStorage.",
+      "acceptanceCriteria": [
+        "setSessionStorage(key, value) is exported from @opentabs-dev/plugin-sdk",
+        "It wraps sessionStorage.setItem with try-catch for SecurityError/QuotaExceededError (same pattern as setLocalStorage)",
+        "It is re-exported from platform/plugin-sdk/src/index.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/storage.ts. Add between getSessionStorage and removeSessionStorage:\n\n```typescript\n/**\n * Set a value in sessionStorage. Silently fails on SecurityError\n * (sandboxed iframes) or QuotaExceededError.\n */\nexport const setSessionStorage = (key: string, value: string): void => {\n  try {\n    sessionStorage.setItem(key, value);\n  } catch {\n    // SecurityError in sandboxed iframes, QuotaExceededError if full\n  }\n};\n```\n\nThen add it to the re-exports in platform/plugin-sdk/src/index.ts (around line 293-300 where other storage exports are)."
+    },
+    {
+      "id": "US-002",
+      "title": "Add deleteJSON, patchJSON, putJSON fetch utilities",
+      "description": "As a plugin developer, I want fetch utilities for common HTTP methods beyond GET and POST.",
+      "acceptanceCriteria": [
+        "deleteJSON<T>(url, init?, schema?) is exported — sends DELETE request, parses JSON response",
+        "patchJSON<T>(url, body, init?, schema?) is exported — sends PATCH with JSON body, parses JSON response",
+        "putJSON<T>(url, body, init?, schema?) is exported — sends PUT with JSON body, parses JSON response",
+        "All three support optional Zod schema validation (same overload pattern as fetchJSON/postJSON)",
+        "All three use fetchFromPage internally (inheriting session cookies, timeout, error handling)",
+        "All three are re-exported from @opentabs-dev/plugin-sdk",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/fetch.ts. Follow the exact same pattern as postJSON (lines 130-164). The only differences are the HTTP method.\n\nFor putJSON and patchJSON — same signature and implementation as postJSON but with `method: 'PUT'` / `method: 'PATCH'`.\n\nFor deleteJSON — similar to fetchJSON but with `method: 'DELETE'`. It may or may not have a request body. Use signature: `deleteJSON<T>(url, init?, schema?)` (no body parameter — DELETE requests typically don't have bodies, but if needed the caller can pass body in init).\n\nActually, a cleaner approach: extract a shared `requestJSON` helper that postJSON, putJSON, patchJSON all delegate to, passing the method. This avoids code duplication.\n\n```typescript\nconst requestJSONImpl = async (\n  method: string,\n  url: string,\n  body: unknown,\n  init?: FetchFromPageOptions,\n  schema?: z.ZodType,\n): Promise<unknown> => {\n  const response = await fetchFromPage(url, {\n    ...init,\n    method,\n    headers: { 'Content-Type': 'application/json', ...init?.headers },\n    body: JSON.stringify(body),\n  });\n  return fetchJSONImpl(url, { ...init, method }, schema);\n};\n```\n\nWait — that's wrong. The fetchJSONImpl calls fetchFromPage again. Better: refactor to share the JSON parsing + schema validation part.\n\nSimplest approach: just duplicate the postJSON pattern for put and patch, and add a simpler deleteJSON. The code duplication is minimal (each is ~15 lines) and keeps the functions readable.\n\nExport all three from platform/plugin-sdk/src/index.ts."
+    },
+    {
+      "id": "US-003",
+      "title": "Add generic type parameter to waitForSelector",
+      "description": "As a plugin developer, I want waitForSelector to return a typed element so I don't need manual casting.",
+      "acceptanceCriteria": [
+        "waitForSelector<T extends Element = Element>(selector, opts?) returns Promise<T>",
+        "Calling waitForSelector<HTMLInputElement>('.my-input') returns Promise<HTMLInputElement>",
+        "Calling waitForSelector('.foo') without generic returns Promise<Element> (backward compatible)",
+        "The runtime behavior is unchanged — only the type signature changes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/dom.ts line 24. Change from:\n```typescript\nexport const waitForSelector = (selector: string, opts?: WaitForSelectorOptions): Promise<Element> => {\n```\nTo:\n```typescript\nexport const waitForSelector = <T extends Element = Element>(selector: string, opts?: WaitForSelectorOptions): Promise<T> => {\n```\n\nInside the function, the `document.querySelector(selector)` calls return `Element | null`. Cast the resolved value:\n- Line where existing element is found: `resolve(existing as T);`\n- Line where observer finds element: `resolve(el as T);`\n\nThis is a type-only change — the runtime behavior is identical."
+    },
+    {
+      "id": "US-004",
+      "title": "Strengthen ResourceDefinition schema connection to read() return type",
+      "description": "As a plugin developer, I want the ResourceDefinition schema to provide a type-level connection to what read() returns, not just be decorative.",
+      "acceptanceCriteria": [
+        "When a Zod schema is provided to defineResource, the read() function's return type for ResourceContent.text is guided by the schema type",
+        "At minimum, the schema type is preserved as a generic parameter on ResourceDefinition so downstream code can reference it",
+        "The JSDoc clearly states that runtime validation is NOT performed — this is a type-level contract only",
+        "Existing resources without schemas continue to work",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "The current ResourceDefinition (platform/plugin-sdk/src/index.ts lines 50-67) already has `schema?: TContent` with generic `TContent extends z.ZodType`. The issue is that `read()` always returns `Promise<ResourceContent>` regardless of the schema.\n\nThe schema can't directly type the `text` field of ResourceContent (which is `string | undefined`) because the content is serialized JSON. What we CAN do is:\n\n1. Add a branded type or utility type that associates the schema with the definition:\n```typescript\ninterface ResourceDefinition<TContent extends z.ZodType = z.ZodType> {\n  // ... existing fields ...\n  schema?: TContent;\n  /** The schema type for this resource's content. Use z.infer<typeof resource.schema> to get the content type. */\n  readonly _contentType?: z.infer<TContent>; // phantom type — never set at runtime\n}\n```\n\nActually, that's still decorative. The real fix is better JSDoc explaining usage:\n```typescript\n/**\n * Optional Zod schema describing the structure of the resource content.\n * This is a type-level contract — the dispatch pipeline does not validate against it.\n * Use it for documentation and to derive content types:\n *   const schema = z.object({ channels: z.array(channelSchema) });\n *   const myResource = defineResource({ schema, ... });\n *   type Content = z.infer<typeof myResource.schema>; // { channels: Channel[] }\n */\n```\n\nThe honest assessment: the schema IS decorative because ResourceContent.text is always string. Making read() return typed content would require changing the dispatch pipeline. The best we can do is improve the documentation and add a type helper.\n\nAdd a type helper exported from the SDK:\n```typescript\nexport type ResourceContentType<R extends ResourceDefinition> = R extends ResourceDefinition<infer T> ? z.infer<T> : unknown;\n```\n\nThis lets plugin authors write: `type MyContent = ResourceContentType<typeof myResource>;`"
+    },
+    {
+      "id": "US-005",
+      "title": "Fix prompt type erasure in prompts array",
+      "description": "As a plugin developer, I want typed prompt render functions to retain their types when stored in the prompts array.",
+      "acceptanceCriteria": [
+        "definePrompt with args schema returns a type that preserves the schema type information",
+        "The OpenTabsPlugin.prompts array accepts typed prompt definitions without losing type info",
+        "At minimum, the render function's args parameter remains typed at the call site",
+        "Existing untyped prompts continue to work",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "The type erasure happens because OpenTabsPlugin.prompts is typed as `PromptDefinition[]` which erases the generic TArgs parameter.\n\nThe fundamental issue: TypeScript can't maintain heterogeneous generic types in an array. A `PromptDefinition<z.ZodObject<{name: z.ZodString}>>` stored in `PromptDefinition[]` becomes plain `PromptDefinition`.\n\nThis is the same pattern as `ToolDefinition[]` — each tool's TInput/TOutput is erased in the array. The type safety exists at the `defineTool`/`definePrompt` call site.\n\nThe best fix: ensure the type safety at the definition site is robust (which it already is via `TypedPromptConfig<TArgs>`) and document that the array erases types (which is expected TypeScript behavior). The render function IS typed when you call `definePrompt({ args: z.object({...}), render(args) { /* args is typed here */ } })`.\n\nSo the real fix is documentation + potentially a type test:\n1. Add JSDoc to OpenTabsPlugin.prompts explaining the type erasure is expected\n2. Add a type test (in tests) that verifies definePrompt with args correctly types the render function\n3. The runtime behavior is correct — args are validated at dispatch time by the adapter runtime\n\nIf we want to go further: change PromptDefinition to store the render function with a more specific internal type that the adapter runtime can use. But this adds complexity for marginal benefit."
+    },
+    {
+      "id": "US-006",
+      "title": "Fix getPageGlobal branded type to use standard generic",
+      "description": "As a plugin developer, I want getPageGlobal's generic parameter to work as a standard TypeScript generic without the confusing branded intersection type.",
+      "acceptanceCriteria": [
+        "getPageGlobal<T>(path) returns T | undefined using a standard generic overload",
+        "getPageGlobal(path) without generic returns unknown (backward compatible)",
+        "The branded type hack (string & { __brand?: T }) is removed",
+        "Usage: getPageGlobal<string>('TS.boot_data.api_token') returns string | undefined",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/page-state.ts. The current implementation (lines 9-35) uses a branded intersection type for the generic overload. Replace with standard TypeScript function overloads:\n\n```typescript\nexport function getPageGlobal(path: string): unknown;\nexport function getPageGlobal<T>(path: string): T | undefined;\nexport function getPageGlobal<T = unknown>(path: string): T | undefined {\n  // ... same implementation ...\n  return current as T | undefined;\n}\n```\n\nRemove the `GetPageGlobal` type alias and the branded type. The function becomes a standard overloaded function.\n\nUpdate the export in platform/plugin-sdk/src/index.ts if it re-exports the type alias."
+    },
+    {
+      "id": "US-007",
+      "title": "Add confirmation to hasEverHadPlugins reset in side panel",
+      "description": "As a user, I want a brief confirmation before the 'Show setup guide' link resets my onboarding state.",
+      "acceptanceCriteria": [
+        "Clicking 'Show setup guide' does not immediately reset — it first shows a small confirmation prompt",
+        "The confirmation can be a simple inline text swap: link text changes to 'Reset? Click again to confirm' with a timeout to revert",
+        "Clicking a second time within 3 seconds performs the actual reset",
+        "If the user doesn't click again within 3 seconds, the link reverts to 'Show setup guide'",
+        "This prevents accidental one-click resets",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Edit platform/browser-extension/src/side-panel/components/ReturningUserEmptyState.tsx. Add a state variable for the confirmation flow:\n\n```typescript\nconst [confirming, setConfirming] = useState(false);\nconst timerRef = useRef<number | null>(null);\n\nconst handleClick = () => {\n  if (confirming) {\n    // Second click — perform reset\n    if (timerRef.current) clearTimeout(timerRef.current);\n    onResetOnboarding();\n  } else {\n    // First click — enter confirmation mode\n    setConfirming(true);\n    timerRef.current = window.setTimeout(() => setConfirming(false), 3000);\n  }\n};\n\n// Cleanup timer on unmount\nuseEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);\n```\n\nRender: `<button onClick={handleClick}>{confirming ? 'Click again to confirm' : 'Show setup guide'}</button>`"
+    }
+  ]
+}

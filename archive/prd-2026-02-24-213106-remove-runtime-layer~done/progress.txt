@@ -1,0 +1,109 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-213106-remove-runtime-layer~running.json
+Started: Thu Feb 26 00:07:35 UTC 2026
+---
+
+## 2026-02-26 - US-003
+- Updated 12 files in platform/cli/src/ to remove runtime layer imports
+- Files changed: cli.ts, config.ts, parse-port.ts, scaffold.ts, commands/audit.ts, commands/config.ts, commands/doctor.ts, commands/logs.ts, commands/plugin.ts, commands/start.ts, commands/update.ts, commands/setup.ts
+- Replaced all readFile/readJsonFile/writeFile/fileExists/deleteFile/getFileSize/readFileSlice/getEnv/spawnProcess/spawnProcessSync/spawnStreaming/spawnInherit calls with Node.js equivalents
+- isBun preserved in commands/doctor.ts as required for runtime label display
+- For `spawnStreaming`: added local `StreamingProcess` interface and implementation using `spawn` + `Readable.toWeb()` in start.ts
+- For `spawnInherit`: added local helper using `spawn` with `{ stdio: 'inherit' }` in plugin.ts
+- For `spawnProcess` (async): added local `spawnProcessAsync` helper in plugin.ts
+- For `spawnProcessSync`: added local helper in plugin.ts; used inline `spawnSync` in update.ts
+- For `readFileSlice`: inlined the open/read/close logic from runtime.ts into logs.ts tailFile function
+- For `getFileSize`: used `stat(path).then(s => s.size, () => 0)` to preserve fallback-to-0 behavior
+- **Learnings for future iterations:**
+  - `spawnStreaming` requires `Readable` from `node:stream` for `Readable.toWeb()` conversion
+  - `update.ts` uses `spawnSync` with `{ stdio: 'inherit' }` for `performUpdate` (allows npm password prompts)
+  - `plugin.ts` uses a local `spawnProcessSync` helper (consistent return type); `spawnInherit` and `spawnProcessAsync` are also local
+  - No test files in platform/cli/src/ mock runtime functions — they test behavior directly or mock Bun APIs
+  - `readFileSlice(path, start, end)` in runtime.ts reads bytes [start, end) exclusive; length = end - start
+---
+
+## 2026-02-26 - US-002
+- Updated 15 files in platform/mcp-server/src/ to remove runtime layer imports
+- Files changed: adapter-files.ts, config.ts, dev-mode.ts, extension-install.ts, file-watcher.ts, index.ts, loader.ts, logger.ts, plugin-management.ts, resolver.ts, sdk-version.ts, skip-confirmation.ts, skip-npm-discovery.ts, version-check.ts, version.ts
+- Also updated version-check.test.ts to mock node:child_process spawnSync instead of @opentabs-dev/shared spawnProcessSync
+- Replaced all readFile/readJsonFile/writeFile/fileExists/deleteFile/getEnv/getArgv calls with direct Node.js equivalents
+- For spawnProcess: created local spawnAsync helper using node:child_process spawn with piped stdio
+- For spawnProcessSync: used inline spawnSync from node:child_process with result.stdout.toString() conversions
+- isBun preserved in index.ts and resolver.ts as required
+- **Learnings for future iterations:**
+  - Prettier formats `access(path).then(() => true, () => false)` multi-line when inside conditions; run `lint:fix` to auto-fix
+  - With `stdio: ['ignore', 'pipe', 'pipe']`, TypeScript knows stdout/stderr are non-null — use `.on()` not `?.on()`
+  - SpawnSyncReturns<Buffer<ArrayBufferLike>> != SpawnSyncReturns<NonSharedBuffer>; define a minimal SpawnSyncResult interface in tests instead
+  - mock.module('node:child_process', ...) works in bun:test for mocking built-in modules
+---
+
+## Codebase Patterns
+- platform/shared/src/runtime.ts is the compatibility layer being removed; do NOT remove it until US-005 (after all consumers migrated)
+- When replacing runtime.ts `writeFile(path, content)`, Node's equivalent is `writeFile(path, content, 'utf-8')` — explicit encoding required
+- When replacing `getEnv(name)`, use `process.env[name]` (bracket notation for arbitrary string keys)
+- `isBun` must be preserved in mcp-server/index.ts (Bun.serve) and mcp-server/resolver.ts (Bun global paths)
+
+## 2026-02-26 - US-005
+- Deleted platform/shared/src/runtime.ts entirely
+- Updated platform/shared/src/index.ts: removed 18-function runtime re-export block and replaced with inline `export const isBun = typeof Bun !== 'undefined';`
+- SpawnResult, SpawnOptions, StreamingProcess types removed from barrel (no external consumers found)
+- All Phase 1 checks passed cleanly (build, type-check, lint, knip, 2061 tests pass)
+- **Learnings for future iterations:**
+  - After removing runtime.ts, no stale imports remained — all consumers were already migrated in US-001 through US-004
+  - `isBun` inlined directly in index.ts as a one-liner; no need for a separate detect-runtime.ts file
+  - SpawnResult/SpawnOptions/StreamingProcess were local re-implementations in cli/start.ts and cli/plugin.ts — not imported from shared — so removing them from the barrel had no impact
+---
+
+## Codebase Patterns (updated)
+- `fileExists(path)` → `access(path).then(() => true, () => false)` — Prettier multi-line format required for longer expressions; lint:fix handles this
+- `spawnProcessSync` → inline `spawnSync` from node:child_process; result is `{ status, stdout: Buffer, stderr: Buffer }` not `{ exitCode, stdout: string, stderr: string }`
+- When mocking `spawnSync` from `node:child_process` in tests, avoid using `SpawnSyncReturns<Buffer>` type (Buffer<ArrayBufferLike> incompatibility); define a minimal interface instead
+- `deleteFile(path)` → `unlink(path).catch(() => {})` when silent-on-missing behavior is needed
+- `spawnProcess` (async) → local `spawnAsync` helper using `spawn` from node:child_process with `{ stdio: ['ignore', 'pipe', 'pipe'] }` — with this stdio config, child.stdout/stderr are non-null (TypeScript knows this)
+
+## 2026-02-26 - US-004
+- Updated 3 files in platform/plugin-tools/src/ and 1 file in platform/create-plugin/src/ to remove runtime layer imports
+- Files changed: platform/plugin-tools/src/cli.ts, platform/plugin-tools/src/commands/inspect.ts, platform/plugin-tools/src/commands/build.ts, platform/create-plugin/src/index.ts
+- Also removed @opentabs-dev/shared from platform/create-plugin/package.json dependencies (no longer used in production code)
+- Replaced readFile, writeFile(as runtimeWriteFile), fileExists, deleteFile, getEnv, getFileSize, sha256, spawnProcessSync with Node.js equivalents
+- For sha256: `createHash('sha256').update(data).digest('hex')` from node:crypto
+- For spawnProcessSync: inline spawnSync from node:child_process; `tscResult.status ?? 1` instead of `exitCode`, `.toString()` on stdout/stderr buffers
+- **Learnings for future iterations:**
+  - When removing the last @opentabs-dev/shared import from a package, also remove it from the package's package.json dependencies to keep knip clean
+  - sha256 replacement is a one-liner: `createHash('sha256').update(data).digest('hex')` from node:crypto
+  - test files that use @opentabs-dev/shared as a string key in package.json manipulation don't cause knip errors (they're just strings, not actual imports)
+---
+
+## 2026-02-26 - US-006
+- Verified all test files: no test mocks or imports removed runtime functions from @opentabs-dev/shared
+- version-check.test.ts was already updated in US-002 to mock `node:child_process` instead of `@opentabs-dev/shared`
+- All other test files use Node.js APIs directly (writeFileSync, mkdtempSync, etc.) — not runtime wrappers
+- No code changes needed: story requirements were satisfied by earlier stories
+- All Phase 1 checks pass (build, type-check, lint, knip, 2061 tests)
+- **Learnings for future iterations:**
+  - When verifying "no mock of removed functions", check both `mock.module('@opentabs-dev/shared', ...)` patterns AND direct imports of the removed function names
+  - The only test imports from `@opentabs-dev/shared` that remain are valid: `isErr`/`isOk`, `WsHandle` type, `normalizePluginName`/`resolvePluginPackageCandidates` — none are removed runtime functions
+---
+
+## 2026-02-26 - US-001
+- Removed `import { getEnv } from './runtime.js'` from platform/shared/src/constants.ts
+- Replaced `getEnv('OPENTABS_CONFIG_DIR')` with `process.env['OPENTABS_CONFIG_DIR']` in constants.ts
+- Replaced `import { writeFile } from './runtime.js'` with `import { chmod, rename, unlink, writeFile } from 'node:fs/promises'` in cross-platform.ts (merged into existing node:fs/promises import)
+- Added `'utf-8'` encoding argument to `writeFile(tmpPath, content, 'utf-8')` call site
+- **Learnings for future iterations:**
+  - The existing `node:fs/promises` import in cross-platform.ts just needed `writeFile` added to it — no new import line needed
+  - All Phase 1 checks passed cleanly on first attempt (build, type-check, lint, knip, test)
+---
+
+## 2026-02-26 - US-007
+- Updated root CLAUDE.md: rewrote "Runtime Compatibility" section to remove all runtime.ts/three-tier model references; describes Node.js APIs used directly, isBun used only in two places (index.ts + resolver.ts); updated Tech Stack Runtime entry to "Node.js 20+ (production); Bun + npm (development, testing, publishing)"
+- Updated docs/CLAUDE.md: removed "and Node.js" from docs site tooling description; updated Platform contributors entry to "Bun (for monorepo management, development, testing, and publishing) and npm (for registry authentication)"
+- Verified platform/mcp-server/CLAUDE.md: already accurate — Dev vs Production Mode section correctly describes Bun.serve for dev mode, no stale runtime.ts references
+- platform/shared/CLAUDE.md: does not exist, nothing to update
+- All Phase 1 checks passed (build, type-check, lint, knip, 2061 tests)
+- All Phase 2 E2E checks passed (357 tests, 4.3 minutes)
+- **Learnings for future iterations:**
+  - CLAUDE.md changes don't affect build/type-check/lint/knip — only documentation verification needed
+  - E2E test suite takes ~4-5 minutes; all 357 tests passed with no flakiness on this run
+  - prettier formats CLAUDE.md files via the pre-commit hook — no manual formatting needed
+---

@@ -1,0 +1,175 @@
+# Ralph Progress Log
+PRD: prd-2026-02-19-214917-docs-tooling-setup~running.json
+Started: Thu Feb 19 21:49:18 PST 2026
+---
+
+## Codebase Patterns
+- docs/ is a standalone project (not in bun workspaces) with its own package.json, node_modules, and bun.lock
+- Root tooling versions to match: eslint ^9.39.2, typescript-eslint ^8.56.0, prettier ^3.8.1, knip ^5.83.1, globals ^17.3.0
+- docs/ uses Next.js 16 with React 19 and Tailwind CSS 4 + Fumadocs
+- E2E tests in e2e/ reference side panel UI text — when side panel UI changes, E2E tests must be updated to match
+- docs/eslint.config.ts must ignore **/*.mjs — these are plain JS config files incompatible with TypeScript parser and strictTypeChecked rules
+- docs/tsconfig.json has baseUrl: "." which causes `import from 'knip'` to resolve to the local knip.ts file instead of node_modules/knip — exclude knip.ts and eslint.config.ts from tsconfig to avoid self-resolution conflicts
+- React 19 forwardRef migration: Remove forwardRef wrapper, add `ref?: React.Ref<ElementType>` to props, remove displayName
+- docs/eslint.config.ts needs `allowDefaultProject: ['eslint.config.ts', 'knip.ts']` for files excluded from tsconfig
+- Use `useSyncExternalStore` for hydration-safe "mounted" checks instead of useState+useEffect pattern
+- `role="region"` with `aria-label` satisfies jsx-a11y/no-noninteractive-tabindex — landmark roles with accessible names are allowed to have tabIndex
+- Import clsx as named export: `import { clsx } from 'clsx'` (not default) to satisfy import-x/no-named-as-default
+
+## 2026-02-19 - US-001
+- Installed all tooling devDependencies in docs/package.json: eslint, typescript-eslint, @eslint/js, @eslint/compat, @eslint/eslintrc, eslint-config-prettier, eslint-plugin-prettier, eslint-plugin-import-x, eslint-import-resolver-typescript, eslint-plugin-jsx-a11y, eslint-plugin-react, eslint-plugin-react-hooks, globals, prettier, prettier-plugin-tailwindcss, knip, @typescript-eslint/parser
+- Added scripts: type-check, lint, lint:fix, format, format:check, knip
+- Preserved existing scripts: dev, build, start, preview
+- Fixed pre-existing E2E test failure in side-panel-data-flow.e2e.ts (connection status test referenced "Connected"/"Disconnected"/"Not Connected" text that was removed in commit ddfec5a)
+- Files changed: docs/package.json, e2e/side-panel-data-flow.e2e.ts
+- **Learnings for future iterations:**
+  - The side panel no longer shows "Connected"/"Disconnected" text badges — it shows plugin cards when connected and "Cannot Reach MCP Server" when disconnected
+  - bun install in docs/ is fast (~1.1s) since docs has its own node_modules
+  - Do NOT add husky or lint-staged to docs/ — those belong at the root level only
+---
+
+## 2026-02-19 - US-002
+- Created docs/eslint.config.ts with ESLint 9 flat config format, matching root config structure
+- Config includes: js.configs.recommended, tseslint strictTypeChecked, jsx-a11y recommended, import-x recommended + typescript, prettier recommended, react-hooks (scoped to .tsx), react recommended + jsx-runtime
+- All rules match root: eqeqeq, prefer-const, no-var, func-style expression, arrow-body-style as-needed, consistent-type-imports/exports, restrict-template-expressions, no-confusing-void-expression, no-unused-vars with underscore patterns, import-x/order
+- Ignores: .next/, .source/, out/, node_modules/, next-env.d.ts, **/*.mjs
+- Uses browser + node + es2020 globals (Next.js runs in both contexts)
+- projectService: true for type-aware linting
+- reportUnusedDisableDirectives set to error
+- Files changed: docs/eslint.config.ts
+- **Learnings for future iterations:**
+  - The .mjs config files (next.config.mjs, postcss.config.mjs) must be ignored — they are plain JS files that the TypeScript parser cannot handle, and strictTypeChecked rules require type information
+  - eslint-plugin-react-hooks v7 has native flat config support (configs.flat['recommended-latest']), but to match root consistency we use the FlatCompat approach
+  - The docs ESLint config found 280 errors across the codebase (import ordering, func-style, unused vars, etc.) — these will be fixed in US-006
+---
+
+## 2026-02-19 - US-002 (commit)
+- Committed the previously-created docs/eslint.config.ts that was left untracked
+- All quality checks passed: build, type-check, lint, knip, test (824 pass), test:e2e (224 passed)
+- Files committed: docs/eslint.config.ts
+- **Learnings for future iterations:**
+  - Always verify git status after creating files — a previous iteration created the file and updated the PRD but failed to commit
+---
+
+## 2026-02-19 - US-003
+- Created docs/.prettierrc — identical copy of root .prettierrc (trailingComma all, semi true, singleQuote true, arrowParens avoid, printWidth 120, bracketSameLine true, htmlWhitespaceSensitivity strict, prettier-plugin-tailwindcss)
+- Created docs/.prettierignore — ignores .next, .source, out, node_modules, bun.lock
+- Created docs/knip.ts — entry points for all Next.js/Fumadocs files (app layouts/pages, source.config.ts, mdx-components.tsx, config files), ignoreDependencies for @tailwindcss/postcss, tailwindcss, @typescript-eslint/parser, tw-animate-css, ignores .next/.source/out dirs, ignoreExportsUsedInFile enabled
+- Updated docs/tsconfig.json to exclude knip.ts and eslint.config.ts — prevents baseUrl: "." self-resolution conflict where `import 'knip'` resolves to local knip.ts instead of node_modules/knip
+- Files changed: docs/.prettierrc, docs/.prettierignore, docs/knip.ts, docs/tsconfig.json
+- All quality checks passed: build, type-check, lint, knip, test (824 pass), test:e2e (228 passed)
+- **Learnings for future iterations:**
+  - The docs tsconfig has baseUrl: "." which makes TypeScript resolve bare module specifiers against the project root before checking node_modules. Any config file at the root named after an npm package (knip.ts, eslint.config.ts) will shadow the package. Exclude these from tsconfig to prevent self-resolution.
+  - Knip ignoreDependencies needed for docs: @tailwindcss/postcss (postcss plugin), tailwindcss (CSS @import), @typescript-eslint/parser (ESLint peer dep), tw-animate-css (CSS @import). These are all consumed via config files or CSS imports that Knip cannot trace.
+---
+
+## 2026-02-19 - US-004
+- Added four strict TypeScript flags to docs/tsconfig.json: noUncheckedIndexedAccess, noFallthroughCasesInSwitch, noImplicitReturns, noImplicitOverride
+- Note: The tsconfig.json already had these flags from a previous iteration (US-003 added them along with the exclude changes), so the tsconfig edit was a no-op
+- Fixed type errors caused by noUncheckedIndexedAccess in two component files:
+  - components/retro-tabs.tsx: `items[defaultIndex]` could be undefined — added optional chaining guard
+  - components/retroui/TableOfContents.tsx: `stack[stack.length - 1]` could be undefined — refactored both `generateTOCFromDOM` and `convertManualDataToTOC` to use optional chaining on stack access and explicit undefined checks for parent variable
+- Files changed: docs/components/retro-tabs.tsx, docs/components/retroui/TableOfContents.tsx
+- All quality checks passed: build, type-check, lint, knip, test (824 pass), test:e2e (224 passed)
+- **Learnings for future iterations:**
+  - noUncheckedIndexedAccess makes all array/object index access return `T | undefined` — common pattern is to use optional chaining (`arr[i]?.prop`) or explicit undefined checks
+  - The `while (stack[stack.length - 1].level >= ...)` pattern needs `stack[stack.length - 1]?.level ?? 0` to handle the undefined case
+  - Next.js `bun run build` runs TypeScript checking internally, so both type-check and build must pass — you can't just fix type-check and hope build ignores errors
+---
+
+## 2026-02-19 - US-006
+- Fixed all 83 ESLint errors across 53 files in docs/ project
+- Used `bun run lint:fix` to auto-fix 25 errors (import ordering, prettier formatting), then manually fixed remaining 58
+- Key fixes applied:
+  - **func-style**: Converted all `function` declarations to `const` arrow functions across 15+ files
+  - **consistent-type-imports**: Split inline type specifiers into top-level type imports (Avatar.tsx)
+  - **no-named-as-default**: Changed `import clsx from 'clsx'` to `import { clsx } from 'clsx'` (lib/utils.ts)
+  - **no-deprecated (ElementRef)**: Replaced `React.ElementRef` with `ComponentRef` (10 instances across Avatar, Popover, Progress, Slider, Toggle, ToggleGroup, Tooltip)
+  - **no-empty-object-type**: Replaced empty interfaces with type aliases (Dialog.tsx, Menu.tsx, Radio.tsx)
+  - **import-x/exports-last**: Moved intermediate exports to end of file (Dialog.tsx, Radio.tsx, retro-files.tsx)
+  - **import-x/no-named-as-default-member**: Changed `React.forwardRef` to `import { forwardRef }` (Dialog.tsx)
+  - **no-unnecessary-condition**: Removed unnecessary optional chains and nullish coalescing (TableOfContents.tsx, retroui-codeblock.tsx)
+  - **no-unnecessary-type-conversion**: Removed `Number()` wrapping already-numeric values (retroui-codeblock.tsx)
+  - **jsx-a11y/heading-has-content**: Explicitly destructured `children` in MDX heading components (mdx-components.tsx)
+  - **jsx-a11y/no-noninteractive-tabindex**: Added `aria-label` to `role="region"` scrollable containers (retroui-codeblock.tsx)
+  - **react-hooks/set-state-in-effect**: Refactored retro-theme-toggle.tsx to use `useSyncExternalStore` for hydration-safe mounted check; refactored TableOfContents.tsx to use custom `useDOMTocItems` hook with `useSyncExternalStore` + `MutationObserver` subscribe pattern
+  - **no-misused-promises**: Wrapped async onClick handler properly (CommandDisplay.tsx)
+  - **no-unused-vars**: Removed unused `React` imports (retro-accordion.tsx, Select.tsx, Switch.tsx, Textarea.tsx)
+  - **consistent-type-specifier-style**: Converted value imports used only as types to type-only imports (Toggle.tsx, Tooltip.tsx, Loader.tsx, Popover.tsx, Radio.tsx)
+- Also ran `bun run format` to fix all Prettier formatting issues
+- Updated docs/eslint.config.ts to add reportUnusedDisableDirectives: 'error' configuration
+- Files changed: 53 files across docs/ (all component files, config files, layout files, lib files)
+- All quality checks passed: build, type-check, lint, knip, test (824 pass), test:e2e (224 passed)
+- **Learnings for future iterations:**
+  - The docs auto-linter hook runs on file save and can fix some issues automatically — plan for the hook modifying files between read and edit
+  - `role="region"` with `aria-label` satisfies jsx-a11y/no-noninteractive-tabindex — the rule allows tabIndex on landmark roles when they have an accessible name
+  - `useSyncExternalStore` is the correct React 19 pattern for hydration-safe mounted checks — avoids the `useState` + `useEffect(() => setMounted(true))` anti-pattern that triggers `set-state-in-effect`
+  - For DOM-dependent state (like scanning headings), use `useSyncExternalStore` with a `MutationObserver` subscribe callback — this avoids `setState` in effects and properly synchronizes with external DOM state
+  - clsx has both default and named exports — prefer `import { clsx } from 'clsx'` to satisfy `import-x/no-named-as-default`
+---
+
+## 2026-02-20 - US-005
+- No code changes needed — `cd docs && bun run type-check` already exits 0
+- The type errors from `noUncheckedIndexedAccess` were already fixed in the US-004 commit (retro-tabs.tsx, TableOfContents.tsx)
+- No @ts-ignore or `any` type assertions present in the codebase
+- `cd docs && bun run build` passes
+- All root quality checks passed: build, type-check, lint, knip, test (824 pass), test:e2e (232 passed)
+- **Learnings for future iterations:**
+  - When a previous story (US-004) already fixes type errors as part of its tsconfig changes, US-005 becomes a no-op verification step — still worth running to confirm
+---
+
+## 2026-02-20 - US-006
+- Fixed all 280 ESLint errors across 53 files in the docs project
+- Started with `bun run lint:fix` which auto-fixed ~165 errors (import ordering, arrow-body-style, consistent-type-imports)
+- Manually fixed remaining ~115 errors:
+  - func-style: Converted all function declarations to arrow function expressions across all component files
+  - React 19 migration: Removed `React.forwardRef` wrappers from ~20 RetroUI components, moved `ref` to component props
+  - `React.ElementRef` → `React.ComponentRef` replacement across all RetroUI components
+  - Removed all `displayName` assignments (not needed without forwardRef)
+  - import-x/exports-last: Moved inline exports to end-of-file in retro-files.tsx, retro-tabs.tsx, retroui-codeblock.tsx, and many RetroUI components
+  - @typescript-eslint/no-empty-object-type: Replaced empty interfaces with type aliases
+  - jsx-a11y/heading-has-content: Explicitly destructured `children` in MDX heading components
+  - react-hooks/set-state-in-effect: Replaced `useState`+`useEffect` mounted pattern with `useSyncExternalStore` in retro-theme-toggle.tsx; rewrote TableOfContents.tsx to use `useSyncExternalStore` for DOM-based TOC generation
+  - Added `allowDefaultProject: ['eslint.config.ts', 'knip.ts']` to projectService config for tooling files excluded from tsconfig
+  - Added `jsx-a11y/no-noninteractive-tabindex` override allowing `role="region"` (WCAG-compliant scrollable containers)
+  - Removed unnecessary `Number()` type conversion in retroui-codeblock.tsx
+- Files changed: 53 files across docs/app/, docs/components/, docs/components/retroui/, docs/lib/, docs/eslint.config.ts, docs/mdx-components.tsx
+- All quality checks passed: root build, type-check, lint, knip, test (824 pass), docs build, docs lint, test:e2e (230+ passed)
+- **Learnings for future iterations:**
+  - React 19 forwardRef migration: Remove forwardRef wrapper, add `ref?: React.Ref<ElementType>` to the component props type, remove displayName
+  - The docs eslint.config.ts needs `allowDefaultProject` for files excluded from tsconfig (knip.ts, eslint.config.ts) since projectService can't find them
+  - `useSyncExternalStore` is the correct pattern for hydration-safe "mounted" checks — replaces the `useState(false)` + `useEffect(() => setMounted(true))` anti-pattern
+  - jsx-a11y/no-noninteractive-tabindex should allow `role="region"` for scrollable containers — this is a valid WCAG pattern
+---
+
+## 2026-02-20 - US-007
+- No code changes needed — `cd docs && bun run format:check` already exits 0
+- All 65 files (ts, tsx, json, md, mjs) reported "unchanged" by Prettier — formatting was already correct from US-006's `bun run lint:fix` which uses eslint-plugin-prettier
+- `cd docs && bun run format:check` passes
+- `cd docs && bun run build` passes
+- `cd docs && bun run lint` passes
+- `cd docs && bun run type-check` passes
+- All root quality checks passed: build, type-check, lint, knip, test (824 pass)
+- **Learnings for future iterations:**
+  - When US-006 uses eslint-plugin-prettier (which runs Prettier as an ESLint rule) and `bun run lint:fix`, all files get Prettier-formatted as a side effect — making US-007 a no-op verification step
+  - Still worth running format:check explicitly to confirm, since the Prettier config (.prettierrc) and ESLint's prettier plugin could theoretically diverge
+---
+
+## 2026-02-20 - US-008
+- Fixed all Knip unused code issues — `cd docs && bun run knip` now exits 0
+- Removed 32 unused RetroUI component files and their barrel export (index.ts) — only Badge.tsx and Button.tsx retained (actively imported from app/page.tsx and components.mdx)
+- Removed 20 unused dependencies from package.json: @headlessui/react, @radix-ui/react-avatar, @radix-ui/react-checkbox, @radix-ui/react-context-menu, @radix-ui/react-dialog, @radix-ui/react-dropdown-menu, @radix-ui/react-label, @radix-ui/react-popover, @radix-ui/react-progress, @radix-ui/react-radio-group, @radix-ui/react-select, @radix-ui/react-slider, @radix-ui/react-switch, @radix-ui/react-toggle, @radix-ui/react-toggle-group, @radix-ui/react-tooltip, @radix-ui/react-visually-hidden, cmdk, sonner, vaul
+- Added 3 unlisted dependencies to package.json: @radix-ui/react-collapsible (retro-files.tsx), @radix-ui/react-tabs (retro-tabs.tsx), next-themes (retro-theme-toggle.tsx)
+- Cleaned up knip.ts: removed redundant entry patterns and ignores auto-discovered by Knip's Next.js plugin
+- Added Badge.tsx as Knip entry point (imported from MDX content, which Knip cannot trace)
+- Added source.config.ts to Knip ignore (export consumed by fumadocs build pipeline)
+- Added eslint-plugin-react-hooks to ignoreDependencies (FlatCompat string reference untraceable by Knip)
+- Kept @tailwindcss/postcss, tailwindcss, tw-animate-css in ignoreDependencies (still needed)
+- Files changed: 35 files (32 deleted RetroUI components, knip.ts, package.json, index.ts)
+- All quality checks passed: root build, type-check, lint, knip, test (824 pass), docs build, lint, type-check, format:check, knip
+- **Learnings for future iterations:**
+  - Prefer deleting truly unused code over adding Knip entry points to keep it — reduces maintenance burden and dependency count
+  - Knip cannot trace imports inside MDX files — components imported only from MDX need to be listed as Knip entry points
+  - The `docs` export in source.config.ts is consumed by fumadocs-mdx's build pipeline (generates .source/) — Knip cannot trace this, so ignore the file
+  - FlatCompat string-based plugin references (`plugin:react-hooks/recommended`) cannot be traced by Knip's ESLint plugin — add to ignoreDependencies
+---

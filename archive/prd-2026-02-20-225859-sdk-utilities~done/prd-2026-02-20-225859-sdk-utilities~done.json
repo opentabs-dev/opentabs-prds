@@ -1,0 +1,137 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add comprehensive SDK utilities to @opentabs-dev/plugin-sdk that reduce boilerplate for plugin authors. The utilities cover DOM querying/waiting, page fetch with error handling, storage access, page state introspection, and retry/timing patterns. All utilities are generic (not tied to any specific plugin), exported from the SDK's public API, unit tested, and validated end-to-end through the e2e-test plugin. After implementation, the SDK is published to npm and plugins are updated to use the new version.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add DOM utilities to plugin SDK",
+      "description": "As a plugin author, I want DOM utility functions in the SDK so I can wait for elements, query the DOM, and observe mutations without writing boilerplate MutationObserver/polling code in every plugin.",
+      "acceptanceCriteria": [
+        "sdk.waitForSelector(selector, opts?) returns Promise<Element> — polls with MutationObserver, configurable timeout (default 10s), rejects with descriptive error on timeout",
+        "sdk.waitForSelectorRemoval(selector, opts?) returns Promise<void> — resolves when the element matching selector is removed from the DOM, configurable timeout (default 10s)",
+        "sdk.querySelectorAll<T>(selector) returns T[] — typed wrapper around document.querySelectorAll, returns a real array (not NodeList)",
+        "sdk.getTextContent(selector) returns string | null — returns trimmed textContent of the first matching element, or null if not found",
+        "sdk.observeDOM(selector, callback, options?) returns () => void — sets up MutationObserver on matching element, returns cleanup function; options include childList, attributes, subtree (defaults: childList+subtree true)",
+        "All functions are exported from @opentabs-dev/plugin-sdk (platform/plugin-sdk/src/index.ts re-exports them)",
+        "Unit tests in platform/plugin-sdk/src/dom.test.ts using happy-dom for DOM simulation",
+        "bun run build, bun run type-check, bun run lint, bun run knip, bun run test all pass"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Implementation file: platform/plugin-sdk/src/dom.ts. Export from platform/plugin-sdk/src/index.ts (currently 97 lines, add re-exports at the bottom). The SDK currently has one test file: platform/plugin-sdk/src/index.test.ts (101 lines) — create a new dom.test.ts alongside it. The tsconfig.test.json at platform/plugin-sdk/tsconfig.test.json already includes 'src/**/*.test.ts' so new test files are auto-discovered. For happy-dom: add 'happy-dom' as a devDependency in platform/plugin-sdk/package.json. Use globalThis.document and globalThis.MutationObserver from happy-dom in tests. waitForSelector implementation: create a MutationObserver on document.body watching childList+subtree, check document.querySelector on each mutation, resolve on match, reject on timeout via setTimeout. waitForSelectorRemoval: similar pattern but resolve when querySelector returns null. observeDOM: querySelector the target, attach MutationObserver, return disconnect function. Make sure to add the new dom.ts module to the tsconfig include paths (already covered by 'src' include in platform/plugin-sdk/tsconfig.json). Run 'bun run knip' to verify no unused exports."
+    },
+    {
+      "id": "US-002",
+      "title": "Add page fetch utilities to plugin SDK",
+      "description": "As a plugin author, I want typed fetch utilities in the SDK that use the page's cookies/session, with built-in error handling, timeout support, and JSON parsing, so I don't have to write the same boilerplate fetch-then-check-ok-then-parse-json pattern in every tool handler.",
+      "acceptanceCriteria": [
+        "sdk.fetchFromPage(url, init?) returns Promise<Response> — uses native fetch with credentials:'include', configurable timeout via AbortSignal.timeout (default 30s), throws descriptive error on non-ok status including status code and response text",
+        "sdk.fetchJSON<T>(url, init?) returns Promise<T> — calls fetchFromPage, parses JSON, returns typed result; throws on parse failure with descriptive error",
+        "sdk.postJSON<T>(url, body, init?) returns Promise<T> — convenience for POST with JSON body (sets Content-Type, stringifies body), calls fetchJSON",
+        "All functions handle AbortSignal timeout, non-ok HTTP status, and JSON parse errors with clear error messages",
+        "All functions are exported from @opentabs-dev/plugin-sdk",
+        "Unit tests in platform/plugin-sdk/src/fetch.test.ts",
+        "bun run build, bun run type-check, bun run lint, bun run knip, bun run test all pass"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Implementation file: platform/plugin-sdk/src/fetch.ts. Export from platform/plugin-sdk/src/index.ts. These are NOT trivial one-liner wrappers — they add real value: (1) credentials:'include' by default (page session cookies), (2) configurable timeout via AbortSignal.timeout with a sensible default, (3) automatic non-ok status checking with error text extraction, (4) JSON parse error handling, (5) generic type parameter for type-safe responses. Compare with plugins/e2e-test/src/test-api.ts (44 lines) and plugins/slack/src/slack-api.ts lines 362-428 — both implement the same fetch+check-ok+parse-json+error-handling pattern manually. For unit tests: use Bun's built-in fetch mock or create a simple Bun.serve() test server in the test file. The fetch functions should throw ToolError (already exported from the SDK at platform/plugin-sdk/src/index.ts:88-97) for consistent error handling across plugins. The init parameter should accept standard RequestInit and merge with defaults (credentials, signal, headers)."
+    },
+    {
+      "id": "US-003",
+      "title": "Add storage utilities to plugin SDK",
+      "description": "As a plugin author, I want simple typed wrappers for reading localStorage, sessionStorage, and cookies so I can access page state without writing try-catch boilerplate for each storage API.",
+      "acceptanceCriteria": [
+        "sdk.getLocalStorage(key) returns string | null — wraps localStorage.getItem with try-catch (returns null on SecurityError or missing)",
+        "sdk.setLocalStorage(key, value) returns void — wraps localStorage.setItem with try-catch (silently fails on SecurityError)",
+        "sdk.getSessionStorage(key) returns string | null — wraps sessionStorage.getItem with try-catch",
+        "sdk.getCookie(name) returns string | null — parses document.cookie string, handles URI-encoded values, returns null if cookie not found",
+        "All functions are exported from @opentabs-dev/plugin-sdk",
+        "Unit tests in platform/plugin-sdk/src/storage.test.ts",
+        "bun run build, bun run type-check, bun run lint, bun run knip, bun run test all pass"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Implementation file: platform/plugin-sdk/src/storage.ts. Export from platform/plugin-sdk/src/index.ts. The try-catch wrappers are important because storage APIs can throw SecurityError in sandboxed iframes or when storage is disabled. See plugins/slack/src/slack-api.ts lines 35-58 (getAuthFromLocalStorage) — it wraps localStorage access in try-catch, which every plugin would need to do. getCookie implementation: split document.cookie by '; ', find the entry starting with 'name=', extract and decodeURIComponent the value. For unit tests: happy-dom provides localStorage and sessionStorage globals. For document.cookie, happy-dom supports it — set cookies directly in the test and read them back. Keep the implementation simple — these are thin safety wrappers, not full cookie-jar implementations."
+    },
+    {
+      "id": "US-004",
+      "title": "Add page state utilities to plugin SDK",
+      "description": "As a plugin author, I want utilities to safely read page globals, the current URL, and page title so I can introspect page state without writing repetitive null-checking and type-casting code.",
+      "acceptanceCriteria": [
+        "sdk.getPageGlobal<T>(path) returns T | undefined — safe deep property access on globalThis using dot-notation path (e.g., 'TS.boot_data.team_id'), returns undefined if any segment is missing, wraps in try-catch",
+        "sdk.getCurrentUrl() returns string — returns window.location.href",
+        "sdk.getPageTitle() returns string — returns document.title",
+        "All functions are exported from @opentabs-dev/plugin-sdk",
+        "Unit tests in platform/plugin-sdk/src/page-state.test.ts",
+        "bun run build, bun run type-check, bun run lint, bun run knip, bun run test all pass"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Implementation file: platform/plugin-sdk/src/page-state.ts. Export from platform/plugin-sdk/src/index.ts. getPageGlobal is the most valuable utility here — see plugins/slack/src/slack-api.ts lines 111-149 (getAuthFromBootData) which manually traverses window.TS.boot_data, window.TS.model, window.TS.redux.getState() — all with defensive null checks and type casts. getPageGlobal('TS.boot_data.api_token') would replace 5+ lines of defensive access. Implementation: split path by '.', walk globalThis reducing each segment with optional chaining semantics, wrap in try-catch to handle getters that throw. Type parameter T is for the caller's convenience (cast at the call site, no runtime validation). For unit tests: set properties on globalThis in beforeEach/afterEach, clean up after. Test edge cases: missing intermediate properties, empty path, properties that are null vs undefined."
+    },
+    {
+      "id": "US-005",
+      "title": "Add retry/timing utilities to plugin SDK",
+      "description": "As a plugin author, I want retry, sleep, and waitUntil utilities so I can handle transient failures, implement polling, and wait for conditions without writing custom retry loops in every tool handler.",
+      "acceptanceCriteria": [
+        "sdk.retry<T>(fn, opts?) returns Promise<T> — retries fn on failure with maxAttempts (default 3), delay (default 1000ms), optional exponential backoff (default false), optional AbortSignal support; re-throws last error after all attempts exhausted",
+        "sdk.sleep(ms) returns Promise<void> — simple promisified setTimeout",
+        "sdk.waitUntil(predicate, opts?) returns Promise<void> — polls predicate at interval (default 200ms), resolves when predicate returns true, rejects on timeout (default 10s) with descriptive error",
+        "All functions are exported from @opentabs-dev/plugin-sdk",
+        "Unit tests in platform/plugin-sdk/src/timing.test.ts",
+        "bun run build, bun run type-check, bun run lint, bun run knip, bun run test all pass"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Implementation file: platform/plugin-sdk/src/timing.ts. Export from platform/plugin-sdk/src/index.ts. See plugins/slack/src/slack-api.ts lines 329-346 (waitForSlackAuth) — a hand-rolled polling loop with interval and timeout. sdk.waitUntil would replace this entirely. Also see the Slack API call at line 398 which uses AbortSignal.timeout(30_000) — the retry utility should support AbortSignal for cancellation. retry implementation: loop maxAttempts times, call fn in try-catch, on error sleep(delay * backoffMultiplier), check signal.aborted before retrying. waitUntil implementation: setInterval + setTimeout combo, clear both on resolution. sleep implementation: new Promise(resolve => setTimeout(resolve, ms)). For unit tests: use Bun's test framework with mock timers if available, or use real timers with short intervals (10-50ms). Test retry with functions that fail N times then succeed, test abort signal cancellation, test waitUntil with predicates that become true after a delay."
+    },
+    {
+      "id": "US-006",
+      "title": "Add E2E tests for SDK utilities using e2e-test plugin",
+      "description": "As a platform developer, I want E2E tests that verify SDK utilities work end-to-end through the full dispatch chain (MCP client → MCP server → Chrome extension → page context → SDK utility → response) so I can be confident the utilities work in real browser contexts.",
+      "acceptanceCriteria": [
+        "The e2e-test plugin uses SDK utilities in existing or new tools (replace manual DOM/fetch code with SDK calls where applicable)",
+        "New E2E test tools exercise: waitForSelector (wait for a DOM element that appears after a delay), fetchJSON (call the test server API through SDK), getLocalStorage (read a value set by the test page), getPageGlobal (read a window global set by the test page), retry (call a flaky endpoint that fails then succeeds)",
+        "New E2E test cases in e2e/ verify the SDK utilities work through the full dispatch chain",
+        "The test server (e2e/test-server.ts) is extended with any necessary endpoints (e.g., a flaky endpoint for retry testing, a page that sets localStorage/globals)",
+        "bun run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "This story requires updating multiple files:\n\n1. Test server (e2e/test-server.ts, 546 lines): Add new endpoints and page features:\n   - Add a '/sdk-test' page route that serves HTML with: (a) a delayed element (appears after 500ms via setTimeout), (b) localStorage.setItem('sdk-test-key', 'sdk-test-value'), (c) window.__sdkTestGlobal = { nested: { value: 42 } }, (d) an element with known textContent for getTextContent testing.\n   - Add 'POST /api/flaky' endpoint that fails the first N requests then succeeds (controlled by a counter in state, resettable via /control/reset). This tests sdk.retry.\n   - Add 'POST /api/sdk-fetch-test' endpoint that returns { ok: true, data: 'sdk-fetch-works' } for testing fetchJSON.\n\n2. E2E test plugin (plugins/e2e-test/): Add new tool files in plugins/e2e-test/src/tools/:\n   - sdk-wait-for-selector.ts: uses sdk.waitForSelector('#delayed-element') on the /sdk-test page\n   - sdk-fetch-json.ts: uses sdk.fetchJSON<T>('/api/sdk-fetch-test') instead of manual fetch\n   - sdk-get-local-storage.ts: uses sdk.getLocalStorage('sdk-test-key')\n   - sdk-get-page-global.ts: uses sdk.getPageGlobal<number>('__sdkTestGlobal.nested.value')\n   - sdk-retry.ts: uses sdk.retry(() => sdk.fetchJSON('/api/flaky'), { maxAttempts: 5, delay: 100 })\n   Register all new tools in plugins/e2e-test/src/index.ts (line 17, tools array).\n   Rebuild: cd plugins/e2e-test && bun install && bun run build.\n\n3. E2E test file: Create e2e/sdk-utilities.e2e.ts with test cases that:\n   - Navigate to the /sdk-test page URL on the test server\n   - Call each SDK tool via mcpClient.callTool() and verify the response\n   - Use the existing fixture pattern from e2e/fixtures.ts (mcpServer, testServer, extensionContext, mcpClient fixtures)\n   - Follow the pattern in e2e/tool-dispatch.e2e.ts for reference\n\n4. The e2e-test plugin must first be updated to depend on the new SDK version with the utility functions (from US-001 through US-005). Since this is before publishing (US-007), use the local path or build the SDK locally. Actually — the e2e-test plugin depends on the npm-published @opentabs-dev/plugin-sdk. For E2E testing before publish, you have two options: (a) temporarily use 'file:../../platform/plugin-sdk' in the e2e-test plugin's package.json dependencies, build, test, then revert before US-007, or (b) do US-007 (publish) first, then come back. Option (a) is preferred — use file: protocol for local testing, then US-007 will switch to the published version.\n\n5. Update the test server's PAGE_HTML or add the /sdk-test page. The existing /interactive page (lines 216-279) shows how to serve custom HTML pages — follow the same pattern.\n\n6. For the fixtures, the config created by createTestConfigDir() (fixtures.ts line 127) reads tool names from plugins/e2e-test/dist/tools.json (line 122-125). After adding new tools and rebuilding the plugin, the new tools will automatically be included in the test config."
+    },
+    {
+      "id": "US-007",
+      "title": "Publish updated SDK and update plugins",
+      "description": "As a platform maintainer, I want to publish the updated @opentabs-dev/plugin-sdk (and its dependencies) to npm so that plugins can depend on the published version with the new SDK utilities.",
+      "acceptanceCriteria": [
+        "@opentabs-dev/plugin-sdk version is bumped (e.g., from 0.0.10 to 0.0.11)",
+        "All platform packages are published in dependency order: shared → plugin-sdk → plugin-tools → cli",
+        "npm propagation is verified (retry 'npm view @opentabs-dev/plugin-sdk version' with delays, do NOT assume token expired on 404/403)",
+        "plugins/e2e-test/package.json updated to depend on the new @opentabs-dev/plugin-sdk version",
+        "plugins/slack/package.json updated to depend on the new @opentabs-dev/plugin-sdk version",
+        "Both plugins build successfully: cd plugins/<name> && bun install && bun run build",
+        "All platform quality gates pass: bun run build, bun run type-check, bun run lint, bun run knip, bun run test"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Use the existing publish script at scripts/publish.sh (100 lines). Current version is 0.0.10 (see platform/plugin-sdk/package.json line 3). Bump to the next appropriate version.\n\nPublish steps:\n1. Run 'bun run build' to ensure everything compiles.\n2. Run './scripts/publish.sh <new-version>' — this bumps versions in all platform packages (platform/shared, platform/plugin-sdk, platform/plugin-tools, platform/cli), updates cross-references, rebuilds, swaps to publish token (~/.npmrc.publish → ~/.npmrc), and publishes all 4 packages in dependency order.\n3. IMPORTANT: After publishing, there can be npm registry propagation delays (30s-2min). Retry 'npm view @opentabs-dev/plugin-sdk@<version> version' with 10-second delays, up to 12 attempts. Do NOT interpret 404 or E403 as a token/auth problem during this window — it's propagation lag.\n4. Once the new version is visible on npm, update plugin dependencies:\n   - plugins/e2e-test/package.json line 39: change '@opentabs-dev/plugin-sdk' version\n   - plugins/e2e-test/package.json line 42: change '@opentabs-dev/plugin-tools' version\n   - plugins/slack/package.json line 37: change '@opentabs-dev/plugin-sdk' version\n   - plugins/slack/package.json line 40: change '@opentabs-dev/plugin-tools' version\n5. Rebuild both plugins: cd plugins/e2e-test && bun install && bun run build && cd ../slack && bun install && bun run build\n6. If the e2e-test plugin was temporarily using 'file:' protocol for local SDK testing in US-006, revert it to the published npm version now.\n7. Run all quality gates from the repo root.\n\nThe ~/.npmrc token can do both read and write (per the user's note). The publish script handles token swapping automatically (lines 68-77 of scripts/publish.sh)."
+    },
+    {
+      "id": "US-008",
+      "title": "Update CLAUDE.md to document SDK utilities",
+      "description": "As a developer (or AI agent) working on the OpenTabs codebase, I want CLAUDE.md to document the available SDK utility functions so I know what's available and how to use them when writing plugins.",
+      "acceptanceCriteria": [
+        "CLAUDE.md includes a new section documenting all SDK utility functions with brief descriptions and example usage",
+        "Documentation covers: DOM utilities (waitForSelector, waitForSelectorRemoval, querySelectorAll, getTextContent, observeDOM), fetch utilities (fetchFromPage, fetchJSON, postJSON), storage utilities (getLocalStorage, setLocalStorage, getSessionStorage, getCookie), page state utilities (getPageGlobal, getCurrentUrl, getPageTitle), and timing utilities (retry, sleep, waitUntil)",
+        "Each function's signature, return type, and purpose are described",
+        "CLAUDE.md remains plugin-agnostic (no plugin-specific examples)",
+        "CLAUDE.md is accurate and reflects the actual implementation"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit CLAUDE.md (root of the repo). Add a new section titled '### SDK Utilities' under the 'Key Concepts' area (after the existing concepts like plugin discovery, tool prefixing, tab state machine, dev vs production mode, hot reload). Keep the documentation concise — CLAUDE.md explicitly says 'Keep additions high-level — avoid excessive detail that wastes context'. Group utilities by category (DOM, Fetch, Storage, Page State, Timing). For each function, provide: function signature, return type, one-sentence description. Include one brief example per category showing how a plugin tool handler would use the utility. Do NOT list individual plugins or plugin-specific use cases — keep it generic per the CLAUDE.md guidelines. The section should be roughly 40-60 lines — enough to be informative without being a full API reference."
+    }
+  ]
+}

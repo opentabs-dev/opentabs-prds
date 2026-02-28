@@ -1,0 +1,50 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Implement a seamless `bun dev` experience where any source file edit auto-rebuilds and auto-reloads the MCP server (via bun --hot) and the Chrome extension (via chrome.runtime.reload()). Today, `bun dev` does a one-shot build then starts the MCP server — there is no file watching on TypeScript source. All the reload primitives exist (bun --hot, POST /extension/reload, chrome.runtime.reload()) but are not wired into an automated dev loop.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Create dev orchestrator script that runs tsc --build --watch + bun --hot together",
+      "description": "As a platform developer, I want `bun dev` to watch all TypeScript source files and auto-rebuild so that the MCP server hot-reloads automatically on any source change without me running `bun run build` manually.",
+      "acceptanceCriteria": [
+        "A new `scripts/dev.ts` file exists that orchestrates the dev workflow",
+        "The script runs `tsc --build --watch` as a child process to incrementally recompile all platform packages via project references",
+        "The script runs `bun --hot platform/mcp-server/dist/index.js` as a child process — the MCP server",
+        "tsc --build --watch is started first. After its initial compilation completes (watch for the 'Found 0 errors. Watching for file changes.' line or similar tsc watch output), the MCP server is started",
+        "The root `package.json` `dev` script is updated to `bun scripts/dev.ts`",
+        "Both child processes' stdout/stderr are piped to the parent's stdout/stderr with clear prefixes (e.g. [tsc], [mcp]) so the developer can see output from both",
+        "When the developer presses Ctrl+C, both child processes are killed cleanly (SIGTERM) and the script exits",
+        "Editing a `.ts` file in `platform/mcp-server/src/` triggers tsc recompilation, which updates `dist/`, which triggers bun --hot reload of the MCP server",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Implementation approach:\n\n1. Create `scripts/dev.ts` using `Bun.spawn()` (NOT `node:child_process` — this runs under Bun, not Playwright).\n\n2. Spawn two long-lived child processes:\n   - `tsc --build --watch` (watches all platform source via project references in root tsconfig.json)\n   - `bun --hot platform/mcp-server/dist/index.js` (the MCP server)\n\n3. tsc --build --watch should start first. Wait for its initial compilation to complete before starting the MCP server. You can detect this by watching tsc's stdout for the line containing 'Watching for file changes' which tsc prints after the initial build.\n\n4. Pipe stdout/stderr from both processes to the parent. Use line prefixes like `[tsc]` and `[mcp]` for clarity. Bun.spawn supports `stdio: ['inherit', 'pipe', 'pipe']` — read from the pipe and prefix each line.\n\n5. Handle SIGINT/SIGTERM: kill both child processes and exit. Use `process.on('SIGINT', ...)` and `process.on('SIGTERM', ...)`.\n\n6. Update root `package.json` script: `\"dev\": \"bun scripts/dev.ts\"`\n\n7. Add `scripts/dev.ts` to the `tsconfig.scripts.json` include pattern (it already covers `scripts/**/*.ts`).\n\n8. The script should NOT do an initial `bun run build` — `tsc --build --watch` handles the initial compilation. However, the extension bundling steps (build:bundle, build:side-panel, build:tailwind, install-extension) are NOT handled by tsc. Those are covered by US-002.\n\nKey constraint: `tsc --build --watch` only runs the TypeScript compiler. It does NOT run Bun.build() for the extension bundles or the Tailwind build. Those post-tsc steps are handled by US-002."
+    },
+    {
+      "id": "US-002",
+      "title": "Auto-rebuild and auto-reload Chrome extension on source changes",
+      "description": "As a platform developer, I want the Chrome extension to automatically rebuild (bundle + tailwind + copy) and reload when I edit extension-related source files, so I never need to manually reload from chrome://extensions/.",
+      "acceptanceCriteria": [
+        "The dev orchestrator (`scripts/dev.ts`) watches for tsc output changes in `platform/browser-extension/dist/` and `platform/shared/dist/` (since the extension imports from shared)",
+        "When changes are detected, the script runs the extension pipeline: (1) build:bundle (Bun.build for background.js + offscreen), (2) build:side-panel (Bun.build for React app), (3) build:tailwind (Tailwind CSS), (4) install-extension (copy to ~/.opentabs/extension/), (5) POST /extension/reload to trigger chrome.runtime.reload()",
+        "The extension pipeline is debounced (e.g. 300ms) so rapid tsc output changes do not trigger multiple rebuilds",
+        "The POST /extension/reload call handles the case where the MCP server is not yet running or the extension is not connected (log a warning, do not crash)",
+        "MCP-server-only changes (files in `platform/mcp-server/dist/` that are NOT in `platform/shared/dist/`) do NOT trigger the extension pipeline — bun --hot handles those automatically",
+        "Console output clearly shows when the extension pipeline is triggered (e.g. '[ext] Rebuilding extension...' and '[ext] Extension reloaded')",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Implementation approach — extend `scripts/dev.ts` from US-001:\n\n1. Use `node:fs` `watch()` (the same approach as `file-watcher.ts` in the MCP server) to watch the directories:\n   - `platform/browser-extension/dist/` — tsc output for extension code\n   - `platform/shared/dist/` — tsc output for shared package (extension imports from shared)\n\n2. When a change is detected in either directory, debounce for 300ms, then run the extension pipeline sequentially:\n   ```\n   bun run --cwd platform/browser-extension build:bundle\n   bun run --cwd platform/browser-extension build:side-panel\n   bun scripts/install-extension.ts\n   POST http://localhost:9515/extension/reload (or whatever port the MCP server is on)\n   ```\n   Use `Bun.spawn()` for the build steps (await each). For the POST, use `fetch()`.\n\n3. The Tailwind build (`build:tailwind` in the extension's package.json) is part of `build:side-panel` — check the extension's package.json to confirm if it needs to run separately or is included. Looking at the scripts: `build:side-panel` runs `bun run build-side-panel.ts && bun run build:tailwind`, so it handles both. But in the dev script, you may want to run Tailwind in watch mode (`@tailwindcss/cli -i ... -o ... --watch`) as a separate long-lived process instead of rebuilding it each time. This is an optimization — the simpler approach (rebuild on each change) works correctly and can be optimized later if slow.\n\n4. For the POST /extension/reload: the MCP server may use a bearer token (wsSecret from config). Read `~/.opentabs/config.json` to get the secret, or use the same auth mechanism. Actually, checking http-routes.ts, the `/extension/reload` endpoint calls `checkBearerAuth(req, state.wsSecret)`. The secret comes from `~/.opentabs/config.json`. Read the config to get it. If no secret is configured, no auth header is needed.\n\n5. Handle the case where the extension is not connected (503 response from the endpoint) — just log and continue. The extension will pick up the new code on its next connection.\n\n6. Watch only tsc output dirs (dist/), NOT source dirs. tsc --build --watch handles the source→dist compilation. This script watches dist→bundle→install→reload.\n\n7. Do NOT watch `platform/mcp-server/dist/` — changes there are handled by bun --hot automatically. Only watch extension-related dist dirs.\n\n8. The initial run should also trigger the extension pipeline once after tsc's initial build completes (so the extension is up to date when dev starts)."
+    }
+  ]
+}

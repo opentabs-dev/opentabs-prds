@@ -1,0 +1,126 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-155200-codebase-review-fixes~running.json
+Started: Wed Feb 18 07:44:12 PST 2026
+---
+
+## Codebase Patterns
+- The offscreen document (`platform/browser-extension/src/offscreen/index.ts`) manages the persistent WebSocket connection to the MCP server with reconnection, ping/pong keepalive, and guard flags to prevent concurrent operations.
+- Guard flags like `connecting` must always be reset in `finally` blocks to prevent deadlocks from unexpected exceptions.
+- In `handleExtensionMessage`, `parsed.method` and `parsed.id` are validated with `typeof` checks (not `as` casts) — follow this pattern for any new fields extracted from parsed JSON.
+- E2E test `hot-reload-dynamic.e2e.ts:365` (IIFE change triggers plugin.update log) is flaky due to file watcher timing — it retries and passes.
+- Slack plugin is standalone (not in bun workspaces) — always verify with `cd plugins/slack && bun run build`.
+- When refactoring ternary to if/else, beware `Uint8Array` vs `Uint8Array<ArrayBuffer>` — the narrower generic is needed for `fetch()` body.
+- In `startCapture` (network-capture.ts), the debugger attach + enable sequence needs cleanup: if `sendCommand` fails after `attach` succeeds, detach the debugger before rethrowing to avoid orphaned debugger attachments.
+- The `pluginLocks` map in `tab-state.ts` stores the `.catch()` return value (not the raw promise) — rethrowing in the catch handler would break the serialization chain for subsequent calls.
+- Slack plugin shared schemas (`messageSchema`, `paginationMetadataSchema`, `channelSchema`) live in `channel-schema.ts` — new shared schemas should be added there.
+
+## 2026-02-18 - US-104
+- Wrapped `Network.enable` and `Runtime.enable` sendCommand calls in a try-catch in `startCapture`
+- On failure, `chrome.debugger.detach()` is called to clean up the orphaned debugger attachment before rethrowing
+- `captures.set()` remains after both commands succeed, so capture state is only created when everything is ready
+- Files changed: `platform/browser-extension/src/network-capture.ts`
+- **Learnings for future iterations:**
+  - When a multi-step resource acquisition sequence (attach → enable domain A → enable domain B → store state) can fail midway, each step after the first must clean up all previously acquired resources on failure
+  - The `stopCapture` function checks `captures.get(tabId)` first — if capture state doesn't exist, it can't clean up the debugger attachment, so the cleanup must happen at the acquisition site
+---
+
+## 2026-02-18 - US-103
+- Replaced `as string | undefined` and `as string | number | undefined` casts with `typeof` runtime checks for `parsed.method` and `parsed.id` in `handleExtensionMessage`
+- Malformed messages with wrong field types (e.g., `method: 42`) now produce `undefined` instead of propagating incorrect types
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`
+- **Learnings for future iterations:**
+  - The extension-protocol already validates many fields with typeof checks (e.g., in `handleTabStateChanged`) — the `method`/`id` extraction was the exception, now fixed
+  - Downstream code already handles `undefined` for both `method` and `id`, so the change is fully backward-compatible
+---
+
+## 2026-02-18 - US-102
+- Added try-catch around `atob()` in Slack upload-file tool handle function
+- Invalid base64 input now throws `ToolError` with code `invalid_base64` and a clear message
+- Used a helper function `decodeBase64` to maintain type inference (`Uint8Array<ArrayBuffer>`) required by the `fetch` body parameter
+- Files changed: `plugins/slack/src/tools/upload-file.ts`
+- **Learnings for future iterations:**
+  - Slack plugin is standalone — verify with `cd plugins/slack && bun run build`, not root build
+  - When refactoring ternary expressions into if/else with explicit variable types, beware of generic type parameters (e.g., `Uint8Array` vs `Uint8Array<ArrayBuffer>`) — the narrower type may be required by downstream consumers like `fetch()`
+  - `ToolError` is already imported in Slack tools from `@opentabs-dev/plugin-sdk`
+---
+
+## 2026-02-18 - US-101
+- Restructured `connect()` in offscreen/index.ts to use try-finally pattern for the `connecting` guard flag
+- Moved both `refreshWsUrl()` and `new WebSocket()` into a single try block with `finally { connecting = false }` to guarantee the flag is always reset
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - The offscreen document uses multiple guard flags (`connecting`, `reconnectScheduledByWatchdog`, `awaitingPong`) to manage concurrency — always use try-finally when setting any of them
+  - `refreshWsUrl()` has its own internal try-catch, but defensive coding means the caller should still handle unexpected exceptions
+---
+
+## 2026-02-18 - US-105
+- Replaced `.catch(() => {})` with `.catch((err: unknown) => { console.warn(...) })` on the adapter teardown executeScript call in `injectPluginIntoMatchingTabs`
+- Warning includes the plugin name and the error for debuggability
+- Teardown remains non-fatal (no rethrow) — only makes failures observable in logs
+- Files changed: `platform/browser-extension/src/iife-injection.ts`
+- **Learnings for future iterations:**
+  - The `injectPluginIntoMatchingTabs` function uses `Promise.allSettled` for parallel tab processing, so individual tab failures don't block others — the `.catch` on teardown is an additional layer of error containment within each tab's processing
+  - The `pluginName` variable from the outer `map` callback is available in the `.catch` handler's scope, making it easy to include context in log messages
+---
+
+## 2026-02-18 - US-106
+- Replaced `.catch(() => {})` with `.catch((err: unknown) => { console.warn(...) })` on the plugin lock chain in `checkTabStateChanges`
+- Warning includes the plugin name and the error for debuggability
+- The catch handler still prevents rejection propagation (no rethrow), since the catch result is stored in `pluginLocks` to chain subsequent calls
+- Files changed: `platform/browser-extension/src/tab-state.ts`
+- **Learnings for future iterations:**
+  - The `pluginLocks` map stores the caught promise (not the raw promise) — the `.catch()` return value is what gets chained for subsequent calls, so rethrowing would break the serialization chain
+  - The `plugin` variable from the outer `map` callback is in scope for the `.catch` handler
+---
+
+## 2026-02-18 - US-107
+- Wrapped both `z.toJSONSchema(tool.input)` and `z.toJSONSchema(tool.output)` calls in `convertToolSchemas` with individual try-catch blocks
+- Each catch block rethrows with a message including the tool name and guidance about `.transform()`, `.pipe()`, `.preprocess()` not being serializable to JSON Schema
+- Files changed: `platform/cli/src/commands/build.ts`
+- **Learnings for future iterations:**
+  - The `convertToolSchemas` function is called per-tool from `generateManifest` — errors bubble up to the build pipeline's `runBuild` which already handles Error messages with `pc.red()`
+  - The `tool.name` field is available on `ToolDefinition` and is the same name used in the manifest, making error messages easy to correlate with the source
+---
+
+## 2026-02-18 - US-108
+- Replaced `Date.now()` with `crypto.randomUUID()` in the temp wrapper file name in `bundleIIFE`
+- `crypto.randomUUID()` is a globally available Web Crypto API in Bun — no import needed
+- Files changed: `platform/cli/src/commands/build.ts`
+- **Learnings for future iterations:**
+  - `crypto.randomUUID()` is available globally in Bun runtime without any import, just like in browsers
+  - The temp wrapper file is created and deleted within `bundleIIFE` in a try-finally block — the UUID-based name prevents collisions if cleanup fails during concurrent builds
+---
+
+## 2026-02-18 - US-109
+- Changed `throw new ToolError(error, error)` to `throw new ToolError('Slack API error: ' + error, error)` in `slackApi`
+- The message is now human-readable ("Slack API error: channel_not_found") while the code remains the raw Slack error string for programmatic handling
+- Files changed: `plugins/slack/src/slack-api.ts`
+- **Learnings for future iterations:**
+  - The `ToolError` constructor signature is `ToolError(message: string, code: string)` — message is for humans, code is for machines
+  - The `slackApi` function already has good error handling patterns for HTTP errors (429, non-ok status) and invalid response format — the `ok: false` branch was the only one with the conflation issue
+---
+
+## 2026-02-18 - US-110
+- Added `messageSchema` and `paginationMetadataSchema` exports to `channel-schema.ts`
+- Updated `read-messages.ts` to import `messageSchema` and `paginationMetadataSchema` from `channel-schema.ts`
+- Updated `read-thread.ts` to extend `messageSchema` with `.extend({ thread_ts })` for `replySchema`, import `paginationMetadataSchema`
+- Updated `list-channels.ts`, `list-members.ts`, `list-users.ts` to import `paginationMetadataSchema`
+- Files changed: `plugins/slack/src/tools/channel-schema.ts`, `read-messages.ts`, `read-thread.ts`, `list-channels.ts`, `list-members.ts`, `list-users.ts`, `opentabs-plugin.json`
+- **Learnings for future iterations:**
+  - `channel-schema.ts` is the central schema file for Slack tools — new shared schemas should go here
+  - Zod's `.extend()` works cleanly for adding fields to an existing schema (e.g., `messageSchema.extend({ thread_ts })`)
+  - The `paginationMetadataSchema` includes the `.optional()` and `.describe()` chain, so consumers just assign it directly without wrapping
+---
+
+## 2026-02-18 - US-111
+- Replaced all 10 `new Promise(resolve => setTimeout(resolve, ...))` occurrences in `browser-tools.e2e.ts` with condition-based polling
+- Added three local helper functions: `waitForExecFileCleanup`, `waitForNetworkRequests`, `waitForConsoleLogs`
+- All helpers use the existing `waitFor()` polling primitive from `helpers.ts`
+- Categories replaced: exec file cleanup (4), screenshot render (1), network capture (3), console logs (2)
+- Files changed: `e2e/browser-tools.e2e.ts`
+- **Learnings for future iterations:**
+  - The `waitFor()` helper in `e2e/helpers.ts` is the foundation for all E2E polling — new polling patterns should be built on top of it
+  - E2E tests run under Playwright's Node.js runner (not Bun), so Node.js APIs like `fs.readdirSync` are correct
+  - When replacing setTimeout with polling for file cleanup, check the filesystem directly rather than calling a tool — it's faster and avoids round-trip overhead
+  - Network capture and console log tests need to poll the respective browser tool until results appear, since events are asynchronous
+---

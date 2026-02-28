@@ -1,0 +1,134 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-151439-extension-debugging-tools~running.json
+Started: Wed Feb 18 17:10:33 PST 2026
+---
+
+## Codebase Patterns
+- The `import-x/exports-last` ESLint rule requires all export statements at the end of files. Define types/classes without `export` keyword, then re-export at the bottom (e.g., `export { MyClass }; export type { MyType };`).
+- When adding new InternalMessage variants to types.ts, update the exhaustive switch in background.ts AND offscreen/index.ts — both have switch cases covering all message types.
+- The `ignoreExportsUsedInFile: true` knip setting means exports used within their own file are not flagged as unused.
+- When adding new extension_* browser tools: update BROWSER_TOOL_NAMES in e2e/helpers.ts and ensure E2E test filters use `!t.name.startsWith('extension_')` not `t.name !== 'extension_reload'`.
+- known-methods.ts DISPATCH_METHODS is the single source of truth for WebSocket method allowlist — offscreen ALLOWED_METHODS derives from it.
+- bgLogCollector was extracted from background.ts into bg-log-state.ts to break circular import: background.ts → message-router.ts → browser-commands.ts → background.ts. Both background.ts and browser-commands.ts import from bg-log-state.ts.
+- When `chrome.runtime.sendMessage` returns `any`, cast to `unknown` first (`const raw: unknown = await ...`) then assert the expected shape. This avoids `@typescript-eslint/no-unsafe-*` lint errors.
+- React 19 lint rule `react-hooks/refs` prohibits `ref.current = value` during render. Sync refs from state using a separate `useEffect` with no dependency array.
+- E2E tests for extension debugging tools: force reconnect happens too fast for /health to see disconnection — verify via tab.syncAll log count instead.
+- The e2e-test plugin adapter has no __hash property, so adapterHash returns null in check_adapter results.
+
+---
+
+## 2026-02-18 - US-001
+- Implemented LogCollector class in platform/browser-extension/src/log-collector.ts
+- Ring buffer with configurable max entries (default 500), captures console.log/warn/error/info
+- Message formatting: strings pass through, Errors use message+stack, objects use JSON.stringify with fallback to String()
+- Messages truncated at 2000 characters
+- installLogCollector() wraps console methods while preserving originals via .bind(console)
+- Background script initializes with source='background', offscreen with source='offscreen'
+- Added BgGetLogsMessage type to InternalMessage union in types.ts
+- Both background.ts and offscreen/index.ts handle 'bg:getLogs' messages, returning entries + stats
+- Files changed: log-collector.ts (new), background.ts, offscreen/index.ts, types.ts
+- **Learnings for future iterations:**
+  - The ESLint `import-x/exports-last` rule is strict — inline `export` fails if ANY non-exported statement precedes it. Use bottom-of-file re-exports.
+  - TypeScript strict mode flags `array[0]` as possibly undefined even after length check — use optional chaining (`array[0]?.prop ?? fallback`).
+  - bgLogCollector is exported from background.ts for future use by browser-commands.ts (US-003 will need it).
+---
+
+## 2026-02-18 - US-002
+- Implemented extension_get_state tool for comprehensive state inspection
+- MCP server side: extension-get-state.ts already existed with tool definition + registered in index.ts
+- Extension side: handleExtensionGetState in browser-commands.ts — reads wsConnected from chrome.storage.session, mcpServerUrl from chrome.storage.local, plugin metadata via getAllPluginMeta(), tab states via getLastKnownStates(), network captures via getActiveCapturesSummary(), offscreen existence via chrome.runtime.getContexts()
+- Dispatch routing: extension.getState in message-router.ts dispatch table and known-methods.ts DISPATCH_METHODS
+- Test mocks: added mockHandleExtensionGetState to message-router.test.ts and known-methods.test.ts mocks
+- Fixed pre-existing E2E test failures: config-watcher.e2e.ts and hot-reload-dynamic.e2e.ts had filters that only excluded `browser_*` and `extension_reload`, missing `extension_get_state`. Updated to `!t.name.startsWith('extension_')` for future-proofing. Added `extension_get_state` to BROWSER_TOOL_NAMES in helpers.ts.
+- Files changed: browser-commands.ts, message-router.ts, message-router.test.ts, known-methods.ts, known-methods.test.ts, network-capture.ts, tab-state.ts, browser-tools/index.ts, browser-tools/extension-get-state.ts, e2e/helpers.ts, e2e/config-watcher.e2e.ts, e2e/hot-reload-dynamic.e2e.ts
+- **Learnings for future iterations:**
+  - When adding new extension_* tools, also update the E2E helper `BROWSER_TOOL_NAMES` in e2e/helpers.ts and ensure E2E test filters exclude `extension_*` tools (not just `browser_*`)
+  - The known-methods.ts is the single source of truth for allowed WebSocket methods — the offscreen ALLOWED_METHODS derives from it
+  - Pre-existing E2E failures must be fixed before committing — the "own the codebase" rule is enforced
+---
+
+## 2026-02-18 - US-003
+- Implemented extension_get_logs tool for retrieving internal logs from background and offscreen
+- MCP server side: extension-get-logs.ts tool definition with optional level/source/limit/since params (already existed from prior iteration)
+- Extension side: handleExtensionGetLogs in browser-commands.ts — gets bg logs from bgLogCollector, offscreen logs via chrome.runtime.sendMessage('bg:getLogs'), merges by timestamp descending, applies limit
+- Created bg-log-state.ts to break circular import (background.ts → message-router.ts → browser-commands.ts → background.ts)
+- Dispatch routing: extension.getLogs in message-router.ts dispatch table and known-methods.ts DISPATCH_METHODS
+- Test mocks: added mockHandleExtensionGetLogs to message-router.test.ts and known-methods.test.ts
+- Added extension_get_logs to BROWSER_TOOL_NAMES in e2e/helpers.ts
+- Fixed lint errors from prior incomplete iteration: import ordering, prettier formatting, unsafe `any` access on chrome.runtime.sendMessage response
+- Files changed: bg-log-state.ts (new), extension-get-logs.ts (new), browser-commands.ts, background.ts, message-router.ts, message-router.test.ts, known-methods.ts, known-methods.test.ts, browser-tools/index.ts, e2e/helpers.ts
+- **Learnings for future iterations:**
+  - bgLogCollector must live in a separate module (bg-log-state.ts) to avoid circular imports between background.ts and browser-commands.ts
+  - chrome.runtime.sendMessage returns `any` — cast via `const raw: unknown = await ...` then type-assert to avoid ESLint unsafe-any rules
+  - The linter auto-fixes code on save/commit; read files fresh before editing to avoid stale-content errors
+---
+
+## 2026-02-18 - US-004
+- Implemented extension_get_side_panel tool for side panel state inspection
+- MCP server side: extension-get-side-panel.ts tool definition dispatching 'extension.getSidePanel'
+- Extension side: handleExtensionGetSidePanel in browser-commands.ts sends 'sp:getState' message to side panel via chrome.runtime.sendMessage with 3-second timeout; returns { open: false } if no response
+- Side panel (App.tsx): added 'sp:getState' handler in the onMessage listener, returns current React state (connected, loading, pluginCount, plugins) and root innerHTML (truncated to 50000 chars)
+- Used useRef pattern to read latest state values in the sp:getState handler without adding them to the useEffect dependency array — React 19 lint rule prohibits updating refs during render, so refs are synced in a separate useEffect with no dependency array
+- Added SpGetStateMessage type to types.ts InternalMessage union
+- Updated exhaustive switches in background.ts and offscreen/index.ts for the new 'sp:getState' message type
+- Dispatch routing: extension.getSidePanel in message-router.ts dispatch table and known-methods.ts DISPATCH_METHODS
+- Test mocks: added mockHandleExtensionGetSidePanel to message-router.test.ts and known-methods.test.ts
+- Added extension_get_side_panel to BROWSER_TOOL_NAMES in e2e/helpers.ts
+- Files changed: types.ts, App.tsx, extension-get-side-panel.ts (new), browser-commands.ts, message-router.ts, message-router.test.ts, known-methods.ts, known-methods.test.ts, browser-tools/index.ts, background.ts, offscreen/index.ts, e2e/helpers.ts
+- **Learnings for future iterations:**
+  - React 19 lint rule `react-hooks/refs` prohibits `ref.current = value` during render body — must use a separate useEffect (with no deps) to sync refs from state
+  - The sp:getState handler in App.tsx uses refs (connectedRef, loadingRef, pluginsRef) to always read latest state values without triggering hook dependency warnings
+  - When adding sp:* message types, update the exhaustive switch in BOTH background.ts and offscreen/index.ts
+---
+
+## 2026-02-18 - US-005
+- Implemented extension_check_adapter tool for plugin injection diagnostics
+- MCP server side: extension-check-adapter.ts tool definition accepting `plugin` param, dispatching 'extension.checkAdapter'
+- Extension side: handleExtensionCheckAdapter in browser-commands.ts — looks up plugin metadata via getPluginMeta(), finds matching tabs via findAllMatchingTabs(), then for each tab runs chrome.scripting.executeScript in MAIN world to inspect globalThis.__openTabs.adapters[pluginName]
+- Each tab reports: tabId, tabUrl, adapterPresent, adapterHash, hashMatch (compares to meta.adapterHash), isReady (with IS_READY_TIMEOUT_MS timeout), toolCount, toolNames
+- Returns { plugin, expectedHash, matchingTabs: [...] } — or error if plugin not found
+- Dispatch routing: extension.checkAdapter in message-router.ts dispatch table and known-methods.ts DISPATCH_METHODS
+- Test mocks: added mockHandleExtensionCheckAdapter to message-router.test.ts and known-methods.test.ts
+- Added routing test in message-router.test.ts for extension.checkAdapter dispatch
+- Added extension_check_adapter to BROWSER_TOOL_NAMES in e2e/helpers.ts
+- Files changed: extension-check-adapter.ts (new), browser-commands.ts, message-router.ts, message-router.test.ts, known-methods.ts, known-methods.test.ts, browser-tools/index.ts, e2e/helpers.ts
+- **Learnings for future iterations:**
+  - The tab-matching.ts findAllMatchingTabs function returns tabs sorted by rank (active+focused first) — useful for checking the most likely tab first
+  - Use IS_READY_TIMEOUT_MS from constants.ts (5 seconds) for isReady() probe timeouts to stay consistent with tab-state.ts
+  - Promise.allSettled is the right pattern for per-tab checks — one failing tab shouldn't prevent reporting on others
+---
+
+## 2026-02-18 - US-006
+- Implemented extension_force_reconnect tool for soft WebSocket recovery
+- MCP server side: extension-force-reconnect.ts tool definition, parameterless, dispatching 'extension.forceReconnect'
+- Extension side: handleExtensionForceReconnect in browser-commands.ts — sends JSON-RPC success response FIRST (before WebSocket drops), waits 50ms for flush, then sends 'bg:forceReconnect' to offscreen document
+- Offscreen side: handles 'bg:forceReconnect' message by closing the WebSocket (close code 1000), resetting backoff to INITIAL_BACKOFF_MS, clearing any pending reconnect timeout, and calling connect() immediately
+- Added BgForceReconnectMessage type to InternalMessage union in types.ts
+- Updated exhaustive switch in background.ts to pass through 'bg:forceReconnect' to offscreen
+- Dispatch routing: extension.forceReconnect in message-router.ts dispatch table and known-methods.ts DISPATCH_METHODS
+- Test mocks: added mockHandleExtensionForceReconnect to message-router.test.ts and known-methods.test.ts
+- Added routing test in message-router.test.ts for extension.forceReconnect dispatch
+- Added extension_force_reconnect to BROWSER_TOOL_NAMES in e2e/helpers.ts
+- Files changed: extension-force-reconnect.ts (new), types.ts, offscreen/index.ts, browser-commands.ts, message-router.ts, message-router.test.ts, known-methods.ts, known-methods.test.ts, browser-tools/index.ts, background.ts, e2e/helpers.ts
+- **Learnings for future iterations:**
+  - The response must be sent BEFORE the WebSocket is torn down — sendToServer uses the current WebSocket connection
+  - A small delay (50ms) between sending the response and requesting reconnect ensures the response flushes
+  - When handling bg:forceReconnect in offscreen, clear any pending reconnect timeout before calling connect() to avoid duplicate connections
+---
+
+## 2026-02-18 - US-007
+- Added E2E tests for all 5 extension debugging tools in browser-tools.e2e.ts
+- New test describe block 'Extension debugging tools' with 6 tests:
+  1. extension_get_state: verifies connection.wsConnected=true, plugins array includes e2e-test, networkCaptures array, offscreen.exists boolean
+  2. extension_get_logs: fetches all logs (no source filter), verifies non-empty entries with timestamp/level/source/message fields, stats object shape
+  3. extension_get_side_panel: verifies { open: false } when side panel is not open in Playwright
+  4. extension_check_adapter (e2e-test): opens test server tab, polls until adapter injected, verifies plugin name, matchingTabs with adapterPresent/tabId/tabUrl/hashMatch/isReady/toolCount/toolNames
+  5. extension_check_adapter (non-existent): verifies error response contains "not found"
+  6. extension_force_reconnect: calls tool, verifies { reconnecting: true }, waits for fresh tab.syncAll log, confirms tools still work after reconnection
+- BROWSER_TOOL_NAMES in helpers.ts already included all 5 new tools from prior iterations
+- Files changed: e2e/browser-tools.e2e.ts
+- **Learnings for future iterations:**
+  - The log collector in the background script may have zero entries when filtering by source='background' in E2E — fetch all logs (no source filter) to get both background and offscreen entries
+  - The e2e-test plugin adapter does not have a __hash property, so adapterHash can be null — assert `=== null || typeof === 'string'` not just `typeof === 'string'`
+  - Force reconnect happens so fast that the /health endpoint never observes extensionConnected=false — verify reconnection by counting tab.syncAll log messages before and after, rather than polling for disconnected state
+---

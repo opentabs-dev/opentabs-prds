@@ -1,0 +1,180 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-225909-mcp-resources-prompts~running.json
+Started: Sat Feb 21 03:38:35 PST 2026
+---
+
+## Codebase Patterns
+- Plugin SDK types and factories are defined directly in `platform/plugin-sdk/src/index.ts` (not in separate files)
+- Factory functions (`defineTool`, `defineResource`, `definePrompt`) are identity functions that provide type inference — no runtime validation
+- The `OpenTabsPlugin` base class uses `abstract readonly` for required properties and plain `readonly` with `?` for optional ones
+- Test file for SDK exports is `platform/plugin-sdk/src/index.test.ts` — tests cover type compilation, factory identity, and runtime behavior
+- Commit messages follow `feat: US-XXX — description` pattern
+- `tools.json` format changed from plain array to `{ tools: [...], resources: [...], prompts: [...] }` — loader and file-watcher support BOTH formats for backward compatibility
+- Manifest types (`ManifestResource`, `ManifestPrompt`, `ManifestPromptArgument`) are in `@opentabs-dev/shared` — build.ts imports from there
+- `RegisteredPlugin` and `LoadedPlugin` include `resources: ManifestResource[]` and `prompts: ManifestPrompt[]` — all test helpers must include these fields
+- The IIFE adapter already exposes `resources` and `prompts` via `adapters[name] = plugin` — no IIFE wrapper changes needed
+- The `makePlugin()` test stub doesn't have real Zod schemas, so `generateManifest` tests must use `makeRealTool()` instead
+- `PluginRegistry` has O(1) lookup maps: `toolLookup`, `resourceLookup`, `promptLookup` — all populated during `buildRegistry()`
+- Resource URI prefixing: `opentabs+<plugin>://<originalUri>`; prompt name prefixing: `<plugin>_<promptName>` (same as tools)
+- MCP SDK exports `McpError` and `ErrorCode` from `@modelcontextprotocol/sdk/types.js` — use for handler errors
+- `McpServerInstance` interface has notification methods: `sendToolListChanged`, `sendResourceListChanged`, `sendPromptListChanged`
+- All mock McpServerInstance objects in test files must be kept in sync when methods are added to the interface
+- When adding new WebSocket dispatch methods: update `DISPATCH_METHODS` in `known-methods.ts`, add handler to `methodHandlers` in `message-router.ts`, mock in both `known-methods.test.ts` and `message-router.test.ts`
+- After changing server log messages, search E2E tests for regex patterns matching the old format — E2E tests assert on log content
+- Extension wraps ALL dispatch results in `{ output: ... }` — dispatch handlers must unwrap: `const raw = result as Record<string, unknown>; const data = raw.output ?? raw;`
+- When tools.json format changes, E2E tests in `hot-reload-dynamic.e2e.ts` that read/write tools.json directly must be updated — use format-aware helpers
+- Publish workflow: `./scripts/publish.sh <version>` handles version bump, cross-references, rebuild, and publish in dependency order
+- When switching plugins from `file:` back to npm, delete `node_modules` and `bun.lock` first for a clean resolve
+---
+
+## 2026-02-21 11:42 - US-001
+- Implemented `ResourceContent`, `ResourceDefinition`, `PromptArgument`, `PromptMessage`, `PromptDefinition` types in `platform/plugin-sdk/src/index.ts`
+- Added `defineResource()` and `definePrompt()` identity factory functions mirroring the existing `defineTool()` pattern
+- Extended `OpenTabsPlugin` base class with optional `resources: ResourceDefinition[]` and `prompts: PromptDefinition[]` properties
+- Added comprehensive tests in `platform/plugin-sdk/src/index.test.ts` covering all new types and factories
+- Files changed: `platform/plugin-sdk/src/index.ts`, `platform/plugin-sdk/src/index.test.ts`
+- **Learnings for future iterations:**
+  - All new types are MCP-protocol-aligned: `ResourceContent` matches `ReadResourceResult.contents[n]`, `PromptMessage` matches `GetPromptResult.messages[n]`, `PromptArgument` matches MCP `PromptArgument`
+  - The `read()` handler receives the URI as an argument (for potential URI template expansion in the future)
+  - The `render()` handler receives `Record<string, string>` since MCP prompt arguments are always string-valued
+  - Template literals in tests need `String()` wrapping for dictionary-style access (e.g., `args['name']`) due to `@typescript-eslint/restrict-template-expressions` rule
+---
+
+## 2026-02-21 11:55 - US-002
+- Added resource and prompt validation to `validatePlugin()` — validates URIs non-empty, prompt names match `[a-z0-9_-]+`, no duplicates, argument names non-empty
+- Added `generateResourcesManifest()` and `generatePromptsManifest()` to extract serializable metadata from definitions (no runtime functions)
+- Added `generateManifest()` returning `{ tools, resources, prompts }` structure
+- Changed `tools.json` output format from plain array to `{ tools: [...], resources: [...], prompts: [...] }`
+- Updated `loader.ts` and `file-watcher.ts` to handle both legacy array format and new object format
+- Updated `e2e/fixtures.ts` (`readPluginToolNames`, `createMinimalPlugin`) for new format
+- Updated `build-e2e.test.ts` and `create-plugin/src/index.test.ts` for new manifest structure
+- Added 24 new tests covering resource/prompt validation, extraction, and manifest generation
+- Files changed: `platform/plugin-tools/src/commands/build.ts`, `platform/plugin-tools/src/commands/build.test.ts`, `platform/plugin-tools/src/commands/build-e2e.test.ts`, `platform/mcp-server/src/loader.ts`, `platform/mcp-server/src/file-watcher.ts`, `platform/create-plugin/src/index.test.ts`, `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - The `tools.json` backward compatibility is critical — loader and file-watcher must handle both `Array<ManifestTool>` and `{ tools: ManifestTool[], resources: ..., prompts: ... }` until all plugins are rebuilt
+  - The e2e-test plugin's pre-built `tools.json` stays in old array format until plugin packages are published (US-008) and plugin is rebuilt
+  - `makePlugin()` test stub uses fake tool objects (no Zod schemas); tests calling `generateManifest()` must use `makeRealTool()` which has real Zod schemas
+  - The IIFE adapter shape already exposes resources/prompts because `adapters[name] = plugin` passes the full OpenTabsPlugin instance
+  - The `ManifestResource`, `ManifestPrompt`, `ManifestPromptArgument` types are defined locally in `build.ts` for now — US-003 will move them to the shared package
+---
+
+## 2026-02-21 12:10 - US-003
+- Added `ManifestResource`, `ManifestPrompt`, `ManifestPromptArgument` types to `platform/shared/src/index.ts`
+- Updated `PluginManifest` to include optional `resources: ManifestResource[]` and `prompts: ManifestPrompt[]` arrays
+- Updated `build.ts` to import these types from `@opentabs-dev/shared` instead of defining locally
+- Updated `RegisteredPlugin` (state.ts) and `LoadedPlugin` (loader.ts) to include `resources` and `prompts` fields
+- Updated `loader.ts` to parse resources and prompts from manifest (backward-compatible with legacy array format)
+- Updated all test helpers (10 occurrences across 7 test files) to include `resources: []` and `prompts: []`
+- Files changed: `platform/shared/src/index.ts`, `platform/plugin-tools/src/commands/build.ts`, `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/loader.ts`, `platform/mcp-server/src/extension-protocol.test.ts`, `platform/mcp-server/src/file-watcher.test.ts`, `platform/mcp-server/src/http-routes.test.ts`, `platform/mcp-server/src/mcp-setup-dispatch.test.ts`, `platform/mcp-server/src/mcp-setup.test.ts`, `platform/mcp-server/src/registry.test.ts`, `platform/mcp-server/src/version-check.test.ts`
+- **Learnings for future iterations:**
+  - When adding required fields to `RegisteredPlugin`, every `makePlugin`/`createPlugin` test helper across all test files must be updated — search broadly with `Grep`
+  - The `LoadedPlugin` interface in loader.ts must mirror `RegisteredPlugin` structure — both need resources/prompts
+  - `manifestRaw` from `Bun.file().json()` is typed as `unknown` — use an intermediate narrowed variable (e.g., `manifestObj`) for type-safe property access rather than repeated casts
+---
+
+## 2026-02-21 12:25 - US-004
+- Added MCP resource and prompt handler registration in `mcp-setup.ts`: resources/list, resources/read, prompts/list, prompts/get
+- Updated `PluginRegistry` with `resourceLookup` (Map<prefixedUri, ResourceLookupEntry>) and `promptLookup` (Map<prefixedName, PromptLookupEntry>)
+- Added `prefixedResourceUri()` and `prefixedPromptName()` to `state.ts`
+- Added resource/prompt lookup functions: `getResource()`, `getPrompt()`, `listAllResources()`, `listAllPrompts()` in `registry.ts`
+- Updated `McpServerInstance` interface with `sendResourceListChanged` and `sendPromptListChanged` methods
+- Added `notifyResourceListChanged()` and `notifyPromptListChanged()` notification helpers
+- Updated `reload.ts` to send resource/prompt list-changed notifications alongside tool list changes
+- Server capabilities now include `resources: { listChanged: true }` and `prompts: { listChanged: true }`
+- Used `McpError` and `ErrorCode` from `@modelcontextprotocol/sdk/types.js` for handler error reporting
+- Resource URI prefixing scheme: `opentabs+<plugin>://<originalUri>`
+- Prompt name prefixing: `<plugin>_<promptName>` (same convention as tools)
+- Added 25+ new tests: registry lookups, list functions, handler responses, error cases
+- Updated all mock `McpServerInstance` objects in 4 test files to include new notification methods
+- Files changed: `state.ts`, `registry.ts`, `mcp-setup.ts`, `reload.ts`, `registry.test.ts`, `mcp-setup.test.ts`, `reload.test.ts`, `mcp-setup-dispatch.test.ts`, `http-routes.test.ts`
+- **Learnings for future iterations:**
+  - The `McpError` class is exported from `@modelcontextprotocol/sdk/types.js` (not deprecated) — import as `SdkMcpError` to avoid name collision
+  - `ErrorCode` enum provides standard JSON-RPC error codes: `InvalidParams` (-32602), `InternalError` (-32603), etc.
+  - When adding methods to `McpServerInstance`, ALL mock server objects in ALL test files must be updated — search for `sendToolListChanged` to find them all
+  - `registerMcpHandlers` now registers 6 handlers (was 2), so tests checking handler count must be updated
+  - The `RequestHandler` type in test files must match `McpServerInstance.setRequestHandler`'s callback signature — `uri` param added for resources/read
+  - Avoid non-null assertions (`!`) in tests — use a helper function like `getHandler(handlers, schema)` that throws with a descriptive message
+---
+
+## 2026-02-21 12:30 - US-005
+- Created `platform/browser-extension/src/resource-prompt-dispatch.ts` with `handleResourceRead` and `handlePromptGet` dispatch handlers
+- Added `resource.read` and `prompt.get` to `DISPATCH_METHODS` in `known-methods.ts`
+- Wired handlers in `message-router.ts` dispatch table via `wrapAsync()`
+- Both handlers follow the same tab-matching → adapter-execution pattern as `tool.dispatch` but simpler (no progress reporting, no invocation start/end)
+- Handlers validate params (plugin name, resource URI / prompt name), find matching tabs, check adapter readiness, and execute in MAIN world via `chrome.scripting.executeScript`
+- Adapter-not-ready errors trigger fallback to next tab (same as tool dispatch)
+- Added mocks and routing tests in `message-router.test.ts` and `known-methods.test.ts`
+- Fixed pre-existing E2E test failures: `hot-reload-tools.e2e.ts` and `hot-reload-dynamic.e2e.ts` expected stale log message `notifying of tool list change` but US-004 changed it to `notifying of list changes`
+- Files changed: `platform/browser-extension/src/resource-prompt-dispatch.ts` (new), `platform/browser-extension/src/known-methods.ts`, `platform/browser-extension/src/known-methods.test.ts`, `platform/browser-extension/src/message-router.ts`, `platform/browser-extension/src/message-router.test.ts`, `e2e/hot-reload-dynamic.e2e.ts`, `e2e/hot-reload-tools.e2e.ts`
+- **Learnings for future iterations:**
+  - When adding new WebSocket methods, add them to `DISPATCH_METHODS` in `known-methods.ts` — the offscreen document derives `ALLOWED_METHODS` from this
+  - Both `known-methods.test.ts` and `message-router.test.ts` require mock modules for new dispatch modules — the tests verify method lists stay in sync
+  - The adapter IIFE exposes `resources` and `prompts` arrays via `adapters[name] = plugin` — accessing `adapter.resources` and `adapter.prompts` in MAIN world works
+  - Resource reads use `resource.read(uri)` and prompt renders use `prompt.render(args)` in page context
+  - After changing server log messages, search E2E tests for regex patterns matching the old message format
+- US-006 acceptance criteria were fully satisfied by US-003 and US-004 — no additional code changes needed for this story
+---
+
+## 2026-02-21 12:35 - US-006
+- All acceptance criteria were already implemented by previous stories:
+  - US-003 added `ManifestResource`, `ManifestPrompt` types to shared; updated `RegisteredPlugin` and `LoadedPlugin` with `resources`/`prompts` fields; updated `loader.ts` to parse resources/prompts from `tools.json` with backward compatibility
+  - US-004 added `resourceLookup` and `promptLookup` O(1) Maps to `PluginRegistry`; added `getResource()`, `getPrompt()`, `listAllResources()`, `listAllPrompts()` functions; added comprehensive tests
+- No code changes needed — verified all quality checks pass (build, type-check, lint, knip, 1012 unit tests)
+- Files already containing the implementation: `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/registry.ts`, `platform/mcp-server/src/loader.ts`, `platform/mcp-server/src/registry.test.ts`
+- **Learnings for future iterations:**
+  - When stories share infrastructure, later stories may find their acceptance criteria already satisfied — always verify before implementing to avoid duplicate work
+  - The registry, loader, and state modules form a tightly coupled trio — changes to one often require changes to all three
+---
+
+## 2026-02-21 12:40 - US-007
+- Added test resource (`test://items`) and test prompt (`greet`) to e2e-test plugin in `plugins/e2e-test/src/index.ts`
+- Added `listResources`, `readResource`, `listPrompts`, `getPrompt` methods to MCP client fixture in `e2e/fixtures.ts`
+- Created `e2e/resources-prompts.e2e.ts` with 6 E2E tests covering: list resources, read resource, read nonexistent resource, list prompts, get prompt, get nonexistent prompt
+- Fixed output unwrapping bug in `platform/mcp-server/src/mcp-setup.ts` — the extension wraps adapter results in `{ output: ... }` but the resource.read and prompt.get handlers weren't unwrapping it
+- Updated `e2e/hot-reload-dynamic.e2e.ts` to handle the new manifest object format (`{ tools, resources, prompts }`) — 7 places that read `tools.json` were updated to use new `readToolsFromManifest`/`writeToolsToManifest` helpers
+- Pointed e2e-test plugin to local platform packages (`file:../../platform/plugin-sdk`, `file:../../platform/plugin-tools`) so the build produces the new manifest format with resources/prompts
+- All 264 E2E tests pass (6 new + 258 existing), 1012 unit tests pass
+- Files changed: `plugins/e2e-test/src/index.ts`, `plugins/e2e-test/package.json`, `plugins/e2e-test/bun.lock`, `e2e/fixtures.ts`, `e2e/resources-prompts.e2e.ts` (new), `e2e/hot-reload-dynamic.e2e.ts`, `platform/mcp-server/src/mcp-setup.ts`
+- **Learnings for future iterations:**
+  - The extension wraps ALL dispatch results in `{ output: ... }` — new dispatch handlers (like resource.read, prompt.get) must unwrap this, just like tool.call does with `(result as Record<string, unknown>).output ?? result`
+  - The e2e-test plugin uses published npm packages by default — to use unpublished changes, switch to `file:` protocol in package.json
+  - When the tools.json format changes, ALL E2E tests that read/write tools.json directly must be updated — search for `readFileSync.*toolsJsonPath` to find them all
+  - The `hot-reload-dynamic.e2e.ts` tests manipulate tools.json files directly to test file watcher behavior — they need format-aware helpers
+---
+
+## 2026-02-21 12:55 - US-008
+- Published all platform packages at v0.0.16 using `scripts/publish.sh 0.0.16`
+  - Publish order: shared → plugin-sdk → plugin-tools → cli (dependency graph order)
+  - Version bumped from 0.0.15 → 0.0.16, including cross-references between packages
+- Updated e2e-test plugin: switched from `file:` protocol references (set by US-007) back to npm `^0.0.16`
+- Updated slack plugin: bumped from `^0.0.15` to `^0.0.16`
+- Both plugins build successfully:
+  - e2e-test: 19 tools, 1 resource, 1 prompt (new manifest format)
+  - slack: 22 tools (no resources/prompts yet)
+- All quality gates pass: build, type-check, lint, knip, 1012 unit tests, 265 E2E tests
+- Files changed: `platform/shared/package.json`, `platform/plugin-sdk/package.json`, `platform/plugin-tools/package.json`, `platform/cli/package.json`, `plugins/e2e-test/package.json`, `plugins/e2e-test/bun.lock`, `plugins/slack/package.json`
+- **Learnings for future iterations:**
+  - The publish script handles version bumping, cross-reference updates, rebuild, and publishing in one command — just provide the version number
+  - npm propagation is fast (<15s) for private packages in the @opentabs-dev org
+  - When switching plugins from `file:` protocol back to npm, delete `node_modules` and `bun.lock` for a clean install
+  - The slack plugin's `bun.lock` was already committed and didn't change content-wise with the version bump (same resolved registry URLs)
+---
+
+## 2026-02-21 13:00 - US-009
+- Updated CLAUDE.md to document resources and prompts throughout the file
+- Updated MCP Server description to mention resource/prompt registration and dispatch
+- Updated Chrome Extension description to mention resource read and prompt get dispatch
+- Updated Plugin SDK description to mention `defineResource()` and `definePrompt()` factories
+- Updated Plugin Tools description to mention resources/prompts in `dist/tools.json`
+- Updated directory structure comments for `index.ts`, `registry.ts`, `mcp-setup.ts`
+- Added `resources-prompts.e2e.ts` to directory structure listing
+- Updated Plugin discovery to mention resource metadata and prompt metadata in `tools.json`
+- Split "Tool prefixing" into tool/prompt name prefixing and added resource URI prefixing section
+- Added "Resource and prompt dispatch" Key Concept explaining the full dispatch pipeline
+- Updated "Adding a New Plugin" section with new step 4 for optional resources and prompts
+- All content remains plugin-agnostic (no specific plugin names)
+- Files changed: `CLAUDE.md`
+- **Learnings for future iterations:**
+  - CLAUDE.md updates are documentation-only changes — all quality checks pass trivially since no code changes
+  - The pre-commit hook runs `prettier --write` on `.md` files, so markdown formatting is enforced automatically
+---

@@ -1,0 +1,206 @@
+## Codebase Patterns
+- Scripts live in `scripts/` and are type-checked by `tsconfig.scripts.json` (includes `scripts/**/*.ts`)
+- Knip config in `knip.ts` lists `scripts/*.ts` as entry points — new scripts are auto-discovered
+- ESLint enforces `func-style` — use arrow function expressions, not function declarations
+- Use `rmSync` from `node:fs` for directory removal (no Bun equivalent)
+- Use `readdirSync` from `node:fs` for directory listing (no Bun equivalent)
+- `Bun.argv` for CLI argument parsing
+- Generated build artifacts include: `platform/*/dist/`, `platform/browser-extension/icons/`, `*.tsbuildinfo` files
+- `platform/browser-extension/side-panel/` contains SOURCE files (HTML, fonts, CSS) tracked by git — NOT build artifacts. Do not delete with clean.
+- `bun run --cwd <dir> <script>` works for standalone subprojects (docs/, plugins/*) with their own package.json
+
+# Ralph Progress Log
+PRD: prd-2026-02-23-231529-dx-improvements~running.json
+Started: Mon Feb 23 23:15:42 PST 2026
+---
+
+## 2026-02-23 23:19 - US-001
+- Created `scripts/clean.ts` with two modes: default (build artifacts only) and `--all` (+ node_modules, plugins, docs)
+- Added `clean` and `clean:all` scripts to root `package.json`
+- Files changed: `scripts/clean.ts` (new), `package.json`
+- **Learnings for future iterations:**
+  - ESLint `func-style` rule requires arrow function expressions — use `const fn = () => {}` not `function fn() {}`
+  - `tsconfig.scripts.json` already covers `scripts/**/*.ts` — no tsconfig changes needed for new scripts
+  - `Bun.file().exists()` is for files, not directories — use `readdirSync` with try/catch for directory existence
+  - Clean script removes: `platform/*/dist/`, `e2e/dist/`, `platform/browser-extension/icons/`, `platform/browser-extension/side-panel/`, all `*.tsbuildinfo` under platform/, e2e/, and root
+---
+
+## 2026-02-24 07:24 - US-002
+- Added ANSI color constants (CYAN, GREEN, YELLOW, MAGENTA, BOLD, RESET) to `scripts/dev.ts`
+- Updated `pipeWithPrefix`, `pipeTscStdout`, and `runWithPrefix` to accept a `color` parameter
+- Updated all call sites: [tsc]=CYAN, [mcp]=GREEN, [ext]=YELLOW, [dev]=MAGENTA
+- Both stdout and stderr use the same colored prefix (stderr is not red)
+- Colors are applied as `${color}${BOLD}${prefix}${RESET}` so prefix is bold+colored, content is normal
+- Files changed: `scripts/dev.ts`
+- **Learnings for future iterations:**
+  - The `pipeWithPrefix` function is used for both stdout and stderr — the color parameter makes both use the same prefix color
+  - `buildExtension` and `reloadExtension` also print prefixed messages via `console.log`/`console.error` — these needed colored prefixes too
+  - The `devPrefix` variable is defined at module scope so it can be used by all `[dev]` log lines throughout the main script
+---
+
+## 2026-02-24 07:28 - US-003
+- Added startup banner with box-drawing characters after MCP server start and output piping setup
+- Banner displays: MCP Server URL (http://localhost:{PORT}/mcp), Extension install path (~/.opentabs/extension/), Mode (dev hot reload), and a bold green "Ready" message
+- PORT is read from `Bun.env.PORT ?? '9515'` (same logic as elsewhere in the file)
+- Extension path uses `join(homedir(), '.opentabs', 'extension')` (already imported)
+- Dynamic lines (MCP URL, extension path) use `padEnd(46)` to maintain box alignment regardless of port number length
+- Files changed: `scripts/dev.ts`
+- **Learnings for future iterations:**
+  - When embedding ANSI color codes in box-drawing strings, hardcode the trailing spaces rather than using `padEnd` — ANSI escape sequences have non-zero string length but zero display width, so `padEnd` miscounts
+  - The banner is placed after MCP output piping (line ~271) so it appears after all initialization messages but before the recompilation watcher is connected
+---
+
+## 2026-02-24 07:35 - US-004
+- Added `dev:docs`, `build:docs`, `lint:docs`, `type-check:docs`, and `check:docs` scripts to root `package.json`
+- All use `bun run --cwd docs <script>` pattern — works because docs/ has its own package.json
+- `check:docs` chains: build → type-check → lint → knip → format:check (stops on first failure)
+- Files changed: `package.json`
+- **Learnings for future iterations:**
+  - `bun run --cwd <dir> <script>` works for standalone subprojects (not in root workspace) as long as the target dir has its own package.json
+  - docs/ is NOT part of the root workspace — it needs its own `bun install` for dependencies
+  - docs/ has pre-existing type-check and lint errors — these are outside the scope of root monorepo quality checks
+---
+
+## 2026-02-24 07:36 - US-005
+- Created `scripts/plugins.ts` with `--build` and `--check` modes
+- `--build` mode: runs `bun install --frozen-lockfile` then `bun run build` in each plugin
+- `--check` mode: runs `bun run type-check`, `bun run lint`, `bun run format:check` in each plugin
+- Discovers plugins by scanning `plugins/` for directories containing `package.json`
+- Tracks failures and exits with code 1 if any plugin fails, printing which plugins failed
+- Added `build:plugins` and `check:plugins` scripts to root `package.json`
+- Files changed: `scripts/plugins.ts` (new), `package.json`
+- **Learnings for future iterations:**
+  - `Bun.spawn` with `stdio: ['ignore', 'inherit', 'inherit']` inherits stdout/stderr for real-time output
+  - `Bun.file(path).exists()` works well for checking package.json presence (file, not directory)
+  - Both plugins (slack, e2e-test) have the same scripts: build, type-check, lint, format:check
+  - Plugins are sorted alphabetically for deterministic output order
+---
+
+## 2026-02-24 07:39 - US-006
+- Added four convenience aliases to root `package.json` scripts:
+  - `dev:mcp`: `bun --hot platform/mcp-server/dist/index.js --dev` — MCP server with hot reload
+  - `build:tsc`: `tsc --build --force` — TypeScript-only build (no extension bundling/icons)
+  - `test:unit`: `bun test platform/` — semantic alias for `test`
+  - `storybook`: `bun run --cwd platform/browser-extension storybook` — launches Storybook from root
+- Files changed: `package.json`
+- **Learnings for future iterations:**
+  - Browser extension's storybook script is `storybook dev -p 6006` — the root alias delegates via `bun run --cwd`
+  - MCP server's own `dev` script is `bun --hot dist/index.js --dev` — the root alias uses the full relative path from root
+  - These are all simple one-liner aliases — no new script files needed
+---
+
+## 2026-02-24 - US-007
+- Added `check` script to `docs/package.json`: `bun run build && bun run type-check && bun run lint && bun run knip && bun run format:check`
+- Added `check` script to `plugins/slack/package.json`: `bun run build && bun run type-check && bun run lint && bun run format:check`
+- Added `check` script to `plugins/e2e-test/package.json`: `bun run build && bun run type-check && bun run lint && bun run format:check`
+- Files changed: `docs/package.json`, `plugins/slack/package.json`, `plugins/e2e-test/package.json`
+- **Learnings for future iterations:**
+  - Plugins don't have `knip` configured, so their `check` script omits it (only build + type-check + lint + format:check)
+  - Docs has `knip` so its `check` script includes it (build + type-check + lint + knip + format:check)
+  - Standalone plugins need `bun install` before builds work — they are not in the root workspace
+  - All acceptance criteria checks passed for all three subprojects
+---
+
+## 2026-02-24 - US-008
+- Expanded `check:all` script in root `package.json` to append `&& bun run check:docs && bun run check:plugins` after the existing root checks and E2E tests
+- The command now runs: build → type-check → lint → format:check → knip → test → test:e2e → check:docs → check:plugins
+- If any step fails, the `&&` chain stops and exits with non-zero code
+- Files changed: `package.json`
+- **Learnings for future iterations:**
+  - `check:all` is just a `&&`-chained shell command — no script file needed
+  - The order matters: root checks first (fast feedback), then docs, then plugins (standalone subprojects)
+  - `check:docs` and `check:plugins` were already implemented in US-004 and US-005 respectively
+---
+
+## 2026-02-24 - US-009
+- Added `bracketSameLine: true` and `htmlWhitespaceSensitivity: "strict"` to `plugins/slack/.prettierrc` and `plugins/e2e-test/.prettierrc`
+- These match the root `.prettierrc` config; the `plugins` array (prettier-plugin-tailwindcss) was NOT added since plugins don't have that dependency
+- Ran `bun run format` in both plugins — all files were unchanged (new options don't affect TypeScript source files)
+- Verified `format:check`, `build`, and `lint` pass in both plugins
+- Files changed: `plugins/slack/.prettierrc`, `plugins/e2e-test/.prettierrc`
+- **Learnings for future iterations:**
+  - `bracketSameLine` and `htmlWhitespaceSensitivity` only affect HTML-like markup — pure TypeScript files are unaffected
+  - Plugin prettierrc files should mirror root config minus the `plugins` array (tailwindcss plugin is only in the root/browser-extension)
+---
+
+## 2026-02-24 - US-010
+- Updated root CLAUDE.md Commands section with all new commands grouped by category (Build, Dev, Quality checks, Docs, Test, Clean, UI, Setup)
+- Updated "Starting the MCP Server" section to use `bun run dev:mcp` and `bun run dev` instead of raw bun --hot commands
+- Updated Development Workflow section to mention `bun run dev:mcp` as a lightweight alternative for server-only work
+- Updated Verification section to mention `bun run check:all` covers docs and plugins
+- Files changed: `CLAUDE.md`
+- **Learnings for future iterations:**
+  - CLAUDE.md Commands section should stay organized by category (Build, Dev, Quality checks, Test, Clean, UI, Setup) for readability
+  - The `bun run dev` description mentions "colored output with startup banner" — these were added in US-002 and US-003
+  - Keep the Verification section's individual check list unchanged (it's the canonical set) — `check:all` is mentioned as a convenience below it
+---
+
+## 2026-02-24 - US-011
+- Updated CONTRIBUTING.md with all new commands and workflows
+- Development Workflow section: added `bun run dev:mcp` subsection for server-only development, mentioned colored output and startup banner for `bun run dev`
+- Running Tests section: added `bun run test:unit` alias, updated `check:all` description to include docs and plugins
+- Command reference table: expanded from 7 rows to 21 rows covering all new commands (build:tsc, build:docs, build:plugins, test:unit, check, check:all, check:docs, check:plugins, dev, dev:mcp, dev:docs, storybook, clean, clean:all)
+- Getting Started section: added note about `bun run clean` for resetting build artifacts
+- Files changed: `CONTRIBUTING.md`
+- **Learnings for future iterations:**
+  - CONTRIBUTING.md command table uses "What it does" header (not "What it checks") since it now includes dev/clean commands that aren't checks
+  - The table is more comprehensive than README.md's — README keeps it concise with the most useful commands only
+  - `check:all` description changed from "everything above + E2E tests" to "everything above + E2E tests + docs checks + plugin checks"
+---
+
+## 2026-02-24 - US-012
+- Updated README.md command reference table with 3 new rows: `check:all`, `dev:mcp`, `clean`
+- Added `scripts/` directory to the directory structure section with description "Build and maintenance scripts (clean, plugins, dev)"
+- Kept the table concise per acceptance criteria — only the most useful commands, not every alias
+- Files changed: `README.md`
+- **Learnings for future iterations:**
+  - README.md command table should stay concise (most useful commands only) — detailed listing goes in CONTRIBUTING.md
+  - Directory structure in README uses short inline descriptions after the directory name
+---
+
+## 2026-02-24 - US-013
+- Added "Root-level commands" section to `plugins/README.md` documenting `bun run build:plugins`, `bun run check:plugins`, and per-plugin `bun run check`
+- Added "Quality Checks" section to `plugins/CLAUDE.md` documenting `bun run check` inside each plugin and root-level `bun run build:plugins` / `bun run check:plugins`
+- Files changed: `plugins/README.md`, `plugins/CLAUDE.md`
+- **Learnings for future iterations:**
+  - plugins/README.md is short (~25 lines) — new sections are added before "Adding a new plugin" for logical flow
+  - plugins/CLAUDE.md has a "Building Plugins" section — the new "Quality Checks" section follows it naturally
+  - Both files use the same code block format: `cd plugins/<name>` then individual commands
+---
+
+## 2026-02-24 - US-014
+- Updated `docs/CLAUDE.md` Commands section to add `bun run check` and `bun run format:check`
+- Added description for `bun run check` explaining it runs all checks sequentially
+- Added "From the repo root" section listing convenience aliases: `dev:docs`, `build:docs`, `lint:docs`, `type-check:docs`, `check:docs`
+- All docs checks pass (build, type-check, lint, knip) and all root Phase 1 checks pass
+- Files changed: `docs/CLAUDE.md`
+- **Learnings for future iterations:**
+  - docs/CLAUDE.md Commands section uses a bash code block format with inline comments — match that style when adding entries
+  - The "All four must pass" line was updated to "All checks must pass" to be accurate with the expanded list
+  - Root convenience aliases use `bun run --cwd docs <script>` pattern
+---
+
+## 2026-02-24 - US-015
+- Updated `.ralph/RALPH.md` Known Project Types table: added `format:check` to docs and plugin quality checks, added note about `bun run check` convenience alias for standalone subprojects
+- Added `bun run clean` troubleshooting tip to RALPH.md Phase 1 section for when builds are in a broken state
+- Updated `.claude/skills/ralph/SKILL.md`: added `format:check` to docs and plugin `qualityChecks` examples, added `format:check` to docs and plugin acceptance criteria templates, added note about `bun run check` as a single-command alternative
+- Files changed: `.ralph/RALPH.md`, `.claude/skills/ralph/SKILL.md`
+- **Learnings for future iterations:**
+  - RALPH.md table formatting uses fixed-width columns — prettier auto-reformats to fit content, so don't worry about manual alignment
+  - SKILL.md acceptance criteria templates should match the `qualityChecks` field exactly — if `qualityChecks` includes `format:check`, the acceptance criteria should too
+  - The phase-based verification logic and e2eCheckpoint instructions in RALPH.md should not be modified when updating project type tables
+---
+
+## 2026-02-24 - US-016
+- **Verification-only story**: ran full end-to-end verification of all DX improvements from US-001 through US-015
+- **Bug found and fixed**: `bun run clean` was deleting `platform/browser-extension/side-panel/` which contains source files (HTML, fonts, CSS) tracked by git, not build artifacts. This caused all E2E tests to fail because the extension's `manifest.json` references `side-panel/side-panel.html` and the build does NOT regenerate these files. Fixed by removing the side-panel deletion from `scripts/clean.ts`.
+- Verified all new scripts work: `clean`, `build:tsc`, `test:unit`, `dev:mcp`, `build:icons`
+- All .md files (CLAUDE.md, CONTRIBUTING.md, README.md, plugins/README.md, plugins/CLAUDE.md, docs/CLAUDE.md, .ralph/RALPH.md, .claude/skills/ralph/SKILL.md) have consistent command references
+- Phase 1 (build, type-check, lint, knip, test): 1845 tests pass
+- Phase 2 (E2E): 356 tests pass
+- Files changed: `scripts/clean.ts`
+- **Learnings for future iterations:**
+  - `platform/browser-extension/side-panel/` contains SOURCE files (HTML, fonts, CSS), NOT build artifacts. The build generates to `dist/side-panel/` (JS bundle + Tailwind CSS), not `side-panel/`.
+  - The E2E fixtures copy from `platform/browser-extension/` in the repo (not `~/.opentabs/extension/`), so missing source files in the repo break E2E even if the extension install directory is fine.
+  - When adding paths to the clean script, verify whether the directory is regenerated by `bun run build` before treating it as a build artifact.
+---

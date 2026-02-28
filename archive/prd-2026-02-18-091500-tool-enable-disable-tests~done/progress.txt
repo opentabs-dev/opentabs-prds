@@ -1,0 +1,65 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-091500-tool-enable-disable-tests~running.json
+Started: Wed Feb 18 10:58:19 PST 2026
+---
+
+## Codebase Patterns
+- Use `createState()` from `./state.js` to create test ServerState instances
+- Use `createPlugin(name, toolNames)` helper in mcp-setup.test.ts to create minimal RegisteredPlugin objects
+- Call `rebuildToolLookups(state)` after setting `state.plugins` and `state.browserTools` to populate lookup maps and cached schemas
+- Use `createMockServer()` to get a mock McpServerInstance that captures handler registrations
+- Browser tool definitions for testing: `{ name, description, input: z.object({}), handler: () => Promise.resolve([]) }`
+- Use `toMatchObject()` for partial shape assertions; avoid non-null assertions (lint rule: `@typescript-eslint/no-non-null-assertion`)
+
+---
+
+## 2026-02-18 11:00 - US-001
+- Extracted `getEnabledToolsList(state)` from inline tools/list handler in mcp-setup.ts
+- Handler now delegates: `server.setRequestHandler(ListToolsRequestSchema, () => ({ tools: getEnabledToolsList(state) }))`
+- Added 8 unit tests covering: all enabled (default), one disabled, all disabled, browser tools immune to toolConfig, multi-plugin mixed, empty plugins, tool entry shape for plugins and browser tools
+- Files changed: `platform/mcp-server/src/mcp-setup.ts`, `platform/mcp-server/src/mcp-setup.test.ts`
+- **Learnings for future iterations:**
+  - The tools/list handler had ~20 lines of inline logic that could be extracted into a pure function taking `state` and returning the tools array — clean extraction pattern
+  - `createBrowserTool()` helper makes browser tool test fixtures trivial
+  - Prettier enforces single-line exports when they fit — don't manually break across lines
+---
+
+## 2026-02-18 11:10 - US-002
+- Extracted `checkToolCallable(state, prefixedToolName)` returning discriminated union `ToolCallableOk | ToolCallableError`
+- Handler delegates lookup + enabled check to `checkToolCallable` before validation/dispatch
+- Added 4 unit tests: tool exists and enabled (ok), tool disabled (error with "disabled"), tool not found (error with "not found"), browser tools not in toolLookup
+- Files changed: `platform/mcp-server/src/mcp-setup.ts`, `platform/mcp-server/src/mcp-setup.test.ts`
+- **Learnings for future iterations:**
+  - After extracting checkToolCallable, the remaining lookup reference needs a type assertion (`as ToolLookupEntry`) since TS doesn't narrow through the Map.get after the check
+  - Use `if (result.ok)` / `if (!result.ok)` narrowing with discriminated unions for clean test assertions
+  - Run `bun run format` to fix Prettier issues before committing — saves time vs manual edits
+---
+
+## 2026-02-18 11:25 - US-003
+- Added E2E test in `e2e/side-panel-plugin-toggle.e2e.ts` — new describe block "disabled tool dispatch rejection"
+- Test opens matching tab, verifies echo tool succeeds, disables via side panel toggle, verifies tools/list excludes it, calls disabled tool and asserts isError + "disabled", re-enables and verifies success
+- Files changed: `e2e/side-panel-plugin-toggle.e2e.ts`
+- **Learnings for future iterations:**
+  - Use `waitForToolResult` to poll until a tool becomes callable (tab state = ready) before running dispatch tests
+  - Use `openTestAppTab` from helpers.ts to get the e2e-test adapter injected — it polls for adapter injection with diagnostics
+  - The `callTool` result has `{ content: string, isError: boolean }` — check `content` for error messages like "disabled"
+---
+
+## 2026-02-18 11:35 - US-004
+- Added E2E test in `e2e/side-panel-plugin-toggle.e2e.ts` — new describe block "toggle all tools"
+- Test verifies all plugin tools initially in tools/list, clicks master toggle, polls tools/list for removal, checks config.json persistence, verifies browser tools unaffected, re-enables and verifies tools reappear
+- Files changed: `e2e/side-panel-plugin-toggle.e2e.ts`
+- **Learnings for future iterations:**
+  - Master toggle has aria-label `Toggle all tools for ${plugin.name}` — locate via `button[role="switch"][aria-label="Toggle all tools for e2e-test"]`
+  - `BROWSER_TOOL_NAMES` array from helpers.ts provides the full list of browser tool names for assertions
+  - `readPluginToolNames()` returns prefixed names like `e2e-test_echo` — useful for bulk assertions
+---
+
+## 2026-02-18 11:45 - US-005
+- Added 2 unit tests in `platform/mcp-server/src/config.test.ts` for tool config round-trip persistence
+- Tests verify: disabled tools survive save→load and `isToolEnabled` returns false; absent tools default to enabled
+- Files changed: `platform/mcp-server/src/config.test.ts`
+- **Learnings for future iterations:**
+  - The existing config.test.ts uses a module-level `OPENTABS_CONFIG_DIR` override pattern — add new tests within the existing describe block to reuse the cleanup infrastructure
+  - `isToolEnabled` takes `ServerState` but only reads `toolConfig` — safe to cast partial objects as `ServerState` for testing
+---

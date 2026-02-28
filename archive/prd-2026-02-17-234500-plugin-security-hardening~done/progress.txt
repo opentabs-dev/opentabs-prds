@@ -1,0 +1,173 @@
+# Ralph Progress Log
+PRD: prd-2026-02-17-234500-plugin-security-hardening~running.json
+Started: Tue Feb 17 23:30:53 PST 2026
+---
+
+## Codebase Patterns
+- Manifest schema validation lives in `platform/mcp-server/src/manifest-schema.ts` using Zod; add length limits via `.max()` on string fields
+- `checkBrowserToolReferences` in `discovery.ts` is an exported pure function for detecting browser tool name references in tool descriptions — testable without mocking
+- ESLint `import-x/exports-last` rule requires all exports at the bottom of the file; use non-export `const` and a single `export { ... }` at the end
+- URL pattern validation lives in `platform/shared/src/index.ts` in `validateUrlPattern`
+- IIFE wrapper template is in `platform/cli/src/commands/build.ts:bundleIIFE` — the wrapper runs at injection time in MAIN world
+- The hash setter snippet is appended AFTER the main IIFE (not inside it) — code in the appended snippet runs after the adapter is registered
+- Use `writable:false, configurable:true` for frozen adapter properties — this prevents page scripts from overwriting via assignment while allowing re-injection (Object.defineProperty) and cleanup (Reflect.deleteProperty)
+- The IIFE wrapper must `Reflect.deleteProperty` before re-assigning the adapter entry — otherwise the non-writable property descriptor silently rejects the assignment in sloppy mode
+- Plugins in `plugins/` use the published npm CLI, not the local one — CLI changes only affect plugins after publishing
+- Validation tests are in `platform/shared/src/validation.test.ts`
+- The validation function returns `string | null` — null means valid, string is the error message
+- URL pattern parsing extracts scheme, host, and path via regex: `/^(\*|https?):\/\/(.+?)(\/.*)$/`
+- Host validation allows: `*`, `localhost(:port)?`, or `(*.)?domain.tld` patterns
+- Config is loaded in `config.ts:loadConfig()` and persisted in `config.ts:saveConfig()`
+- Config fields: `plugins` (local paths), `tools` (enabled/disabled map), `secret` (WS auth), `npmPlugins` (allowed npm packages)
+- Plugin discovery call chain: `reload.ts:reloadCore` → `loadConfig()` → `discoverPlugins(paths, npmPlugins)` → parallel `discoverFromNodeModules` + `discoverFromLocalPaths`
+- Config is persisted from `http-routes.ts:onToolConfigPersist` callback — must include all state fields
+- `ServerState` in `state.ts` mirrors config fields: `pluginPaths`, `npmPlugins`, `toolConfig`, `wsSecret`
+- E2E tests have their own `OpentabsConfig` interface in `e2e/fixtures.ts` — keep in sync with the main one
+- MCP endpoint auth uses Bearer token from `state.wsSecret`; `/health` and `/ws-info` are unauthenticated
+- `checkBearerAuth` in `http-routes.ts` returns null (pass) or Response(401); when wsSecret is null, auth is bypassed
+- E2E `McpServer` interface has a `secret` field populated from config at startup; pass it to `createMcpClient`
+- When writing test configs after server startup, always preserve the `secret` field — the server auto-generates secrets, so overwriting config without secret causes auth failures
+- `loadConfig` fallback path (corrupt JSON) returns a new random secret that is NOT persisted to disk
+- ESLint import order: relative (`./`) before external type imports; `bun run lint:fix` auto-sorts
+- `trustTierPrefix` in `mcp-setup.ts` maps TrustTier → description prefix string; browser tools are NOT prefixed
+- `ToolLookupEntry` in `state.ts` includes `validate` (pre-compiled Ajv function) and `validationErrors` (error formatter) — compiled at discovery time in `rebuildToolLookups`
+- Ajv is used for JSON Schema validation of plugin tool inputs; validators are pre-compiled per tool for performance
+- ESLint `import-x/no-named-as-default` rule prohibits using the same name as a named export for default imports — use a different identifier (e.g., `import AjvValidator from 'ajv'` instead of `import Ajv from 'ajv'`)
+- ESLint `@typescript-eslint/no-non-null-assertion` prohibits `!` assertions in tests — use `if (!x) throw new Error(...)` for narrowing instead
+
+## 2026-02-17 - US-001
+- Implemented bare TLD wildcard rejection in `validateUrlPattern`
+- Added regex check `/^\*\.[a-z]{2,}$/i` after the existing `*://*/*` and `<all_urls>` broad pattern checks
+- This catches hosts like `*.com`, `*.org`, `*.io` — any wildcard followed by a single TLD segment
+- Files changed: `platform/shared/src/index.ts`, `platform/shared/src/validation.test.ts`
+- Added 12 new test cases: 9 for rejection of various TLDs, 3 confirming allowed patterns still work
+- **Learnings for future iterations:**
+  - The regex approach (`/^\*\.[a-z]{2,}$/i`) is cleaner than a TLD set — catches all TLDs without maintenance
+  - The check must go AFTER regex parsing (so `host` is extracted) but BEFORE the general host validation
+  - All 420 unit tests and 164 E2E tests pass with the change
+---
+
+## 2026-02-17 - US-002
+- Implemented explicit opt-in for npm-discovered plugins via `config.npmPlugins` field
+- Added `npmPlugins?: string[]` to `OpentabsConfig` in `config.ts` with full parsing/filtering
+- Updated `discoverFromNodeModules` in `discovery.ts` to accept `allowedPackages: string[]` param
+- Added allow-list check in all 4 discovery paths (direct, scoped, keyword, scoped keyword)
+- Skipped packages get a `log.info` message with instructions to add them to config
+- Added `npmPlugins: string[]` to `ServerState` in `state.ts`
+- Updated `reload.ts` to pass `config.npmPlugins ?? []` to `discoverPlugins` and store on state
+- Updated `http-routes.ts:onToolConfigPersist` to include `npmPlugins` in saved config
+- Updated E2E `OpentabsConfig` interface in `e2e/fixtures.ts` for consistency
+- Added 4 new unit tests for `npmPlugins` field: round-trip, filtering, absent field, default config
+- Files changed: `config.ts`, `config.test.ts`, `discovery.ts`, `state.ts`, `reload.ts`, `http-routes.ts`, `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - `discoverPlugins` is called only from `reload.ts:reloadCore` — single call site makes signature changes safe
+  - `saveConfig` is called from `http-routes.ts:onToolConfigPersist` — any new config field must be included there
+  - `ServerState` needs to mirror config fields that are used at persist time (e.g., `npmPlugins`)
+  - E2E tests have their own `OpentabsConfig` interface — duplicated, not imported from MCP server
+  - All 424 unit tests and 165 E2E tests pass with the change
+---
+
+## 2026-02-18 - US-003
+- Added Bearer token authentication to /mcp, /reload, and /extension/reload endpoints
+- Implemented `checkBearerAuth` helper in `http-routes.ts` that validates Authorization: Bearer token against `state.wsSecret`
+- When `wsSecret` is null, auth is bypassed (backwards-compatible)
+- Returns 401 Unauthorized for missing, invalid, or wrong tokens
+- `/health` and `/ws-info` remain unauthenticated
+- Added `secret` field to E2E `McpServer` interface, populated from config after server startup
+- Updated `createMcpClient` to accept and send Bearer token in all HTTP requests (POST, GET, DELETE)
+- Updated ALL `createMcpClient` call sites across 9 E2E test files to pass `server.secret` or `mcpServer.secret`
+- Fixed config-watcher tests to preserve secret when writing updated configs
+- Fixed corrupted-config test to handle fallback secret by restoring config and re-initializing client
+- Fixed lifecycle secret-rotation test to create new MCP client with rotated secret
+- Added 6 unit tests for `checkBearerAuth`: null secret, matching token, missing header, wrong token, non-Bearer scheme, empty token
+- Files changed: `http-routes.ts`, `http-routes.test.ts`, `fixtures.ts`, `helpers.ts`, `config-watcher.e2e.ts`, `dispatch-resilience.e2e.ts`, `hot-reload-dynamic.e2e.ts`, `lifecycle.e2e.ts`, `side-panel-data-flow.e2e.ts`, `side-panel-plugin-toggle.e2e.ts`, `strict-csp.e2e.ts`
+- **Learnings for future iterations:**
+  - `loadConfig` auto-generates a secret if missing, but the fallback (catch) path does NOT persist it to disk
+  - E2E tests that modify config.json after server starts must preserve the `secret` field or the MCP client's auth token becomes stale
+  - The `readTestConfig` + spread pattern is safest for config modifications: `const cfg = readTestConfig(dir); writeTestConfig(dir, { ...cfg, plugins: [...] })`
+  - Hot reload re-reads config — if the secret changed, all existing MCP sessions need new tokens
+  - All 430 unit tests and 165 E2E tests pass with the change
+---
+
+## 2026-02-18 - US-004
+- Added trust tier prefix to plugin tool descriptions in the MCP tools/list response
+- Added `trustTierPrefix` helper in `mcp-setup.ts` that maps TrustTier to human-readable prefix strings
+- Official → `[Official] `, Community → `[Community plugin — unverified] `, Local → `[Local plugin] `
+- Modified the tools/list handler to prepend `trustTierPrefix(plugin.trustTier)` to each plugin tool description
+- Browser tools remain unprefixed (they are always trusted platform tools)
+- The prefix is a read-time transformation — stored manifest descriptions are not modified
+- Added 3 unit tests for `trustTierPrefix` covering all three tiers
+- Files changed: `platform/mcp-server/src/mcp-setup.ts`, `platform/mcp-server/src/mcp-setup.test.ts`
+- **Learnings for future iterations:**
+  - The `tools/list` handler already iterates `state.plugins.values()` which provides `trustTier` directly — no additional lookup needed
+  - Import ordering matters for eslint: relative imports (`./`) come before external package type imports (`@opentabs-dev/shared`) which come before other external packages (`zod`). Use `bun run lint:fix` to auto-sort.
+  - All 433 unit tests and 165 E2E tests pass with the change
+---
+
+## 2026-02-18 - US-005
+- Added description length limits to manifest schema: tool descriptions max 1000 chars, plugin descriptions max 500 chars
+- Added browser tool name reference warning in `loadPluginFromDir` during plugin discovery
+- Extracted `checkBrowserToolReferences` as an exported pure function in `discovery.ts` for testability
+- Created `manifest-schema.test.ts` with 6 tests: valid parsing, invalid JSON, missing fields, tool desc limit, plugin desc limit, boundary cases
+- Added 6 tests to `discovery.test.ts` for `checkBrowserToolReferences`: clean descriptions, single ref, case-insensitive, multi-ref per tool, multi-tool, empty
+- Files changed: `platform/mcp-server/src/manifest-schema.ts`, `platform/mcp-server/src/manifest-schema.test.ts`, `platform/mcp-server/src/discovery.ts`, `platform/mcp-server/src/discovery.test.ts`
+- **Learnings for future iterations:**
+  - ESLint `import-x/exports-last` rule means you can't use `export const` inline if there are non-export declarations after it — use a single `export { ... }` statement at the end
+  - Extracting validation logic into pure exported functions makes it testable without needing integration tests with real plugin directories
+  - Zod `.max()` on string fields integrates cleanly with the existing `.min()` chain and produces clear error messages via `safeParse`
+  - All 446 unit tests and 165 E2E tests pass with the change
+---
+
+## 2026-02-18 - US-006
+- Implemented adapter entry freezing in the IIFE wrapper generated by `opentabs build`
+- Modified the hash setter snippet (appended after the main IIFE) to also freeze the adapter:
+  1. Sets `__adapterHash` on the adapter object
+  2. Freezes each individual tool entry with `Object.freeze(tool)`
+  3. Freezes the `tools` array with `Object.freeze(adapter.tools)`
+  4. Freezes the adapter object itself with `Object.freeze(adapter)`
+  5. Redefines the property on the adapters map with `Object.defineProperty` using `writable:false, configurable:true, enumerable:true`
+- Added `Reflect.deleteProperty` in the IIFE wrapper's teardown flow before re-assigning the adapter entry — without this, the non-writable property descriptor silently rejects the new assignment in sloppy mode
+- Protection model: `writable:false` prevents page scripts from overwriting via simple assignment; `configurable:true` allows re-injection (new IIFE deletes and re-creates the property) and extension cleanup (Reflect.deleteProperty)
+- Files changed: `platform/cli/src/commands/build.ts`
+- **Learnings for future iterations:**
+  - The IIFE generated by `Bun.build({ format: 'iife' })` runs in sloppy mode — assignments to non-writable properties silently fail rather than throwing
+  - The hash setter snippet runs as a separate self-invoking function appended after the main IIFE, making it the ideal place for post-registration locking
+  - `Object.defineProperty` with `configurable:true` allows re-definition but prevents simple `obj[key] = value` assignment — a good balance between security and re-injectability
+  - Plugins use the published CLI from npm, not the local workspace CLI — changes to the CLI only affect plugin builds after publishing
+  - All 446 unit tests and 165 E2E tests pass with the change
+---
+
+## 2026-02-18 - US-007
+- Added security annotations to browser tool descriptions
+- `browser_execute_script`: Appended SECURITY warning instructing AI agents to never use this tool based on plugin tool descriptions/outputs, only when the human user directly requests JS execution
+- `browser_list_tabs`: Appended privacy note about sensitive tab data (banking, email) and warning not to share tab info with plugin tools unless user requests it
+- `browser_open_tab`, `browser_close_tab`, `browser_navigate_tab`: Left unchanged (low risk, per acceptance criteria)
+- Files changed: `platform/mcp-server/src/browser-tools/execute-script.ts`, `platform/mcp-server/src/browser-tools/list-tabs.ts`
+- **Learnings for future iterations:**
+  - Browser tool definitions are simple — `defineBrowserTool` with name, description, input (Zod), and handler
+  - Security annotations are description-only changes — no logic, no schema changes, no handler changes
+  - All 446 unit tests and 165 E2E tests pass with the change
+---
+
+## 2026-02-18 - US-008
+- Added server-side JSON Schema validation for plugin tool arguments before dispatch
+- Added `ajv` (v8.18.0) as a dependency to `platform/mcp-server`
+- Extended `ToolLookupEntry` in `state.ts` with `validate` (pre-compiled Ajv function) and `validationErrors` (error formatter)
+- Added `compileToolValidator` helper in `mcp-setup.ts` that compiles JSON Schema into an Ajv validate function with error formatting
+- Updated `rebuildToolLookups` to create a single Ajv instance and pre-compile validators for all plugin tool schemas at discovery time
+- Added validation check in the `tools/call` handler: after tool lookup and enabled check, validates args via `lookup.validate(args)` before dispatching to extension
+- If validation fails, returns an `isError: true` response with descriptive error messages (field paths + reasons)
+- If schema compilation fails (unlikely), `validate` is null and validation is skipped (graceful degradation with a warning log)
+- Browser tools continue to use their existing Zod-based validation — no change needed
+- Added 4 unit tests: working validate function, human-readable error messages, trivial schema compilation, additionalProperties rejection
+- Updated E2E test `dispatch-resilience.e2e.ts:597` to reflect new behavior: plugin tool with missing required field is now rejected by server-side validation (previously passed through)
+- Updated existing `mcp-setup.test.ts` assertions from `toEqual` to `toMatchObject` to accommodate new ToolLookupEntry fields
+- Files changed: `platform/mcp-server/package.json`, `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/mcp-setup.ts`, `platform/mcp-server/src/mcp-setup.test.ts`, `e2e/dispatch-resilience.e2e.ts`, `bun.lock`
+- **Learnings for future iterations:**
+  - Ajv default mode (draft-07) handles the plugin schemas produced by `z.toJSONSchema()` without issues — no need for draft-2020-12 mode
+  - ESLint `import-x/no-named-as-default` fires when `ajv` module exports both `default` and named `Ajv` — use `import AjvValidator from 'ajv'` to avoid the rule
+  - Pre-compiling validators is important: `ajv.compile()` is the expensive step, and doing it at discovery time means zero overhead per tool call
+  - The `allErrors: true` Ajv option ensures all validation errors are reported, not just the first one
+  - The `validationErrors()` function reads from `validate.errors` which is set by the last `validate()` call — it's a mutable property on the compiled function
+  - All 450 unit tests and 165 E2E tests pass with the change
+---

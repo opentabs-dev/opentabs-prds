@@ -1,0 +1,108 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix doctor command auth inconsistency, improve logs --follow default UX, auto-run tsc from opentabs-plugin build, create CONTRIBUTING.md for human contributors, and add JSDoc documentation to E2E fixtures.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix doctor command to send auth header on health check",
+      "description": "As a user, I want opentabs doctor to authenticate its health check the same way opentabs status does so that doctor checks work reliably when the server has auth configured.",
+      "acceptanceCriteria": [
+        "checkServerHealth in platform/cli/src/commands/doctor.ts reads the secret from config and sends an Authorization: Bearer header on the /health fetch — matching the pattern used in platform/cli/src/commands/status.ts",
+        "If the config file is unreadable or has no secret, the health check proceeds without auth (graceful degradation)",
+        "The checkNpmPlugins function returns a warn() instead of pass() when the server is not reachable, since 'requires running server to check' is not a passing check — it is an unknown state",
+        "The existing doctor unit tests in platform/cli/src/commands/doctor.test.ts are updated to cover the auth header being sent",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/cli/src/commands/doctor.ts\n\nThe health check at line 77 does `fetch(url, { signal: AbortSignal.timeout(3_000) })` with no Authorization header. Compare with platform/cli/src/commands/status.ts which reads the config secret and sends `Authorization: Bearer ${secret}`.\n\nFix:\n1. The `runDoctor` function (find it — it's the main action handler) should read the config before running checks: `const { config } = readConfig();` using the same readConfig import as status.ts.\n2. Pass the secret to checkServerHealth: `checkServerHealth(port, config?.secret)`\n3. In checkServerHealth, add the auth header if secret is provided:\n```typescript\nconst headers: Record<string, string> = {};\nif (secret) headers['Authorization'] = `Bearer ${secret}`;\nconst res = await fetch(url, { headers, signal: AbortSignal.timeout(3_000) });\n```\n\nFor checkNpmPlugins at line 178: change `pass('npm plugins', 'requires running server to check')` to `warn('npm plugins', 'requires running server to check', 'Start the MCP server first')`. A pass implies the check succeeded, but we're actually unable to verify anything.\n\nUpdate the unit tests to verify the auth header behavior."
+    },
+    {
+      "id": "US-002",
+      "title": "Change logs command to default to --no-follow and add explicit --follow flag",
+      "description": "As a user, I want opentabs logs to print recent lines and exit by default (like cat), with an explicit --follow / -f flag to tail (like tail -f), so that the command doesn't unexpectedly block.",
+      "acceptanceCriteria": [
+        "Running 'opentabs logs' prints the last 50 lines and exits (no blocking)",
+        "Running 'opentabs logs --follow' or 'opentabs logs -f' enters follow mode (tails the log file continuously)",
+        "The --no-follow flag is removed (since no-follow is now the default)",
+        "The -f shorthand is added for --follow",
+        "The help text examples are updated to reflect the new defaults",
+        "The help text description is updated to clarify: 'Show recent MCP server log output'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/cli/src/commands/logs.ts\n\nCurrent behavior: Commander's `--no-follow` pattern makes follow=true the default (line 166). Change to an opt-in `--follow` / `-f` flag.\n\nReplace line 166:\n```typescript\n.option('--no-follow', 'Print recent lines and exit (do not follow)')\n```\nWith:\n```typescript\n.option('-f, --follow', 'Follow new output (like tail -f)')\n```\n\nThen change line 156 from:\n```typescript\nif (options.follow !== false) {\n```\nTo:\n```typescript\nif (options.follow === true) {\n```\n\nUpdate the description at line 164 from 'Tail the MCP server log output' to 'Show recent MCP server log output'.\n\nUpdate help text examples at lines 170-175:\n```\nExamples:\n  $ opentabs logs                       # Show last 50 lines and exit\n  $ opentabs logs --lines 100           # Show last 100 lines and exit\n  $ opentabs logs -f                    # Follow new output (like tail -f)\n  $ opentabs logs -f --plugin slack     # Follow only Slack plugin logs\n```\n\nUpdate the LogsOptions interface to change `follow?: boolean` from the --no-follow pattern to a simple boolean flag."
+    },
+    {
+      "id": "US-003",
+      "title": "Auto-run tsc from opentabs-plugin build when dist/index.js is missing",
+      "description": "As a plugin developer, I want opentabs-plugin build to automatically run tsc when the compiled output is missing so that I don't have to remember the two-step build process.",
+      "acceptanceCriteria": [
+        "When dist/index.js does not exist and src/index.ts DOES exist, opentabs-plugin build automatically runs 'tsc' before proceeding",
+        "The auto-tsc step prints a dim message: 'Compiled output not found, running tsc...'",
+        "If tsc fails (non-zero exit), the build fails with the tsc error output",
+        "If tsc succeeds, the build continues normally with the freshly compiled output",
+        "When dist/index.js already exists, no automatic tsc is triggered (existing behavior preserved)",
+        "In watch mode, the auto-tsc behavior only applies to the initial build (watch mode already expects tsc --watch to be running separately)",
+        "The existing error message 'Run tsc first, then retry opentabs-plugin build' is kept as a fallback only when src/index.ts also doesn't exist (neither source nor compiled output found)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, lines 731-739.\n\nCurrent code:\n```typescript\nif (!(await Bun.file(entryPoint).exists())) {\n  throw new Error(\n    `Compiled entry point not found at ${entryPoint}. Run tsc first, then retry opentabs-plugin build.`,\n  );\n}\n```\n\nReplace with:\n```typescript\nif (!(await Bun.file(entryPoint).exists())) {\n  const sourceExists = await Bun.file(sourceEntry).exists();\n  if (!sourceExists) {\n    throw new Error(\n      `Neither compiled output (${entryPoint}) nor source (${sourceEntry}) found. Is this a plugin directory?`,\n    );\n  }\n  console.log(pc.dim('Compiled output not found, running tsc...'));\n  const tscResult = Bun.spawnSync(['tsc'], { cwd: projectDir, stdio: ['ignore', 'pipe', 'pipe'] });\n  if (tscResult.exitCode !== 0) {\n    const stderr = tscResult.stderr.toString().trim();\n    const stdout = tscResult.stdout.toString().trim();\n    throw new Error(`tsc failed:\\n${stderr || stdout || 'Unknown error'}`);\n  }\n  if (!(await Bun.file(entryPoint).exists())) {\n    throw new Error(\n      `tsc succeeded but ${entryPoint} was not created. Check your tsconfig.json outDir setting.`,\n    );\n  }\n}\n```\n\nIMPORTANT: This only applies to the non-watch initial build. In watch mode (lines 866+), the watcher watches dist/ for .js changes from tsc --watch, so auto-tsc is not needed. Add a parameter or check to skip auto-tsc in watch rebuilds."
+    },
+    {
+      "id": "US-004",
+      "title": "Create CONTRIBUTING.md for human contributors",
+      "description": "As a new platform contributor, I want a human-friendly contributing guide that covers setup, development workflow, testing, and common tasks so that I can get productive quickly without parsing the AI-focused CLAUDE.md.",
+      "acceptanceCriteria": [
+        "A new CONTRIBUTING.md file exists in the repository root",
+        "It covers: prerequisites (Bun >= 1.3.9, Chrome), initial setup (bun install, bun run build, loading extension), development workflow (bun run dev), running tests (unit + E2E), creating a PR, code style conventions",
+        "It links to CLAUDE.md for detailed architecture and conventions rather than duplicating that content",
+        "It explains the E2E test infrastructure at a high level: what fixtures provide, how to write a new test, how to debug failures",
+        "It documents the multi-process debugging challenge (Bun server → Chrome extension → injected IIFE → web page) and provides tips for each layer",
+        "It explains the pre-commit and pre-push hooks",
+        "It is concise (target 150-250 lines) and scannable with clear headings",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Create CONTRIBUTING.md at the repository root.\n\nStructure:\n\n# Contributing to OpenTabs\n\n## Prerequisites\n- Bun >= 1.3.9\n- Chrome (for extension development and E2E tests)\n- Node.js >= 20 (Playwright E2E tests run under Node.js)\n\n## Getting Started\n1. Clone the repo\n2. bun install\n3. bun run build\n4. Load extension from chrome://extensions/ → ~/.opentabs/extension/\n\n## Development Workflow\n- `bun run dev` — starts tsc --watch, extension rebuilds, MCP server with hot reload\n- Extension changes require manual reload from chrome://extensions/\n- Plugin changes: cd plugins/<name> && bun run build (auto-notifies server)\n\n## Running Tests\n- `bun run test` — unit tests (Bun test runner)\n- `bun run test:e2e` — E2E tests (Playwright, requires built extension + e2e plugin)\n- `bun run check` — all quality checks (build, type-check, lint, knip, test)\n- `bun run check:all` — everything including E2E\n\n## E2E Test Infrastructure\nBrief explanation of:\n- fixtures.ts: provides isolated config dirs, MCP server subprocesses, Chrome contexts, MCP clients\n- helpers.ts: shared polling utilities (waitForLog, waitForExtensionConnected, waitForToolResult)\n- Each test gets ephemeral ports (PORT=0), isolated config, and its own extension copy\n- How to write a new test: import from fixtures, use the test() from fixtures.ts\n\n## Debugging\n- MCP server: check ~/.opentabs/server.log or opentabs logs -f\n- Extension background: chrome://extensions/ → 'Inspect service worker'\n- Side panel: right-click → Inspect\n- Injected adapters: page DevTools console, look for __openTabs global\n- E2E failures: check Playwright traces in test-results/\n\n## Code Conventions\nLink to CLAUDE.md sections rather than duplicating. Key callouts:\n- Bun-first APIs\n- No eslint-disable comments\n- No TODO/FIXME comments\n- Every change must pass all 6 quality checks\n- instanceof doesn't work across bun --hot reloads (use duck typing)\n\n## Architecture\nLink to CLAUDE.md 'Architecture' section. Brief 3-sentence summary.\n\nDo NOT duplicate CLAUDE.md content — reference it. The goal is a quick-start guide that points to the right places."
+    },
+    {
+      "id": "US-005",
+      "title": "Add comprehensive JSDoc documentation to E2E fixtures and helpers",
+      "description": "As a contributor writing E2E tests, I want the fixture functions and types to have clear JSDoc documentation explaining what each function does, what it returns, and how the pieces fit together so that I don't have to reverse-engineer 1400 lines of fixture code.",
+      "acceptanceCriteria": [
+        "Every exported function in e2e/fixtures.ts has a JSDoc comment explaining: what it does, what parameters it needs, what it returns, and any important side effects",
+        "Every exported type/interface in e2e/fixtures.ts has a JSDoc comment explaining its purpose and relationship to other types",
+        "The file header comment in e2e/fixtures.ts is expanded to include a 'Fixture Hierarchy' section explaining how testPorts, mcpServer, testServer, extensionContext, backgroundPage, mcpClient, and sidePanelPage relate to each other",
+        "Every exported function in e2e/helpers.ts that doesn't already have JSDoc gets one (many already have good JSDoc — only add where missing)",
+        "The JSDoc comments are factual descriptions of current behavior, not historical notes",
+        "No functional code changes — only documentation additions",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File 1: e2e/fixtures.ts (1415 lines)\n\nThe file already has some JSDoc comments (e.g., createTestConfigDir at line 158, startMcpServer at line 412, createExtensionCopy at line 688), but many exported functions and ALL types lack documentation.\n\nKey areas to document:\n- The fixture hierarchy at the top of the file: explain that fixtures compose hierarchically (testPorts → mcpServer → extensionContext → mcpClient → sidePanelPage) and each test gets isolated instances\n- McpServer interface: what each field does (proc, logs, port, configDir, secret, health(), waitForHealth(), triggerHotReload(), kill())\n- McpClient interface: what each method does (initialize, listTools, callTool, listResources, readResource, listPrompts, getPrompt, close, resetSession)\n- TestServer interface: what the control methods do (control, controlGet, reset, setAuth, setError, setSlow, invocations)\n- createExtensionCopy: explain the port-patching strategy and why the extension is copied (for isolated WebSocket URLs per test)\n- launchExtensionContext: explain the Chrome launch args and headless mode\n- The fixtureTest object itself: explain it extends Playwright's test with custom fixtures\n\nFile 2: e2e/helpers.ts — already well-documented. Just fill in any gaps.\n\nIMPORTANT: Only add JSDoc. Do NOT change any code. Do NOT refactor the file structure. The cross-platform PRDs are actively editing this file, so keep changes to comment-only additions to minimize merge conflicts."
+    }
+  ]
+}

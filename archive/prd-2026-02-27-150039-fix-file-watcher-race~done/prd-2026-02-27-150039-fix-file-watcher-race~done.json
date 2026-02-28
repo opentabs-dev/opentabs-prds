@@ -1,0 +1,41 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix file-watcher-based E2E test flakiness under high Playwright parallelism (16 workers). Tests fail because fs.watch events are lost or coalesced when many tests simultaneously write to watched directories. The fix should make all 357 E2E tests pass reliably with PW_WORKERS=16.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Diagnose the file watcher race condition under high parallelism",
+      "description": "As a contributor, I want to understand exactly why file watcher tests fail with 16 Playwright workers so we can fix the root cause.",
+      "acceptanceCriteria": [
+        "A clear diagnosis exists (documented in a commit message or code comment) of why these tests fail at PW_WORKERS=16 but pass at PW_WORKERS=4",
+        "The root cause is identified — whether it's fs.watch event coalescing, debounce timer contention, port/socket exhaustion, or something else",
+        "npm run build passes",
+        "npm run type-check passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The failing tests are ALL in files that test file watching or side panel live updates. They timeout at 10-16s waiting for expected log messages. The tests that fail: hot-reload-dynamic.e2e.ts (7 tests — file watcher detection, manifest changes, IIFE changes), iife-injection.e2e.ts (4 tests — re-injection after file change), onboarding.e2e.ts (2 tests — side panel transitions), side-panel-data-flow.e2e.ts (1 test — connection status), side-panel-live-update.e2e.ts (2 tests), side-panel-reload.e2e.ts (2 tests), strict-csp.e2e.ts (1 test — re-injection). Each test spawns its own MCP server on a dynamic port with its own file watcher. At 16 parallel, that's 16 fs.watch instances, 16 MCP servers, 16 Chromium contexts. With PW_WORKERS=4, all 357 pass. The file watcher uses a 200ms debounce in platform/mcp-server/src/file-watcher.ts. It also has a fallback mtime polling mechanism (5-second interval). The key question: is this a Linux-specific fs.watch limitation (inotify watch limits, event queue overflow), a debounce timing issue, or a resource exhaustion issue (too many processes/sockets)?"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix the root cause so file watcher tests pass with 16 Playwright workers",
+      "description": "As a contributor, I want all file-watcher E2E tests to pass reliably at high parallelism.",
+      "acceptanceCriteria": [
+        "PW_WORKERS=16 npm run test:e2e passes with 357/357 tests, 0 failures",
+        "Run the suite 3 times with PW_WORKERS=16 — all 3 runs must have 0 failures",
+        "PW_WORKERS=4 npm run test:e2e still passes (no regression)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Possible fixes depending on the diagnosis from US-001: (1) If inotify limit: increase the limit in the test setup or use fewer watchers per server instance. Check /proc/sys/fs/inotify/max_user_watches. (2) If debounce coalescing: make the test helpers use explicit signaling (write a trigger file, have watcher acknowledge) instead of relying on timing. (3) If event queue overflow: switch from fs.watch to chokidar (uses polling as fallback) or increase the mtime polling frequency during tests. (4) If resource exhaustion: add connection pooling or reduce per-test resource usage. (5) If it's inherent to having 16 simultaneous fs.watch instances on Linux: make the tests more resilient by increasing timeouts for file-watcher tests specifically, or by using the mtime poll fallback more aggressively. The fix must be in the production code or test infrastructure — not by reducing PW_WORKERS. The goal is to support 16 workers."
+    }
+  ]
+}

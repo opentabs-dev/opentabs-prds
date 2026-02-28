@@ -1,0 +1,72 @@
+# Ralph Progress Log
+PRD: prd-2026-02-23-083210-plugin-management-apis~running.json
+Started: Mon Feb 23 08:32:17 PST 2026
+---
+
+## Codebase Patterns
+- The McpCallbacks interface in extension-protocol.ts is the contract between the extension WebSocket protocol handlers and the MCP server. Add new callbacks here for operations that need access to session servers, transports, or config reload.
+- The `createMcpCallbacks()` in http-routes.ts wires callbacks to the real implementations and passes `state`, `sessionServers`, and `transports`.
+- Plugin name normalization: shorthand "slack" → "opentabs-plugin-slack". Scoped names and full names pass through. Same logic in CLI and server.
+- `sendToExtension()` accepts any JSON-RPC message type (notification, result, error, request). Use it for both responses and push notifications.
+- The `plugins.changed` notification is already handled by the extension message-router.ts (SIDE_PANEL_METHODS set) and side panel App.tsx — just send it via sendToExtension.
+- `platformExec('npm')` from `@opentabs-dev/shared` resolves to `npm.cmd` on Windows or `npm` on Unix.
+- ESLint enforces `import-x/exports-last` — all exports must be at the bottom of the file.
+- The e2e-test plugin needs `bun install` in its directory before build-e2e.test.ts tests can pass.
+- `findPlugin()` in plugin-management.ts matches by npmPackageName, stripped name, plugin name, or raw name — reuse it when looking up plugins by user-provided names.
+- The `configWriteMutex` on ServerState serializes all config file writes to prevent concurrent read-modify-write races. Any new config write operation must chain on this mutex.
+- The `plugin.uninstall` JSON-RPC method is already handled by the extension (message-router.ts / known-methods.ts) — the server just needs to send it with a name param.
+- When naming new JSON-RPC methods, check for collisions with existing methods (e.g., `plugin.update` is already used as a notification from the file watcher).
+- For E2E tests that send raw JSON-RPC over WebSocket, use `fetchWsInfo` + `WebSocket` with protocol headers. Create a `sendRequest` helper with a pending Map keyed by UUID for clean request/response correlation.
+- `createMinimalPlugin` gives plugins the `opentabs-plugin-<name>` npm package name in package.json, making them discoverable as if npm-installed.
+
+## 2026-02-23 - US-001
+- Implemented plugin.search and plugin.install JSON-RPC handlers on the MCP server
+- Files created:
+  - `platform/mcp-server/src/plugin-management.ts` — searchNpmPlugins, installPlugin, normalizePluginName, isValidPluginPackageName
+  - `platform/mcp-server/src/plugin-management.test.ts` — unit tests for name normalization and validation
+- Files modified:
+  - `platform/mcp-server/src/extension-protocol.ts` — added plugin.search and plugin.install dispatch, handler functions, import
+  - `platform/mcp-server/src/extension-protocol.test.ts` — added onReload to noopCallbacks and all inline callback objects
+  - `platform/mcp-server/src/http-routes.ts` — extended createMcpCallbacks with onReload, fixed /ws-info to return wsSecret
+  - `platform/mcp-server/src/http-routes.test.ts` — updated ws-info test to expect wsSecret
+  - `platform/mcp-server/src/mcp-setup-dispatch.test.ts` — added onReload to noopCallbacks
+  - `e2e/side-panel-reload.e2e.ts` — fixed pre-existing wrong text assertion ("Welcome to OpenTabs" → "No Plugins Installed")
+- **Learnings for future iterations:**
+  - Adding a field to McpCallbacks requires updating ALL test files that construct callback objects — there are many inline objects beyond the shared noopCallbacks constant
+  - The /ws-info endpoint was missing wsSecret from its response — the E2E test expected it but the server didn't send it. Fixed as a pre-existing bug.
+  - The side-panel-reload E2E test used "Welcome to OpenTabs" but the actual UI text is "No Plugins Installed" — fixed as pre-existing
+  - The e2e-test plugin in plugins/e2e-test/ needs `bun install` before build-e2e.test.ts tests pass (its node_modules are not committed)
+---
+
+## 2026-02-23 - US-002
+- Implemented plugin.updateFromRegistry, plugin.remove, and plugin.checkUpdates JSON-RPC handlers on the MCP server
+- Files modified:
+  - `platform/mcp-server/src/plugin-management.ts` — added updatePlugin, removePlugin, checkPluginUpdates, findPlugin, removeLocalPlugin, PluginUpdateResult, CheckUpdatesResult types. Also added getConfigDir/getConfigPath helpers (duplicated from config.ts to avoid circular deps).
+  - `platform/mcp-server/src/extension-protocol.ts` — added dispatch entries for plugin.updateFromRegistry, plugin.remove, plugin.checkUpdates; added handler functions handlePluginUpdateFromRegistry, handlePluginRemove, handlePluginCheckUpdates; updated import from plugin-management.js
+- **Learnings for future iterations:**
+  - The `plugin.update` method name was already taken by the file-watcher notification (server→extension, no id). New methods must use distinct names (e.g., `plugin.updateFromRegistry`) to avoid collisions with the extension message router.
+  - The `removeLocalPlugin` function needs to match local plugin paths by both directory name AND package.json name, since plugin directory names may not match the plugin name.
+  - The `configWriteMutex` pattern from `saveToolConfig` in config.ts must be followed for any config read-modify-write — duplicate the mutex chaining pattern exactly.
+  - Config file helpers (getConfigDir, getConfigPath) were duplicated from config.ts to plugin-management.ts to avoid circular dependencies — this is acceptable since they're simple one-liners.
+  - Dynamic import (`await import('./version-check.js')`) used for checkPluginUpdates to keep the import lazy and avoid pulling in version-check at module load time.
+---
+
+## 2026-02-23 - US-003
+- Implemented comprehensive E2E tests for all plugin management JSON-RPC APIs
+- Files created:
+  - `e2e/plugin-management.e2e.ts` — 16 tests covering plugin.search, plugin.install, plugin.updateFromRegistry, plugin.remove, plugin.checkUpdates
+- Tests implemented:
+  - plugin.search: results with query, results without query, -32602 for invalid params
+  - plugin.install: -32602 for missing name/number/empty, -32602 for invalid naming convention, -32603 for non-existent package
+  - plugin.updateFromRegistry: -32602 for missing name, -32602 for non-installed plugin
+  - plugin.remove: -32602 for missing name, -32602 for non-installed plugin, successful local plugin removal with config verification
+  - plugin.checkUpdates: returns outdatedPlugins array shape
+  - notification rejection: methods without id get no response
+  - WebSocket authentication: authenticated client can call plugin management methods
+- **Learnings for future iterations:**
+  - The connectWs helper + sendRequest pattern is clean for testing JSON-RPC over WebSocket — creates pending map keyed by UUID, resolves on matching response id
+  - ESLint enforces prettier formatting strictly — use `bun run lint:fix` to auto-fix before manual review
+  - Non-null assertions (`!`) are banned by ESLint — use proper `if` guards or extract assertion helpers like `expectError()`
+  - Local plugins registered in the fixture config ARE found by `findPlugin()`, so `plugin.updateFromRegistry` on e2e-test will NOT return "not installed" — it attempts `npm update -g` which may succeed as a no-op
+  - The `createMinimalPlugin` helper creates plugins with `opentabs-plugin-` prefix in package.json name, so discovery works correctly for testing plugin.remove
+---

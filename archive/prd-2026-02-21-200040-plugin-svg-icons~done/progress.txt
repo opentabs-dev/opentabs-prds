@@ -1,0 +1,131 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-200040-plugin-svg-icons~running.json
+Started: Sat Feb 21 22:59:22 PST 2026
+---
+
+## Codebase Patterns
+- Most icon SVG fields (iconSvg, iconInactiveSvg) were already added to types across the pipeline in a prior iteration — only LoadedPlugin in loader.ts and the removed icon field in PluginOpentabsField needed changes
+- The icon data flows: tools.json manifest → loader.ts (LoadedPlugin) → registry.ts (RegisteredPlugin) → extension-protocol.ts (WirePluginPayload) → message-router.ts (ValidatedPluginPayload → PluginMeta)
+- Optional wire fields use conditional spread pattern: `...(value ? { key: value } : {})`
+- The `parsePluginPackageJson` validates the `opentabs` field in package.json — icon SVG fields are NOT in package.json, they are in dist/tools.json
+- SVG icon validation and grayscale generation utilities are in `platform/plugin-tools/src/validate-icon.ts` — use regex-based parsing (no XML parser dependency), ITU-R BT.709 for luminance
+- ESLint forbids non-null assertions — always use `?? fallback` for regex match groups instead of `!`
+- Test files in plugin-tools live alongside source (e.g., `src/validate-icon.test.ts`), excluded from tsc output via `tsconfig.json` but type-checked via `tsconfig.test.json`
+- Import order: parent/sibling → @scoped → external → builtin → type imports. External (picocolors, zod) comes BEFORE builtin (node:*).
+- `Bun.write()` returns `Promise<number>`, not `Promise<void>` — wrap in a helper returning `Promise<void>` when used in tests to avoid `@typescript-eslint/await-thenable`
+- `expect(promise).rejects.toThrow()` in bun:test is synchronous (returns void) — do NOT use `await` on it
+- `PluginManifestOutput` in build.ts is the internal manifest shape — it now supports optional `iconSvg` and `iconInactiveSvg` fields
+- `readAndValidateIcons(projectDir)` reads icon.svg/icon-inactive.svg from plugin root, validates, auto-generates inactive, and returns minified SVGs
+
+---
+
+## 2026-02-22 - US-001
+- What was implemented:
+  - Removed unused `icon?: string` field from `PluginOpentabsField` in `platform/shared/src/manifest.ts`
+  - Removed `icon` validation logic from `parsePluginPackageJson`
+  - Added `iconSvg` and `iconInactiveSvg` fields to `LoadedPlugin` interface in `platform/mcp-server/src/loader.ts`
+  - Added extraction of `iconSvg`/`iconInactiveSvg` from manifest object in `loadPlugin()`
+- Files changed:
+  - `platform/shared/src/manifest.ts` — removed icon field and its validation
+  - `platform/mcp-server/src/loader.ts` — added icon fields to LoadedPlugin interface and extraction logic
+- **Learnings for future iterations:**
+  - Most types already had iconSvg/iconInactiveSvg from a prior change — only LoadedPlugin was missing
+  - The `icon` field on `PluginOpentabsField` was a Lucide icon name concept that was never used — it was safe to remove
+  - All 1453 unit tests pass with these changes — no tests reference the removed icon field
+---
+
+## 2026-02-22 - US-002
+- What was implemented:
+  - Created `platform/plugin-tools/src/validate-icon.ts` with three exported functions:
+    - `validateIconSvg(content, filename)` — validates SVG structure (size ≤ 8KB, square viewBox, no `<image>`/`<script>`, no event handlers)
+    - `validateInactiveIconColors(content)` — validates that only achromatic colors are used (checks fill, stroke, stop-color, flood-color in attributes and inline styles)
+    - `generateInactiveIcon(svgContent)` — converts all color values to luminance-equivalent grays using ITU-R BT.709 formula
+  - Created `platform/plugin-tools/src/validate-icon.test.ts` with 75 test cases across three describe blocks
+  - Includes comprehensive named color lookup table (CSS2.1 + extended names)
+  - Handles hex (#RGB, #RRGGBB), rgb(), rgba(), hsl(), hsla(), and named CSS colors
+  - Passthrough values (none, currentColor, transparent, inherit, url()) are preserved unchanged
+  - For HSL/HSLA colors, sets saturation to 0% while preserving hue and lightness
+  - For RGB/RGBA colors, computes luminance gray and outputs as hex (or rgba with alpha preserved)
+- Files changed:
+  - `platform/plugin-tools/src/validate-icon.ts` — new file, SVG validation and grayscale generation
+  - `platform/plugin-tools/src/validate-icon.test.ts` — new file, 75 unit tests
+- **Learnings for future iterations:**
+  - ESLint in this project forbids non-null assertions (`!`) — use `?? fallback` pattern instead for regex match groups
+  - Prettier formatting must be applied before committing — run `bun run format` or let pre-commit hooks handle it
+  - The `dist/` directory had stale compiled `validate-icon.js` from a prior attempt — the `tsc --build --force` flag in the build script ensures these get overwritten
+  - Test files live alongside source files (e.g., `src/validate-icon.test.ts`) and are excluded from tsc output via `tsconfig.json` but type-checked via `tsconfig.test.json`
+  - All 1528 unit tests pass (75 new + 1453 existing)
+---
+
+## 2026-02-22 - US-003
+- What was implemented:
+  - Added `readAndValidateIcons(projectDir)` function to `platform/plugin-tools/src/commands/build.ts` that reads, validates, and auto-generates icon files
+  - Added `minifySvg(svg)` utility function for stripping XML comments, collapsing whitespace, and trimming SVGs
+  - Updated `PluginManifestOutput` interface to include optional `iconSvg` and `iconInactiveSvg` fields
+  - Updated `generateManifest()` to accept an optional `IconResult` parameter and include icon fields in output
+  - Wired icon reading into `runBuild()` pipeline — runs after package.json validation, before manifest generation
+  - Build logs the icon strategy: auto-generated, manual override, or no icons
+  - Handles all icon file combinations: no icons (default), icon.svg only (auto-generates inactive), both icons (manual override), icon-inactive.svg without icon.svg (error), invalid icons (error)
+  - Added 22 new unit tests: 9 for `minifySvg`, 10 for `readAndValidateIcons`, 3 for `generateManifest` with icons
+- Files changed:
+  - `platform/plugin-tools/src/commands/build.ts` — icon reading, validation, minification, and manifest embedding
+  - `platform/plugin-tools/src/commands/build.test.ts` — 22 new tests for icon build integration
+- **Learnings for future iterations:**
+  - Import order in this codebase: parent/sibling → @scoped → external → builtin → type. External packages (picocolors, zod) come BEFORE node:* builtins.
+  - `expect(promise).rejects.toThrow()` in bun:test does NOT return a Promise — never `await` it
+  - `Bun.write()` returns `Promise<number>`, not `Promise<void>` — wrap in a void-returning helper to avoid ESLint's `@typescript-eslint/await-thenable` in test assertions
+  - The `readAndValidateIcons` function validates icon.svg structure first, then processes inactive icons (either manual override with color validation, or auto-generated via `generateInactiveIcon`)
+  - All 1550 unit tests pass (22 new + 1528 existing)
+---
+
+## 2026-02-22 - US-004 (completed manually, not by Ralph)
+- What was implemented:
+  - Updated extension-protocol.ts sendSyncFull(), sendPluginUpdate(), and handleConfigGetState() to use conditional spread for iconSvg/iconInactiveSvg (omit undefined from wire payloads)
+  - Added SVG icon tests to extension-protocol.test.ts (sync.full payload with/without icons, config.getState with/without icons)
+  - Added SVG icon tests to loader.test.ts (icon extraction from manifest, missing icons, non-string values, legacy format)
+  - Added SVG icon validation tests to message-router.test.ts (extracts icon fields, handles missing/non-string)
+  - Also completed: published all platform packages to npm at v0.0.17, renamed create-opentabs-plugin to @opentabs-dev/create-plugin, updated plugin deps from file: links to published npm versions
+- Files changed:
+  - `platform/mcp-server/src/extension-protocol.ts` — conditional spread for icon fields in 3 wire payload locations
+  - `platform/mcp-server/src/extension-protocol.test.ts` — 4 new test cases for icon data in sync.full and config.getState
+  - `platform/mcp-server/src/loader.test.ts` — 4 new test cases for SVG icon extraction from manifest
+  - `platform/browser-extension/src/message-router.test.ts` — 5 new test cases for icon field validation
+- All 1563 unit tests pass
+---
+
+## 2026-02-22 - US-005
+- What was implemented:
+  - Updated PluginIcon component to accept optional `iconSvg` and `iconInactiveSvg` props
+  - When `iconSvg` is provided and plugin is ready, renders the active SVG via `dangerouslySetInnerHTML` inside the same border-2 rounded frame
+  - When plugin is not ready and `iconInactiveSvg` is provided, renders the inactive SVG
+  - When no `iconSvg` is provided, the existing letter avatar renders unchanged (backwards compatible)
+  - SVG is constrained via overflow-hidden container at ~60% of icon size (matching letter avatar proportions)
+  - Background is transparent for SVG icons, colored for letter avatars
+  - Updated PluginCard to pass `plugin.iconSvg` and `plugin.iconInactiveSvg` to PluginIcon
+  - Added WithIcon and WithIconInactive stories using inline test SVGs (colored circle for active, gray for inactive)
+  - Existing stories (Ready, NotReady, Palette, Sizes) preserved unchanged
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/PluginIcon.tsx` — SVG icon rendering branch
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — pass icon props
+  - `platform/browser-extension/src/side-panel/components/PluginIcon.stories.tsx` — WithIcon, WithIconInactive stories
+- **Learnings for future iterations:**
+  - PluginState type (aliased from ConfigStatePlugin) already had iconSvg/iconInactiveSvg from US-001 — no bridge.ts changes needed
+  - SVG icons from the manifest are already validated at build time (no scripts, no event handlers), so dangerouslySetInnerHTML is safe
+  - The component branches on `hasSvg && svgToRender` — if iconSvg exists but plugin is not ready and iconInactiveSvg is missing, it falls back to letter avatar (defensive)
+  - All 1563 unit tests pass, all quality checks exit 0
+---
+
+## 2026-02-22 - US-006
+- What was implemented:
+  - Added `"//"` comment field inside the `opentabs` section of the generated `package.json` template, explaining that `icon.svg` and `icon-inactive.svg` can be placed next to `package.json` for a custom side-panel icon
+  - Added `icon.svg` and `icon-inactive.svg` to the project structure tree in the generated README
+  - Added a new "Custom Icons" section to the generated README covering: file placement, auto-generation behavior, manual override workflow, icon requirements (square SVG, viewBox, max 8KB, no scripts/images/event handlers), and grayscale requirement for manual inactive icons
+  - Verified that the scaffold does NOT generate placeholder icon files (letter avatar is the default experience)
+  - Verified that `parsePluginPackageJson` in `platform/shared/src/manifest.ts` no longer validates the removed `icon` field (already cleaned up in US-001)
+- Files changed:
+  - `platform/cli/src/scaffold.ts` — package.json template comment + README template with Custom Icons section
+- **Learnings for future iterations:**
+  - JSON doesn't support comments, so the `"//"` key convention is used for documentation hints in package.json
+  - The scaffold is shared between `opentabs plugin create` and `create-opentabs-plugin` via the `scaffoldPlugin` export — both CLIs use the same template generation code
+  - All 1563 unit tests pass, all quality checks exit 0
+---

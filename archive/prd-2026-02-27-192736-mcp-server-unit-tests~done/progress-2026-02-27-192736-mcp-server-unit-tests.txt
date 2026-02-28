@@ -1,0 +1,57 @@
+## Codebase Patterns
+- Test files in platform/mcp-server/src/ follow: import the module under test first, then `vitest`, then other deps (import-x/order rule)
+- The tsconfig.test.json in mcp-server includes `src/**/*.test.ts` — new test files auto-covered, no tsconfig changes needed
+- Functions in mcp-tool-dispatch.ts are declared as `const` (arrow functions), exported at the bottom of the file in a grouped `export { ... }` block
+- Run `npm run lint:fix` after creating new test files to auto-fix import order and prettier formatting issues
+- Zod v4 is in use (`^4.3.6`); ZodError.issues array with path/message is still available; don't hardcode exact Zod error messages in tests (they may differ from v3)
+- Depth limit in sanitizeOutput: `depth > 50` (returns '[Object too deep]' at depth=51+); the function accepts optional depth param from tests
+- vi.mock hoisting works safely in the same file as non-mocked tests: pure function tests that don't call mocked modules are unaffected
+- Use `vi.mocked(fn)` to access mock state rather than `vi.importMock` (which doesn't exist in Vitest)
+- ESLint forbids `!` non-null assertions — use type casts like `(arr[0] as { text: string }).text` or `(arr[0] as unknown[])[1] as Record<string, unknown>` instead
+- `handleBrowserToolCall` and `handlePluginToolCall` are already exported from mcp-tool-dispatch.ts; no changes needed
+- For mocking the handler's dependencies: mock `./extension-protocol.js`, `./permissions.js`, `./state.js`, `./sanitize-error.js`, `./logger.js` — then import them normally (vi.mock is hoisted)
+---
+
+## 2026-02-28 - US-001
+- Exported `formatStructuredError` and `truncateParamsPreview` from mcp-tool-dispatch.ts (they were not previously exported; `sanitizeOutput` and `formatZodError` were already exported)
+- Created `platform/mcp-server/src/mcp-tool-dispatch.test.ts` with 30 tests covering all four pure functions
+- Files changed: `platform/mcp-server/src/mcp-tool-dispatch.ts`, `platform/mcp-server/src/mcp-tool-dispatch.test.ts`
+- **Learnings for future iterations:**
+  - Import order lint rule requires the module under test to be imported before `vitest` — run lint:fix immediately after creating test files
+  - The export block in this file uses multi-line format (prettier enforces this when >5 exports)
+  - For formatZodError tests: use `z.object().safeParse()` to get real ZodError instances; don't check exact Zod v4 error messages
+  - `sanitizeOutput` accepts a second `depth` parameter — useful for directly testing depth-limit behavior without building a 52-level-deep object
+  - truncateParamsPreview uses `JSON.stringify(args, null, 2)` internally — test boundary at exactly 200 chars by computing `200 - prefix.length - suffix.length` for the value
+---
+
+## 2026-02-28 - US-002
+- Added 38 tests for `handleBrowserToolCall` and `handlePluginToolCall` in the existing `mcp-tool-dispatch.test.ts` file (total now 68 tests)
+- Used `vi.mock` for `extension-protocol.js`, `permissions.js`, `state.js`, `sanitize-error.js`, `logger.js` — imported normally and used `vi.mocked()` for mock control
+- Files changed: `platform/mcp-server/src/mcp-tool-dispatch.test.ts`
+- **handleBrowserToolCall tests cover:** disabled tool, Zod validation failure, permission denied (with/without domain), permission allow (skips confirmation), session allowed (skips evaluation), ask+deny, ask+allow_once, ask+allow_always, confirmation timeout, confirmation error, successful execution with output sanitization, handler error, audit entry on success/failure, progress notification with progressToken
+- **handlePluginToolCall tests cover:** schema compilation failure (validate null), validator throws, validation failure, concurrency limit exceeded, extension not connected, successful dispatch with sanitization, dangerous key stripping, raw result fallback (no output field), DispatchError -32001 (Tab closed), -32002 (Tab unavailable), data.code ToolError structured format, data.code legacy format, generic non-dispatch error, activeDispatches counter increment/decrement (success and error), invocation start/end calls, success=false on error, audit entry on success/failure, progress reporting with/without progressToken, extension disconnected audit entry
+- **Learnings for future iterations:**
+  - `vi.mock` is hoisted to the top of the file but doesn't affect pure function tests that don't use the mocked modules
+  - ESLint no-non-null-assertion rule is enforced: use type casts instead of `!` operator
+  - `isDispatchError` must be mocked to return true/false to control the error handling path (it's duck-typed in production)
+  - `createMockState` with `extensionWs: null` tests the "extension not connected" path; with a mock ws object tests the dispatch path
+  - Confirmation flow: `evaluatePermission` returning 'ask' triggers `sendConfirmationRequest`, whose resolved/rejected value controls the outcome
+---
+
+## 2026-02-28 - US-003
+- Exported 10 pure functions from `platform/mcp-server/src/browser-tools/analyze-site/index.ts`: `generateSuggestions`, `restEndpointSuggestion`, `graphqlQuerySuggestions`, `extractTrpcProcedure`, `deriveFormName`, `extractPathSegments`, `extractResourceName`, `httpMethodToVerb`, `toSnakeCase`, `capitalizeFirst`
+- Created `platform/mcp-server/src/browser-tools/analyze-site/index.test.ts` with 57 tests covering all exported pure functions
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site/index.ts`, `platform/mcp-server/src/browser-tools/analyze-site/index.test.ts`
+- **Learnings for future iterations:**
+  - Helper `endpoint()` factory pattern (following detect-apis.test.ts's `req()` pattern) makes test construction concise
+  - `extractResourceName('/api/v1')` → undefined (both `api` and `v1` are reserved segments)
+  - `deriveFormName` uses `new URL(form.action, 'http://dummy')` for relative URLs — no issue when action is an empty string (falls through to field-based detection)
+  - tRPC procedure tests: the regex `/\/(?:api\/)?trpc\/(.+)$/` requires a valid absolute URL to work (uses `new URL()`)
+  - `graphqlQuerySuggestions` only works on `ApiEndpoint` types, not limited to graphql protocol — it checks `requestBodySample` directly
+  - All 76 test files pass (2218 tests total) with the additions
+---
+
+# Ralph Progress Log
+PRD: prd-2026-02-27-192736-mcp-server-unit-tests~running.json
+Started: Sat Feb 28 03:53:52 UTC 2026
+---

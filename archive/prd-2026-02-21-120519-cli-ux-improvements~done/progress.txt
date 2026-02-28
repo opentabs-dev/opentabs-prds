@@ -1,0 +1,130 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-120519-cli-ux-improvements~running.json
+Started: Sat Feb 21 12:20:19 PST 2026
+---
+
+## Codebase Patterns
+- The CLI start command has two output paths: `printFirstTimeInstructions` (extension first installed) and the `else` block (subsequent runs). Both show MCP config hints.
+- `printMcpClientConfigs` is a shared helper that both paths call with the MCP URL to keep config output consistent.
+- Cursor uses VS Code's `mcp.json` format with `{ "type": "http", "url": "..." }` (not `streamable-http`).
+- Windsurf uses `~/.codeium/windsurf/mcp_config.json` with `{ "serverUrl": "..." }` instead of `type` + `url`.
+- Console output lines must stay under 120 chars (prettier printWidth). Long `console.log(pc.dim(...))` calls that exceed this need to be restructured.
+- Config commands follow the pattern: get config path via `getConfigPath()`, check file with `Bun.file(path).exists()`, delete with `Bun.file(path).delete()`.
+- Destructive CLI commands use a `--confirm` flag pattern instead of interactive prompts.
+- `handleConfigSet` routes on key prefixes: `tool.*`, `port`, `localPlugins.add`, `localPlugins.remove`. Each has its own handler function.
+- User-provided paths are resolved to absolute via `resolve()` from `node:path` before storing in config.
+- `readConfig` returns a discriminated `ConfigResult` union (`missing | invalid | success`), not null. Callers destructure `{ config }` or check `result.error` to distinguish failure modes.
+---
+
+## 2026-02-21 - US-001
+- Implemented multi-client MCP config display in `opentabs start` command
+- Created shared `printMcpClientConfigs` helper showing Claude Code, Cursor, and Windsurf configs
+- Updated first-time instructions to call the shared helper
+- Updated subsequent-run hint to use generic phrasing ("add to your client") and show all three clients
+- Added generic fallback note for other Streamable HTTP clients
+- Files changed: `platform/cli/src/commands/start.ts`
+- **Learnings for future iterations:**
+  - Cursor's MCP config uses `{ "type": "http" }` not `"streamable-http"` — it's VS Code-based
+  - Windsurf config path is `~/.codeium/windsurf/mcp_config.json` and uses `serverUrl` field
+  - `pc.bold()` works inside `pc.dim()` to create emphasis within dimmed text
+---
+
+## 2026-02-21 - US-002
+- Added `opentabs config reset` subcommand to delete config file
+- Without `--confirm`, shows a warning about the config path and secret change, then exits with instructions
+- With `--confirm`, deletes the config file and prints confirmation message
+- If no config file exists, prints a clean message and exits normally
+- Help text explains the command deletes config and server regenerates on next start
+- Files changed: `platform/cli/src/commands/config.ts`
+- **Learnings for future iterations:**
+  - `Bun.file(path).delete()` is the idiomatic way to delete files in this codebase (not `node:fs` `unlink`)
+  - Commander's `.option('--confirm', ...)` creates an `options.confirm` boolean automatically
+  - The `--confirm` flag pattern avoids needing interactive TTY prompts, keeping the CLI scriptable
+---
+
+## 2026-02-21 - US-003
+- Expanded `handleConfigSet` to support `port`, `localPlugins.add`, and `localPlugins.remove` keys
+- Extracted shared `loadConfig` helper to reduce duplication across handlers
+- Added `handleSetPort` with integer validation (1-65535)
+- Added `handleSetLocalPluginsAdd` that resolves relative paths and prevents duplicates
+- Added `handleSetLocalPluginsRemove` that resolves paths and errors if not found
+- Updated error message for unknown keys to list all supported key patterns
+- Updated help text with examples for all supported keys
+- Files changed: `platform/cli/src/commands/config.ts`
+- **Learnings for future iterations:**
+  - `resolve()` from `node:path` resolves relative paths against `process.cwd()` — use it for user-provided paths
+  - Splitting handlers into individual functions keeps the router (`handleConfigSet`) clean and testable
+  - `Array.includes` works for deduplication when paths are already resolved to absolute form
+- The `/health` endpoint's `pluginDetails` now includes per-plugin `tools` arrays of prefixed tool names
+---
+
+## 2026-02-21 - US-004
+- Added tool name discovery: `opentabs config set tool.` fetches available tools from the running server
+- Added `tools` array (prefixed tool names) to `/health` endpoint's `pluginDetails` response
+- Added `fetchToolNames` and `handleListTools` functions in CLI config command
+- Made `value` parameter optional in `set` command (`<key> [value]`) to support the tool listing case
+- When server is unreachable, prints a helpful hint to start the server
+- When no tools available (no plugins), prints an informative message
+- Invalid tool names now also suggest using `opentabs config set tool.` for discovery
+- Files changed: `platform/cli/src/commands/config.ts`, `platform/mcp-server/src/http-routes.ts`
+- **Learnings for future iterations:**
+  - The `/health` endpoint is public (no auth required) — safe to fetch from any CLI command
+  - `AbortSignal.timeout(3_000)` provides a clean timeout pattern for health checks
+  - Commander's `[value]` (brackets) makes a positional argument optional, vs `<value>` (angles) which is required
+  - `prefixedToolName` from `state.ts` generates the `<plugin>_<tool>` format used across the platform
+---
+
+## 2026-02-21 - US-005
+- Added yellow warning to stderr when OPENTABS_PORT env var is set but invalid
+- Warning prints before falling through to default port 9515
+- Uses `console.error` with `pc.yellow()` so it doesn't interfere with JSON output
+- Valid and unset values continue to work silently (no behavioral change)
+- Files changed: `platform/cli/src/parse-port.ts`
+- **Learnings for future iterations:**
+  - `console.error` is the correct channel for warnings — keeps stdout clean for structured/JSON output
+  - The `resolvePort` function is shared across multiple CLI commands, so this warning applies everywhere port resolution happens
+  - picocolors is already a dependency — just import `pc from 'picocolors'`
+---
+
+## 2026-02-21 - US-006
+- Added Environment section to root `opentabs` CLI help text using `addHelpText('after', ...)`
+- Lists OPENTABS_PORT and OPENTABS_CONFIG_DIR with descriptions
+- Files changed: `platform/cli/src/cli.ts`
+- **Learnings for future iterations:**
+  - Commander's `.addHelpText('after', str)` appends text after the auto-generated help — ideal for environment variable docs
+  - The help text is chained on the `Command` builder before `.action()` to keep it co-located with the command definition
+---
+
+## 2026-02-21 - US-007
+- Added reload hint after "Extension updated to v..." message in `autoInitialize`
+- When extension is updated (not first install), prints dim text: "Reload the extension from chrome://extensions/ for changes to take effect."
+- First-time installs are unaffected — they show the full setup instructions as before
+- Files changed: `platform/cli/src/commands/start.ts`
+- **Learnings for future iterations:**
+  - The `autoInitialize` function returns `true` for first-time installs, `false` otherwise — the reload hint only applies to the `else if (result.installed)` branch
+  - `pc.dim()` is the correct style for non-critical hints (matches existing extension update message style)
+---
+
+## 2026-02-21 - US-008
+- Changed status output label from "Reloads" to "Plugin reloads" for clarity
+- The `pad` function's `padEnd(14)` exactly accommodates "Plugin reloads" (14 chars), keeping alignment intact
+- Files changed: `platform/cli/src/commands/status.ts`
+- **Learnings for future iterations:**
+  - The `pad` helper uses `padEnd(14)` — labels up to 14 characters align correctly without adjustments
+  - Simple label renames are the cleanest approach for adding context (vs dim annotations that add visual noise)
+---
+
+## 2026-02-21 - US-009
+- Fixed config read error double-messaging by changing `readConfig` return type from `Record | null` to a discriminated `ConfigResult` union
+- `ConfigResult` has three variants: `{ config, error: undefined }` (success), `{ config: null, error: 'missing' }`, `{ config: null, error: 'invalid', message: string }`
+- Updated all 7 callers across `config.ts`, `audit.ts`, `doctor.ts`, and `plugin.ts` to handle the new return type
+- `handleConfigShow` and `loadConfig` now show "Invalid config at ..." for corrupt files vs "No config found at ..." for missing files
+- `checkConfigFile` in `doctor.ts` now returns a `fail` result (not `warn`) for invalid configs with a hint to run `config reset --confirm`
+- `audit.ts` and `plugin.ts` callers use destructuring `{ config }` since they gracefully handle null configs
+- Updated all unit tests to assert on the new `ConfigResult` structure (error field, message content)
+- Files changed: `platform/cli/src/config.ts`, `platform/cli/src/config.test.ts`, `platform/cli/src/commands/config.ts`, `platform/cli/src/commands/audit.ts`, `platform/cli/src/commands/doctor.ts`, `platform/cli/src/commands/plugin.ts`
+- **Learnings for future iterations:**
+  - Discriminated unions with an `error` field are the cleanest pattern for functions that can fail in multiple ways — callers get type-safe narrowing
+  - When `readConfig` returns null, callers need to distinguish "file missing" from "file corrupt" — returning null for both cases loses information
+  - `doctor.ts` uses `pass`/`warn`/`fail` factory functions for check results — invalid config should be `fail` (fatal) since the user needs to fix it
+---

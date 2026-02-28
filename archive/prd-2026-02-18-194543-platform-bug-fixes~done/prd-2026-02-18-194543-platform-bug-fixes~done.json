@@ -1,0 +1,192 @@
+{
+  "project": "OpenTabs Platform Bug Fixes",
+  "description": "Fix 10 verified bugs found during a comprehensive audit of the entire OpenTabs platform: data corruption in network capture, session memory leaks, watch mode reliability, log follow race conditions, dead code, modifier key handling, token extraction, message validation, version comparison, and extension installation cleanup.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix atob corrupting non-ASCII response bodies in network capture",
+      "description": "As a developer using browser_get_network_requests, I want response bodies with non-ASCII characters (Chinese, emoji, accented text) to be captured correctly so that I can inspect any page's network traffic without data corruption.",
+      "acceptanceCriteria": [
+        "Line 202 of network-capture.ts uses TextDecoder to decode base64 content instead of bare atob",
+        "The decode pattern is: new TextDecoder().decode(Uint8Array.from(atob(res.body), c => c.charCodeAt(0)))",
+        "Text content that is not base64-encoded (res.base64Encoded === false) is still stored directly without any decoding",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/network-capture.ts line 202. Current code: `const body = res.base64Encoded ? atob(res.body) : res.body;`. The Chrome DevTools Protocol returns base64-encoded UTF-8 text for response bodies. atob() decodes to a Latin1 binary string, not Unicode text. Fix: `const body = res.base64Encoded ? new TextDecoder().decode(Uint8Array.from(atob(res.body), c => c.charCodeAt(0))) : res.body;`. This is the standard pattern for decoding base64 to UTF-8 in browser environments."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix MCP session leak when transport connect throws",
+      "description": "As the MCP server, I want to clean up session objects when transport connection fails so that failed connection attempts do not cause unbounded memory growth.",
+      "acceptanceCriteria": [
+        "Lines 290-293 in http-routes.ts are wrapped in a try/catch that calls removeSession() on error before re-throwing",
+        "sessionServers.push(sessionServer) still happens before connect() so the removeSession closure can find it",
+        "The catch block calls removeSession() then rethrows the error so the outer handler returns an appropriate error response",
+        "The existing removeSession() closure handles cleanup correctly (it already checks indexOf and splices)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/http-routes.ts lines 290-293. Current code:\n```\nsessionServer = await createMcpServer(state);\nsessionServers.push(sessionServer);\nawait sessionServer.connect(transport);\nreturn transport.handleRequest(req, { parsedBody: body });\n```\nIf `connect(transport)` throws, `sessionServer` is already in `sessionServers` with no transport ID. The stale session sweeper (line 442-443) explicitly skips sessions without transport IDs, so the orphan is never cleaned up. Fix: wrap in try/catch:\n```\ntry {\n  sessionServer = await createMcpServer(state);\n  sessionServers.push(sessionServer);\n  await sessionServer.connect(transport);\n  return transport.handleRequest(req, { parsedBody: body });\n} catch (err) {\n  removeSession();\n  throw err;\n}\n```\nThe outer Bun.serve fetch handler will catch the re-thrown error and return a 500."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix EXTENSION_COPY_EXCLUDE_PATTERN to exclude root-level tsconfig files",
+      "description": "As a user running opentabs setup, I want the installed extension directory to not contain tsconfig files so that the extension installation is clean and contains only runtime-necessary files.",
+      "acceptanceCriteria": [
+        "EXTENSION_COPY_EXCLUDE_PATTERN in platform/shared/src/index.ts matches root-level tsconfig files (e.g., rel path 'tsconfig.json', 'tsconfig.test.json')",
+        "The regex still matches tsconfig files in subdirectories (existing behavior preserved)",
+        "The regex still matches node_modules, src, .git at any level (existing behavior preserved)",
+        "New test cases in validation.test.ts verify root-level tsconfig exclusion: 'tsconfig.json' -> excluded, 'tsconfig.test.json' -> excluded",
+        "Existing tests still pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/shared/src/index.ts line 250. Current regex: `/(?:^|[\\/])(?:node_modules|src|\\.git)(?:[\\/]|$)|[\\/]tsconfig[^/\\\\]*/`. The tsconfig part only matches with a leading path separator `[\\\\/]tsconfig`. For root-level files, `relative()` returns `tsconfig.json` with no leading separator. Fix: change the tsconfig part to `(?:^|[\\\\/])tsconfig[^/\\\\]*` so it also matches at string start. Full regex: `/(?:^|[\\\\/])(?:node_modules|src|\\.git)(?:[\\\\/]|$)|(?:^|[\\\\/])tsconfig[^/\\\\]*/`. Add test cases in platform/shared/src/validation.test.ts in the EXTENSION_COPY_EXCLUDE_PATTERN describe block for 'tsconfig.json' (root) and 'tsconfig.test.json' (root) both matching the pattern."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix opentabs build --watch silently dropping file changes during rebuild",
+      "description": "As a plugin developer using watch mode, I want every file save to trigger a rebuild so that my latest changes are always reflected in the built output.",
+      "acceptanceCriteria": [
+        "A pendingRebuild flag (or equivalent) is added that is set to true when a rebuild is requested while building is true",
+        "After the current build completes, the code checks pendingRebuild and initiates another rebuild if set",
+        "The pendingRebuild flag is cleared at the start of each rebuild",
+        "The existing debounce behavior is preserved (changes are still debounced before triggering rebuild)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/cli/src/commands/build.ts lines 278-293. Current code:\n```\nlet building = false;\nconst rebuild = async () => {\n  if (building) return;  // <-- silently drops the change\n  building = true;\n  // ... build ...\n  building = false;\n};\n```\nFix: add `let pendingRebuild = false;` and change the guard:\n```\nlet building = false;\nlet pendingRebuild = false;\nconst rebuild = async () => {\n  if (building) {\n    pendingRebuild = true;\n    return;\n  }\n  building = true;\n  pendingRebuild = false;\n  // ... existing build logic in try/catch ...\n  building = false;\n  if (pendingRebuild) {\n    pendingRebuild = false;\n    void rebuild();\n  }\n};\n```\nMake sure the `pendingRebuild` check and `void rebuild()` call are AFTER setting `building = false` (in the finally block or after the try/catch)."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix followFile race condition in opentabs logs",
+      "description": "As a developer tailing server logs, I want the log follower to not duplicate or skip lines when the log file is being written to rapidly.",
+      "acceptanceCriteria": [
+        "offset is updated in the stream's 'end' event callback instead of synchronously before the stream delivers data",
+        "A reading flag prevents concurrent readNewContent calls from creating overlapping streams",
+        "When readNewContent is called while a read is in flight, it is deferred until the current read completes",
+        "File truncation detection (offset > currentSize) still works correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: platform/cli/src/commands/logs.ts lines 49-61. Current code sets `offset = currentSize` on line 60 synchronously, but `createReadStream` delivers data asynchronously. Fix:\n```\nlet reading = false;\nlet readRequested = false;\nconst readNewContent = (): void => {\n  if (reading) {\n    readRequested = true;\n    return;\n  }\n  const currentSize = statSync(filePath).size;\n  if (currentSize < offset) offset = 0;\n  if (currentSize <= offset) return;\n  reading = true;\n  const stream = createReadStream(filePath, { start: offset, encoding: 'utf-8' });\n  stream.on('data', (chunk: string | Buffer) => process.stdout.write(chunk));\n  stream.on('end', () => {\n    offset = currentSize;\n    reading = false;\n    if (readRequested) {\n      readRequested = false;\n      readNewContent();\n    }\n  });\n  stream.on('error', () => {\n    reading = false;\n  });\n};\n```"
+    },
+    {
+      "id": "US-006",
+      "title": "Remove dead code in handleBrowserTypeText clear logic",
+      "description": "As a code maintainer, I want the type-text handler to not contain dead code so that the clear-then-type logic is clear and unambiguous.",
+      "acceptanceCriteria": [
+        "The redundant input.value = '' assignment (line 529) is removed from the func parameter in handleBrowserTypeText",
+        "The remaining input.value = clr ? txt : input.value + txt assignment correctly handles both clear and append modes",
+        "Existing E2E tests for browser_type_text still pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/browser-commands.ts lines 528-531. Current code inside the func passed to chrome.scripting.executeScript:\n```\nif (clr) {\n  input.value = '';\n}\ninput.value = clr ? txt : input.value + txt;\n```\nThe `input.value = ''` on line 529 is immediately overwritten by line 531 (`input.value = clr ? txt : ...`). No event is dispatched between the two assignments, so the empty-string assignment has zero observable effect. Remove the if block (lines 528-530), keeping only line 531. The result should be:\n```\ninput.value = clr ? txt : input.value + txt;\n```"
+    },
+    {
+      "id": "US-007",
+      "title": "Add separate meta modifier parameter to browser_press_key",
+      "description": "As an AI agent automating keyboard input, I want to send Ctrl and Meta (Cmd) modifier keys independently so that web apps that distinguish between Ctrl+key and Cmd+key receive correct keyboard events.",
+      "acceptanceCriteria": [
+        "browser_press_key tool input schema has a new optional 'meta' boolean parameter (default false) alongside the existing 'ctrl' parameter",
+        "The KeyboardEvent metaKey property is set from the new meta parameter, not from ctrl",
+        "The ctrlKey property continues to be set from the ctrl parameter",
+        "The tool description mentions the meta parameter for Cmd key on macOS",
+        "Existing E2E tests for browser_press_key still pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Two files need changes:\n\n1. MCP server tool definition: platform/mcp-server/src/browser-tools/press-key.ts — add `meta: z.boolean().optional().default(false).describe('Meta (Cmd on macOS) modifier key')` to the input schema. Pass `meta: args.meta` in the dispatch params alongside existing `ctrl: args.ctrl`.\n\n2. Extension handler: platform/browser-extension/src/browser-commands.ts line 1244 — currently `metaKey: ctrl`. Change to read the `meta` parameter from params (with fallback to false) and use it: `const meta = params.meta === true;` then `metaKey: meta`. The existing ctrl parameter continues to set ctrlKey.\n\nThe handler reads params as Record<string, unknown>, so adding a new param is straightforward — just read `params.meta` with a boolean check."
+    },
+    {
+      "id": "US-008",
+      "title": "Fix Slack token regex to include underscores in character class",
+      "description": "As a Slack plugin user, I want the token extraction to match Slack tokens that contain underscores so that authentication works with all valid Slack token formats.",
+      "acceptanceCriteria": [
+        "The regex on line 157 of slack-api.ts uses character class [a-zA-Z0-9_-]+ instead of [a-zA-Z0-9-]+ for the xoxc- token match",
+        "The fix only changes the token character class, not the surrounding regex structure",
+        "bun run build passes (in plugins/slack/)",
+        "bun run type-check passes (in plugins/slack/)"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "File: plugins/slack/src/slack-api.ts line 157. Current regex: `/[\"']?api_token[\"']?\\s*:\\s*[\"'](xoxc-[a-zA-Z0-9-]+)[\"']/`. The character class `[a-zA-Z0-9-]+` does not include underscores. Slack xoxc- tokens can contain underscores. Change to `[a-zA-Z0-9_-]+`. This is a one-character fix. Build and type-check the plugin with `cd plugins/slack && bun run build`. Note: plugins are standalone projects (not in bun workspaces), so root build/lint/test commands don't cover them."
+    },
+    {
+      "id": "US-009",
+      "title": "Add runtime object check for extension message params",
+      "description": "As the MCP server, I want to validate that incoming WebSocket message params are actually objects before casting so that malformed messages from the extension don't cause silent misbehavior.",
+      "acceptanceCriteria": [
+        "handleExtensionMessage in extension-protocol.ts validates that parsed.params is a plain object (or undefined/null) before processing",
+        "Non-object params values (numbers, strings, arrays, booleans) are rejected with a warning log",
+        "Messages with valid object params or no params continue to work exactly as before",
+        "The validation happens once before the method-specific handlers, not duplicated in each handler",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/extension-protocol.ts, in the handleExtensionMessage function. After parsing the JSON and extracting `parsed.params`, add a guard before the method handlers (around line 375):\n```\nconst rawParams = parsed.params;\nif (rawParams !== undefined && rawParams !== null && (typeof rawParams !== 'object' || Array.isArray(rawParams))) {\n  log.warn(`Dropping message with non-object params: ${method}`);\n  return;\n}\nconst params = rawParams as Record<string, unknown> | undefined;\n```\nThen use `params` in all the handler calls instead of `parsed.params as Record<string, unknown>`. This removes all the unsafe `as` casts and centralizes validation. The Array.isArray check is needed because `typeof [] === 'object'`."
+    },
+    {
+      "id": "US-010",
+      "title": "Fix isNewer version comparison for NaN segments",
+      "description": "As the MCP server checking for plugin updates, I want version comparison to handle malformed version strings correctly so that update notifications are accurate even for non-standard version formats.",
+      "acceptanceCriteria": [
+        "isNewer correctly returns true for isNewer('1.0.abc', '2.0.0') (latest is newer despite malformed current)",
+        "isNewer correctly returns false for isNewer('2.0.0', '1.0.abc') (current is newer despite malformed latest)",
+        "isNewer still returns correct results for normal semver versions (existing behavior preserved)",
+        "isNewer still correctly handles prerelease suffixes with hyphens (existing behavior preserved)",
+        "New test cases cover the NaN segment scenarios",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/version-check.ts lines 52-72. The issue is in the comparison loop: when Number() returns NaN for a non-numeric segment, both `latestSegment > currentSegment` and `latestSegment < currentSegment` return false (NaN comparisons), so the loop continues to the next segment as if they were equal. Fix: after the `Number()` parse, treat NaN as 0 (the safest default — a malformed segment should not prevent the numeric segments from being compared correctly):\n```\nconst parse = (v: string): number[] =>\n  v.replace(/^v/, '').split('.').map(segment => {\n    const hyphen = segment.indexOf('-');\n    const n = Number(hyphen >= 0 ? segment.slice(0, hyphen) : segment);\n    return Number.isFinite(n) ? n : 0;\n  });\n```\nAdd test cases in version-check.test.ts: `isNewer('1.0.abc', '2.0.0')` should be `true`, `isNewer('2.0.0', '1.0.abc')` should be `true` (2.0.0 > 1.0.0 when abc->0)."
+    }
+  ]
+}

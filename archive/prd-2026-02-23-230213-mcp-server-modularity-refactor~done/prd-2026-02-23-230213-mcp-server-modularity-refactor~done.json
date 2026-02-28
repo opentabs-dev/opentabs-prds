@@ -1,0 +1,134 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Refactor the MCP server for improved modularity, testability, and code cleanliness. Splits oversized files into focused modules, moves mutable state to ServerState, extracts browser tool name constants to break a layer-crossing dependency, and exports internal handlers for targeted unit testing. All changes are pure refactors — no behavior changes.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Extract adapter and exec file I/O from extension-protocol.ts into adapter-files.ts",
+      "description": "As a developer, I want adapter/exec file I/O separated from the WebSocket protocol module so that each file has a single responsibility and file I/O can be tested independently of WebSocket messaging.",
+      "acceptanceCriteria": [
+        "A new file platform/mcp-server/src/adapter-files.ts exists containing: ensureAdaptersDir, writeAdapterFile, cleanupStaleAdapterFiles, writeExecFile, deleteExecFile, cleanupStaleExecFiles, timeoutRace, ADAPTER_WRITE_TIMEOUT_MS, EXEC_FILE_PREFIX, MAX_IIFE_SIZE (if used), and the module-level adaptersDirReady flag",
+        "extension-protocol.ts imports these functions from adapter-files.ts instead of defining them inline",
+        "All existing tests in extension-protocol.test.ts continue to pass without modification (or with minimal import path updates)",
+        "No behavior change — all runtime paths produce identical results",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The functions to extract are at platform/mcp-server/src/extension-protocol.ts lines 48-258 (adaptersDirReady, ensureAdaptersDir, writeAdapterFile, cleanupStaleAdapterFiles, timeoutRace, ADAPTER_WRITE_TIMEOUT_MS) and lines 1163-1239 (EXEC_FILE_PREFIX, writeExecFile, deleteExecFile, cleanupStaleExecFiles). These functions only depend on config.ts (getAdaptersDir), logger.ts, @opentabs-dev/shared (atomicWrite), and node:fs/promises — they have zero dependency on WebSocket state or ServerState. Create platform/mcp-server/src/adapter-files.ts with these extracted functions. Update extension-protocol.ts to import from adapter-files.ts. The adaptersDirReady flag can stay as a module-level let in the new file (it intentionally resets on hot reload). Make sure the new file is covered by the existing tsconfig.json (it should be, since it lives in src/). Check that knip doesn't flag any unused exports."
+    },
+    {
+      "id": "US-002",
+      "title": "Extract extension WebSocket message handlers from extension-protocol.ts into extension-handlers.ts",
+      "description": "As a developer, I want individual WS message handlers to be in their own module so they can be exported and unit tested directly, rather than only through the handleExtensionMessage router.",
+      "acceptanceCriteria": [
+        "A new file platform/mcp-server/src/extension-handlers.ts exists containing: handleTabSyncAll, handleTabStateChanged, handleConfigGetState, handleConfigSetToolEnabled, handleConfigSetAllToolsEnabled, handlePluginSearch, handlePluginInstall, handlePluginUpdateFromRegistry, handlePluginRemove, handlePluginCheckUpdates, handleToolProgress, handlePluginLog, handleConfirmationResponse, rejectAllPendingConfirmations, and the supporting helpers (parseTabMapping, WireTabMapping, VALID_LOG_LEVELS, serializePluginForExtension, sendJsonRpcError, sendPluginManagementError, sendToExtension)",
+        "extension-protocol.ts imports these handlers and delegates to them from handleExtensionMessage",
+        "extension-protocol.ts is reduced to ~400-500 lines containing only: dispatch mechanics (dispatchToExtension, sendSyncFull, sendPluginUpdate, sendInvocationStart/End, sendConfirmationRequest), the handleExtensionMessage router, and DispatchError/isDispatchError",
+        "All handlers are exported from extension-handlers.ts so they can be individually unit tested",
+        "All existing tests pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The handlers to extract are at platform/mcp-server/src/extension-protocol.ts lines 71-113 (sendToExtension, sendJsonRpcError, sendPluginManagementError), lines 121-158 (serializePluginForExtension), lines 468-511 (handleConfirmationResponse, rejectAllPendingConfirmations), lines 751-1161 (all handle* functions including handleTabSyncAll, handleTabStateChanged, handleConfigGetState, handleConfigSetToolEnabled, handleConfigSetAllToolsEnabled, handlePluginSearch, handlePluginInstall, handlePluginUpdateFromRegistry, handlePluginRemove, handlePluginCheckUpdates, handleToolProgress, handlePluginLog, WireTabMapping, parseTabMapping, VALID_LOG_LEVELS). The McpCallbacks interface (line 161) should also move since the handlers use it. The handleExtensionMessage function in extension-protocol.ts becomes a thin router that delegates to the imported handlers. sendToExtension must be available to both files — export it from extension-handlers.ts and import in extension-protocol.ts. Keep the existing extension-protocol.test.ts working; individual handler tests can be added later."
+    },
+    {
+      "id": "US-003",
+      "title": "Extract handleBrowserToolCall and handlePluginToolCall from mcp-setup.ts tools/call handler",
+      "description": "As a developer, I want the 336-line tools/call handler split into two focused functions so each can be tested independently and the control flow is easier to follow.",
+      "acceptanceCriteria": [
+        "A new exported function handleBrowserToolCall exists (either in mcp-setup.ts or a new file platform/mcp-server/src/mcp-tool-dispatch.ts) that handles browser tool calls including Zod validation, permission evaluation, confirmation flow, execution, output sanitization, and audit logging",
+        "A new exported function handlePluginToolCall exists that handles plugin tool calls including Ajv validation, concurrency limiting, dispatch, error formatting, and audit logging",
+        "The CallToolRequestSchema handler in registerMcpHandlers becomes a thin dispatcher: check if browser tool → handleBrowserToolCall, else → handlePluginToolCall",
+        "Both functions accept explicit parameters (state, toolName, args, extra) rather than relying on closure scope, making them independently testable",
+        "All existing tests in mcp-setup.test.ts and mcp-setup-dispatch.test.ts pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The monolith handler is at platform/mcp-server/src/mcp-setup.ts lines 373-709. The browser tool path is lines 379-523 (cachedBt check, Zod validation, permission evaluation via resolveToolDomain + evaluatePermission, confirmation flow via sendConfirmationRequest, execution, audit). The plugin tool path is lines 526-709 (checkToolCallable, Ajv validation, concurrency limit, dispatchToExtension, error formatting, audit). The return type for both is the MCP CallToolResult shape: { content: [{type: 'text', text: string}], isError?: boolean }. Define this as a type alias (e.g., ToolCallResult). Both functions need access to the RequestHandlerExtra for progressToken and sendNotification. Consider creating platform/mcp-server/src/mcp-tool-dispatch.ts with both functions plus the supporting helpers (resolveToolDomain, truncateParamsPreview, formatStructuredError, formatZodError, sanitizeOutput, MAX_CONCURRENT_DISPATCHES_PER_PLUGIN, DANGEROUS_KEYS). Then mcp-setup.ts imports and delegates. The test files mock dispatchToExtension and sendConfirmationRequest — ensure those import paths still work."
+    },
+    {
+      "id": "US-004",
+      "title": "Move rate-limit state from http-routes.ts module scope to ServerState",
+      "description": "As a developer, I want rate-limit timestamps to survive hot reloads so that rate limits are not silently bypassed when bun --hot re-evaluates the module.",
+      "acceptanceCriteria": [
+        "ServerState interface in state.ts has a new field: endpointCallTimestamps: Map<string, number[]>",
+        "createState() initializes endpointCallTimestamps as new Map()",
+        "The checkEndpointRateLimit function in http-routes.ts reads/writes state.endpointCallTimestamps instead of the module-level map",
+        "The module-level endpointCallTimestamps variable is removed from http-routes.ts",
+        "Rate limits persist across hot reloads (verified by the fact that state survives on globalThis)",
+        "All existing tests in http-routes.test.ts pass (may need minor updates to provide the new state field in test fixtures)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The module-level state is at platform/mcp-server/src/http-routes.ts line 135: `const endpointCallTimestamps = new Map<string, number[]>();`. The checkEndpointRateLimit function at lines 137-147 uses it. To fix: (1) Add `endpointCallTimestamps: Map<string, number[]>` to ServerState in platform/mcp-server/src/state.ts, (2) Add `endpointCallTimestamps: new Map()` to createState(), (3) Change checkEndpointRateLimit to accept state as a parameter: `const checkEndpointRateLimit = (state: ServerState, endpoint: string, maxPerMinute: number): boolean`, (4) Update all callers in createHandleFetch to pass state. The callers are at lines 373, 394, 428. The state is available via the deps closure in createHandleFetch. Check platform/mcp-server/src/http-routes.test.ts for test fixtures that create mock ServerState — they'll need the new field. Also bump STATE_SCHEMA_VERSION in state.ts since a new field is added (though this is just a Map so patching in index.ts handles it)."
+    },
+    {
+      "id": "US-005",
+      "title": "Extract BROWSER_TOOL_NAMES constant to break loader.ts → browser-tools dependency",
+      "description": "As a developer, I want the browser tool name list decoupled from the browser-tools barrel export so that the loading layer doesn't depend on the browser tools layer, and both can be tested in isolation.",
+      "acceptanceCriteria": [
+        "A constant BROWSER_TOOL_NAMES (array of strings) is defined in a new file platform/mcp-server/src/browser-tool-names.ts or in an existing shared location",
+        "loader.ts imports BROWSER_TOOL_NAMES from the new location instead of importing browserTools from browser-tools/index.ts",
+        "browser-tools/index.ts also uses BROWSER_TOOL_NAMES (or generates it) to ensure the list stays in sync with actual definitions",
+        "loader.ts no longer imports from browser-tools/index.ts",
+        "All existing tests pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The problematic import is at platform/mcp-server/src/loader.ts line 12: `import { browserTools } from './browser-tools/index.js';` and line 102: `const BROWSER_TOOL_NAMES = browserTools.map(t => t.name);`. The loader only needs the string names for prompt injection detection in checkBrowserToolReferences (lines 108-121). Approach: Create platform/mcp-server/src/browser-tool-names.ts that exports a const array of all browser tool name strings. This is a static list that changes rarely and can be derived from the defineBrowserTool calls. In browser-tools/index.ts, import this list and use it for a consistency check (or just import the tool definitions and verify they match). In loader.ts, import only BROWSER_TOOL_NAMES from browser-tool-names.ts. This breaks the circular-ish dependency. Alternative simpler approach: just export BROWSER_TOOL_NAMES from browser-tools/index.ts as a separate named export, and have loader.ts import only that. But this still couples loader to the barrel. The cleanest approach is a separate file."
+    },
+    {
+      "id": "US-006",
+      "title": "Move adaptersDirReady flag to ServerState for consistency",
+      "description": "As a developer, I want the adaptersDirReady cache flag on ServerState (like all other mutable state) so the hot-reload behavior is explicit and consistent with the project's state management pattern.",
+      "acceptanceCriteria": [
+        "ServerState interface has a new field: adaptersDirReady: boolean",
+        "createState() initializes adaptersDirReady as false",
+        "ensureAdaptersDir in adapter-files.ts (or extension-protocol.ts if US-001 hasn't been implemented yet) accepts state as a parameter and reads/writes state.adaptersDirReady instead of a module-level let",
+        "All callers of ensureAdaptersDir pass state",
+        "The module-level let adaptersDirReady is removed",
+        "All existing tests pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "The module-level flag is at platform/mcp-server/src/extension-protocol.ts line 53: `let adaptersDirReady = false;`. If US-001 has been completed, this flag will be in platform/mcp-server/src/adapter-files.ts instead. The ensureAdaptersDir function (lines 54-58) uses it. Callers: sendSyncFull (line 270), sendPluginUpdate (line 533), writeExecFile (line 1175). After this change, ensureAdaptersDir signature becomes: `const ensureAdaptersDir = async (state: ServerState): Promise<void>`. All callers already have access to state. This is the final story — mark as e2eCheckpoint to run the full verification suite before merge."
+    }
+  ]
+}

@@ -1,0 +1,53 @@
+# Ralph Progress Log
+PRD: prd-2026-02-22-183957-server-observability~running.json
+Started: Sun Feb 22 19:53:36 PST 2026
+
+## Codebase Patterns
+- The MCP server logger is imported as `import { log } from './logger.js'` in platform/mcp-server/src/ files
+- `log.debug()` is the correct level for per-directory/per-file failures in plugin discovery (noisy in environments with many global modules)
+- `log.warn()` is appropriate for summary-level signals that users should act on (e.g., both npm and bun resolution failing)
+- The `plugins/e2e-test/dist/` directory is gitignored and must be built before running `bun run test` — run `cd plugins/e2e-test && bun install --frozen-lockfile && bun run build` if the build-e2e.test.ts tests fail with ENOENT on dist/index.js
+- Error message pattern in catch blocks: `e instanceof Error ? e.message : String(e)` — use this consistently for error stringification
+- In build.ts, `validatePlugin` handles hard errors (empty names, bad formats), while `warnResourcesAndPrompts` handles soft warnings (wrong field types for optional fields) — don't duplicate checks across both
+---
+
+## 2026-02-22 - US-001
+- **What was implemented**: Added log.debug messages to 5 silent catch blocks in platform/mcp-server/src/resolver.ts (npm root -g failure, bun pm -g bin failure, hasOpentabsField package.json read failure, scanGlobalDir readdir failure, scoped directory readdir failure). Upgraded log.info to log.warn when both npm and bun global path resolution fail.
+- **Files changed**: platform/mcp-server/src/resolver.ts
+- **Learnings for future iterations:**
+  - The resolver already imports `log` from `./logger.js` — no new imports needed
+  - Prettier enforces line length limits — long template literals in log.debug() calls need to be wrapped with parentheses across multiple lines
+  - The `.catch()` handler on a Promise chain needs an explicit `(e: unknown)` type annotation to satisfy TypeScript strict mode
+  - The `plugins/e2e-test/dist/` directory needs to be pre-built for unit tests to pass — the `bun run test` script doesn't automatically build it
+- When `fetchLatestVersion` catches errors internally and returns null, `Promise.allSettled` will report `fulfilled` — use a discriminated union (`CheckResult`) in the mapping function to distinguish "up-to-date" from "unreachable"
+---
+
+## 2026-02-22 - US-002
+- **What was implemented**: Added log.debug messages to fetchLatestVersion for HTTP errors (with status code) and network errors (with error message). Introduced a `CheckResult` discriminated union type to distinguish "outdated", "up-to-date", and "unreachable" results in checkForUpdates. Updated summary logging: all unreachable → log.warn, some unreachable → log.info with counts, none unreachable → existing "All npm plugins are up to date".
+- **Files changed**: platform/mcp-server/src/version-check.ts
+- **Learnings for future iterations:**
+  - `fetchLatestVersion` catches its own errors and returns null, so `Promise.allSettled` almost always reports `fulfilled` — cannot rely on `rejected` status to count failures
+  - A discriminated union (`{ kind: 'outdated' | 'up-to-date' | 'unreachable' }`) is cleaner than tracking separate counters when you need to distinguish multiple null-like states
+  - Prettier prefers single-line type unions when they fit within the line width
+  - The E2E progress tests are flaky (timeout-related) but pass on retry — not related to version-check changes
+---
+
+## 2026-02-22 - US-003
+- **What was implemented**: Added a `warnResourcesAndPrompts` function in platform/plugin-tools/src/commands/build.ts that prints non-fatal yellow warnings for resource and prompt definitions with structural issues. The function checks: resource `description` and `mimeType` are strings (if present), and prompt `render` is a function. This complements the existing `validatePlugin` function which already validates uri/name emptiness and prompt name format as hard errors. The warning function runs after `validatePlugin` and before tools.json generation.
+- **Files changed**: platform/plugin-tools/src/commands/build.ts
+- **Learnings for future iterations:**
+  - `validatePlugin` already validates resource uri/name (non-empty) and prompt name (snake_case regex) as hard errors — no need to duplicate those checks as warnings
+  - TypeScript's `@typescript-eslint/no-unnecessary-condition` lint rule catches runtime type checks that are redundant given the TypeScript types (e.g., `typeof resource.uri !== 'string'` when `uri: string` in the interface)
+  - The build.ts exports pattern: all notable functions are exported for test consumption in build.test.ts
+  - E2E tests have pre-existing flakiness in dispatch-resilience and lifecycle tests (timeout/reconnect timing), unrelated to build command changes
+---
+
+## 2026-02-22 - US-004
+- **What was implemented**: Updated the build success message in platform/plugin-tools/src/commands/build.ts to include resource and prompt counts alongside tool count. The new format is `Built <name> v<version> — N tools, M resources, K prompts (Xs)` where resource and prompt counts are only shown when > 0. Updated the build-e2e.test.ts assertion to match the new message format. The inspect command already showed all three counts and required no changes.
+- **Files changed**: platform/plugin-tools/src/commands/build.ts, platform/plugin-tools/src/commands/build-e2e.test.ts
+- **Learnings for future iterations:**
+  - The build output already had resource/prompt counting logic in the `dist/tools.json` written line — the `parts` array was already computed with conditional push for non-zero counts
+  - Prettier collapses short `console.log(pc.green(...))` calls to single lines — use a local `summary` variable if the template literal is long
+  - The inspect command (inspect.ts lines 113-118) already shows all three counts unconditionally with middle-dot separators — no changes needed there
+  - The e2e-test plugin built during `bun run test:e2e` uses the *published* npm version of plugin-tools, not the local source, so its build output shows the old format — this is expected
+---

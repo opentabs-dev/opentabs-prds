@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two concrete issues found during browser extension audit: stale Chrome notifications that linger after confirmation resolution, and dead production code (exported but never imported).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Dismiss Chrome notifications when confirmations are resolved or expire",
+      "description": "As a user, I want confirmation notifications to be dismissed automatically when I respond to or when they expire, so that I don't see stale 'Approval Required' notifications in my OS notification center.",
+      "acceptanceCriteria": [
+        "When sp:confirmationResponse is handled in background-message-handlers.ts, chrome.notifications.clear() is called for the corresponding notification ID (opentabs-confirm-${id})",
+        "When sp:confirmationTimeout is handled in background-message-handlers.ts, chrome.notifications.clear() is called for the corresponding notification ID",
+        "When the background-side timeout fires in confirmation-badge.ts (line 49-53), chrome.notifications.clear() is called for the corresponding notification ID",
+        "When clearAllConfirmationBadges() is called (on disconnect), all opentabs-confirm-* notifications are cleared",
+        "Existing unit tests for confirmation-badge continue to pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The bug is in platform/browser-extension/src/confirmation-badge.ts and platform/browser-extension/src/background-message-handlers.ts.\n\nIn confirmation-badge.ts:\n- Line 56-65: chrome.notifications.create() creates notifications with ID `opentabs-confirm-${id}` and requireInteraction: true\n- Line 104-116: chrome.notifications.onClicked handler calls chrome.notifications.clear() — this is the ONLY place notifications are dismissed\n- Line 49-53: background timeout fires clearConfirmationBadge() but does NOT clear the notification\n- Line 89-96: clearAllConfirmationBadges() clears all timeouts and badge but does NOT clear notifications\n\nIn background-message-handlers.ts:\n- Lines 170-179: handleSpConfirmationResponse calls clearConfirmationBackgroundTimeout and clearConfirmationBadge but does NOT clear the notification\n- Lines 182-188: handleSpConfirmationTimeout calls clearConfirmationBackgroundTimeout and clearConfirmationBadge but does NOT clear the notification\n\nFix approach:\n1. In confirmation-badge.ts, add chrome.notifications.clear(`opentabs-confirm-${id}`).catch(() => {}) in the background timeout handler (around line 51)\n2. Add a new exported function clearConfirmationNotification(id: string) that calls chrome.notifications.clear(`opentabs-confirm-${id}`).catch(() => {})\n3. In clearAllConfirmationBadges(), also clear all tracked notification IDs. You'll need to track active confirmation IDs (the confirmationTimeouts map keys are available, but also need to track IDs that had timeoutMs=0). Consider tracking notification IDs in a separate Set, or iterating confirmationTimeouts keys before clearing.\n4. In background-message-handlers.ts, call the new function in handleSpConfirmationResponse and handleSpConfirmationTimeout\n\nAlternatively, you could fold the notification clearing into clearConfirmationBadge() and clearConfirmationBackgroundTimeout() directly, passing the confirmation ID. The simplest approach: make clearConfirmationBadge accept an optional id parameter and clear the notification when provided."
+    },
+    {
+      "id": "US-002",
+      "title": "Remove dead teardownAdapterInTab export",
+      "description": "As a developer, I want dead code removed from the codebase so that the exported API surface accurately reflects what is used in production.",
+      "acceptanceCriteria": [
+        "teardownAdapterInTab is no longer exported from iife-injection.ts (it can remain as a private function if still called internally, or be deleted entirely if unused)",
+        "All test files that reference teardownAdapterInTab are updated (remove mocks, imports, and test cases for this function)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Dead code location: platform/browser-extension/src/iife-injection.ts\n\n- Line 259-282: teardownAdapterInTab is defined as a standalone function\n- Line 547: exported in the export block\n- The function IS NOT imported by any production code. Teardown is handled inline by cleanupAdaptersInMatchingTabs (lines 453-508) which has its own inline teardown logic in the executeScript func.\n\nTest references to update:\n- platform/browser-extension/src/iife-injection.test.ts line 43: imported in test\n- platform/browser-extension/src/iife-injection.test.ts lines 203-227: test suite 'teardownAdapterInTab' — delete this entire describe block\n- platform/browser-extension/src/message-router.test.ts line 198: mocked as vi.fn(() => Promise.resolve()) — remove from mock\n\nThe function itself can be deleted entirely since no production code calls it. cleanupAdaptersInMatchingTabs (line 453) does its own teardown inline via chrome.scripting.executeScript."
+    }
+  ]
+}

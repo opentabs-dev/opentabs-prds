@@ -1,0 +1,107 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix validated bugs and code quality issues in the browser extension: missing CDP event handler causing memory leaks, dropped server notifications due to allowlist gap, confirmation badge count drift, and duplicated utility code.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Handle Network.loadingFailed CDP event in network-capture.ts",
+      "description": "As an AI agent using browser_get_network_requests, I want failed network requests (DNS errors, CORS blocks, aborted requests) to be captured and their tracking state cleaned up, so that I can debug network issues and the pendingRequests map does not leak memory.",
+      "acceptanceCriteria": [
+        "A Network.loadingFailed handler is registered in the CDP event listener alongside the existing Network.requestWillBeSent, Network.responseReceived, and Network.loadingFinished handlers",
+        "When Network.loadingFailed fires, the corresponding entry is removed from pendingRequests",
+        "When Network.loadingFailed fires, the corresponding entry is removed from requestIdToRequest if present",
+        "Failed requests are recorded in the requests array with appropriate metadata (status 0, the error reason from the CDP event params, timing info)",
+        "The requests array maxRequests cap (shift when full) applies to failed requests the same as successful ones",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/network-capture.ts. The CDP event listener starts at line 140 with a switch on params.__event. Currently handles: Network.requestWillBeSent (line 147), Network.responseReceived (line 166), Network.loadingFinished (line 194), Network.webSocketCreated (line 220), Runtime.consoleAPICalled (line 243). Add a case for 'Network.loadingFailed'. The CDP event params include `requestId`, `timestamp`, `type`, `errorText`, and `blockedReason`. Use `requestId` to look up the pending request, build a CapturedRequest with status 0 and the errorText, push to the requests array (respecting maxRequests cap via shift), and delete from both pendingRequests and requestIdToRequest. Follow the same pattern as Network.responseReceived + Network.loadingFinished but combined into one handler since for failed requests there is no separate loading phase."
+    },
+    {
+      "id": "US-002",
+      "title": "Add plugins.changed to the offscreen allowlist so server notifications reach the side panel",
+      "description": "As a user managing plugins via the MCP server (install/update/remove), I want the side panel to auto-refresh when the server sends a plugins.changed notification, so that I see updated plugin state without manually refreshing.",
+      "acceptanceCriteria": [
+        "plugins.changed is added to PASSTHROUGH_METHODS in platform/browser-extension/src/known-methods.ts",
+        "The offscreen document no longer drops incoming plugins.changed WebSocket messages (previously logged 'Dropping message with unknown method: plugins.changed')",
+        "The message-router.ts handleServerMessage function forwards plugins.changed to the side panel via the SIDE_PANEL_METHODS set (which already includes plugins.changed at line 92)",
+        "No duplicate forwarding occurs — plugins.changed should NOT have a handler in the dispatch table (it is purely a passthrough notification), and the existing explicit forwardToSidePanel calls in handleSyncFull and handlePluginUpdate should remain as-is since they cover the sync.full and plugin.update code paths",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/known-methods.ts. Add 'plugins.changed' to the PASSTHROUGH_METHODS array (around line 61-66). This is a one-line fix. The PASSTHROUGH_METHODS are methods that go through to the background message handler but are not dispatched to a specific handler — they are forwarded to the side panel via the SIDE_PANEL_METHODS check in message-router.ts (line 432-434). Since 'plugins.changed' is already in SIDE_PANEL_METHODS (line 92), adding it to PASSTHROUGH_METHODS is sufficient for the message to flow: server → WebSocket → offscreen (passes allowlist) → background (handleServerMessage) → side panel (via SIDE_PANEL_METHODS forward). The MCP server sends this notification from platform/mcp-server/src/extension-handlers.ts at lines 513, 540, and 576 after plugin install/update/remove operations."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix confirmation badge count drift on timeout",
+      "description": "As a user, I want the extension badge count to accurately reflect the number of pending confirmation requests, so that the badge does not show a stale count after confirmations time out without a response.",
+      "acceptanceCriteria": [
+        "When a confirmation is removed from pendingConfirmations in the side panel due to timeout, the background is notified to decrement the badge count",
+        "The badge count reaches 0 when all confirmations have either been responded to or timed out",
+        "The existing clearConfirmationBadge function is called for each timed-out confirmation (not just user-responded ones)",
+        "The clearAllConfirmationBadges on disconnect behavior is preserved as a safety net",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The issue spans two files:\n\n1. platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts (lines 42-44): The setTimeout that auto-removes timed-out confirmations calls setPendingConfirmations but does NOT notify the background to decrement the badge. Fix: when the timeout fires and removes a confirmation, send a message to the background (e.g., chrome.runtime.sendMessage with a new message type like 'sp:confirmationTimeout' containing the confirmation id).\n\n2. platform/browser-extension/src/background-message-handlers.ts: Add a handler for the new message type that calls clearConfirmationBadge() from confirmation-badge.ts.\n\n3. platform/browser-extension/src/extension-messages.ts: Add the new message type to the InternalMessage discriminated union.\n\nAlso fix the secondary issue: the setTimeout in useServerNotifications is not cleaned up on unmount. Store timeout IDs in a useRef and clear them in the useEffect cleanup. When a confirmation is responded to manually (via handleConfirmationResponse), also clear its timeout to prevent the timeout callback from firing after the user already responded."
+    },
+    {
+      "id": "US-004",
+      "title": "Consolidate duplicate requireStringParam utility",
+      "description": "As a developer, I want a single requireStringParam function used across the codebase, so that parameter validation is consistent and there is no duplicated code.",
+      "acceptanceCriteria": [
+        "There is exactly one requireStringParam function in the codebase (not two with different error messages)",
+        "All callers that previously used dispatch-helpers.ts requireStringParam or browser-commands/helpers.ts requireStringParam import from the same location",
+        "The consolidated function uses a consistent error message format",
+        "No unused exports remain after consolidation (knip passes)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Two files have nearly identical requireStringParam functions:\n\n1. platform/browser-extension/src/dispatch-helpers.ts:39-53 — used by tool-dispatch.ts, resource-prompt-dispatch.ts\n   Error: 'Missing or invalid \"${paramName}\" param (expected non-empty string)'\n\n2. platform/browser-extension/src/browser-commands/helpers.ts:44-59 — used by cookie-commands.ts, resource-commands.ts, key-press-command.ts, interaction-commands.ts, extension-commands.ts\n   Error: 'Missing or invalid ${paramName} parameter'\n\nBoth check typeof value !== 'string' || value.length === 0 and send JSONRPC_INVALID_PARAMS error via sendToServer. Pick one location (browser-commands/helpers.ts is the more widely used one), keep it there, remove the other, and update all imports. Use a consistent error message format. The dispatch-helpers.ts version should be removed and its callers (tool-dispatch.ts, resource-prompt-dispatch.ts) updated to import from browser-commands/helpers.ts. If dispatch-helpers.ts becomes empty or has no other exports after this, check if it can be removed entirely (check knip)."
+    },
+    {
+      "id": "US-005",
+      "title": "Add Chrome API version guards for sidePanel.onOpened/onClosed",
+      "description": "As an extension user on an older Chrome version, I want the service worker to start successfully even if chrome.sidePanel.onOpened/onClosed are unavailable, so that the extension degrades gracefully instead of crashing.",
+      "acceptanceCriteria": [
+        "chrome.sidePanel.onOpened.addListener is only called if chrome.sidePanel.onOpened exists",
+        "chrome.sidePanel.onClosed.addListener is only called if chrome.sidePanel.onClosed exists",
+        "When the APIs are unavailable, the toggle functionality falls back gracefully (the side panel still opens via chrome.sidePanel.open but the toggle-to-close behavior is unavailable)",
+        "The existing behavior on Chrome 141+ is unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "File: platform/browser-extension/src/side-panel-toggle.ts, lines 12-18. Currently:\n\nchrome.sidePanel.onOpened.addListener(({ windowId }) => { openWindows.add(windowId); });\nchrome.sidePanel.onClosed.addListener(({ windowId }) => { openWindows.delete(windowId); });\n\nThese APIs are Chrome 141+. On older Chrome, chrome.sidePanel exists (since 114) but onOpened/onClosed are undefined, causing a TypeError that crashes service worker initialization.\n\nFix: Guard with optional chaining or existence checks:\n\nchrome.sidePanel.onOpened?.addListener(({ windowId }) => { openWindows.add(windowId); });\nchrome.sidePanel.onClosed?.addListener(({ windowId }) => { openWindows.delete(windowId); });\n\nAlternatively use if-checks for clarity. The toggleSidePanel function (which reads openWindows) should handle the case where openWindows is never populated (always empty) — in that case it should default to always opening the side panel (never toggling closed), which is the safe fallback. Check that the existing logic handles this correctly."
+    }
+  ]
+}

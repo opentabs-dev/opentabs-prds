@@ -1,0 +1,61 @@
+{
+  "project": "OpenTabs Plugin — slack",
+  "workingDirectory": "plugins/slack",
+  "qualityChecks": "cd plugins/slack && bun install && bun run build && bun run type-check && bun run lint",
+  "description": "Update the Slack plugin to use ToolError factory methods with structured metadata instead of raw ToolError constructor calls. This requires the latest SDK to be published first (done by a prior PRD). Update SDK dependency version.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Update Slack plugin SDK dependency to latest version",
+      "description": "As a plugin developer maintaining the Slack plugin, I want to use the latest SDK version with all the new utilities and improved error factories.",
+      "acceptanceCriteria": [
+        "plugins/slack/package.json @opentabs-dev/plugin-sdk dependency is updated to the latest published version",
+        "plugins/slack/package.json @opentabs-dev/plugin-tools dependency is updated to the latest published version",
+        "bun install succeeds with the new versions",
+        "bun run build succeeds",
+        "cd plugins/slack && bun run build passes",
+        "cd plugins/slack && bun run type-check passes",
+        "cd plugins/slack && bun run lint passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit plugins/slack/package.json. Update the version for:\n- @opentabs-dev/plugin-sdk: change from ^0.0.16 to the latest version (check what version was just published by the publish script — likely ^0.0.17 or whatever the new version is)\n- @opentabs-dev/plugin-tools: same version\n\nThen run `cd plugins/slack && bun install` to update the lockfile.\n\nIMPORTANT: This story depends on the SDK being published to npm first. Check the current published version with `npm view @opentabs-dev/plugin-sdk version`. If it hasn't been published yet, update to the workspace version by temporarily using a file: reference or just bump the caret range to include the current workspace version."
+    },
+    {
+      "id": "US-002",
+      "title": "Migrate slackApi error handling to ToolError factory methods",
+      "description": "As a plugin developer, I want the Slack plugin to use ToolError factory methods for proper structured error metadata that AI agents can act on.",
+      "acceptanceCriteria": [
+        "slackApi auth errors use ToolError.auth() with custom code 'not_authed'",
+        "slackApi 429 errors use ToolError.rateLimited() with retryAfterMs parsed from the Retry-After header",
+        "slackApi HTTP errors use ToolError.internal() or appropriate factory based on status code",
+        "slackApi JSON parse errors use ToolError.internal() with code 'invalid_response'",
+        "slackApi Slack API errors (ok !== true) use appropriate factory methods based on common Slack error codes",
+        "All ToolError instances have proper category, retryable, and retryAfterMs metadata",
+        "cd plugins/slack && bun run build passes",
+        "cd plugins/slack && bun run type-check passes",
+        "cd plugins/slack && bun run lint passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit plugins/slack/src/slack-api.ts. The slackApi function (lines 362-428) currently uses raw `new ToolError(message, code)` without structured metadata. Replace with factory methods:\n\n1. **No auth** (line 368): `throw new ToolError(...)` -> `throw ToolError.auth('Not authenticated. Open Slack in your browser and sign in.', 'not_authed')`\n\n2. **429 rate limit** (line 402): `throw new ToolError(...)` -> Parse Retry-After header if available:\n```typescript\nconst retryAfter = response.headers.get('Retry-After');\nconst retryMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : 60000;\nthrow ToolError.rateLimited(`Slack API rate limited on ${method}`, retryMs, 'rate_limited');\n```\n\n3. **Non-ok HTTP** (line 407): Check status code:\n- 401/403: `ToolError.auth(...)` \n- 404: `ToolError.notFound(...)`\n- Other: `ToolError.internal(..., 'http_error')`\n\n4. **JSON parse error** (line 414): `throw ToolError.internal('Invalid JSON response from Slack API', 'invalid_response')`\n\n5. **Slack API error (ok !== true)** (line 424): Map common Slack error strings:\n- `not_authed`, `invalid_auth`, `account_inactive`: `ToolError.auth(msg, errorCode)`\n- `channel_not_found`, `user_not_found`: `ToolError.notFound(msg, errorCode)`\n- `ratelimited`: `ToolError.rateLimited(msg)`\n- `invalid_arguments`, `too_many_attachments`: `ToolError.validation(msg, errorCode)`\n- Others: `ToolError.internal(msg, errorCode)`\n\nAlso check other files in plugins/slack/src/tools/ that may throw ToolError directly and update those too."
+    },
+    {
+      "id": "US-003",
+      "title": "Migrate individual Slack tool error handling to factory methods",
+      "description": "As a plugin developer, I want all Slack tool files to use ToolError factory methods consistently.",
+      "acceptanceCriteria": [
+        "All ToolError usage in plugins/slack/src/tools/*.ts uses factory methods instead of raw constructors",
+        "Validation errors (missing params, invalid input) use ToolError.validation()",
+        "Not-found errors use ToolError.notFound()",
+        "Auth errors use ToolError.auth()",
+        "cd plugins/slack && bun run build passes",
+        "cd plugins/slack && bun run type-check passes",
+        "cd plugins/slack && bun run lint passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Search all files in plugins/slack/src/tools/ for `new ToolError(` and replace with the appropriate factory method.\n\nCommon patterns to look for:\n- `new ToolError('...not found...', 'NOT_FOUND')` -> `ToolError.notFound('...', 'NOT_FOUND')`\n- `new ToolError('...not authenticated...', 'not_authed')` -> `ToolError.auth('...', 'not_authed')`\n- `new ToolError('...invalid...', 'VALIDATION_ERROR')` -> `ToolError.validation('...', 'VALIDATION_ERROR')`\n\nAlso check upload-file.ts which likely has validation errors for file type checks.\n\nNote: Some tools may import ToolError directly. They should now import the factory methods too (they're static methods on ToolError, so the import doesn't change — just the usage)."
+    }
+  ]
+}

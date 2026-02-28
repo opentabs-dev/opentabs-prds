@@ -1,0 +1,100 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add SDK version compatibility checks between the MCP server and plugins. Plugins depend on @opentabs-dev/plugin-sdk at a specific version, and the MCP server bundles its own version. Currently there is no compatibility check — a plugin built with SDK 0.0.1 loads on a server with SDK 0.0.10. If the SDK interface changes (new required methods, changed types), old plugins fail with cryptic runtime errors. This PRD embeds the SDK version in plugin build artifacts, checks compatibility at discovery time, surfaces version info in status/health/side-panel, and adds E2E test coverage.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Embed SDK version in plugin build artifacts",
+      "description": "As a plugin developer, I want opentabs-plugin build to embed the SDK version in the build output so that the MCP server can check compatibility at load time.",
+      "acceptanceCriteria": [
+        "opentabs-plugin build reads the installed @opentabs-dev/plugin-sdk version from the plugin's node_modules/@opentabs-dev/plugin-sdk/package.json",
+        "The resolved SDK version is embedded as a top-level sdkVersion field in dist/tools.json",
+        "The sdkVersion value is the exact semver version string (e.g. '0.0.10'), not a range",
+        "If @opentabs-dev/plugin-sdk is not found in node_modules, the build fails with a clear error: 'Could not resolve @opentabs-dev/plugin-sdk version. Ensure the package is installed.'",
+        "Existing fields in tools.json are preserved — sdkVersion is additive",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/plugin-tools/src/commands/build.ts. The build command already reads the plugin's package.json and generates dist/tools.json. After resolving tools, read node_modules/@opentabs-dev/plugin-sdk/package.json to get the installed version. Use Bun.file() to read the SDK package.json from the plugin's node_modules (resolve relative to the plugin root, not the platform). Add sdkVersion to the tools.json output object. The version must be the concrete installed version, not the dependency range from the plugin's package.json (e.g. if package.json says '^0.0.10' but node_modules has 0.0.12, use '0.0.12'). Also rebuild the e2e-test plugin and any example plugins so their tools.json includes the new field."
+    },
+    {
+      "id": "US-002",
+      "title": "Check SDK compatibility at discovery time",
+      "description": "As a platform operator, I want the MCP server to check SDK version compatibility when loading plugins so that incompatible plugins fail with a clear error instead of cryptic runtime crashes.",
+      "acceptanceCriteria": [
+        "The MCP server's loader reads the sdkVersion field from the plugin's tools.json",
+        "The server knows its own SDK version (read from its own @opentabs-dev/plugin-sdk dependency or hardcoded from build)",
+        "Compatibility rule: the plugin's sdkVersion major.minor must be <= the server's SDK major.minor; patch differences are always fine",
+        "If the plugin's sdkVersion is incompatible (newer major.minor than server), the plugin loads as a FailedPlugin with error message: 'Plugin built with SDK <plugin_version>, server has SDK <server_version>. Rebuild the plugin: cd <plugin_path> && bun install && bun run build'",
+        "If sdkVersion is missing from tools.json (old plugin that predates this feature), the plugin loads normally with a warning logged: 'Plugin <name> does not declare sdkVersion — skipping compatibility check'",
+        "If sdkVersion is present and compatible, the plugin loads normally with no warning",
+        "The sdkVersion is stored on the loaded plugin object for later use by health/status endpoints",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/loader.ts. After reading tools.json, extract the sdkVersion field. Add a new function checkSdkCompatibility(pluginSdkVersion: string | undefined, serverSdkVersion: string): { compatible: boolean; error?: string }. For the server's own SDK version, read it from the @opentabs-dev/plugin-sdk package.json resolved relative to the mcp-server package (use Bun.resolveSync or a static import of the SDK's package.json version). Parse versions with a simple major.minor.patch split — no need for a full semver library since we only compare major.minor. The compatibility rule is intentionally simple: if the plugin was built with a newer SDK than the server, it might use APIs the server doesn't have. If the plugin was built with an older SDK, the server's SDK is backward-compatible (assuming we follow semver within 0.x). Store the sdkVersion on the LoadedPlugin type so it flows through to the registry."
+    },
+    {
+      "id": "US-003",
+      "title": "Show version compatibility in status and health",
+      "description": "As a platform developer, I want to see SDK version information in the health endpoint and CLI status so that I can diagnose compatibility issues.",
+      "acceptanceCriteria": [
+        "/health endpoint includes sdkVersion per plugin in the pluginDetails array",
+        "/health endpoint includes the server's own sdkVersion at the top level",
+        "opentabs status shows an SDK version warning line for any plugin with a missing or incompatible sdkVersion",
+        "opentabs status shows the server SDK version in the header",
+        "Side panel shows a warning badge (e.g. yellow/orange indicator) on plugins that have incompatible or missing sdkVersion",
+        "The warning badge tooltip or text says 'SDK version mismatch — rebuild plugin'",
+        "Compatible plugins show no extra badge or warning",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Three areas to edit: (1) platform/mcp-server/src/http-routes.ts — add sdkVersion to the /health response at the top level (server's SDK version) and per plugin in pluginDetails. For failed plugins due to SDK incompatibility, include the sdkVersion and the error. (2) platform/cli/src/commands/status.ts — read the sdkVersion fields from /health, display server SDK version in the header section, and for each plugin show a warning if sdkVersion is missing or if the plugin is failed due to SDK incompatibility. (3) platform/browser-extension/src/side-panel/ — update the PluginCard component. The config.getState response from extension-protocol.ts needs to include sdkVersion per plugin. If sdkVersion is missing or the plugin failed due to SDK incompatibility, show a small warning badge. Keep it minimal — a small outlined 'SDK' tag in yellow/orange next to the plugin name, or a tooltip on the existing status indicator. Update the shared ConfigStatePlugin type in platform/shared/src/index.ts to include optional sdkVersion field."
+    },
+    {
+      "id": "US-004",
+      "title": "Add E2E tests for SDK version compatibility",
+      "description": "As a platform developer, I want E2E tests covering the SDK compatibility check so that regressions are caught automatically.",
+      "acceptanceCriteria": [
+        "Test: a plugin with a matching SDK version loads successfully and its tools are callable",
+        "Test: a plugin with a too-new SDK version (e.g. 99.0.0) fails to load with a clear error message containing 'SDK' and the version numbers",
+        "Test: the /health endpoint includes sdkVersion for loaded plugins",
+        "Test: a plugin with missing sdkVersion (no field in tools.json) loads with a warning but still works",
+        "bun run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Edit e2e/ test files. For the incompatible SDK test, create a variant of the e2e-test plugin's tools.json with sdkVersion set to '99.0.0' (a version guaranteed to be newer than the server). The test fixture can write a modified tools.json to a temp directory. For the missing sdkVersion test, use a tools.json without the field. For the compatible test, use the normal e2e-test plugin (which now has sdkVersion from US-001). Check the /health endpoint response to verify sdkVersion is present. Check that the failed plugin's error message contains the expected SDK version information."
+    },
+    {
+      "id": "US-005",
+      "title": "Update CLAUDE.md with SDK version compatibility documentation",
+      "description": "As a platform developer, I want CLAUDE.md to document the SDK version compatibility mechanism so that future contributors understand the design.",
+      "acceptanceCriteria": [
+        "Key Concepts section includes a paragraph about SDK version compatibility",
+        "The paragraph explains: sdkVersion is embedded in tools.json at build time, checked at discovery time, and surfaced in health/status",
+        "The compatibility rule is documented: plugin's major.minor must be <= server's major.minor",
+        "The backward compatibility behavior for old plugins (missing sdkVersion) is documented",
+        "No plugin-specific names are mentioned (keeps CLAUDE.md plugin-agnostic per existing guidelines)"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Edit CLAUDE.md. Add a short paragraph under Key Concepts, after the existing 'Dev vs production mode' or 'Tab state machine' section. Keep it concise — 4-6 sentences covering: what sdkVersion is, where it's embedded, when it's checked, what happens on mismatch, and backward compatibility for old plugins. Do not enumerate specific plugins or version numbers."
+    }
+  ]
+}

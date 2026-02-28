@@ -1,0 +1,74 @@
+# Ralph Progress Log
+PRD: prd-2026-02-27-204234-plugin-sdk-tools-audit-fixes~running.json
+Started: Sat Feb 28 04:57:58 UTC 2026
+---
+
+## Codebase Patterns
+- `acquireConfigLock` uses `mkdirSync` (atomic on POSIX) as a mutex, writes `pid.txt` inside the lock dir, and closes the TOCTOU race by immediately calling `tryAcquire()` after removing a stale lock rather than falling through to the next loop iteration.
+- The generated IIFE adapter wrapper code lives as template literals inside `platform/plugin-tools/src/commands/build.ts`. Search for string patterns like `onDeactivate`, `teardown`, etc. within that file to find the generated code sections.
+- The teardown wrapping always happens (two branches: onNavigate and non-onNavigate). Both branches capture `origOnDeactivate` and call it inside the wrapped teardown, then `delete plugin.onDeactivate` from the instance.
+- `delete plugin.onDeactivate` on a class instance only removes own properties; prototype methods remain accessible. This means prototype-defined `onDeactivate` would still be visible as `existing.onDeactivate` on re-injection.
+- Navigation monkey-patching uses a shared `_navigationInterceptor` on `globalThis.__openTabs` with a `Map<string, () => void>` of callbacks keyed by plugin name. This avoids per-plugin monkey-patch chains that break on unordered teardown.
+- When esbuild uses `sourcemap: 'linked'`, the output JS file ends with `\n//# sourceMappingURL=<filename>.map\n`. Any post-build content must strip this suffix first and re-append it last, since the source map spec requires the comment to be the final line.
+- The no-schema overloads of fetchJSON/postJSON/postForm/postFormData/putJSON/patchJSON/deleteJSON all return `Promise<T | undefined>`. Tests use `?.` optional chaining on return values.
+- Root `npm run type-check` covers only platform packages. When modifying `plugins/*`, also run `cd plugins/<name> && npm run type-check` to verify those compile.
+---
+
+## 2026-02-28 - US-001
+- Removed explicit `existing.onDeactivate()` call from the re-injection path in the generated IIFE wrapper (build.ts ~line 716-724)
+- The teardown wrapper (set up at the end of the IIFE initialization) already calls `origOnDeactivate()` as its first step in both the onNavigate and non-onNavigate branches
+- Double invocation occurred because: (1) prototype-defined `onDeactivate` wasn't removed by `delete`, so `existing.onDeactivate` resolved to it; (2) teardown wrapper also called the captured `origOnDeactivate`
+- Files changed: `platform/plugin-tools/src/commands/build.ts`
+- **Learnings for future iterations:**
+  - Always check teardown wrapper logic before adding explicit lifecycle calls — the wrapper owns the onDeactivate→cleanup→origTeardown ordering
+  - `delete (plugin as Record<string, unknown>).onDeactivate` only removes own properties; class prototype methods remain discoverable
+---
+
+## 2026-02-28 - US-003
+- Fixed source map invalidation: esbuild with `sourcemap: 'linked'` appends `//# sourceMappingURL=...` at the end of the JS file. The original code then appended `hashAndFreeze` after the file content (including the comment), putting sourceMappingURL in the middle of the file.
+- Fix: strip the `sourceMappingURL` suffix before hashing; then write `core content + hashAndFreeze + sourceMappingURL` so the comment is always at the very end.
+- The hash is now computed from the core IIFE content WITHOUT the sourceMappingURL comment (previously it included the comment). This is a behavioral change but doesn't break anything — adapters regenerate their hash on every build.
+- Files changed: `platform/plugin-tools/src/commands/build.ts` (runBuild function, around the iifeContent read and hashAndFreeze write)
+- **Learnings for future iterations:**
+  - When esbuild uses `sourcemap: 'linked'`, the output JS file ends with `\n//# sourceMappingURL=<filename>.map\n`. Any post-build appends must account for stripping this suffix and re-appending at the very end.
+  - The source map specification requires the `sourceMappingURL` comment to be the last line of the file. Content appended after it silently breaks source map tooling.
+---
+
+## 2026-02-28 - US-002
+- Replaced per-plugin history.pushState/replaceState monkey-patching with a shared interceptor registry on `globalThis.__openTabs._navigationInterceptor`
+- Added `NavigationInterceptor` interface to `OpenTabsRuntime` in the IIFE template: stores a `Map<string, () => void>` of callbacks keyed by plugin name plus the original `pushState`/`replaceState` references
+- First plugin with onNavigate installs the shared monkey-patch; subsequent plugins just register their callback in the Map
+- Teardown removes the plugin's callback; when the last callback is removed, original history methods are restored and the interceptor is deleted
+- popstate/hashchange listeners use `addEventListener`/`removeEventListener` per-plugin (natively safe for multiple listeners)
+- Files changed: `platform/plugin-tools/src/commands/build.ts`
+- **Learnings for future iterations:**
+  - Navigation monkey-patching uses a shared interceptor on `globalThis.__openTabs._navigationInterceptor` so multiple plugins can coexist
+  - `addEventListener`/`removeEventListener` natively supports multiple listeners — no shared registry needed for event-based listeners, only for method monkey-patching
+  - The `NavigationInterceptor` stores original method references so restoration is independent of teardown order
+---
+
+## 2026-02-28 - US-005
+- Fixed fetchJSON type-safety: updated no-schema overloads of FetchJSON, PostJSON, PostForm, PostFormData, PutJSON, and PatchJSON interfaces to return `Promise<T | undefined>` instead of `Promise<T>`, matching deleteJSON's existing pattern
+- Updated fetch.test.ts: replaced direct property accesses (e.g., `data.status`) on no-schema return values with optional chaining (`data?.status`) to match the deleteJSON test pattern
+- Updated plugins/e2e-test/src/tools/sdk-fetch-json.ts: added ToolError import and null guard throwing ToolError.validation when fetchJSON returns undefined
+- Updated plugins/e2e-test/src/tools/sdk-retry.ts: same null guard pattern
+- All root monorepo quality checks pass (build, type-check, lint, knip, test); e2e-test plugin type-check also verified clean
+- Files changed: `platform/plugin-sdk/src/fetch.ts`, `platform/plugin-sdk/src/fetch.test.ts`, `plugins/e2e-test/src/tools/sdk-fetch-json.ts`, `plugins/e2e-test/src/tools/sdk-retry.ts`
+- **Learnings for future iterations:**
+  - The no-schema fetch overloads previously returned `Promise<T>` despite `fetchJSONImpl` being able to return `undefined` — this was a type lie; the fix aligns types with runtime behavior
+  - The established pattern for test code using no-schema fetch overloads is `?.` optional chaining (matching how deleteJSON tests already worked)
+  - When adding null guards in plugin code, use `ToolError.validation()` since it's already imported from `@opentabs-dev/plugin-sdk`
+  - The e2e-test plugin's type-check (`npm run type-check` from `plugins/e2e-test/`) should be run separately when modifying plugin code, since root `npm run type-check` only covers platform packages
+---
+
+## 2026-02-28 - US-004
+- Fixed TOCTOU race in `acquireConfigLock` in `platform/plugin-tools/src/commands/build.ts`
+- Extracted `tryAcquire()` inner function: atomically creates lock dir via `mkdirSync`, writes `pid.txt` with `process.pid`, returns release function or null on EEXIST
+- Added process-liveness check using `process.kill(pid, 0)` (EPERM = alive, ESRCH = dead) to distinguish genuinely stale locks from freshly acquired ones
+- After removing a stale lock with `rmSync`, immediately calls `tryAcquire()` to re-acquire atomically — this is the key fix closing the TOCTOU window (previously a `continue` let a concurrent process win the race between rmSync and the next mkdirSync)
+- Files changed: `platform/plugin-tools/src/commands/build.ts` (import line + acquireConfigLock function)
+- **Learnings for future iterations:**
+  - The TOCTOU window in stale-lock removal is: after rmSync and before the next loop iteration's mkdirSync. Fix by attempting mkdirSync immediately after rmSync in the same code path.
+  - `process.kill(pid, 0)` on POSIX: succeeds (holderAlive=true) if process alive + we own it, throws EPERM (holderAlive=true) if alive but different owner, throws ESRCH (holderAlive=false) if process gone.
+  - `writeFileSync`/`readFileSync` are in `node:fs` (sync). Don't confuse with async `writeFile`/`readFile` from `node:fs/promises`.
+---

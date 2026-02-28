@@ -1,0 +1,167 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-122316-e2e-tests-for-improvements~running.json
+Started: Sat Feb 21 16:05:30 PST 2026
+---
+
+## Codebase Patterns
+- The e2e-test plugin uses published npm packages (`@opentabs-dev/plugin-sdk@^0.0.16`), not local source. When testing SDK features that haven't been published yet, the tool must implement the logic directly rather than relying on unpublished SDK functions.
+- Test server endpoints in `e2e/test-server.ts` follow: record invocation → check maybeShortCircuit → check requireAuth → process request → return jsonResponse. New endpoints should follow the same pattern.
+- E2E test files follow: `import { test, expect } from './fixtures.js'` and `import { setupToolTest } from './helpers.js'`. Tests use the standard fixture pattern `{ mcpServer, testServer, extensionContext, mcpClient }`.
+- Prettier formatting: when a test description is short enough, the destructured params must be on a single line. Also, short `callToolWithProgress` arg lists must be on a single line. Check with `bun run lint` before committing.
+- To run a single E2E test file: `bunx playwright test --project=e2e e2e/<file>.e2e.ts`
+- The published SDK (v0.0.16) `ProgressOptions` has `progress` and `total` as required. Use `progress: 0, total: 0` as the indeterminate sentinel values. The adapter fills omitted values with 0 via `?? 0`.
+- The published SDK (v0.0.16) has `displayName` and `icon` as **required** fields in `ToolDefinition`. The local source has made them optional. The published plugin-tools (v0.0.16) also requires displayName (validates it during build). To omit them in the plugin source, use `as unknown as ToolDefinition` type assertion and build with the local `platform/plugin-tools/dist/cli.js` which has the auto-derivation logic (`deriveDisplayName` and default icon).
+- The MCP `tools/list` response only returns `name`, `description`, and `inputSchema`. displayName and icon are NOT exposed via MCP — they're in `dist/tools.json` and the `/health` endpoint's `pluginDetails`.
+- The health endpoint's `pluginDetails[].tools` is an array of prefixed tool name strings, not full ManifestTool objects. The `PluginDetail` type in `e2e/fixtures.ts` doesn't include a `tools` field — cast to access it at runtime.
+- The published SDK (v0.0.16) only supports custom codes on `ToolError.notFound(msg, code?)`. Other factories don't accept codes. Use `new ToolError(msg, code, { category, retryable, ... })` constructor directly for custom codes on unpublished factory signatures.
+- The `/health` endpoint is unauthenticated. The `failedPlugins` field is `Array<{ path, error }>`, not in the `HealthResponse` TS type — cast raw JSON to access it. Use `waitForHealth` with a predicate for tabState assertions (the server's tabMapping may lag behind the extension's isReady probe).
+- For POST /reload tests that modify config.json, wait for `Config reload complete` in server logs BEFORE calling POST /reload. This avoids the race condition between the dev-mode config watcher and the HTTP reload endpoint, which both call performConfigReload and can create dual sync.full notifications that interfere with side panel update timing.
+- When calling writeTestConfig, the server may have auto-generated a secret. Read the current config first with `readTestConfig(configDir)` to preserve the secret in the new config. Otherwise POST /reload fails with 401.
+- The POST /reload response returns `{ ok: boolean, plugins: number, durationMs: number }` — `plugins` is a count (number), not an array.
+
+## 2026-02-21 - US-001
+- Implemented E2E tests for structured fetch error categories through the full dispatch chain
+- Files changed:
+  - `e2e/test-server.ts` — added `/api/status-code/:code` endpoint (returns any HTTP status with appropriate body; 429 includes Retry-After header) and `/api/slow-forever` endpoint (never responds, for timeout testing)
+  - `plugins/e2e-test/src/tools/sdk-fetch-error-categories.ts` — new tool that fetches an endpoint, checks the HTTP status, and throws the appropriate `ToolError` factory method (auth, notFound, rateLimited, timeout, internal)
+  - `plugins/e2e-test/src/index.ts` — registered the new tool
+  - `e2e/sdk-fetch-errors.e2e.ts` — 5 E2E tests covering 401→auth, 404→not_found, 429→rate_limit, timeout→timeout, 500→internal
+- **Learnings for future iterations:**
+  - The published SDK (v0.0.16) `fetchFromPage` does NOT categorize HTTP errors — it throws plain `ToolError('...', 'http_error')` for all non-ok responses. The `httpStatusToToolError` function exists in the local source tree but hasn't been published. Tools that need categorized errors must implement the status→category mapping themselves.
+  - `ToolError` factory methods (`.auth()`, `.timeout()`, `.rateLimited()`, etc.) ARE available in the published SDK and propagate correctly through the dispatch chain (adapter → extension → MCP server → MCP client).
+  - The `parseErrorJson` helper (extracting JSON from error responses) is duplicated in `structured-errors.e2e.ts` and `sdk-fetch-errors.e2e.ts`. A future iteration could extract it to `helpers.ts`.
+---
+
+## 2026-02-21 - US-002
+- Implemented E2E tests for indeterminate progress reporting through the full dispatch chain
+- Files changed:
+  - `plugins/e2e-test/src/tools/indeterminate-progress.ts` — new tool that reports 3 progress notifications with `progress: 0, total: 0` (indeterminate sentinel) and message-only content
+  - `plugins/e2e-test/src/index.ts` — registered the new `indeterminateProgress` tool
+  - `e2e/progress.e2e.ts` — added new test section "Indeterminate progress reporting" with 1 test verifying progress=0/total=0 sentinel values and message content flow through the full pipeline
+- **Learnings for future iterations:**
+  - The published SDK (v0.0.16) has `progress` and `total` as **required** fields in `ProgressOptions`, not optional. The indeterminate progress feature (making them optional) exists in the local source tree but hasn't been published. Tools must pass `progress: 0, total: 0` explicitly as the indeterminate sentinel values.
+  - The adapter fills omitted progress/total with `0` via `opts.progress ?? 0` and `opts.total ?? 0`, so the wire format is always `{ progress: 0, total: 0, message?: string }` for indeterminate progress.
+  - `callToolWithProgress` in the E2E fixtures correctly captures the SSE progress notifications with the sentinel values — no special handling needed for indeterminate progress.
+  - Prettier wants short `callToolWithProgress` arg lists on a single line. Check with `bun run lint` before committing.
+---
+
+## 2026-02-21 - US-003
+- Implemented E2E tests for auto-derived displayName and default icon
+- Files changed:
+  - `plugins/e2e-test/src/tools/no-display-name.ts` — new tool that deliberately omits displayName and icon, using `as unknown as ToolDefinition` to bypass the published SDK's type requirement
+  - `plugins/e2e-test/src/index.ts` — registered the new `noDisplayName` tool
+  - `e2e/tool-defaults.e2e.ts` — 3 E2E tests: (1) build artifact verification (reads dist/tools.json to confirm auto-derived 'No Display Name' and default 'wrench' icon), (2) runtime discoverability and callability via MCP tools/list and dispatch, (3) health endpoint includes the tool in pluginDetails
+- **Learnings for future iterations:**
+  - The published SDK (v0.0.16) has displayName and icon as required in `ToolDefinition`. The local source has made them optional. Use `as unknown as ToolDefinition` in the tool source and build with the local `platform/plugin-tools/dist/cli.js` (which has `deriveDisplayName` and default icon logic) instead of the published npm build tool.
+  - The auto-derivation converts snake_case to Title Case: `'no_display_name'` → `'No Display Name'`. The default icon is `'wrench'`.
+  - MCP `tools/list` does NOT return displayName or icon. To verify these fields, read `dist/tools.json` directly or query the `/health` endpoint.
+  - The health endpoint's `pluginDetails` includes `tools` as an array of prefixed name strings (e.g., `'e2e-test_no_display_name'`), but the `PluginDetail` TypeScript interface in `e2e/fixtures.ts` doesn't declare this field. Use a type cast to access it.
+  - The published SDK (v0.0.16) `PromptDefinition` does NOT have the `args` Zod schema field. The local source has added it. Use `as unknown as PromptDefinition` type assertion and build with the local `platform/plugin-tools/dist/cli.js` which has `extractArgsFromSchema` for auto-generating `arguments` metadata from the Zod schema.
+  - The local plugin-tools build generates `arguments` metadata from Zod schemas: extracts field names, `.describe()` as description, optional detection via `z.ZodOptional`/`z.ZodDefault`. Explicit `arguments` array takes priority over auto-generation.
+  - MCP prompt arguments are always passed as `Record<string, string>` at runtime regardless of the Zod schema type. The typed `args` schema provides compile-time inference only.
+  - To run E2E tests for a single file: `bunx playwright test e2e/<file>.e2e.ts` (no `--project=e2e` flag needed).
+---
+
+## 2026-02-21 - US-004
+- Implemented E2E tests for typed prompt arguments with Zod schema through the full dispatch chain
+- Files changed:
+  - `plugins/e2e-test/src/index.ts` — added `typed_greet` prompt using Zod `args` schema with `z.object({ name: z.string(), formal: z.string().optional() })`, registered in the prompts array
+  - `e2e/resources-prompts.e2e.ts` — added 3 new E2E tests in "Typed prompts — Zod args schema" section: (1) verifies `prompts/list` returns auto-generated argument metadata from Zod schema (name required, formal optional, both with descriptions), (2) verifies informal greeting by default, (3) verifies formal greeting with optional arg
+  - `plugins/e2e-test/src/tools/error-rate-limited.ts` — pre-existing prettier fix (long description line)
+  - `plugins/e2e-test/src/tools/log-levels.ts` — pre-existing prettier fix (long description line)
+- **Learnings for future iterations:**
+  - The published SDK (v0.0.16) `PromptDefinition` does NOT have the `args` field. Use `as unknown as PromptDefinition` type assertion. The local `platform/plugin-tools/dist/cli.js` has `extractArgsFromSchema` to auto-generate `arguments` from Zod schemas.
+  - MCP prompt arguments are always `Record<string, string>` at runtime. The `args` Zod schema is compile-time only. The `render` function must annotate args as `Record<string, string>` when using a type assertion that bypasses the typed overload.
+  - The Zod `args` schema to `arguments` pipeline: field name → arg name, `.describe()` → description, `z.ZodOptional`/`z.ZodDefault` → `required: false`, else `required: true`.
+---
+
+## 2026-02-21 - US-005
+- Implemented E2E tests for ToolError factory methods with custom error codes through the full dispatch chain
+- Files changed:
+  - `plugins/e2e-test/src/tools/error-custom-code.ts` — new tool that throws ToolError with custom codes for all 6 categories (auth, not_found, rate_limited, validation, timeout, internal)
+  - `plugins/e2e-test/src/index.ts` — registered the new `errorCustomCode` tool
+  - `e2e/structured-errors.e2e.ts` — added 6 E2E tests (one per category) verifying custom codes propagate through the dispatch chain instead of default codes, while preserving category, retryable, and retryAfterMs metadata
+- **Learnings for future iterations:**
+  - The published SDK (v0.0.16) only supports custom codes on `notFound(message, code?)`. All other factory methods (`auth`, `rateLimited`, `validation`, `timeout`, `internal`) do NOT accept a custom code parameter. The local source has added custom code support to all factories. For tests that need custom codes on unpublished factories, use `new ToolError(message, code, opts)` constructor directly with the correct category/retryable opts.
+  - Custom codes propagate correctly through the full dispatch chain (adapter → extension → MCP server → MCP client) regardless of whether they were set via factory method or constructor — the error format includes both human-readable `[ERROR code=X category=Y ...]` prefix and JSON block.
+  - The `rateLimited` factory in the published SDK has signature `rateLimited(message, retryAfterMs?)` — no code parameter. The local source has `rateLimited(message, retryAfterMs?, code?)`.
+---
+
+## 2026-02-21 - US-006
+- Implemented E2E tests for removeLocalStorage and removeSessionStorage through the full dispatch chain
+- Files changed:
+  - `plugins/e2e-test/src/tools/sdk-remove-storage.ts` — new tool that removes a key from localStorage or sessionStorage and reports whether the key existed before/after removal
+  - `plugins/e2e-test/src/index.ts` — registered the new `sdkRemoveStorage` tool
+  - `e2e/sdk-utilities.e2e.ts` — added 2 E2E tests: (1) set localStorage key via page.evaluate, call tool to remove it, verify existed=true and afterRemoval=false, confirm from page context key is gone; (2) same flow for sessionStorage
+- **Learnings for future iterations:**
+  - The published SDK (v0.0.16) does NOT export `removeLocalStorage` or `removeSessionStorage`. These exist only in the local source (`platform/plugin-sdk/src/storage.ts`). The tool implements removal logic inline using `localStorage.removeItem()`/`sessionStorage.removeItem()` wrapped in try-catch, matching the SDK pattern.
+  - `page.evaluate(() => localStorage.setItem(...))` can be used to set up storage state before calling a tool — this runs in the page context just like the adapter, so the tool's handler sees the value.
+  - The `setupSdkTest` helper navigates to `/sdk-test` and waits for the adapter; additional page.evaluate calls can set up test state after the adapter is ready.
+---
+
+## 2026-02-22 - US-007
+- Implemented E2E tests for typed getPageGlobal with deep nesting and edge cases
+- Files changed:
+  - `e2e/test-server.ts` — extended `window.__sdkTestGlobal` to include deeply nested structure: `{ nested: { value: 42, deeply: { nested: { value: 'deep' } } } }` (4 levels deep)
+  - `e2e/sdk-utilities.e2e.ts` — added 2 new E2E tests: (1) deeply nested property access at 4 levels (`__sdkTestGlobal.nested.deeply.nested.value`), (2) non-existent intermediate segment (`__sdkTestGlobal.nested.nonexistent.value`) returns found=false without throwing
+- **Learnings for future iterations:**
+  - The typed `getPageGlobal<T>` generic is a compile-time-only improvement — runtime behavior is unchanged. E2E tests verify nothing broke.
+  - The existing `sdk_get_page_global` tool already handles both found and not-found cases correctly (`found: boolean, value: unknown`), returning `null` for undefined values and `found: false` when the path doesn't resolve.
+  - No new tools or plugin changes were needed — the existing tool covers all edge cases. Only the test server global structure and E2E test file needed updates.
+---
+
+## 2026-02-22 - US-008
+- Implemented E2E tests for audit `?tool=` and combined `?tool=&plugin=` filters
+- Files changed:
+  - `e2e/audit-logging.e2e.ts` — added 2 new E2E tests: (1) `GET /audit?tool=<name>` verifies filtering by tool name (echo vs greet vs nonexistent), (2) `GET /audit?tool=<name>&plugin=<name>` verifies combined filter returns matching entries and that mismatched plugin returns empty
+- **Learnings for future iterations:**
+  - The `/audit` endpoint already supports `?tool=`, `?plugin=`, `?success=`, and `?limit=` query params in `http-routes.ts`. No server-side changes were needed — just E2E test coverage.
+  - The `tool` field in audit entries stores the prefixed tool name (e.g., `e2e-test_echo`), which matches what the MCP client sends in `tools/call`.
+  - The `--since` filter is CLI-side (client-side filtering), not a server endpoint param, so it doesn't need a server-level E2E test. The existing tests already verify that audit entries have valid ISO 8601 timestamps.
+  - Prettier requires long test description lines to have destructured params on separate lines. The threshold seems to be around ~100 chars for the test description.
+---
+
+## 2026-02-22 - US-009
+- Implemented E2E tests for /health endpoint plugin details, failed plugins, and tab state transitions
+- Files changed:
+  - `e2e/health-endpoint.e2e.ts` — new test file with 4 tests across 3 describe blocks: (1) pluginDetails with correct source/tabState/toolCount/sdkVersion using `waitForHealth` polling, (2) top-level health fields (status, version, extensionConnected, mcpClients, plugins, toolCount, uptime, failedPlugins, discoveryErrors), (3) failedPlugins when a nonexistent local plugin path is configured (manual server setup with custom config), (4) tabState transitions from ready→unavailable→ready when toggling auth off/on
+- **Learnings for future iterations:**
+  - The health endpoint's `tabState` may lag slightly behind the extension's `isReady()` probe results. Use `waitForHealth` with a predicate instead of a single `health()` snapshot to avoid race conditions.
+  - The `failedPlugins` field in the health response is `Array<{ path: string; error: string }>` (FailedPlugin objects), NOT just strings. The `HealthResponse` type in `e2e/fixtures.ts` doesn't include `failedPlugins` — cast the raw JSON to `Record<string, unknown>` to access it.
+  - For testing failed plugin loading, create a custom config dir with a nonexistent path in `localPlugins`. The valid e2e-test plugin still loads alongside the failure — failures don't block successful plugins.
+  - The `/health` endpoint is unauthenticated — no Bearer token required. But `/audit` requires auth.
+  - Tab state transitions work through the auth toggle: `setAuth(false)` → page.reload → extension re-probes isReady → reports `unavailable` via `tab.stateChanged` → server updates `tabMapping`. The reload is needed to trigger the extension's onUpdated/status=complete → isReady re-probe.
+---
+
+## 2026-02-22 - US-010
+- Implemented E2E test for side panel onboarding reset via "Show setup guide" link
+- Files changed:
+  - `e2e/onboarding.e2e.ts` — added new test '"Show setup guide" resets onboarding from returning user empty state' that: (1) starts server with e2e-test plugin to set `hasEverHadPlugins=true`, (2) removes plugin via config.json to trigger ReturningUserEmptyState, (3) clicks "Show setup guide" button, (4) verifies OnboardingState appears with welcome heading and checklist
+- **Learnings for future iterations:**
+  - No server restart is needed to transition from plugin list to ReturningUserEmptyState — removing plugins via `writeTestConfig(configDir, { localPlugins: [], tools: {} })` while the server runs (with config watcher in dev mode) triggers the live update pipeline: config watcher → performConfigReload → sync.full → side panel re-renders.
+  - The "Show setup guide" button resets `hasEverHadPlugins` to `false` in both React state and `chrome.storage.local`, causing an immediate re-render from ReturningUserEmptyState to OnboardingState without any page reload.
+  - The exact text content: ReturningUserEmptyState shows "No Plugins Installed" (title) and "Show setup guide" (button). OnboardingState shows "Welcome to OpenTabs" (title) with "MCP server running" and "Plugins installed" checklist items.
+---
+
+## 2026-02-22 - US-011
+- Implemented E2E tests for side panel auto-refresh via POST /reload through the full dispatch pipeline
+- Files changed:
+  - `e2e/side-panel-reload.e2e.ts` — new test file with 3 E2E tests: (1) plugin removal reflected after POST /reload (writes empty config, waits for config watcher to settle, calls POST /reload, verifies "No Plugins" empty state), (2) plugin addition reflected after POST /reload (writes config with plugin, waits for config watcher, calls POST /reload, verifies "E2E Test" plugin card appears), (3) side panel preserves plugin state after POST /reload without config change (calls POST /reload on unchanged config, verifies response has correct plugin count, verifies plugin still visible)
+- **Learnings for future iterations:**
+  - The POST /reload → side panel update pipeline works: POST /reload → performConfigReload → reloadCore → sendSyncFull → extension background processes sync.full → chrome.storage updated → offscreen broadcasts ws:message → side panel detects sync.full and calls loadPlugins → re-renders.
+  - When both the config watcher and POST /reload fire simultaneously (because writeTestConfig triggers the watcher), there's a race condition that causes flaky tests. Fix: use `waitForLog(server, 'Config reload complete')` to wait for the config watcher to finish BEFORE calling POST /reload.
+  - The server auto-generates a secret when the config doesn't have one. When overwriting config.json (e.g., to remove plugins), always preserve the secret by reading the current config first: `const config = readTestConfig(configDir); writeTestConfig(configDir, { localPlugins: [], tools: {}, secret: config.secret })`.
+  - The POST /reload response returns `{ ok: boolean, plugins: number, durationMs: number }` — `plugins` is a count, NOT an array. Don't try to access `.plugins.length`.
+  - Pre-existing untracked Storybook files (`.stories.tsx`, `.storybook/`) cause knip and lint failures. These are local development artifacts that should be deleted before committing.
+---
+
+## 2026-02-22 - US-012
+- Implemented E2E tests for source maps in plugin IIFE bundles as build artifact verification
+- Files changed:
+  - `e2e/build-artifacts.e2e.ts` — new test file with 3 E2E tests: (1) verifies `adapter.iife.js.map` exists alongside the IIFE bundle with non-zero size, (2) verifies the IIFE contains a `//# debugId=` comment for source map association, (3) validates the source map is valid JSON with standard fields (version=3, sources array containing plugin `src/` files, mappings string, sourcesContent array matching sources length)
+- **Learnings for future iterations:**
+  - Bun's `sourcemap: 'external'` generates a `//# debugId=<hex>` comment in the JS file, NOT a `//# sourceMappingURL=` comment. The debugId is Bun's mechanism for associating bundles with their external `.map` files. Tests should check for `debugId` rather than `sourceMappingURL`.
+  - The source map file is substantial (~1MB for the e2e-test plugin) and includes `sourcesContent` with inline source code, enabling DevTools to show original TypeScript without needing source files on disk.
+  - Build artifact tests are lightweight and fast — they don't need the full MCP server/extension/WebSocket infrastructure. They use `node:fs` to read files from the plugin's `dist/` directory.
+  - The `E2E_TEST_PLUGIN_DIR` export from `e2e/fixtures.ts` points to `plugins/e2e-test` and is the canonical way to reference the plugin directory in tests.
+---

@@ -1,0 +1,87 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs found during CLI code audit: Windows path resolution, false-negative port check, scaffold cleanup on failure, and logs follow-mode content gap.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix resolveStoredPluginPath for Windows absolute paths",
+      "description": "As a Windows user, I want localPlugins.add and localPlugins.remove to correctly handle Windows absolute paths so that plugin management works cross-platform.",
+      "acceptanceCriteria": [
+        "resolveStoredPluginPath uses isAbsolute() from node:path instead of startsWith('/')",
+        "Unix absolute paths (starting with /) still work correctly",
+        "Home-relative paths (starting with ~/) still work correctly",
+        "Relative paths are still resolved against configDir",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The bug: In platform/cli/src/commands/config.ts, resolveStoredPluginPath (lines 293-297) checks startsWith('/') for absolute paths, which misses Windows drive-letter paths (e.g., C:\\...). The resolvePluginPath function in the same file (line ~60) correctly uses isAbsolute() from node:path.\n\nFix: Replace `storedPath.startsWith('/')` with `isAbsolute(storedPath)` from node:path. Keep the ~/  check before the isAbsolute check since ~ is not recognized by isAbsolute. The function should become:\n\n```typescript\nconst resolveStoredPluginPath = (storedPath: string, configDir: string): string => {\n  if (storedPath.startsWith('~/')) return resolve(homedir(), storedPath.slice(2));\n  if (isAbsolute(storedPath)) return storedPath;\n  return resolve(configDir, storedPath);\n};\n```\n\nImport isAbsolute from node:path if not already imported. Add a unit test that verifies a Windows-style path like 'C:\\\\plugins\\\\foo' is returned as-is (on all platforms, since isAbsolute handles cross-platform detection)."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix isPortInUse to detect non-HTTP services",
+      "description": "As a user, I want opentabs start to correctly detect when the port is occupied by any service so I get a clear error instead of a confusing crash.",
+      "acceptanceCriteria": [
+        "isPortInUse detects port occupation by any service, not just HTTP services responding to /health",
+        "The existing behavior of detecting a running OpenTabs server is preserved",
+        "When the port is occupied by a non-OpenTabs service, the user sees a clear 'port already in use' message",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The bug: In platform/cli/src/commands/start.ts, isPortInUse (lines 79-88) checks by fetching http://localhost:PORT/health. Non-HTTP services or slow services cause fetch to throw, returning false. The MCP server then crashes with EADDRINUSE.\n\nFix: Use net.createServer() to check port availability. Create a TCP server, try to listen on the port, then close it. If listen succeeds, the port is free. If it emits an error (EADDRINUSE), the port is occupied.\n\n```typescript\nconst isPortInUse = (port: number): Promise<boolean> =>\n  new Promise(resolve => {\n    const server = net.createServer();\n    server.once('error', () => resolve(true));\n    server.once('listening', () => { server.close(() => resolve(false)); });\n    server.listen(port, '127.0.0.1');\n  });\n```\n\nImport net from 'node:net'. The existing code also extracts server info from the /health response (line ~83-84 area) for the 'server already running' message. Keep that as a separate check — first do the TCP check, then if the port is in use, optionally try /health to determine if it's an OpenTabs instance."
+    },
+    {
+      "id": "US-003",
+      "title": "Clean up partial directory on scaffold failure",
+      "description": "As a user, I want to be able to retry plugin scaffolding after a failure without manually deleting a partial directory.",
+      "acceptanceCriteria": [
+        "If any file write fails during scaffolding, the project directory is recursively removed before re-throwing the error",
+        "A retry with the same name succeeds after a previous failure",
+        "Successful scaffolding is not affected by the cleanup logic",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The bug: In platform/cli/src/scaffold.ts (lines 478-503), directories are created with mkdirSync, then files are written with writeFile. If any writeFile fails (disk full, permissions), the partial directory is left behind. A retry fails with 'Directory already exists' (line ~474 existsSync check).\n\nFix: Wrap the file creation section (lines 478-503) in a try-catch. In the catch block, call rmSync(projectDir, { recursive: true, force: true }) to clean up, then re-throw the original error. The projectDir variable is defined earlier (around line 473).\n\n```typescript\ntry {\n  mkdirSync(projectDir, { recursive: true });\n  mkdirSync(join(projectDir, 'src', 'tools'), { recursive: true });\n  // ... all writeFile calls ...\n} catch (error) {\n  // Clean up partial directory\n  try { rmSync(projectDir, { recursive: true, force: true }); } catch { /* ignore cleanup errors */ }\n  throw error;\n}\n```\n\nImport rmSync from node:fs if not already imported."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix followFile content gap and error recovery in logs command",
+      "description": "As a user, I want opentabs logs --follow to not miss content written between the initial tail and the watch setup, and to recover from transient read errors.",
+      "acceptanceCriteria": [
+        "readNewContent() is called immediately after setting up the file watcher",
+        "Content written between the tailFile read and the watch setup is displayed promptly",
+        "When a read stream error occurs with readRequested set, a retry is scheduled after a short delay",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two related bugs in platform/cli/src/commands/logs.ts, followFile function (lines 80-151):\n\nBug 1 (content gap): After the watcher is set up (line ~136), there is no initial readNewContent() call. Content written between tailFile and watch setup is delayed until the next filesystem event.\n\nBug 2 (error recovery): The stream error handler (lines 131-133) sets reading = false but does not check/clear readRequested or schedule a retry.\n\nFix for Bug 1: Add readNewContent() call immediately after the watcher is set up, around line 137.\n\nFix for Bug 2: In the stream.on('error') handler (line 131-133), add: if (readRequested) { readRequested = false; setTimeout(readNewContent, 100); }\n\nBoth fixes are small changes within the followFile function."
+    }
+  ]
+}

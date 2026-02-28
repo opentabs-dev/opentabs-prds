@@ -1,0 +1,124 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Close the most critical network-level attack vectors: bind to loopback only, add Host header validation to prevent DNS rebinding (CVE-2025-66414 class), sanitize dispatch errors, and expand sensitive header redaction in network capture.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Bind HTTP server to 127.0.0.1 instead of all interfaces",
+      "description": "As a platform operator, I want the MCP server to listen only on the loopback interface so that other devices on the local network cannot reach it.",
+      "acceptanceCriteria": [
+        "Bun.serve() in platform/mcp-server/src/index.ts includes hostname: '127.0.0.1'",
+        "The server still starts on the configured port (default 9515)",
+        "The log message still says the correct URL",
+        "All existing E2E tests pass (they connect via localhost which resolves to 127.0.0.1)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "platform/mcp-server/src/index.ts line 175: `Bun.serve({ port: PORT, ... })`. Add `hostname: '127.0.0.1'` to the options object. This is a one-line change. Bun's default when no hostname is specified is to bind to 0.0.0.0 (all interfaces), which exposes the server to the local network. Binding to 127.0.0.1 restricts it to loopback only. The extension and all MCP clients connect via localhost, which resolves to 127.0.0.1, so this is fully transparent."
+    },
+    {
+      "id": "US-002",
+      "title": "Add Host header validation to prevent DNS rebinding attacks",
+      "description": "As a platform operator, I want the MCP server to reject HTTP requests with non-localhost Host headers so that DNS rebinding attacks from malicious web pages cannot reach the server.",
+      "acceptanceCriteria": [
+        "A new validation step in platform/mcp-server/src/http-routes.ts rejects requests where the Host header is not one of: localhost, localhost:<port>, 127.0.0.1, 127.0.0.1:<port>, [::1], [::1]:<port>",
+        "Requests with no Host header are rejected (HTTP/1.1 requires Host, but defense in depth)",
+        "Requests with Host: evil.com are rejected with 403",
+        "Requests with Host: localhost:9515 pass through",
+        "Requests with Host: 127.0.0.1:9515 pass through",
+        "The validation runs before any other route handling (before CORS check)",
+        "Unit tests in platform/mcp-server/src/http-routes.test.ts cover: Host: evil.com rejected, Host: localhost allowed, Host: localhost:9515 allowed, Host: 127.0.0.1 allowed, Host: [::1] allowed, missing Host rejected",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "This is the exact mitigation for CVE-2025-66414 (official MCP TypeScript SDK DNS rebinding vulnerability). In platform/mcp-server/src/http-routes.ts, add a Host header check as the FIRST validation in the fetch handler (before the CORS check at line 168). Extract the host (without port) from the Host header using `new URL('http://' + hostHeader).hostname` or simple string parsing. The allowed hostnames are: 'localhost', '127.0.0.1', '::1'. Return 403 with body 'Forbidden: invalid Host header' for any other value. The check must handle the port suffix (Host: localhost:9515) — strip the port before comparing. The existing CORS check at line 168-171 blocks browser Origin headers but does NOT protect against DNS rebinding because a DNS-rebound request has Origin: http://evil.com (blocked) BUT the real attack vector is non-browser HTTP requests where no Origin header is sent — the Host header is the only defense. Both checks are needed: Origin blocks browser-based attacks, Host blocks DNS rebinding."
+    },
+    {
+      "id": "US-003",
+      "title": "Sanitize generic dispatch error messages in MCP tool responses",
+      "description": "As a platform operator, I want server-side dispatch error messages to be sanitized before reaching MCP clients so that internal file paths and URLs are not leaked.",
+      "acceptanceCriteria": [
+        "The generic catch block in platform/mcp-server/src/mcp-setup.ts (around line 519) passes the error message through sanitizeErrorMessage() before including it in the MCP response",
+        "sanitizeErrorMessage is imported from platform/mcp-server/src/sanitize-error.ts",
+        "A unit test verifies that a dispatch error containing a file path is sanitized to [PATH] in the MCP response",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "platform/mcp-server/src/mcp-setup.ts line 519: `const msg = err instanceof Error ? err.message : String(err);` followed by line 525: `text: \\`Tool dispatch error: ${msg}\\``. The `msg` variable is used directly without sanitization. The DispatchError path above it (lines 494-517) formats structured errors from the extension (which already sanitizes on its side), but this generic catch handles server-side errors (WebSocket failures, timeout race conditions, etc.) that may contain file paths or URLs. Import `sanitizeErrorMessage` from './sanitize-error.js' and wrap: `const msg = sanitizeErrorMessage(err instanceof Error ? err.message : String(err));`. Also add to the errorInfo assignment at line 520: `message: sanitizeErrorMessage(msg)` (the errorInfo is used in the audit log, which is auth-gated, but defense in depth)."
+    },
+    {
+      "id": "US-004",
+      "title": "Expand sensitive header redaction in network capture",
+      "description": "As a user, I want common API authentication headers to be redacted in network capture output so that API keys are not leaked into the AI agent context.",
+      "acceptanceCriteria": [
+        "The SENSITIVE_HEADERS set in platform/browser-extension/src/network-capture.ts includes: x-api-key, x-auth-token, x-access-token, x-api-token, www-authenticate",
+        "Existing headers (authorization, cookie, set-cookie, x-csrf-token, x-xsrf-token, proxy-authorization) are still present",
+        "The scrubHeaders function still works correctly (case-insensitive matching)",
+        "Unit tests in platform/browser-extension/src/network-capture.test.ts (create if needed) verify that x-api-key is redacted, x-auth-token is redacted, and non-sensitive headers are preserved",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "platform/browser-extension/src/network-capture.ts lines 9-16: the SENSITIVE_HEADERS Set. Add 'x-api-key', 'x-auth-token', 'x-access-token', 'x-api-token', 'www-authenticate' to the set. The scrubHeaders function at line 19 already does case-insensitive matching via `k.toLowerCase()`, so the new entries just need to be lowercase strings. For tests, check if platform/browser-extension/src/network-capture.test.ts exists — if not, create it following the same pattern as platform/browser-extension/src/sanitize-error.test.ts (which uses bun:test, describe/test/expect). Test cases: (1) x-api-key value is replaced with [REDACTED], (2) X-Api-Key (mixed case) is also redacted, (3) x-custom-header is preserved, (4) existing authorization header is still redacted."
+    },
+    {
+      "id": "US-005",
+      "title": "Add nonce-based authentication to postMessage relay between adapter and ISOLATED world",
+      "description": "As a platform operator, I want the postMessage relay between MAIN world adapters and the ISOLATED world content script to use an unguessable nonce so that malicious page scripts cannot spoof tool results or inject fake log entries.",
+      "acceptanceCriteria": [
+        "The ISOLATED world log relay script in platform/browser-extension/src/iife-injection.ts generates a cryptographically random nonce (crypto.randomUUID or crypto.getRandomValues) and injects it into the MAIN world as a parameter",
+        "The MAIN world adapter log transport includes this nonce in every postMessage payload",
+        "The ISOLATED world relay script validates the nonce on every received message and drops messages with missing or incorrect nonces",
+        "The nonce is generated per-tab (each tab gets a unique nonce)",
+        "Tool dispatch progress events in platform/browser-extension/src/tool-dispatch.ts also use a per-dispatch nonce for the CustomEvent listener (the dispatchId already serves this purpose for progress events — verify it is validated in the ISOLATED world relay)",
+        "A malicious page calling window.postMessage with type 'opentabs:plugin-logs' but without the correct nonce is dropped",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "platform/browser-extension/src/iife-injection.ts lines 98-126: the injectLogRelay function. Currently it injects an ISOLATED world listener that checks `event.source === window` and `data.type === 'opentabs:plugin-logs'` — any MAIN world script can satisfy both conditions. The fix: (1) In injectLogRelay, generate a nonce: `const nonce = crypto.randomUUID();`. (2) Pass the nonce as a parameter to the ISOLATED world func: `func: (n: string) => { ... }` with `args: [nonce]`. (3) The ISOLATED listener adds a check: `if (data.nonce !== n) return;`. (4) The nonce must also be passed to the MAIN world adapter so it can include it in postMessage payloads. The adapter IIFE's log transport is set up via `_setLogTransport()` — the nonce can be passed through a separate MAIN world injection: `chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func: (n) => { globalThis.__openTabs._logNonce = n; }, args: [nonce] })`. Then the log transport reads `globalThis.__openTabs._logNonce` and includes it in every postMessage. For tool dispatch progress events, the dispatchId already acts as a nonce (it's a UUID generated server-side and passed as an arg to the MAIN world execution) — verify the ISOLATED relay for progress also validates this. Be careful with ordering: the nonce injection must happen before or during adapter injection, not after."
+    },
+    {
+      "id": "US-006",
+      "title": "Freeze adapter objects after injection to prevent page-side tampering",
+      "description": "As a platform operator, I want adapter objects on globalThis.__openTabs.adapters to be frozen after registration so that malicious page scripts cannot replace tool handlers or isReady functions.",
+      "acceptanceCriteria": [
+        "After an adapter is registered on globalThis.__openTabs.adapters[pluginName], the adapter object and its tools array are deeply frozen (Object.freeze on the adapter, each tool object, and the tools array)",
+        "The globalThis.__openTabs.adapters property itself is non-configurable and non-writable (Object.defineProperty with writable: false, configurable: false)",
+        "Existing tool dispatch still works correctly (frozen objects are still readable)",
+        "The freeze happens in the adapter IIFE wrapper generated by opentabs-plugin build, OR in a post-injection script executed by the extension",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "There are two places this could be done: (1) In the IIFE wrapper generated by platform/plugin-tools/src/commands/build.ts — add Object.freeze calls after the adapter is assigned to globalThis.__openTabs.adapters[name]. This is the cleanest approach since it happens at registration time. (2) In a post-injection MAIN world script in platform/browser-extension/src/iife-injection.ts after injectAdapterFile. Option 1 is better because it freezes immediately, leaving no window for tampering. In the IIFE wrapper, after the line that sets `globalThis.__openTabs.adapters[name] = adapter`, add: `Object.freeze(adapter.tools); adapter.tools.forEach(t => Object.freeze(t)); Object.freeze(adapter);`. Then also freeze the adapters container: `Object.defineProperty(globalThis.__openTabs, 'adapters', { value: globalThis.__openTabs.adapters, writable: false, configurable: false });`. Note: Object.freeze is shallow — it freezes the object's own properties but not nested objects. So each tool must be individually frozen. Also note: the handle function is a closure, so freezing it doesn't affect its internal state — it can still be called. Be careful not to freeze the adapters map itself if multiple plugins need to be registered on the same page — only freeze individual adapter entries, not the whole adapters object. Use Object.defineProperty per adapter entry instead."
+    }
+  ]
+}

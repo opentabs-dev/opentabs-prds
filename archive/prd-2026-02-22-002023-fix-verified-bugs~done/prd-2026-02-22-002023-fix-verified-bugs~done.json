@@ -1,0 +1,117 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix verified bugs found during thorough code review: logic errors, null safety issues, missing validation, and incorrect filtering conditions across the platform.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix AND vs OR logic error in analyze-site globals filtering",
+      "description": "As a plugin developer using plugin_analyze_site, I want the globals detection to correctly filter out underscore-prefixed keys so that the analysis results are not polluted with internal framework globals.",
+      "acceptanceCriteria": [
+        "Line 419 of platform/mcp-server/src/browser-tools/analyze-site/index.ts uses || instead of &&",
+        "Keys starting with '_' are filtered out (e.g. '_myPrivateGlobal')",
+        "Keys starting with '__zone' are filtered out (e.g. '__zone_symbol__UNPATCHED_EVENTS')",
+        "The BROWSER_BUILTINS set check on line 418 remains unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts, line 419. Current code: `if (key.startsWith('_') && key.startsWith('__zone') ) continue;` — the AND (&&) means both conditions must be true simultaneously, but any string starting with '__zone' already starts with '_', so the second condition is only a subset of the first. The intent is clearly to skip keys that start with '_' OR start with '__zone'. Fix: change `&&` to `||`. Note: after the fix, the `key.startsWith('__zone')` check is actually redundant since '__zone' starts with '_', but keep it for readability/intent documentation."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix null pointer in getTextContent when textContent is null",
+      "description": "As a plugin developer using the SDK's getTextContent utility, I want it to handle elements with null textContent gracefully so that my plugin doesn't crash with a TypeError.",
+      "acceptanceCriteria": [
+        "getTextContent uses optional chaining: el.textContent?.trim() ?? null",
+        "getTextContent returns null when the element exists but textContent is null",
+        "Existing behavior is preserved: returns trimmed text when textContent is a string, returns null when element not found",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/plugin-sdk/src/dom.ts, line 108. Current code: `return el.textContent.trim();` — Element.textContent can be null (MDN documents this for certain node types). Calling .trim() on null throws TypeError. Fix: `return el.textContent?.trim() ?? null;`. This is a one-line fix. The plugin-sdk has tests in platform/plugin-sdk/src/dom.test.ts — verify existing tests still pass."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix unvalidated resource and prompt arrays in plugin manifest loader",
+      "description": "As a platform operator, I want the manifest loader to validate resource and prompt entries from tools.json so that malformed plugin manifests are caught at load time instead of causing runtime crashes.",
+      "acceptanceCriteria": [
+        "Resource entries in tools.json are validated: each must have uri (string), name (string), description (string), and optionally mimeType (string)",
+        "Prompt entries in tools.json are validated: each must have name (string), description (string), and optionally arguments (array)",
+        "Invalid resource/prompt entries are filtered out with a warning log, not a hard failure",
+        "Valid entries still load correctly — no regression for well-formed manifests",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/loader.ts, lines 312-315. Current code casts arrays directly without validation: `manifestObj.resources as ManifestResource[]`. Tools are validated via validateTools() but resources and prompts are not. Add inline validation that checks each array element has the required fields before including it. Filter out invalid entries with log.warn(). Look at ManifestResource and ManifestPrompt types for the required fields — they're defined in the same file or imported from shared types."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix source map stat() call without existence check in plugin build",
+      "description": "As a plugin developer, I want the build command to handle missing source map files gracefully so that the build doesn't crash with an unclear error if source map generation fails.",
+      "acceptanceCriteria": [
+        "Source map file existence is checked before calling .stat()",
+        "If source map file doesn't exist, the build still succeeds and prints a warning instead of crashing",
+        "If source map file exists, existing behavior is preserved (prints file size)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, lines 790-792. Current code: `const sourceMapSize = (await Bun.file(sourceMapPath).stat()).size;` — if the source map wasn't generated (e.g., bundler error or config issue), .stat() throws an unclear error. Fix: wrap in an existence check: `if (await Bun.file(sourceMapPath).exists()) { ... } else { console.log(pc.dim('  Source map not generated')); }`. Also check the IIFE stat on line 787 the same way for consistency."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix JWT detection regex to handle base64url padding characters",
+      "description": "As a plugin developer using analyze_site, I want JWT detection to recognize JWTs with padding characters so that auth detection is accurate for all valid JWTs.",
+      "acceptanceCriteria": [
+        "BASE64URL_SEGMENT regex accepts '=' padding characters",
+        "JWTs with padding (e.g., segments ending in '==') are correctly detected by looksLikeJwt",
+        "JWTs without padding are still correctly detected (no regression)",
+        "Non-JWT strings are still correctly rejected",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts, line 112. Current regex: `/^[A-Za-z0-9_-]+$/`. Base64url encoding can include '=' padding characters at the end. Fix: `/^[A-Za-z0-9_-]+=*$/` — the '=' is optional and only appears at the end. Note: standard base64url (RFC 4648 §5) omits padding, but in practice many JWTs include it. The '+' character is NOT valid in base64url (it's base64 standard), so do NOT add it. Only add '=' for trailing padding."
+    },
+    {
+      "id": "US-006",
+      "title": "Fix audit table status column alignment with ANSI color codes",
+      "description": "As a CLI user running opentabs audit, I want the table output to be properly aligned so that the status icons and subsequent columns don't shift based on ANSI escape code lengths.",
+      "acceptanceCriteria": [
+        "The status column in audit table output is visually aligned regardless of whether ✓ or ✗ is displayed",
+        "The separator line width matches the actual visual width of the header row",
+        "Both audit output paths (file mode at lines 142-161 and server mode at lines 230-249) are fixed consistently",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: platform/cli/src/commands/audit.ts, lines 142-161 and 230-249 (duplicated logic). The issue: statusCol is 4 chars wide, but the status icon (✓/✗) is wrapped in pc.green()/pc.red() which adds invisible ANSI escape codes. padEnd() counts bytes, not visual width, so the column after status shifts. Fix: instead of `statusIcon + ' '.repeat(Math.max(0, statusCol - 1))`, calculate padding based on visual width of the icon character (1), not string length. Something like: `const status = statusIcon + ' '.repeat(statusCol - 1);` should work since the icon is always 1 visual char wide. Alternatively, pad the raw icon text first and then colorize just the icon. DRY opportunity: extract the table formatting into a shared helper used by both code paths."
+    }
+  ]
+}

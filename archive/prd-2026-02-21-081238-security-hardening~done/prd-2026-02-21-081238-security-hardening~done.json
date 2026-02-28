@@ -1,0 +1,99 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Security hardening: fix the constant-time token comparison vulnerability, add unit tests for untested security features (prototype pollution sanitization, WebSocket message size limits), and add a test verifying the server secret is not leaked through public endpoints.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Use constant-time comparison for Bearer token and WebSocket secret",
+      "description": "As a platform operator, I want token comparisons to use constant-time algorithms so that timing side-channel attacks cannot reconstruct the shared secret byte-by-byte.",
+      "acceptanceCriteria": [
+        "checkBearerAuth in platform/mcp-server/src/http-routes.ts uses crypto.timingSafeEqual (or equivalent) instead of !== for comparing the Bearer token against wsSecret",
+        "WebSocket secret comparison at the /ws upgrade path in the same file also uses constant-time comparison",
+        "Both comparisons handle mismatched string lengths safely (timingSafeEqual requires equal-length buffers — pad or hash before comparing, or use a length check that rejects early only on length mismatch, not on content)",
+        "All existing unit tests in platform/mcp-server/src/http-routes.test.ts still pass (correct tokens accepted, wrong tokens rejected, null secret allows all)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "The vulnerability is in platform/mcp-server/src/http-routes.ts. Lines 83 and 183 both use direct === / !== string comparison. Use Node's crypto.timingSafeEqual with Buffer.from() on both sides. Since timingSafeEqual throws on length mismatch, first check if lengths differ — an early reject on length difference is safe (length is not secret). The pattern: `if (token.length !== wsSecret.length) return 401Response; if (!crypto.timingSafeEqual(Buffer.from(token), Buffer.from(wsSecret))) return 401Response;`. For the WS path (line 183), the secret is found via parts.includes() which also short-circuits — replace with a loop that does constant-time comparison on each part. Import timingSafeEqual from 'node:crypto'."
+    },
+    {
+      "id": "US-002",
+      "title": "Add unit tests for sanitizeOutput (prototype pollution protection)",
+      "description": "As a developer, I want unit tests for the sanitizeOutput function so that regressions in prototype pollution protection are caught before they reach production.",
+      "acceptanceCriteria": [
+        "A new describe block in platform/mcp-server/src/mcp-setup.test.ts (or a new test file if mcp-setup.test.ts doesn't exist yet) covers sanitizeOutput",
+        "Test cases: (1) passes through primitives (string, number, boolean, null, undefined) unchanged, (2) removes __proto__ key from objects, (3) removes constructor key from objects, (4) removes prototype key from objects, (5) recursively sanitizes nested objects, (6) recursively sanitizes objects inside arrays, (7) handles depth > 50 by returning value as-is, (8) handles empty objects and arrays, (9) preserves safe keys alongside dangerous ones",
+        "sanitizeOutput is exported from mcp-setup.ts (or extracted to its own file and exported) so the test file can import it",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "sanitizeOutput is currently a module-private const in platform/mcp-server/src/mcp-setup.ts at line 53. To test it, either: (a) extract it to a new file platform/mcp-server/src/sanitize-output.ts and re-export from mcp-setup.ts, or (b) add an export. Option (a) is cleaner. The function signature is sanitizeOutput(obj: unknown, depth?: number): unknown. Check platform/mcp-server/src/mcp-setup.test.ts to see if it exists — if so, add tests there. If not, create it. Follow the existing test patterns (bun:test, describe/test/expect)."
+    },
+    {
+      "id": "US-003",
+      "title": "Add unit tests for WebSocket message size limit enforcement",
+      "description": "As a developer, I want unit tests verifying that oversized WebSocket messages are rejected, so that a regression in the size check cannot cause memory exhaustion.",
+      "acceptanceCriteria": [
+        "A test verifies that messages at or below MAX_MESSAGE_SIZE (10MB) are processed normally",
+        "A test verifies that messages exceeding MAX_MESSAGE_SIZE are dropped (not parsed, not dispatched)",
+        "The test covers the check in platform/mcp-server/src/extension-protocol.ts around line 353",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "The size check is in platform/mcp-server/src/extension-protocol.ts. Look for where incoming WebSocket text messages are received — there should be a text.length check against MAX_MESSAGE_SIZE that drops oversized messages with a console.warn. The constant MAX_MESSAGE_SIZE = 10 * 1024 * 1024 is at line 45. To test this, you need to find the WebSocket message handler function and verify it rejects oversized messages. If the handler is deeply embedded in createHandlers or createWsHandlers, you may need to extract the size check into a testable function (like isMessageTooLarge(text: string): boolean) or test via the exported handler interface. Check platform/mcp-server/src/extension-protocol.test.ts for existing test patterns. Keep the test focused — just test the size boundary, not the full dispatch pipeline."
+    },
+    {
+      "id": "US-004",
+      "title": "Add unit test verifying server secret is excluded from /health response",
+      "description": "As a platform operator, I want a test ensuring the shared secret never appears in the /health endpoint response, so that a future code change cannot accidentally leak the secret to unauthenticated callers.",
+      "acceptanceCriteria": [
+        "A test calls the /health endpoint handler and verifies the response body does not contain the configured wsSecret value anywhere in the JSON output",
+        "The test uses a recognizable secret string (not a substring of other values) and does a full-text search of the serialized response",
+        "The test is in platform/mcp-server/src/http-routes.test.ts alongside the existing /health tests",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Look at the existing /health test pattern in platform/mcp-server/src/http-routes.test.ts. The test should: (1) create state with a known wsSecret like 'super-secret-token-12345', (2) call the /health handler, (3) read the response body as text, (4) assert the secret string does not appear anywhere in the response body. This catches both direct leaks (a 'secret' field) and accidental leaks (secret embedded in a debug string). Keep it simple — one test case is enough."
+    },
+    {
+      "id": "US-005",
+      "title": "Add WebSocket upgrade origin check",
+      "description": "As a platform operator, I want the WebSocket upgrade path to reject connections with non-extension Origin headers, providing defense-in-depth against secret leakage scenarios.",
+      "acceptanceCriteria": [
+        "The /ws upgrade path in platform/mcp-server/src/http-routes.ts checks the Origin header before processing the secret — if an Origin header is present and does not start with chrome-extension://, the upgrade is rejected with 403",
+        "Requests with no Origin header (legitimate MCP tooling, curl) are allowed through to the normal secret check",
+        "Requests with Origin: chrome-extension://<id> are allowed through to the normal secret check",
+        "Unit tests in platform/mcp-server/src/http-routes.test.ts cover: (1) WS upgrade rejected with Origin: http://evil.com, (2) WS upgrade allowed with no Origin, (3) WS upgrade allowed with Origin: chrome-extension://abc",
+        "The existing CORS check for HTTP requests is not affected",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "The CORS check at line 168-171 of platform/mcp-server/src/http-routes.ts runs before the WS upgrade block at line 174, so it already protects the /ws path for browser-origin requests. However, verify this by reading the full request handler flow — if the CORS check returns early with 403 before reaching the /ws block, then this story is about adding explicit unit tests proving that the CORS check covers WS upgrades too (not just HTTP endpoints). If the flow bypasses CORS for WS upgrades somehow, add the check. Add unit tests either way to lock in the behavior."
+    }
+  ]
+}

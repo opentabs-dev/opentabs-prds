@@ -1,0 +1,117 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-120523-platform-dev-tooling~running.json
+Started: Sat Feb 21 15:29:24 PST 2026
+---
+
+## 2026-02-21 15:30 - US-001
+- Created root README.md with project name, one-line description, quick start, architecture diagram, development commands table, directory structure, and link to CLAUDE.md
+- Files changed: README.md (new)
+- **Learnings for future iterations:**
+  - Prettier auto-formats markdown tables when lint-staged runs on commit — the table alignment changes are expected
+  - The root package.json has no README.md referenced anywhere (knip, eslint, etc.) so adding it has no side effects on tooling
+---
+
+## 2026-02-21 15:34 - US-002
+- Created CONTRIBUTING.md at project root with all required sections: Development Setup, Development Workflow, Making Changes (server/extension/plugin subsections), Verification (table of 5 commands + pre-push/pre-commit hook details), Code Quality (key principles + CLAUDE.md link), E2E Tests (plugin prerequisite), Adding a Platform Package, Publishing
+- Files changed: CONTRIBUTING.md (new)
+- **Learnings for future iterations:**
+  - The pre-push hook runs `build`, `type-check`, and `test` (3 of 5 checks)
+  - The pre-commit hook runs `lint-staged` (Prettier + ESLint on staged files) and `knip`
+  - `bun run dev` is the single command for full dev mode (tsc watch + hot reload MCP server + extension auto-rebuild)
+  - Markdown files only go through Prettier in lint-staged, not ESLint
+---
+
+## 2026-02-21 15:36 - US-003
+- Added `check` script to root package.json: chains build, type-check, lint, knip, test with `&&`
+- Added `check:all` script: comprehensive version that also includes type-check:e2e and test:e2e
+- Updated README.md development commands table to include `bun run check` as the first entry
+- Updated CONTRIBUTING.md verification section to reference `bun run check` instead of the manual command chain
+- Files changed: package.json, README.md, CONTRIBUTING.md
+- **Learnings for future iterations:**
+  - Prettier reformats markdown table column widths on commit (lint-staged) — just accept the formatting changes
+  - The `&&` chain approach is simplest for `bun run check` — no custom script needed, and the first failure stops the chain with the correct exit code
+---
+
+## 2026-02-21 15:40 - US-004
+- Replaced all macOS-specific `sed -i ''` calls with portable `sed -i.bak ... && rm *.bak` pattern in scripts/publish.sh
+- Lines changed: 43, 49, 52, 54, 80 (all sed -i invocations)
+- Also updated the "Next steps" echo on line 80 to use the portable syntax in the suggested command
+- Files changed: scripts/publish.sh
+- **Learnings for future iterations:**
+  - `sed -i.bak` with explicit backup extension works identically on macOS (BSD sed) and Linux (GNU sed) — the backup suffix is required for both, making it the simplest portable workaround
+  - The `&& rm file.bak` cleanup must use the same path as the input file — in loops, use `"$pkg/package.json.bak"` not just `*.bak`
+  - lint-staged skips non-JS/TS files like `.sh` — shell scripts only go through the pre-commit knip check
+---
+
+## 2026-02-21 15:42 - US-005
+- Removed the redundant pre-bump `bun run build` call (previously lines 37-38) from scripts/publish.sh
+- The script now builds only once, after version bumping (the "Rebuilding with new versions..." step), ensuring all artifacts contain the correct version
+- Files changed: scripts/publish.sh
+- **Learnings for future iterations:**
+  - The publish script's flow is: authenticate → bump versions → build → publish — the pre-bump build was unnecessary since the post-bump build compiles everything fresh with the updated versions
+  - Shell script changes only trigger the knip check during pre-commit (lint-staged has no matcher for .sh files)
+---
+
+## 2026-02-21 15:45 - US-006
+- Added dirty working directory check at the start of scripts/publish.sh — warns and prompts for confirmation if uncommitted changes exist
+- Added automated git commit (`release: v$VERSION`) and tag (`v$VERSION`) creation after successful npm publish
+- Updated "Next steps" output: first step is now `git push && git push --tags`, followed by plugin dependency updates
+- The script does NOT push — leaves that to the developer
+- Files changed: scripts/publish.sh
+- **Learnings for future iterations:**
+  - The publish script flow is now: dirty check → auth → bump → build → publish → commit + tag → print next steps
+  - `git status --porcelain` is the portable way to check for uncommitted changes (empty output = clean)
+  - The `git add` in the commit step explicitly lists the 4 package.json files rather than using `git add .` to avoid staging unrelated files
+---
+
+## 2026-02-21 15:47 - US-007
+- Added `engines.bun: ">= 1.3.9"` field to root package.json
+- Created `scripts/check-bun-version.ts` — validates running Bun version against the engines.bun requirement, exits with clear error message if too old
+- Added `postinstall` script to package.json that runs the version check on every `bun install`
+- CI Bun version (1.3.9 in `.github/workflows/ci.yml`) is consistent with the engines field
+- Files changed: package.json, scripts/check-bun-version.ts (new)
+- **Learnings for future iterations:**
+  - Bun does NOT natively enforce the `engines` field in package.json — it silently ignores it (tested empirically). A postinstall script is needed for real enforcement.
+  - The `tsconfig.scripts.json` already covers `scripts/**/*.ts` with `bun-types`, so new scripts in `scripts/` are automatically type-checked.
+  - The `knip.ts` config already has `scripts/*.ts` as an entry point, so new scripts are automatically picked up for unused code detection.
+  - `Bun.version` returns the version string (e.g., "1.3.9") — use this instead of spawning `bun --version`.
+---
+
+## 2026-02-21 15:50 - US-008
+- Confirmed that `tsc --build` (the `type-check` script) already type-checks E2E tests — the root `tsconfig.json` references `e2e/tsconfig.json` at line 34, and `tsc --build --verbose` shows it processes `e2e/tsconfig.json`
+- Removed the redundant `bun run type-check:e2e` step from CI's type-check job (`.github/workflows/ci.yml` line 45)
+- Removed redundant `type-check:e2e` from the `check:all` script in `package.json`
+- Kept the standalone `type-check:e2e` script in `package.json` for targeted use
+- Files changed: `.github/workflows/ci.yml`, `package.json`
+- **Learnings for future iterations:**
+  - The e2e tsconfig has `composite: true` and `noEmit: true` — this combination works correctly with `tsc --build`. The `composite` flag enables project references, and `noEmit` means no `.js` artifacts are produced, but type-checking still occurs (verified by `tsc --build --verbose` showing it processes the project)
+  - `tsc --build --listFilesOnly` is NOT a valid flag combination — TypeScript rejects it with error TS5094. Use `tsc --build --verbose` to confirm which projects are processed
+  - The separate `type-check:e2e` script (`tsc --noEmit -p e2e/tsconfig.json`) was always redundant since the root tsconfig already referenced the e2e project — it was added as a belt-and-suspenders measure but served no purpose
+---
+
+## 2026-02-21 15:53 - US-009
+- Created `e2e/global-setup.ts` — Playwright global setup that checks for `plugins/e2e-test/dist/tools.json` and `dist/adapter.iife.js` before tests run
+- Added `globalSetup: './e2e/global-setup.ts'` to `playwright.config.ts`
+- If either artifact is missing, throws a clear error with the exact build command to run
+- Files changed: e2e/global-setup.ts (new), playwright.config.ts
+- **Learnings for future iterations:**
+  - Playwright global setup/teardown files must be in the e2e/ directory and included in e2e/tsconfig.json's `include: ["*.ts"]` pattern to be type-checked
+  - The global-teardown.ts already existed as a pattern to follow — global-setup.ts mirrors its structure (default export function)
+  - Prettier in this project enforces no parens on single arrow function parameters (e.g., `file =>` not `(file) =>`)
+  - E2E tests run under Node.js (Playwright), so `node:fs` `existsSync` is the correct API for file existence checks
+---
+
+## 2026-02-21 16:01 - US-010
+- Created `scripts/check-tsconfig-coverage.ts` — parses each tsconfig referenced from root tsconfig.json, resolves include/exclude patterns via `Bun.Glob`, and reports any .ts/.tsx files not covered by any tsconfig
+- Added `check:tsconfig-coverage` script to package.json
+- Added `bun run check:tsconfig-coverage` step to CI type-check job in `.github/workflows/ci.yml`
+- Script covers: `platform/` (all packages), `e2e/`, `scripts/`, and root config files (eslint.config.ts, knip.ts, playwright.config.ts)
+- Verified: 231 .ts/.tsx files all covered, script correctly detects orphaned files (tested with temporary file)
+- Files changed: scripts/check-tsconfig-coverage.ts (new), package.json, .github/workflows/ci.yml
+- **Learnings for future iterations:**
+  - `tsc --build --listFilesOnly` is NOT a valid flag combination — TypeScript rejects it with error TS5094. Must parse tsconfig include/exclude patterns manually
+  - `Bun.file().json()` returns `Promise<any>` which triggers `@typescript-eslint/no-unsafe-assignment`. Use `Bun.file().text()` + `JSON.parse() as T` pattern instead (matches existing check-bun-version.ts style)
+  - `Bun.Glob.match(str)` checks if a string matches the glob pattern; `Bun.Glob.scanSync({ cwd })` returns an iterator of relative paths from the cwd
+  - TypeScript treats bare directory names in `include` (e.g., `"src"`) as `src/**/*` — convert to `src/**/*.{ts,tsx}` for glob resolution
+  - The `tsconfig.scripts.json` at root already covers `scripts/**/*.ts`, so new scripts in `scripts/` are automatically type-checked
+---

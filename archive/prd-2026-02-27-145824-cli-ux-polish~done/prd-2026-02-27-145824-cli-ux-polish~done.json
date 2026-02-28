@@ -1,0 +1,73 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three CLI UX issues discovered during fresh-user experience testing: (1) bare `opentabs` command degrades poorly when server is down, (2) `opentabs audit` doesn't hint about --file when server is offline, (3) `opentabs config set browser-tool.` doesn't list available browser tools like `tool.` does. These are MEDIUM-severity issues affecting new-user discoverability and error guidance. Known LOW-severity issues not addressed: `config show` renders `permissions` as raw JSON, doctor hint text doesn't mention OpenCode, `config set tool.` says 'No tools available' when browser tools exist.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Graceful fallback when bare `opentabs` runs with server offline",
+      "description": "As a new user, I want `opentabs` (no arguments) to show a helpful welcome/status message instead of an error exit code when the server isn't running, so that my first interaction with the CLI feels welcoming rather than broken.",
+      "acceptanceCriteria": [
+        "When server is running: `opentabs` (no args) shows status output (same as `opentabs status`) and exits 0",
+        "When server is NOT running: `opentabs` (no args) shows a friendly message like 'OpenTabs MCP Server is not running. Get started: opentabs start' and exits 0 (not 1)",
+        "The bare-command output when offline does NOT show the full help text — it shows a concise status + getting-started hint",
+        "The bare-command output when offline includes a hint to run `opentabs --help` for available commands",
+        "`opentabs status` behavior remains unchanged (exits 1 when server is down, as it's explicitly asking for status)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The root command action is in `platform/cli/src/cli.ts` line 35: `.action((_options, command: Command) => handleStatus(command.optsWithGlobals()))`. This calls `handleStatus` from `platform/cli/src/commands/status.ts` which calls `process.exit(1)` when the server is unreachable (line 167). The fix should create a new wrapper function (e.g., `handleBareCommand`) in `cli.ts` that catches the 'server not running' case and shows a friendly message + exits 0 instead. Do NOT change `handleStatus` itself — that function should keep its current behavior for the explicit `opentabs status` command. The wrapper can either: (a) try the health check itself and show friendly output on failure, or (b) call `handleStatus` in a try/catch and intercept the exit. Option (a) is cleaner. The wrapper should attempt a health check, and if it succeeds, delegate to `handleStatus`. If it fails (connection refused), print a concise message like:\n\nOpenTabs MCP Server\n  Status: not running\n\nGet started:\n  opentabs start          Start the MCP server\n  opentabs --help         Show all commands\n\nImport `resolvePort` from `../parse-port.js` and `isConnectionRefused` from `../config.js` for the health check."
+    },
+    {
+      "id": "US-002",
+      "title": "Hint about `--file` flag when `opentabs audit` fails due to offline server",
+      "description": "As a user, I want `opentabs audit` to tell me about the `--file` flag when the server is not running, so that I can read persistent audit logs without needing to discover the flag on my own.",
+      "acceptanceCriteria": [
+        "When server is not running, `opentabs audit` error output includes a hint like: 'Tip: Use --file to read from the persistent disk log'",
+        "The hint appears after the existing 'MCP server is not running' / 'Start it with: opentabs start' messages",
+        "The hint is styled with `pc.dim()` to be secondary to the main error message",
+        "The hint also appears for timeout errors (server not responding)",
+        "`opentabs audit --file` behavior is unchanged",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Edit `platform/cli/src/commands/audit.ts`. The error handling is in the catch block at lines 287-303. There are three error paths: `isConnectionRefused` (line 290), `isTimeout` (line 293), and generic error (line 296). Add a `pc.dim('Tip: Use --file to read from the persistent disk log (~/.opentabs/audit.log)')` line after the existing `console.error` calls in the `isConnectionRefused` and `isTimeout` branches (before `process.exit(1)` at line 302). Use the existing `pc` import (picocolors, already imported at line 13). Example placement after line 291:\n```\nconsole.error(pc.dim(startHint));\nconsole.error(pc.dim('Tip: Use --file to read from the persistent disk log'));\n```"
+    },
+    {
+      "id": "US-003",
+      "title": "List available browser tools with `opentabs config set browser-tool.`",
+      "description": "As a user, I want `opentabs config set browser-tool.` (with just the prefix) to list available browser tools, matching the existing behavior of `opentabs config set tool.` which lists plugin tools.",
+      "acceptanceCriteria": [
+        "`opentabs config set browser-tool.` (no tool name after the dot) lists all available browser tools by fetching from the server health endpoint",
+        "Each browser tool name is printed on its own line, indented, similar to the plugin tool listing",
+        "If the server is not running, shows a helpful error message (same pattern as the plugin tool listing: 'Cannot reach the MCP server to list available browser tools')",
+        "If no browser tools exist (edge case), shows 'No browser tools available'",
+        "The listing includes a usage hint: 'Usage: opentabs config set browser-tool.<name> enabled|disabled'",
+        "`opentabs config set browser-tool.browser_execute_script disabled` still works (existing behavior unchanged)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Edit `platform/cli/src/commands/config.ts`. The fix mirrors the existing `tool.` listing pattern.\n\n1. Add a `fetchBrowserToolNames` function (near line 150, after `fetchToolNames`) that fetches from the health endpoint and returns `cachedBrowserTools` names. The health endpoint response includes a `disabledBrowserTools` array, but that only has disabled ones. Instead, look at the health response — it has `browserToolCount` but not the actual names. Actually, check the health endpoint code at `platform/mcp-server/src/http-routes.ts` around line 277 — the health response includes `cachedBrowserTools` data implicitly via `browserToolCount`. We need the actual names. Looking at the health endpoint code, it doesn't expose all browser tool names. Two options: (a) add a browser tool names field to the health endpoint, or (b) use a different approach. Option (b): the CLI can use existing data — all browser tool names start with `browser_` or `extension_`. The health endpoint doesn't list all of them. Best approach: add `browserToolNames` to the health response.\n\n2. In `platform/mcp-server/src/http-routes.ts`, around line 303, add `browserToolNames: state.cachedBrowserTools.map(c => c.name)` to the health response object.\n\n3. Back in `platform/cli/src/commands/config.ts`, add `handleListBrowserTools` (similar to `handleListTools` at line 168). It should fetch from health, extract `browserToolNames`, and print them.\n\n4. In `handleConfigSet` (line 393), add a check before the `key.startsWith(BROWSER_TOOL_PREFIX)` check (line 407): `if (key === BROWSER_TOOL_PREFIX) return handleListBrowserTools(options);`\n\n5. Update the `BROWSER_TOOL_PREFIX` constant usage so that `browser-tool.` with no suffix triggers the listing.\n\nFiles to edit: `platform/cli/src/commands/config.ts` (~lines 150, 393-408) and `platform/mcp-server/src/http-routes.ts` (~line 303). Also update any related test files if they validate the health endpoint shape: `platform/mcp-server/src/http-routes.test.ts`."
+    }
+  ]
+}

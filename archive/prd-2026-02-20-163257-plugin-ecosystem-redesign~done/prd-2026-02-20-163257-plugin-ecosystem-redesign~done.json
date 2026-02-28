@@ -1,0 +1,447 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Redesign the plugin discovery and installation system to be clean, robust, and intuitive for platform developers, plugin developers, and end users. Eliminate opentabs-plugin.json in favor of package.json, unify local/npm plugin configuration, replace directory scanning with explicit resolution, and restructure the codebase into focused, testable phases.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add Result type for structured error handling",
+      "description": "As a platform developer, I want a Result<T, E> type so that errors are explicitly propagated instead of swallowed in try/catch blocks.",
+      "acceptanceCriteria": [
+        "platform/shared/src/result.ts exports Result<T, E>, Ok<T>, Err<E> types",
+        "ok(value) and err(error) factory functions are exported",
+        "isOk(result) and isErr(result) type guards are exported",
+        "unwrap(result) throws on Err, returns value on Ok",
+        "unwrapOr(result, defaultValue) returns value or default",
+        "mapResult(result, fn) transforms Ok values",
+        "All exports are re-exported from platform/shared/src/index.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Create platform/shared/src/result.ts. This is a simple discriminated union: type Result<T, E> = { ok: true; value: T } | { ok: false; error: E }. Keep it minimal - no monadic chaining, just the basics needed for error propagation. Export from platform/shared/src/index.ts."
+    },
+    {
+      "id": "US-002",
+      "title": "Define PluginManifest type for package.json opentabs field",
+      "description": "As a plugin developer, I want to define plugin metadata in package.json so that I don't need a separate manifest file.",
+      "acceptanceCriteria": [
+        "platform/shared/src/manifest.ts exports PluginPackageJson interface with name, version, main, and opentabs fields",
+        "opentabs field contains displayName, description, urlPatterns (required) and optional fields",
+        "platform/shared/src/manifest.ts exports parsePluginPackageJson(json, sourcePath) that returns Result<PluginPackageJson, string>",
+        "Validation includes: name starts with 'opentabs-plugin-' or is a scoped package, opentabs field exists, urlPatterns is non-empty array",
+        "Existing ManifestTool type is preserved for tool schema definitions",
+        "All exports are re-exported from platform/shared/src/index.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Create platform/shared/src/manifest.ts. The PluginPackageJson interface should mirror a standard package.json structure with an additional 'opentabs' field. The 'main' field points to dist/adapter.iife.js. Tool schemas will be in a separate dist/tools.json file (handled in a later story). Import Result from ./result.js and use it for the parse function return type."
+    },
+    {
+      "id": "US-003",
+      "title": "Create plugin resolver module",
+      "description": "As a platform developer, I want a resolver module that turns plugin specifiers into absolute paths so that I can support both npm packages and local paths uniformly.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/resolver.ts exports resolvePluginPath(specifier, configDir) returning Result<string, string>",
+        "If specifier starts with './' or '/' or '~/', resolves as filesystem path relative to configDir",
+        "If specifier looks like an npm package name, uses Bun.resolveSync or import.meta.resolve to find the package directory",
+        "Security check: resolved path must be under homedir() or tmpdir() for local paths",
+        "Returns the directory path containing package.json, not the main entry file",
+        "Handles scoped packages like @org/opentabs-plugin-foo",
+        "Errors are descriptive: 'Package not found', 'Path outside allowed directories', etc.",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Create platform/mcp-server/src/resolver.ts. Use Bun.resolveSync(specifier + '/package.json', cwd) then dirname() to get the package directory. For local paths, use node:path resolve() against configDir. Import isAllowedPluginPath logic from current discovery.ts (the homedir/tmpdir security check). This replaces the 4 scanning loops in discoverFromNodeModules with direct resolution."
+    },
+    {
+      "id": "US-004",
+      "title": "Create plugin loader module",
+      "description": "As a platform developer, I want a loader module that reads plugin artifacts from a resolved directory so that loading is decoupled from resolution.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/loader.ts exports loadPlugin(dir, trustTier) returning Result<LoadedPlugin, string>",
+        "LoadedPlugin contains: name, version, displayName, description, urlPatterns, trustTier, iife (string), tools (ManifestTool[]), sourcePath, adapterHash",
+        "Reads package.json from dir, validates via parsePluginPackageJson",
+        "Reads dist/adapter.iife.js, validates exists and under 5MB size limit",
+        "Reads dist/tools.json for tool schemas, validates each tool has required fields",
+        "Derives plugin name from npm package name (strips opentabs-plugin- prefix)",
+        "Computes or reads adapterHash from the IIFE content",
+        "All errors are descriptive with the source path included",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Create platform/mcp-server/src/loader.ts. This is a pure function: takes a directory path and trust tier, reads files, validates, returns a Result. No side effects, no state mutation. The LoadedPlugin type should be similar to current RegisteredPlugin but loaded fresh each time. Read package.json with Bun.file().json(), adapter with Bun.file().text(), tools.json with Bun.file().json(). The tools.json file will be generated by the CLI build command (later story)."
+    },
+    {
+      "id": "US-005",
+      "title": "Create immutable PluginRegistry type",
+      "description": "As a platform developer, I want an immutable PluginRegistry so that state transitions are atomic and there are no intermediate inconsistent states.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/registry.ts exports PluginRegistry interface with readonly plugins Map, readonly toolLookup Map, readonly failures array",
+        "buildRegistry(loadedPlugins, failures) creates a frozen PluginRegistry from loaded plugins",
+        "Tool lookup is built during registry construction with prefixed names (pluginName_toolName)",
+        "getPlugin(registry, name) returns plugin or undefined",
+        "getTool(registry, prefixedName) returns {plugin, tool} or undefined",
+        "listEnabledTools(registry, toolConfig) returns tool list filtered by config",
+        "All registry objects are frozen (Object.freeze) to prevent mutation",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Create platform/mcp-server/src/registry.ts. The registry is built once and never mutated. When plugins change, a new registry is built and swapped atomically. This replaces the current pattern of mutating state.plugins then rebuilding state.toolLookup separately. The Ajv validators for tool input schemas should be compiled during registry construction and stored in the toolLookup entries."
+    },
+    {
+      "id": "US-006",
+      "title": "Create discovery orchestrator with phase separation",
+      "description": "As a platform developer, I want a discovery orchestrator that composes resolve/load/register phases so that the flow is clear and testable.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/discovery.ts exports discoverPlugins(specifiers, configDir) returning DiscoveryResult",
+        "DiscoveryResult contains registry (PluginRegistry) and errors (array of {specifier, error})",
+        "Phase 1: Resolve all specifiers in parallel via resolvePluginPath",
+        "Phase 2: Load all resolved paths in parallel via loadPlugin",
+        "Phase 3: Determine trust tier for each (local path = 'local', @opentabs-dev/ = 'official', else = 'community')",
+        "Phase 4: Build registry via buildRegistry",
+        "Errors from any phase are collected and returned, not thrown",
+        "Successful plugins continue even if some fail",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Rewrite platform/mcp-server/src/discovery.ts from scratch. The current file is 531 lines with 4 scanning loops. The new file should be under 100 lines: resolve specifiers, load plugins, build registry, collect errors. Use Promise.allSettled for parallel operations. Import resolvePluginPath from ./resolver.js, loadPlugin from ./loader.js, buildRegistry from ./registry.js."
+    },
+    {
+      "id": "US-007",
+      "title": "Unify config.plugins to accept both npm packages and local paths",
+      "description": "As a user, I want a single plugins array in config so that I don't need to understand the difference between npmPlugins and plugins.",
+      "acceptanceCriteria": [
+        "OpentabsConfig interface has plugins: string[] that accepts both npm package names and local paths",
+        "npmPlugins field is removed from OpentabsConfig interface",
+        "loadConfig() no longer returns npmPlugins",
+        "parseConfigRecord validates plugins array contains strings",
+        "Config migration: if old config has both plugins and npmPlugins, merge them into plugins",
+        "Documentation in config.ts explains the unified format",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/config.ts. Remove npmPlugins from OpentabsConfig. In parseConfigRecord, if the raw config has an npmPlugins array, concatenate it with plugins and log a migration notice. Update loadConfig to handle configs with or without the old npmPlugins field. The resolver (US-003) already handles distinguishing npm packages from local paths by their format."
+    },
+    {
+      "id": "US-008",
+      "title": "Update ServerState to use PluginRegistry",
+      "description": "As a platform developer, I want ServerState to hold a single PluginRegistry reference so that state updates are atomic.",
+      "acceptanceCriteria": [
+        "ServerState.plugins is replaced with ServerState.registry of type PluginRegistry",
+        "ServerState.toolLookup is removed (now in registry)",
+        "ServerState.failedPlugins is removed (now in registry.failures)",
+        "ServerState.npmPlugins is removed (unified into config.plugins)",
+        "createState() initializes registry to an empty PluginRegistry",
+        "All references to state.plugins, state.toolLookup, state.failedPlugins are updated",
+        "prefixedToolName and isToolEnabled utilities remain on state.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/state.ts. Replace plugins Map with registry: PluginRegistry. Remove toolLookup, failedPlugins, npmPlugins fields. Update createState() to create an empty registry. This is a breaking change to state shape - all consumers must be updated in the same story. Search for 'state.plugins', 'state.toolLookup', 'state.failedPlugins', 'state.npmPlugins' across the codebase and update each reference."
+    },
+    {
+      "id": "US-009",
+      "title": "Simplify reload.ts to use new discovery orchestrator",
+      "description": "As a platform developer, I want reload.ts to be a thin orchestrator so that the reload flow is easy to understand.",
+      "acceptanceCriteria": [
+        "reloadCore is simplified to: load config, call discoverPlugins, swap state.registry, sync extension",
+        "Path resolution logic is removed from reload.ts (now in resolver)",
+        "Tool lookup rebuilding is removed from reload.ts (now in registry construction)",
+        "Pruning logic for tabMapping/activeDispatches uses registry.plugins instead of state.plugins",
+        "State swap is a single assignment: state.registry = newRegistry",
+        "File watcher callbacks reference state.registry.plugins",
+        "reloadCore is under 50 lines",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/reload.ts. Remove the path resolution logic (lines 133), the 6-field state swap (lines 137-142), and the rebuildToolLookups call (line 149). Replace with: const result = await discoverPlugins(config.plugins, configDir); state.registry = result.registry; The pruning logic should iterate result.registry.plugins.keys() to find valid plugin names."
+    },
+    {
+      "id": "US-010",
+      "title": "Update mcp-setup.ts to use PluginRegistry",
+      "description": "As a platform developer, I want mcp-setup.ts to read from the registry so that tool dispatch uses the new architecture.",
+      "acceptanceCriteria": [
+        "getEnabledToolsList reads from state.registry.plugins",
+        "tools/call handler uses getTool(state.registry, toolName) for O(1) lookup",
+        "rebuildToolLookups function is removed (registry handles this)",
+        "checkToolCallable uses registry lookup",
+        "Ajv validators are retrieved from registry.toolLookup entries",
+        "Trust tier prefixes are computed from registry plugin data",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/mcp-setup.ts. Replace state.plugins with state.registry.plugins. Replace state.toolLookup with state.registry.toolLookup. Remove the rebuildToolLookups export and function. Update getEnabledToolsList to iterate state.registry.plugins. Update the tools/call handler to use getTool from registry.ts."
+    },
+    {
+      "id": "US-011",
+      "title": "Update extension-protocol.ts for new registry structure",
+      "description": "As a platform developer, I want extension-protocol.ts to work with the new registry so that the extension receives correct plugin data.",
+      "acceptanceCriteria": [
+        "sendSyncFull reads plugins from state.registry.plugins",
+        "sendPluginUpdate finds plugin in state.registry.plugins",
+        "handleExtensionMessage tab.stateChanged updates work with registry",
+        "config.getState returns registry failures instead of state.failedPlugins",
+        "Plugin metadata sent to extension includes all required fields",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/extension-protocol.ts. Replace state.plugins with state.registry.plugins. Replace state.failedPlugins with state.registry.failures. The sendSyncFull function iterates plugins and writes adapter files - update to use registry.plugins.values()."
+    },
+    {
+      "id": "US-012",
+      "title": "Update file-watcher.ts for new registry structure",
+      "description": "As a platform developer, I want file-watcher.ts to work with the new registry so that hot reload detects plugin changes correctly.",
+      "acceptanceCriteria": [
+        "handleManifestChange reads plugin from state.registry.plugins",
+        "handleIifeChange reads plugin from state.registry.plugins",
+        "startFileWatching iterates state.registry.plugins for paths to watch",
+        "watchPendingPlugin watches state.registry.failures paths",
+        "File watcher callbacks update the correct plugin in registry",
+        "mtime polling checks files from registry.plugins",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/file-watcher.ts. Replace state.plugins with state.registry.plugins. Replace state.failedPlugins with state.registry.failures. The file watcher needs to read sourcePath from each plugin to know what directories to watch. Note: handleManifestChange and handleIifeChange need to trigger a registry rebuild since the registry is immutable."
+    },
+    {
+      "id": "US-013",
+      "title": "Update version-check.ts for new registry structure",
+      "description": "As a platform developer, I want version-check.ts to work with the new registry so that outdated plugin detection works correctly.",
+      "acceptanceCriteria": [
+        "checkForUpdates reads plugins from state.registry.plugins",
+        "Filters plugins by trustTier !== 'local' from registry",
+        "Uses npmPackageName from registry plugin entries",
+        "Results stored in state.outdatedPlugins (unchanged)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/version-check.ts. Replace state.plugins with state.registry.plugins. The iteration logic should use state.registry.plugins.values() and filter by trustTier."
+    },
+    {
+      "id": "US-014",
+      "title": "Update CLI to generate tools.json instead of opentabs-plugin.json",
+      "description": "As a plugin developer, I want the CLI to generate dist/tools.json so that tool schemas are separate from package.json metadata.",
+      "acceptanceCriteria": [
+        "opentabs build generates dist/tools.json with array of tool definitions",
+        "Each tool in tools.json has name, displayName, description, icon, input_schema, output_schema",
+        "opentabs build no longer generates opentabs-plugin.json",
+        "opentabs build validates that package.json has opentabs field with required fields",
+        "opentabs build fails with clear error if package.json is missing opentabs field",
+        "adapterHash is embedded in the IIFE itself (already done), not in a manifest",
+        "bun run build passes in platform/cli",
+        "bun run type-check passes in platform/cli",
+        "bun run lint passes in platform/cli"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/build.ts. Change generateManifest to generateToolsJson that only outputs the tools array. Remove the opentabs-plugin.json write. Add validation that package.json has an opentabs field with displayName, description, urlPatterns. The plugin's name, version, displayName, description, urlPatterns now come from package.json at discovery time, not from a generated manifest."
+    },
+    {
+      "id": "US-015",
+      "title": "Update plugin scaffolding to use package.json opentabs field",
+      "description": "As a plugin developer, I want create-opentabs-plugin to scaffold package.json with opentabs field so that new plugins follow the new convention.",
+      "acceptanceCriteria": [
+        "Scaffolded package.json includes opentabs field with displayName, description, urlPatterns",
+        "Scaffolded package.json main field points to dist/adapter.iife.js",
+        "No opentabs-plugin.json is generated in scaffolded project",
+        "Scaffolded .gitignore does not include opentabs-plugin.json",
+        "Scaffolded package.json files array includes dist/ but not opentabs-plugin.json",
+        "README in scaffolded project explains the package.json structure",
+        "bun run build passes in platform/cli",
+        "bun run type-check passes in platform/cli",
+        "bun run lint passes in platform/cli"
+      ],
+      "priority": 15,
+      "passes": true,
+      "notes": "Edit platform/cli/src/scaffold.ts. Update the packageJson template to include the opentabs field. Remove any reference to opentabs-plugin.json from generated files. Update the generated README to explain the new structure."
+    },
+    {
+      "id": "US-016",
+      "title": "Migrate slack plugin to package.json manifest",
+      "description": "As a plugin developer, I want the slack plugin to demonstrate the new package.json-based manifest so that it serves as a reference implementation.",
+      "acceptanceCriteria": [
+        "plugins/slack/package.json has opentabs field with displayName, description, urlPatterns",
+        "plugins/slack/package.json main field is dist/adapter.iife.js",
+        "plugins/slack/opentabs-plugin.json is deleted",
+        "plugins/slack/src/index.ts no longer hardcodes displayName, description, urlPatterns (read from package.json at build time or removed)",
+        "bun run build succeeds in plugins/slack and produces dist/tools.json",
+        "dist/tools.json contains all 22 tool definitions with schemas",
+        "Plugin loads correctly when MCP server discovers it"
+      ],
+      "priority": 16,
+      "passes": true,
+      "notes": "Edit plugins/slack/package.json to add opentabs field. Delete plugins/slack/opentabs-plugin.json. The plugin class in src/index.ts still needs name, version, displayName, description, urlPatterns properties for runtime use (isReady check, etc), but they should match package.json. Run 'bun run build' to generate dist/tools.json."
+    },
+    {
+      "id": "US-017",
+      "title": "Migrate e2e-test plugin to package.json manifest",
+      "description": "As a platform developer, I want the e2e-test plugin to use the new manifest format so that E2E tests exercise the new discovery flow.",
+      "acceptanceCriteria": [
+        "plugins/e2e-test/package.json has opentabs field with displayName, description, urlPatterns",
+        "plugins/e2e-test/package.json main field is dist/adapter.iife.js",
+        "plugins/e2e-test/opentabs-plugin.json is deleted",
+        "bun run build succeeds in plugins/e2e-test and produces dist/tools.json",
+        "dist/tools.json contains all 6 tool definitions with schemas"
+      ],
+      "priority": 17,
+      "passes": true,
+      "notes": "Edit plugins/e2e-test/package.json to add opentabs field. Delete plugins/e2e-test/opentabs-plugin.json. Run 'bun run build' to generate dist/tools.json. The E2E tests may need updates in later stories if they reference opentabs-plugin.json directly."
+    },
+    {
+      "id": "US-018",
+      "title": "Update E2E test fixtures for new plugin format",
+      "description": "As a platform developer, I want E2E test fixtures to work with the new plugin format so that tests pass.",
+      "acceptanceCriteria": [
+        "readPluginToolNames reads from dist/tools.json instead of opentabs-plugin.json",
+        "createMinimalPlugin creates package.json with opentabs field and dist/tools.json",
+        "copyE2eTestPlugin copies the new file structure",
+        "Config format uses unified plugins array (no npmPlugins)",
+        "All references to opentabs-plugin.json in fixtures.ts are removed",
+        "bun run test:e2e passes (or fails only on unrelated issues)"
+      ],
+      "priority": 18,
+      "passes": true,
+      "notes": "Edit e2e/fixtures.ts. Update readPluginToolNames to read tools.json. Update createMinimalPlugin to create package.json with opentabs field and dist/tools.json. Update createTestConfigDir to not include npmPlugins. Search for 'opentabs-plugin.json' in the file and update all references."
+    },
+    {
+      "id": "US-019",
+      "title": "Update E2E tests for new config format",
+      "description": "As a platform developer, I want E2E tests to use the new unified config format so that tests exercise the real discovery flow.",
+      "acceptanceCriteria": [
+        "Tests that create config.json use plugins array only (no npmPlugins)",
+        "Tests that modify plugin manifests modify package.json opentabs field and dist/tools.json",
+        "Hot reload tests trigger rebuilds via package.json or tools.json changes",
+        "All E2E tests pass with the new plugin format"
+      ],
+      "priority": 19,
+      "passes": true,
+      "notes": "Edit E2E test files in e2e/ directory. Search for 'npmPlugins' and 'opentabs-plugin.json' across all test files. Update config creation to use unified plugins array. Update any manifest modification tests to modify the new file structure."
+    },
+    {
+      "id": "US-020",
+      "title": "Delete old discovery code and manifest-schema.ts",
+      "description": "As a platform developer, I want to remove the old discovery code so that the codebase is clean and there's no confusion about which code path is used.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/manifest-schema.ts is deleted (parsePluginPackageJson in shared replaces it)",
+        "Old discoverFromNodeModules and discoverFromLocalPaths functions are removed",
+        "Old loadPluginFromDir function is removed (replaced by loader.ts)",
+        "All 4 scanning loops are gone",
+        "No references to opentabs-plugin.json remain in mcp-server code",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 20,
+      "passes": true,
+      "notes": "Delete platform/mcp-server/src/manifest-schema.ts. Clean up platform/mcp-server/src/discovery.ts to remove any remaining old code. Run knip to find any unused exports or dead code. The new discovery.ts should be under 100 lines total."
+    },
+    {
+      "id": "US-021",
+      "title": "Add structured error reporting for discovery failures",
+      "description": "As a user, I want clear error messages when plugin discovery fails so that I can fix configuration issues.",
+      "acceptanceCriteria": [
+        "Discovery errors include the plugin specifier that failed",
+        "Resolution errors say 'Package not found: <name>' or 'Path not found: <path>'",
+        "Load errors say 'Failed to load <name>: <specific reason>'",
+        "Validation errors list specific fields that are invalid",
+        "All errors are logged at startup with a summary count",
+        "Errors are available via /health endpoint for debugging",
+        "Side panel shows failed plugins with error messages",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes"
+      ],
+      "priority": 21,
+      "passes": true,
+      "notes": "Update platform/mcp-server/src/discovery.ts to collect errors with context. Update the health endpoint in http-routes.ts to include registry.failures. The side panel already shows failed plugins - verify it works with the new error format. Errors should be actionable: tell the user what to do to fix the issue."
+    },
+    {
+      "id": "US-022",
+      "title": "Update CLAUDE.md documentation for new plugin format",
+      "description": "As a platform developer, I want CLAUDE.md to document the new plugin format so that the project instructions are accurate.",
+      "acceptanceCriteria": [
+        "Plugin discovery section describes the new resolution-based approach",
+        "Config file section shows unified plugins array format",
+        "Plugin structure section shows package.json with opentabs field",
+        "No references to opentabs-plugin.json remain in CLAUDE.md",
+        "No references to npmPlugins config field remain",
+        "Build artifacts section mentions dist/tools.json instead of opentabs-plugin.json"
+      ],
+      "priority": 22,
+      "passes": true,
+      "notes": "Edit CLAUDE.md. Search for 'opentabs-plugin.json' and 'npmPlugins' and update all references. Update the directory structure section if it mentions manifest files. Update the 'Adding a New Plugin' section with the new workflow."
+    },
+    {
+      "id": "US-023",
+      "title": "Final cleanup and verification",
+      "description": "As a platform developer, I want the codebase to be clean and all tests passing so that the refactor is complete.",
+      "acceptanceCriteria": [
+        "No references to opentabs-plugin.json in platform/ code (except possibly in migration/deprecation notices)",
+        "No references to npmPlugins config field in platform/ code",
+        "discovery.ts is under 100 lines",
+        "reload.ts reloadCore function is under 50 lines",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 23,
+      "passes": true,
+      "notes": "Run all verification commands. Search the codebase for any remaining references to old patterns. Fix any issues found. This is the final cleanup story that ensures the refactor is complete."
+    }
+  ]
+}

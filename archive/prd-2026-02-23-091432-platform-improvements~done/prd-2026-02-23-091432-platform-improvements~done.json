@@ -1,0 +1,97 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix platform codebase issues: SVG sanitizer bug, contradictory tool descriptions, hardcoded constant duplication, and edge case improvements.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix SVG sanitizer strippedDepth tracking bug",
+      "description": "As a plugin developer using SVG icons, I want the SVG sanitizer to correctly handle allowed elements nested inside disallowed elements so my icons render completely.",
+      "acceptanceCriteria": [
+        "When a disallowed element (e.g., `<script>`) contains allowed child elements (e.g., `<g>`), the depth counter correctly tracks open/close tags within the stripped subtree",
+        "After the disallowed element closes, subsequent allowed content is NOT stripped",
+        "The test case `<svg><script><g></g></script><path d='M0,0'/></svg>` preserves the `<path>` element",
+        "The test case `<svg><script>alert(1)</script><rect width='10' height='10'/></svg>` strips the script but preserves the rect",
+        "Existing sanitizer tests still pass",
+        "`bun run build` passes",
+        "`bun run type-check` passes",
+        "`bun run lint` passes",
+        "`bun run test` passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/sanitize-svg.ts, lines 278-308.\n\nThe bug: When processing elements inside a stripped subtree (strippedDepth > 0), the code increments strippedDepth on opening tags (line 304) but the closing tag handler (around line 282) falls through without decrementing. After the outermost disallowed element closes and strippedDepth reaches 0, any allowed elements that were opened inside it left strippedDepth elevated, so subsequent content is incorrectly stripped.\n\nFix: In the closing tag handler, when strippedDepth > 0, decrement strippedDepth and continue (don't emit the closing tag). The logic should be:\n```\nif (strippedDepth > 0) {\n  strippedDepth--;\n  continue; // or return\n}\n```\n\nAdd unit tests for the specific cases mentioned in acceptance criteria. Check if there's an existing test file for sanitize-svg."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix contradictory browser tool descriptions for screenshot and focus",
+      "description": "As an AI agent using browser tools, I want consistent tool descriptions so I know whether to call focus_tab before screenshot_tab.",
+      "acceptanceCriteria": [
+        "The `browser_screenshot_tab` description clearly states that the tab is automatically focused before capture (no need to call focus_tab first)",
+        "The `browser_focus_tab` description does NOT say focus is 'required before using browser_screenshot_tab'",
+        "The two tool descriptions are consistent with each other about the focus requirement",
+        "`bun run build` passes",
+        "`bun run type-check` passes",
+        "`bun run lint` passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Two files with contradictory descriptions:\n\n1. platform/mcp-server/src/browser-tools/screenshot-tab.ts line 14: Says 'tab is automatically focused before capture' — this is the correct behavior (the implementation calls chrome.tabs.update with active:true).\n\n2. platform/mcp-server/src/browser-tools/focus-tab.ts line 13: Says focus is 'required before using browser_screenshot_tab' — this contradicts screenshot-tab's own description.\n\nFix: Update focus-tab.ts description to remove the claim that focus is required before screenshots. It could say something like 'Useful for bringing a tab to the foreground for visual inspection.' Check if there are other browser tool descriptions that reference focus_tab as a prerequisite."
+    },
+    {
+      "id": "US-003",
+      "title": "Extract shared constants: DEFAULT_PORT, config paths, artifact filenames",
+      "description": "As a platform developer, I want shared constants defined once so changes propagate automatically and values stay consistent.",
+      "acceptanceCriteria": [
+        "`DEFAULT_PORT` (9515) is defined in one place (platform/shared) and imported by all packages that use it (mcp-server, cli, plugin-tools, browser-extension)",
+        "`ADAPTER_FILENAME` ('adapter.iife.js') and `TOOLS_FILENAME` ('tools.json') are defined in shared and used by all packages instead of raw string literals",
+        "Config directory functions (`getConfigDir`, `getConfigPath`, `getExtensionDir`) are defined in shared and imported by mcp-server, cli, and plugin-tools instead of duplicated",
+        "No duplicate definitions of these constants remain across packages",
+        "`bun run build` passes",
+        "`bun run type-check` passes",
+        "`bun run lint` passes",
+        "`bun run knip` passes",
+        "`bun run test` passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Multiple constants are duplicated across packages:\n\n1. `DEFAULT_PORT = 9515` appears in 5 locations: cli/parse-port.ts:8, plugin-tools/build.ts:28, mcp-server/index.ts:171, browser-extension/offscreen/index.ts:23, browser-extension/browser-commands.ts:1876. Move to platform/shared/src/index.ts and export.\n\n2. `'adapter.iife.js'` and `'tools.json'` appear as raw string literals in 40+ places across mcp-server, plugin-tools, cli, and browser-extension. Define `ADAPTER_FILENAME = 'adapter.iife.js'` and `TOOLS_FILENAME = 'tools.json'` in shared.\n\n3. `getConfigDir()`, `getConfigPath()`, `getExtensionDir()` are implemented identically in mcp-server/config.ts:60-64, cli/config.ts:9-13, and plugin-tools/build.ts:35-36. Move to shared.\n\n4. `generateSecret()` is duplicated in mcp-server/config.ts:77-81 and cli/commands/config.ts:369-373. Move to shared.\n\nFor browser-extension: it cannot import from platform/shared (it's a standalone build). For those files, keep the constants as-is but add a comment noting the canonical source. Or check if the extension build can resolve workspace imports.\n\nUpdate all import sites after moving. Run the full test suite to verify nothing breaks."
+    },
+    {
+      "id": "US-004",
+      "title": "Add toErrorMessage utility and replace 62 instances of err instanceof Error pattern",
+      "description": "As a platform developer, I want a shared error message extraction utility so error handling is consistent and DRY.",
+      "acceptanceCriteria": [
+        "A `toErrorMessage(err: unknown): string` function is exported from platform/shared",
+        "The function returns `err.message` for Error instances and `String(err)` otherwise",
+        "At least the 38 occurrences in browser-commands.ts are replaced with `toErrorMessage(err)`",
+        "Other high-occurrence files are also updated where practical",
+        "No behavioral changes — the output is identical",
+        "`bun run build` passes",
+        "`bun run type-check` passes",
+        "`bun run lint` passes",
+        "`bun run test` passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "The pattern `err instanceof Error ? err.message : String(err)` appears 62 times across the codebase, with 38 occurrences in platform/browser-extension/src/browser-commands.ts alone.\n\nCreate in platform/shared/src/index.ts:\n```typescript\nexport function toErrorMessage(err: unknown): string {\n  return err instanceof Error ? err.message : String(err);\n}\n```\n\nFor browser-extension (which may not import from shared): either add the function locally in browser-extension/src/utils.ts, or check if the build resolves workspace imports. The 38 occurrences in browser-commands.ts are the biggest win.\n\nUse find-and-replace carefully — some occurrences may have slight variations (e.g., `(error as Error).message` or `error instanceof Error ? error.message : ...`). Search for all variants."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix edge cases: PORT validation, log level parsing, build lock staleness, retry maxDelay",
+      "description": "As a platform operator, I want proper input validation and error recovery so the system handles edge cases gracefully.",
+      "acceptanceCriteria": [
+        "`Number(Bun.env.PORT)` in mcp-server/index.ts is validated — NaN from invalid PORT values produces a clear error message instead of passing NaN to Bun.serve()",
+        "Log level parsing in logger.ts normalizes case (e.g., `OPENTABS_LOG_LEVEL=DEBUG` works, not just lowercase `debug`)",
+        "The build lock in plugin-tools/build.ts has stale detection — if the lock directory is older than a reasonable threshold (e.g., 5 minutes), it is automatically cleaned up with a warning",
+        "The `retry()` utility in plugin-sdk/timing.ts has a `maxDelay` cap (e.g., 30s) to prevent exponential backoff from reaching unreasonable values",
+        "`bun run build` passes",
+        "`bun run type-check` passes",
+        "`bun run lint` passes",
+        "`bun run test` passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Four small edge case fixes:\n\n1. platform/mcp-server/src/index.ts line 171: `const port = Number(Bun.env.PORT) || Number(Bun.env.OPENTABS_PORT) || DEFAULT_PORT`. If PORT='abc', Number('abc') is NaN, and NaN || next works correctly via the fallback chain. But if OPENTABS_PORT is also invalid and DEFAULT_PORT is somehow undefined after refactoring, we get NaN. Add explicit validation: `const rawPort = Number(Bun.env.PORT || Bun.env.OPENTABS_PORT || DEFAULT_PORT); if (isNaN(rawPort)) throw new Error('Invalid PORT');`\n\n2. platform/mcp-server/src/logger.ts around line 54: `parseLevel()` should do `level.toLowerCase()` before the switch statement so `DEBUG`, `Debug`, `debug` all work.\n\n3. platform/plugin-tools/src/commands/build.ts lines 52-74: The `mkdirSync` advisory lock persists forever if a build crashes. Add stale detection: check the lock directory's mtime, and if it's older than 5 minutes, log a warning and remove it before proceeding.\n\n4. platform/plugin-sdk/src/timing.ts around line 73: The `retry()` function computes delay as `opts.delay * Math.pow(2, attempt)` with no cap. Add `maxDelay` option (default 30_000ms) and clamp: `Math.min(computedDelay, opts.maxDelay ?? 30_000)`."
+    }
+  ]
+}

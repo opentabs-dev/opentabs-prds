@@ -1,0 +1,113 @@
+{
+  "project": "OpenTabs — Config Watcher & Side Panel Live Updates",
+  "description": "Add automatic config.json file watching to the MCP server so plugin additions/removals are detected without manual reload, and add a lightweight plugins.changed notification to the extension so the side panel live-updates when the plugin list changes.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add config.json file watcher to MCP server",
+      "description": "As a plugin developer, I want the MCP server to automatically detect changes to ~/.opentabs/config.json so that adding or removing a plugin path triggers a config reload without needing to manually run `opentabs reload`.",
+      "acceptanceCriteria": [
+        "A new `configWatcher` field of type `FSWatcher | null` exists on `ServerState` in state.ts",
+        "A new function `startConfigWatching(state, callbacks)` in file-watcher.ts watches the config directory (from `getConfigDir()`) for changes to `config.json`",
+        "Config file changes are debounced at 200ms (same pattern as plugin file watchers) using the existing `fileWatcherTimers` map with a 'config' key",
+        "The debounced callback invokes `callbacks.onConfigChanged()` which triggers `performConfigReload`",
+        "The config watcher uses `fileWatcherGeneration` to discard stale callbacks, same pattern as plugin watchers",
+        "`stopFileWatching` in file-watcher.ts also closes the config watcher and sets it to null",
+        "The config watcher is started in `reloadCore` (reload.ts) alongside `startFileWatching`, by wiring `onConfigChanged` to call `performConfigReload(state, sessionServers, transports)`",
+        "The `FileWatcherCallbacks` interface gains an `onConfigChanged: () => void` callback",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Key files: platform/mcp-server/src/file-watcher.ts (add startConfigWatching, update stopFileWatching), platform/mcp-server/src/state.ts (add configWatcher: FSWatcher | null field, update createState), platform/mcp-server/src/reload.ts (wire onConfigChanged callback in reloadCore around line 200 where startFileWatching is called). Use `watch()` from node:fs on `getConfigDir()` (not the file itself — macOS fs.watch on files is unreliable). Filter for filename === 'config.json'. Import getConfigDir from './config.js'. Follow the exact same debounce pattern used by `debouncedManifestCallback` and `debouncedIifeCallback` in file-watcher.ts — capture `state.fileWatcherGeneration` at setup time and bail if generation changes."
+    },
+    {
+      "id": "US-002",
+      "title": "Send plugins.changed notification to side panel after sync.full and plugin.update",
+      "description": "As a user, I want the Chrome extension side panel to automatically refresh the plugin list when plugins are added, removed, or updated, without needing to close and reopen the side panel.",
+      "acceptanceCriteria": [
+        "`SIDE_PANEL_METHODS` in message-router.ts includes 'plugins.changed'",
+        "At the end of `handleSyncFull` (after `sendTabSyncAll()` completes around line 281), a lightweight `{ jsonrpc: '2.0', method: 'plugins.changed' }` notification is forwarded to the side panel via `forwardToSidePanel`",
+        "At the end of `handlePluginUpdate` (after the tab state is sent to server around line 305), the same `plugins.changed` notification is forwarded to the side panel",
+        "In App.tsx, the `sp:serverMessage` listener handles `data.method === 'plugins.changed'` by calling `loadPluginsRef.current()` to refetch the full plugin state",
+        "The side panel updates the plugin list without user interaction (no close/reopen needed)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Key files: platform/browser-extension/src/message-router.ts (line 25: add 'plugins.changed' to SIDE_PANEL_METHODS set; line 281: after sendTabSyncAll() in handleSyncFull, call forwardToSidePanel({ type: 'sp:serverMessage', data: { jsonrpc: '2.0', method: 'plugins.changed' } }); line ~305: same in handlePluginUpdate after the sendToServer call). platform/browser-extension/src/side-panel/App.tsx (around line 87, add a handler block: if (data.method === 'plugins.changed') { loadPluginsRef.current(); }). The forwardToSidePanel function is already imported and used in handleServerMessage. The loadPluginsRef pattern is already established in App.tsx — it calls fetchConfigState() which sends a config.getState JSON-RPC request to the background, which proxies to the MCP server."
+    },
+    {
+      "id": "US-003",
+      "title": "Unit tests for config file watcher",
+      "description": "As a developer, I want unit tests covering the config file watcher to ensure config changes trigger reloads and that the watcher is properly cleaned up.",
+      "acceptanceCriteria": [
+        "Tests are added to platform/mcp-server/src/file-watcher.test.ts",
+        "Test: config watcher starts when startConfigWatching is called and configWatcher field is set on state",
+        "Test: stopFileWatching closes the config watcher and sets it to null",
+        "Test: config watcher debounces rapid changes (only one callback fires for multiple quick changes)",
+        "Test: stale config watcher callbacks are discarded when fileWatcherGeneration changes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Follow the existing test patterns in platform/mcp-server/src/file-watcher.test.ts. The file already mocks `watch` from node:fs and has helper functions for creating test state. Use the same createTestState() pattern. For debounce testing, use Bun's timer mocking or manual Promise resolution. The existing tests use `describe`/`it`/`expect` from bun:test."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: config.json change auto-discovers new plugin",
+      "description": "As a developer, I want an E2E test that verifies modifying config.json to add a plugin path automatically triggers plugin discovery without manual reload.",
+      "acceptanceCriteria": [
+        "New test in e2e/hot-reload-dynamic.e2e.ts (or a new e2e/config-watcher.e2e.ts file)",
+        "Test starts MCP server with empty config (no plugins)",
+        "Test verifies tools/list returns only browser tools (no plugin tools)",
+        "Test writes a new config.json with the e2e-test plugin path",
+        "Test waits (with polling/retry) for the server to auto-detect the change",
+        "Test verifies tools/list now includes the e2e-test plugin tools",
+        "Test does NOT call POST /reload — the config watcher must detect the change automatically",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "The new E2E test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Use the existing e2e fixtures pattern from e2e/fixtures.ts (startMcpServer, connectExtension, etc.). The e2e-test plugin is at plugins/e2e-test/ with 6 tools. Look at how e2e/hot-reload-dynamic.e2e.ts tests file watcher changes — it writes files and polls tools/list for changes. Same pattern here but write to config.json instead of plugin files. The config path in e2e tests is controlled by OPENTABS_CONFIG_DIR env var (see e2e/fixtures.ts). Use a wait/poll loop with a timeout rather than fixed sleep. Make sure to check that the config file watcher debounce (200ms) has time to fire."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: side panel live-updates when plugins change",
+      "description": "As a developer, I want an E2E test that verifies the side panel automatically refreshes its plugin list when sync.full or plugin.update occurs, without requiring close/reopen.",
+      "acceptanceCriteria": [
+        "New E2E test that starts MCP server, connects extension, and opens the side panel",
+        "Test verifies side panel initially shows no plugins (or the baseline set)",
+        "Test triggers a plugin change (either config.json modification or hot reload that adds a plugin)",
+        "Test verifies the side panel DOM updates to show the new plugin WITHOUT closing/reopening the side panel",
+        "The plugins.changed notification path is exercised end-to-end",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "The new E2E test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "This test requires interacting with the side panel DOM via Playwright. Check if existing e2e tests already open the side panel — look in e2e/full-e2e.e2e.ts and e2e/lifecycle.e2e.ts for side panel interaction patterns. If no existing tests open the side panel, you may need to use chrome.sidePanel API or find the side panel page in the extension's pages. The side panel shows plugin cards with the plugin name — check for the plugin name text appearing in the DOM. Use Playwright's page.waitForSelector() or expect(locator).toBeVisible() with a timeout for the live update assertion. If side panel testing is too complex for the current test infrastructure, document the limitation and test via the extension's chrome.storage instead (verify storage is updated after sync.full, which the side panel reads from)."
+    }
+  ]
+}

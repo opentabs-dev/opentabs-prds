@@ -1,0 +1,125 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Harden the tab status sync mechanism between the Chrome extension and MCP server. Fix bugs where tab state becomes stale (missing onReplaced handler, lastKnownState cache not updated by plugin.update), and add comprehensive E2E tests for navigate-away, multi-tab, and tab replacement scenarios.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add chrome.tabs.onReplaced handler for tab replacement events",
+      "description": "As a plugin user, I want tab state to remain accurate when Chrome replaces a tab (e.g., prerendered page promotion) so that the MCP server always has correct tab mappings.",
+      "acceptanceCriteria": [
+        "chrome.tabs.onReplaced listener is registered in platform/browser-extension/src/background.ts",
+        "When a tab is replaced, checkTabStateChanges is called for the new tab ID so plugin states are recomputed",
+        "The old tab ID is no longer referenced in any plugin state",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Chrome fires chrome.tabs.onReplaced(addedTabId, removedTabId) when a prerendered tab replaces an existing one. The extension currently has no handler for this event (background.ts only has onUpdated and onRemoved). Add a listener that: (1) calls checkTabStateChanges(removedTabId, undefined, true) to handle the removed tab, then (2) fetches the new tab's URL via chrome.tabs.get(addedTabId) and calls checkTabStateChanges(addedTabId, { status: 'complete' }) to check the replacement. The handler should also call injectPluginsIntoTab(addedTabId, tab.url) before the state check (same pattern as onUpdated status=complete in background.ts:102-110). File to edit: platform/browser-extension/src/background.ts, add the listener after the existing onRemoved listener (line 122)."
+    },
+    {
+      "id": "US-002",
+      "title": "Update lastKnownState cache when plugin.update sends tab.stateChanged directly",
+      "description": "As a platform developer, I want the lastKnownState cache in tab-state.ts to stay in sync when handlePluginUpdate sends tab.stateChanged, so that subsequent checkTabStateChanges calls don't produce incorrect suppressions or redundant notifications.",
+      "acceptanceCriteria": [
+        "handlePluginUpdate in message-router.ts updates the lastKnownState cache after computing the new state",
+        "A function is exported from tab-state.ts that allows external callers to update the cache for a single plugin",
+        "The cache update happens before sending tab.stateChanged to the server, consistent with the pattern in checkTabStateChanges (tab-state.ts:258)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "In platform/browser-extension/src/message-router.ts, handlePluginUpdate (line 348) computes tab state via computePluginTabState and sends tab.stateChanged directly (lines 363-372), bypassing checkTabStateChanges. This means the lastKnownState Map in tab-state.ts (line 19) never gets updated. Fix: export a new function from tab-state.ts like `updateLastKnownState(pluginName: string, state: TabState): void` that sets lastKnownState.set(pluginName, state). Call it in handlePluginUpdate after computePluginTabState returns and before sending the tab.stateChanged notification. The function must also be called in the clearPluginTabState function path. Also update the unit test file platform/browser-extension/src/tab-state.test.ts (if it exists) or note that this is covered by E2E tests."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: tab state transitions to closed when navigating away from matching URL",
+      "description": "As a QA engineer, I want an E2E test that verifies when a user navigates a matching tab to a non-matching URL, the plugin's tab state correctly transitions to 'closed'.",
+      "acceptanceCriteria": [
+        "New E2E test in e2e/tab-state-sync.e2e.ts verifies navigate-away → closed transition",
+        "Test opens a matching tab (test server URL), waits for 'ready' state",
+        "Test navigates the same tab to a non-matching URL (e.g., about:blank or a different domain)",
+        "Test verifies the server's /health endpoint reports 'closed' state for the plugin",
+        "Test verifies tool dispatch returns an error after navigation",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Create a new file e2e/tab-state-sync.e2e.ts for all tab state sync tests. Follow the pattern from e2e/side-panel-data-flow.e2e.ts (lines 94-193) for setup boilerplate: import fixtures, start MCP server + test server, launch extension context, setup adapter symlink, wait for connection. The navigate-away test should: (1) open tab to testServer.url, (2) wait for /health to show 'ready', (3) navigate the same tab to 'chrome://newtab' or 'https://example.com', (4) poll /health until tabState becomes 'closed', (5) verify tool dispatch returns isError=true. Use the helpers from e2e/helpers.ts (waitForExtensionConnected, waitForLog, setupAdapterSymlink). The test server URL pattern is http://localhost/* which means navigating to a different origin should trigger the closed transition."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: plugin stays ready when one of multiple matching tabs is closed",
+      "description": "As a QA engineer, I want an E2E test that verifies when multiple tabs match a plugin's URL patterns and one is closed, the plugin remains 'ready' as long as another matching tab is still open and ready.",
+      "acceptanceCriteria": [
+        "New E2E test in e2e/tab-state-sync.e2e.ts verifies multi-tab resilience",
+        "Test opens two matching tabs to the test server",
+        "Test waits for 'ready' state",
+        "Test closes one of the two matching tabs",
+        "Test verifies the server's /health endpoint still reports 'ready' state for the plugin",
+        "Test verifies tool dispatch still succeeds after closing one tab",
+        "Test closes the second tab and verifies state transitions to 'closed'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Add this test to e2e/tab-state-sync.e2e.ts. The key verification is that computePluginTabState (tab-state.ts:66-98) checks ALL matching tabs and reports 'ready' if ANY is ready. Open two tabs to testServer.url, wait for ready, close one, verify still ready, close the other, verify closed. Use expect.poll against /health like the existing side-panel-data-flow tests do. Also do a tool call after closing the first tab to verify it succeeds. Use an MCP client (createMcpClient + initialize) for tool calls."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: tab state recovers after rapid close-and-reopen",
+      "description": "As a QA engineer, I want an E2E test that verifies the tab state correctly transitions through closed→ready when a matching tab is rapidly closed and reopened.",
+      "acceptanceCriteria": [
+        "New E2E test in e2e/tab-state-sync.e2e.ts verifies rapid close/reopen cycle",
+        "Test opens a matching tab, waits for 'ready'",
+        "Test closes the tab and immediately opens a new matching tab",
+        "Test verifies the plugin eventually reaches 'ready' state again",
+        "Test verifies tool dispatch succeeds on the new tab",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Add this test to e2e/tab-state-sync.e2e.ts. This test exercises the pluginLocks serialization in tab-state.ts (line 27) — rapid tab events should not cause race conditions. Close the first tab, then immediately (without waiting for state to settle) open a new tab to testServer.url. Wait for /health to show 'ready'. Verify tool dispatch works. The close triggers checkTabStateChanges with removed=true, and the open triggers onUpdated status=complete — these events should be serialized correctly per-plugin."
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: tab state sync after server restart (reconnect)",
+      "description": "As a QA engineer, I want an E2E test that verifies after the MCP server restarts and the extension reconnects, the tab state is fully re-synced via tab.syncAll.",
+      "acceptanceCriteria": [
+        "New E2E test in e2e/tab-state-sync.e2e.ts verifies reconnect tab sync",
+        "Test starts MCP server, opens matching tab, verifies 'ready' state",
+        "Test kills the MCP server and waits for disconnection",
+        "Test restarts MCP server on the same port",
+        "Test verifies the extension reconnects and sends tab.syncAll",
+        "Test verifies the server's /health shows 'ready' state after reconnect",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Add this test to e2e/tab-state-sync.e2e.ts. Follow the pattern from side-panel-data-flow.e2e.ts test 'shows connected status and transitions on server stop/restart' (line 31-87) but focus on tab state rather than UI. The key verification is: (1) with a matching tab open, kill the server, (2) restart the server on the same port (use startMcpServer with explicit port), (3) wait for 'tab.syncAll received' in server logs, (4) verify /health shows ready for the plugin. This confirms clearTabStateCache on disconnect + sendTabSyncAll on reconnect works correctly."
+    }
+  ]
+}

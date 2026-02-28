@@ -1,0 +1,101 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-225913-audit-logging~running.json
+Started: Sat Feb 21 05:34:27 PST 2026
+---
+
+## Codebase Patterns
+- ServerState fields survive hot reloads via globalThis — new fields on state are immediately available to all modules
+- STATE_SCHEMA_VERSION must be bumped when adding new fields to ServerState
+- Browser tools use a separate code path (cachedBrowserTools) from plugin tools in the tools/call handler
+- Plugin tool error info comes from DispatchError (with isDispatchError check) which has code, message, and data fields; generic errors use code 'UNKNOWN'
+- The tools/call handler uses a finally block for cleanup (activeDispatches, sendInvocationEnd); audit logging fits naturally there
+- HTTP routes in http-routes.ts use a sequential if/return pattern with checkBearerAuth for protected endpoints
+- state.auditLog stores entries in chronological order (oldest first); reverse for newest-first API responses
+- CLI commands follow registerXxxCommand(program) pattern in platform/cli/src/commands/ with export from index.ts and registration in cli.ts
+- Global --port option is accessed via command.optsWithGlobals() — subcommand options interfaces must include port?: number
+- Secret for Bearer auth is read from ~/.opentabs/config.json via readConfig() + config.secret
+- Connection refused detection uses isConnectionRefused() helper from config.ts
+- E2E tests use standard Playwright fixtures (mcpServer, testServer, extensionContext, mcpClient) from fixtures.ts
+- E2E test HTTP requests to the MCP server use mcpServer.port and mcpServer.secret for auth
+- E2E tests must avoid non-null assertions (use guard clauses with throw instead)
+
+## 2026-02-21 - US-001
+- Implemented in-memory audit log with AuditEntry type and 500-entry circular buffer
+- Added appendAuditEntry helper to state.ts
+- Integrated audit logging into both plugin tool and browser tool dispatch paths in mcp-setup.ts
+- Plugin tool errors captured from DispatchError (code, message, category from data) or generic Error (code: 'UNKNOWN')
+- Browser tool errors captured as code: 'UNKNOWN' since they don't use DispatchError
+- Files changed: platform/mcp-server/src/state.ts, platform/mcp-server/src/mcp-setup.ts
+- **Learnings for future iterations:**
+  - The catch block in plugin tool dispatch has two paths: isDispatchError (structured with code/data) and generic Error — both need to populate errorInfo separately
+  - Browser tool handler doesn't go through dispatchToExtension, so it only produces generic errors
+  - The `err.data?.code` on DispatchError is the structured ToolError code (string like 'auth', 'rate_limit'), while `err.data?.category` also exists — the PRD asked to use `err.data?.code` as category in the audit error field
+---
+
+## 2026-02-21 - US-002
+- Added GET /audit endpoint to http-routes.ts, placed between /health and /reload blocks
+- Supports query params: ?limit=N (default 50, max 500), ?plugin=name, ?tool=name, ?success=true|false
+- Multiple filters are AND-combined; returns newest-first ordering via array reverse
+- Protected by Bearer auth (checkBearerAuth), returns 401 on auth failure
+- Returns empty array [] when no entries match filters
+- Files changed: platform/mcp-server/src/http-routes.ts
+- **Learnings for future iterations:**
+  - The http-routes.ts route blocks follow a simple if/return pattern with checkBearerAuth at the top — new endpoints fit naturally in sequence
+  - state.auditLog is already typed as AuditEntry[] from US-001, so the endpoint accesses it directly without additional imports
+  - The endpoint reverses the array to return newest-first (auditLog stores in chronological order)
+---
+
+## 2026-02-21 - US-003
+- Added computeAuditSummary function to http-routes.ts that computes aggregate stats from state.auditLog in a single pass
+- auditSummary includes: totalInvocations, successCount, failureCount, last24h (total/success/failure), avgDurationMs
+- 24-hour cutoff uses Date.now() - 86_400_000 compared against parsed entry timestamps
+- avgDurationMs rounded to 1 decimal place; returns 0 when no entries exist
+- Added auditSummary to the /health endpoint Response.json alongside existing fields
+- Imported AuditEntry type from state.ts for the function parameter typing
+- Files changed: platform/mcp-server/src/http-routes.ts
+- **Learnings for future iterations:**
+  - The /health endpoint already has a rich response object with many fields — new fields are added to the same Response.json call
+  - computeAuditSummary is a pure function defined at module scope — keeps the route handler clean
+  - AuditEntry type needed explicit import since the function parameter types it directly (state.auditLog was already typed implicitly)
+---
+
+## 2026-02-21 - US-004
+- Created platform/cli/src/commands/audit.ts with registerAuditCommand following the same pattern as status.ts
+- Command fetches GET /audit with Bearer auth from config.json secret, supports --limit, --plugin, --json options
+- Default output: formatted table with timestamp (HH:mm:ss or MM-DD HH:mm:ss), tool name, success (green ✓ / red ✗), duration
+- --json flag outputs raw JSON array from the /audit endpoint
+- Error handling: connection refused → "MCP server is not running", 401 → "Authentication failed"
+- Registered command in commands/index.ts (export) and cli.ts (registerAuditCommand call)
+- Files changed: platform/cli/src/commands/audit.ts (new), platform/cli/src/commands/index.ts, platform/cli/src/cli.ts
+- **Learnings for future iterations:**
+  - CLI subcommand options interfaces must include `port?: number` if they call `resolvePort()` — the global --port is merged via `command.optsWithGlobals()` but TypeScript doesn't know about it unless the interface declares it
+  - Don't import parsePort in subcommands unless the subcommand defines its own --port option — the global option is already parsed by the parent program
+  - The readConfig/getConfigPath pattern from config.ts is the standard way to get the server secret for CLI commands that need authenticated endpoints
+---
+
+## 2026-02-21 - US-005
+- Created e2e/audit-logging.e2e.ts with 6 tests covering the full audit logging pipeline
+- Tests use the standard fixture pattern (mcpServer, testServer, extensionContext, mcpClient)
+- Test 1: Invokes successful + failing tools, verifies entries have correct fields (ISO 8601 timestamp, tool, plugin, success, durationMs, error), newest-first ordering
+- Test 2: GET /audit?plugin=e2e-test filters correctly, non-existent plugin returns empty array
+- Test 3: GET /audit?success=false returns only failed invocations
+- Test 4: GET /audit?limit=1 returns exactly 1 entry
+- Test 5: GET /health includes auditSummary with correct aggregate stats (totalInvocations, successCount + failureCount = total, last24h matches total since all entries are recent)
+- Test 6: GET /audit without Bearer auth returns 401
+- Files changed: e2e/audit-logging.e2e.ts (new)
+- **Learnings for future iterations:**
+  - E2E test files use Playwright's no-non-null-assertion ESLint rule — use guard clauses (`if (!x) throw`) instead of `x!`
+  - Prettier enforces single-line destructuring for test callbacks when the line fits within the print width
+  - The mcpServer fixture provides `.port` and `.secret` for making authenticated HTTP requests to the server
+  - fetchAudit helper pattern: build URL with searchParams, add Bearer auth header, handle non-ok responses
+---
+
+## 2026-02-21 - US-006
+- Updated CLAUDE.md MCP Server description to mention the in-memory audit log (500 entries), GET /audit endpoint, and /health auditSummary
+- Updated CLI description to add `audit` to the command list and a one-liner description
+- Kept additions concise (1-2 sentences each) per the PRD's guidance
+- Files changed: CLAUDE.md
+- **Learnings for future iterations:**
+  - CLAUDE.md edits are straightforward — the Architecture section has component descriptions where new features can be mentioned inline
+  - The PRD explicitly said to keep it concise and not enumerate fields/params — the code and types are the source of truth
+---

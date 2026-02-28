@@ -1,0 +1,355 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-135350-cli-ux-improvements~running.json
+Started: Tue Feb 24 14:04:34 PST 2026
+---
+
+## Codebase Patterns
+- CLI commands are in platform/cli/src/commands/. Each file registers a top-level command.
+- Commander's `.action()` receives (args..., options, command). Use `command.optsWithGlobals()` to access global options like `--port`.
+- The `resolvePort()` function from parse-port.ts resolves port from options → env → default.
+- Shared helpers that multiple commands need belong in platform/cli/src/ (not inside commands/).
+- Pre-existing `tsc --build --noEmit` may fail in worktrees with stale build info. Run `bun run clean && bun run build` first to fix.
+
+## 2026-02-24 14:10 PST - US-001
+- Extracted `notifyServer` from `platform/cli/src/commands/plugin.ts` to `platform/cli/src/notify-server.ts`
+- Updated `plugin.ts` to import from the shared module (removed inline definition, removed unused `readAuthSecret` import)
+- Added `notifyServer` calls to all five config set handlers: `handleSetTool`, `handleSetBrowserTool`, `handleSetPort`, `handleSetLocalPluginsAdd`, `handleSetLocalPluginsRemove`
+- Threaded `options: { port?: number }` through `handleConfigSet` → individual handlers via `command.optsWithGlobals()` in the `.action()` callback
+- Added `warnIfNotRunning` option to notifyServer to control whether "server not running" message is shown (true for config, false/default for plugins)
+- Files changed: platform/cli/src/notify-server.ts (new), platform/cli/src/commands/plugin.ts, platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - The `config set` action originally didn't pass Commander options through — needed to change the `.action()` signature to `(key, value, _options, command)` to access `command.optsWithGlobals()`
+  - The `notifyServer` function first checks `/health` to see if the server is running, then POSTs to `/reload` with auth header — this two-step pattern prevents noisy errors when the server is down
+  - `bun run type-check` may fail in worktrees due to stale tsbuildinfo; `bun run clean && bun run build` resolves it
+---
+
+## 2026-02-24 14:15 PST - US-002
+- Added `--confirm` (with `-y` alias) flag to `opentabs plugin remove` command
+- Without `--confirm`, the command prints the plugin name and exits with instructions to use `--confirm` or `-y`
+- With `--confirm`, the command proceeds with npm uninstall as before
+- Simplified the fallback logic: resolved package name or normalized name is computed up front, then the confirmation gate applies before any destructive action
+- Files changed: platform/cli/src/commands/plugin.ts
+- **Learnings for future iterations:**
+  - Commander option syntax for aliases is `-y, --confirm` (short flag first in the string), not `--confirm, -y`
+  - The `config reset` command (config.ts lines 355-375) is the canonical pattern for `--confirm` gates in this codebase
+---
+
+## 2026-02-24 14:17 PST - US-003
+- Added `--confirm` flag to `opentabs config rotate-secret` command
+- Without `--confirm`, prints a warning about consequences (all MCP client configs need updating) and exits
+- With `--confirm`, proceeds with secret rotation as before
+- Added `RotateSecretOptions` interface to type the options properly
+- Updated subcommand registration to merge local options with global options via spread
+- Files changed: platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - Commander `.action()` for subcommands with both local and global options: use `(options, command)` signature, then merge `{ ...options, ...command.optsWithGlobals() }` to get both
+  - The `--confirm` gate pattern is now used in three places: config reset, plugin remove, and config rotate-secret
+---
+
+## 2026-02-24 14:22 PST - US-004
+- Replaced `config.secret` reading with `readAuthSecret()` in doctor.ts `handleDoctor`
+- Added `readAuthSecret` to imports from `../config.js`
+- The secret is now correctly read from `~/.opentabs/extension/auth.json` (single source of truth) instead of from the config JSON object
+- Files changed: platform/cli/src/commands/doctor.ts
+- **Learnings for future iterations:**
+  - `readAuthSecret()` from `platform/cli/src/config.ts` is the canonical way to read the auth secret — it reads from `~/.opentabs/extension/auth.json` and returns `string | null`
+  - The config JSON object (`config.json`) does NOT store the secret; `auth.json` is the single source of truth
+  - The doctor command's `checkServerHealth` already accepts an optional secret parameter for the Authorization header
+---
+
+## 2026-02-24 14:25 PST - US-005
+- Added timeout error handling to the audit command's catch block in `handleAudit`
+- Imported `isTimeout` from `./status.js` (reusing the existing helper that checks `err instanceof DOMException && err.name === 'TimeoutError'`)
+- Added an `else if (isTimeout(err))` branch between `isConnectionRefused` and the generic error, displaying: "Server not responding (timed out). Is the server running?"
+- Fixed import ordering to satisfy `import-x/order` lint rule (sibling `./` imports before parent `../` imports)
+- Files changed: platform/cli/src/commands/audit.ts
+- **Learnings for future iterations:**
+  - The `isTimeout` helper is exported from `status.ts` and can be reused by any command that does fetch with `AbortSignal.timeout()`
+  - Import ordering rule: sibling imports (`./`) must come before parent imports (`../`) in this codebase
+  - The audit command uses `AbortSignal.timeout(3_000)` for its server fetch, same as status command
+---
+
+## 2026-02-24 14:30 PST - US-006
+- Improved the error message in `handleStart` when the MCP server entry point is not found
+- Added a heuristic: if the resolved `serverEntry` path contains `node_modules`, the CLI was installed via npm — suggests reinstalling with `bun install -g @opentabs-dev/cli`
+- If the path does not contain `node_modules` (dev/monorepo context), the existing "Run bun run build" message is preserved
+- Files changed: platform/cli/src/commands/start.ts
+- **Learnings for future iterations:**
+  - `resolveServerEntry()` first tries `import.meta.resolve('@opentabs-dev/mcp-server')` (works when installed via npm) and falls back to a relative path from the CLI directory (dev context)
+  - The `node_modules` path heuristic is simple and reliable: npm-installed packages always resolve through `node_modules`, while workspace packages resolve to their source directories
+---
+
+## 2026-02-24 14:35 PST - US-007
+- Fixed column alignment in the start command output for MCP endpoint, Health check, and Log file labels
+- Introduced a local `label` helper that uses `.padEnd(15)` with `pc.cyan()` to ensure all labels are right-padded to the same width
+- Values now align vertically regardless of label length
+- Files changed: platform/cli/src/commands/start.ts
+- **Learnings for future iterations:**
+  - The status command uses a `pad` helper (`const pad = (label: string) => \`  ${pc.cyan(label.padEnd(14))}\``) for consistent alignment — the start command now uses the same pattern with a local `label` function
+  - When labels have different character lengths, always use `.padEnd()` rather than manual space counting to maintain alignment
+---
+
+## 2026-02-24 14:40 PST - US-008
+- Added did-you-mean suggestions for unknown config set keys using Levenshtein distance
+- Implemented `levenshtein()` using a two-row DP approach with `?? 0` fallbacks (avoids `!` non-null assertions which are banned by ESLint, and avoids `Uint32Array` which still triggers `noUncheckedIndexedAccess`)
+- Added `KNOWN_KEYS` constant and `suggestKey()` function that finds the closest match within edit distance 2
+- For prefix keys (e.g., `tool.`, `browser-tool.`), compares only the prefix portion of user input and appends the user's suffix to form a complete suggestion
+- Files changed: platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - TypeScript strict mode with `noUncheckedIndexedAccess` makes array indexing return `T | undefined` — even `Uint32Array` and `new Array<number>().fill(0)` are affected. Use `?? defaultValue` instead of `!` assertions (ESLint bans `@typescript-eslint/no-non-null-assertion`)
+  - The two-row Levenshtein approach (prev/curr arrays) is cleaner than a full 2D matrix in strict TS
+  - `KNOWN_KEYS` list: `['tool.', 'browser-tool.', 'port', 'localPlugins.add', 'localPlugins.remove']`
+---
+
+## 2026-02-24 14:45 PST - US-009
+- Added `--show-secret` option to `opentabs config show` command
+- Secrets are now masked by default: first 4 chars + '...' + last 4 chars (or '****' for short secrets)
+- Masking applies to both display and JSON output modes
+- Added `maskSecret` helper function and updated `ConfigShowOptions` interface
+- Files changed: platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - The `readAuthSecret()` call was already in `handleConfigShow` — the masking is applied to the display variable, not the raw secret
+  - Commander parses `--show-secret` as `showSecret` (camelCase) in the options object
+---
+
+## 2026-02-24 14:50 PST - US-010
+- Added specific 401 error handling to the status command's HTTP response path
+- Before the generic `!res.ok` check, added a `res.status === 401` branch that prints an actionable authentication failure message
+- The message directs users to check `~/.opentabs/extension/auth.json` and suggests restarting the server or rotating the secret
+- Follows the same pattern as audit.ts lines 218-222
+- Files changed: platform/cli/src/commands/status.ts
+- **Learnings for future iterations:**
+  - The audit command (audit.ts) already has 401 handling — use it as the canonical pattern for all commands that call server endpoints
+  - The 401 check must be placed before the generic `!res.ok` check since 401 is a specific non-OK status
+---
+
+## 2026-02-24 14:55 PST - US-011
+- Added `platformExec` import from `@opentabs-dev/shared` to update.ts
+- Replaced raw `'npm'` with `platformExec('npm')` in `getLatestVersion`
+- Replaced raw `'bun'` with `platformExec('bun')` in `performUpdate`
+- Files changed: platform/cli/src/commands/update.ts
+- **Learnings for future iterations:**
+  - `platformExec` from `@opentabs-dev/shared` wraps command names for Windows compatibility (appends `.cmd` on Windows)
+  - All `Bun.spawn`/`Bun.spawnSync` calls that shell out to CLI tools (`npm`, `bun`) should use `platformExec()` for cross-platform support
+  - The pattern is already established in plugin.ts, start.ts, resolver.ts, and plugin-management.ts
+---
+
+## 2026-02-24 14:57 PST - US-012
+- Fixed plugin search empty query display: when no query is provided and no results are found, the message now says "No plugins found." without empty quotes
+- When a query is provided, the message includes the query: `No plugins found for "<query>". Try a different search term.`
+- Files changed: platform/cli/src/commands/plugin.ts
+- **Learnings for future iterations:**
+  - The `query` parameter to `handlePluginSearch` is `string | undefined` — use truthiness check rather than `?? ''` to distinguish between "no query" and "empty query"
+---
+
+## 2026-02-24 15:00 PST - US-013
+- Added `.alias('ls')` to the `list` subcommand
+- Added `.alias('rm')` to the `remove` subcommand
+- Added `.alias('add')` to the `install` subcommand
+- Aliases appear in Commander help text automatically
+- Files changed: platform/cli/src/commands/plugin.ts
+- **Learnings for future iterations:**
+  - Commander's `.alias()` method is chainable and must be placed after `.command()` but before `.description()` (or anywhere in the chain — it's flexible)
+  - Aliases automatically appear in help text parenthesized after the command name
+---
+
+## 2026-02-24 15:05 PST - US-014
+- Added `.alias('get')` to the `show` subcommand in `registerConfigCommand`
+- `opentabs config get` now works identically to `opentabs config show`
+- The alias appears in Commander help text automatically
+- Files changed: platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - Commander's `.alias()` is the simplest way to add command aliases — one line, chainable, auto-appears in help
+  - The `create-plugin` install test can be flaky in worktree environments due to symlink `EEXIST` errors — retry if it fails once
+---
+
+## 2026-02-24 15:10 PST - US-015
+- Reformatted `printMcpClientConfigs` in start.ts to output multi-line JSON instead of single-line
+- Constructed JS objects for each MCP client config and used `JSON.stringify(obj, null, 2)` for formatting
+- Added an `indent` helper to prefix each JSON line with consistent padding
+- Moved config definitions into a data-driven `configs` array, reducing repetition
+- Each config block (Claude Code, OpenCode, Cursor, Windsurf) now prints as formatted, indented, copy-pasteable JSON
+- Files changed: platform/cli/src/commands/start.ts
+- **Learnings for future iterations:**
+  - `JSON.stringify(obj, null, 2)` produces clean multi-line JSON; combine with a line-based indent helper for terminal output
+  - Using a data-driven approach (`configs` array of `{label, file, json}`) reduces repetition when printing similar structured output for multiple clients
+  - The `pc.dim()` wrapper applies to the entire formatted JSON block — wrap each line, not just the first
+---
+
+## 2026-02-24 15:20 PST - US-017
+- Added warning message for unexpected errors in plugin list offline fallback
+- The empty `if (!isConnectionRefused(err))` block now logs a dim message: "Could not reach server: <error>. Showing offline data."
+- Added `toErrorMessage` import from `@opentabs-dev/shared` for consistent error formatting
+- Connection-refused errors (server not running) still silently fall through to offline mode
+- Files changed: platform/cli/src/commands/plugin.ts
+- **Learnings for future iterations:**
+  - The `toErrorMessage` utility from `@opentabs-dev/shared` is the canonical way to convert unknown errors to strings across the codebase
+  - Connection-refused errors are expected (server not running) and should be silent; all other errors should at least show a dim warning
+---
+
+## 2026-02-24 15:15 PST - US-016
+- Updated both `handleAuditFromFile` (file mode) and `handleAudit` (server mode) empty results messages
+- When filters are active (`plugin`, `tool`, or `since`), the message says: "No entries match the current filters. Try broadening the search."
+- When no filters are active, the message says: "No audit entries found. Invoke tools through an MCP client to generate audit entries."
+- Files changed: platform/cli/src/commands/audit.ts
+- **Learnings for future iterations:**
+  - The audit command has two code paths for displaying results: `handleAuditFromFile` (disk log) and `handleAudit` (server query) — both need the same empty-state treatment
+  - `AuditOptions` has `plugin`, `tool`, and `since` as filter fields — checking truthiness of any of them determines if filters are active
+---
+
+## 2026-02-24 15:25 PST - US-018
+- Added `skippedCount` counter to the NDJSON parsing loop in `handleAuditFromFile`
+- Increments on each `catch` (malformed JSON line)
+- After all output (table, JSON, or empty message), prints a dim note if any lines were skipped: "Note: N malformed log entry/entries was/were skipped."
+- Refactored the output section from early-return style to if/else to ensure the skipped warning prints in all code paths
+- Files changed: platform/cli/src/commands/audit.ts
+- **Learnings for future iterations:**
+  - When adding "after all output" messages, refactor early returns into if/else chains so the trailing message always runs
+  - Prettier enforces line length — long template literals with ternaries need to be wrapped in multi-line `console.log()` calls
+---
+
+## 2026-02-24 15:30 PST - US-019
+- Added `console.log(pc.dim('Server stopped.'))` message after the child process exits in `handleStart`
+- The message prints after the stream pipes complete and before `process.exit(exitCode)`, so it appears after all server output
+- The exit code is preserved — `process.exit(exitCode)` still runs with the child's exit code
+- Files changed: platform/cli/src/commands/start.ts
+- **Learnings for future iterations:**
+  - The server lifecycle in `handleStart`: spawn → tee stdout/stderr to terminal+logfile → wait for streams to end → await exit code → exit. The shutdown message goes between `await proc.exited` and `process.exit()`
+  - SIGINT is forwarded to the child process via `proc.kill('SIGINT')` on line 225 — the parent doesn't exit directly on SIGINT, it waits for the child to exit
+---
+
+## 2026-02-24 15:35 PST - US-020
+- Added `bun run dev` step to the "Next steps" output in `scaffoldPlugin`
+- Also added dim comments to both `bun run build` ("# compile once") and `bun run dev` ("# watch mode — auto-rebuild on changes") for clarity
+- The scaffolded template already has a `dev` script defined (concurrently running tsc --watch + opentabs-plugin build --watch)
+- Files changed: platform/cli/src/scaffold.ts
+- **Learnings for future iterations:**
+  - The scaffolded plugin template's `dev` script uses `concurrently` to run `tsc --watch` and `opentabs-plugin build --watch` in parallel
+  - Adding dim comments after cyan command text in "Next steps" output follows the pattern used in the README template (line 272)
+---
+
+## 2026-02-24 15:45 PST - US-021
+- Added `checkAuthSecret` function to doctor.ts that verifies auth.json exists and contains a valid secret
+- The function reuses `readAuthSecret()` from config.ts (reads from `~/.opentabs/extension/auth.json`)
+- Pass: auth.json exists with valid non-empty secret string → "Auth secret: valid"
+- Warn: auth.json missing, malformed, or has empty secret → shows path and suggests running `opentabs start`
+- Integrated as check #3 in `handleDoctor`, between config file and server health checks
+- The secret from `checkAuthSecret` is now passed to `checkServerHealth` (previously called `readAuthSecret` separately)
+- Exported `checkAuthSecret` for use in tests
+- Added 4 unit tests: valid secret, missing auth.json, empty secret, malformed JSON
+- Files changed: platform/cli/src/commands/doctor.ts, platform/cli/src/commands/doctor.test.ts
+- **Learnings for future iterations:**
+  - `checkAuthSecret` returns `{ result, secret }` so the secret can be reused by `checkServerHealth` without a second read
+  - The test uses `OPENTABS_CONFIG_DIR` env var override (already set by the test file) to control where `getExtensionDir()` resolves
+  - All doctor check functions follow the same pattern: return `{ result: CheckResult; ...extra }` for composability
+---
+
+## 2026-02-24 15:50 PST - US-022
+- Added `warnIfNotPlugin` helper function in plugin.ts that validates an installed npm package looks like an OpenTabs plugin
+- After a successful `npm install -g`, the function resolves the global node_modules path via `npm root -g`, reads the installed package's `package.json`, and checks for the `opentabs` field or `opentabs-plugin` keyword
+- If neither is found, prints a yellow warning; the install is not rolled back
+- Called between the success message and `notifyServer` in `handlePluginInstall`
+- Files changed: platform/cli/src/commands/plugin.ts
+- **Learnings for future iterations:**
+  - `npm root -g` gives the global node_modules directory path — combine with package name to find installed package.json
+  - The `opentabs` field in package.json is an object containing plugin metadata (displayName, etc.); its presence indicates a valid OpenTabs plugin
+  - The `opentabs-plugin` keyword in package.json keywords array is an alternative marker for valid plugins
+  - Validation errors are silently caught — if the package.json can't be read (e.g., npm root fails), skip validation rather than failing the install
+---
+
+## 2026-02-24 16:00 PST - US-023
+- Added tool name validation to `handleSetTool` in config.ts
+- After saving the config and printing confirmation, calls `fetchToolNames(port)` to check the tool name against the server's registered tools
+- If the server responds and the tool name is not in the list, prints a yellow warning: `Warning: "<name>" does not match any registered tool. Check the name or start the server.`
+- If the server is not running (fetchToolNames returns null), validation is silently skipped
+- The config is always saved regardless of validation result
+- Files changed: platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - `fetchToolNames(port)` returns `string[] | null` — null means server unreachable, empty array means no tools registered. Both cases should skip the warning.
+  - The validation happens after config write but before `notifyServer` — this is intentional so the warning appears between the confirmation and the server notification
+---
+
+## 2026-02-24 16:17 PST - US-024
+- Added path validation warnings to `handleSetLocalPluginsAdd` in config.ts
+- After saving the path to config, checks if the resolved path exists using `existsSync(pluginPath)`
+- If path doesn't exist, prints yellow warning: "Warning: Path does not exist: <path>"
+- If path exists but has no `package.json`, prints yellow warning: "Warning: No package.json found at <path>. Plugin may not load."
+- The path is always added to config regardless of warnings
+- Added `existsSync` import from `node:fs` (directory existence checks require Node.js API — `Bun.file().exists()` returns false for directories)
+- Files changed: platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - `Bun.file(path).exists()` returns `false` for directories — use `existsSync` from `node:fs` for directory existence checks
+  - `Bun.file(join(dirPath, 'file.json')).exists()` works correctly for checking file existence within a directory
+  - Validation warnings go between the success message and `notifyServer` call, following the pattern established in US-023 (tool name validation)
+---
+
+## 2026-02-24 15:20 PST - US-025
+- Added `isRunningFromSource()` helper to update.ts that detects dev vs installed context
+- Uses the same `node_modules` path heuristic as start.ts (US-006): if `import.meta.url` resolves to a path not containing `node_modules`, it's running from source
+- When running from source, prints a yellow warning: "You appear to be running from source. Use git pull to update instead." and returns early
+- When running from global npm install, proceeds with update normally
+- The check runs before any version checks or server status queries, so there's no unnecessary work in the dev case
+- Files changed: platform/cli/src/commands/update.ts
+- **Learnings for future iterations:**
+  - The `node_modules` path heuristic is now used in two places: start.ts (US-006) and update.ts (US-025). Both use `fileURLToPath(import.meta.url)` to resolve the CLI's location and check for `node_modules` in the path
+  - Workspace (monorepo) packages resolve to their source directories without `node_modules` in the path; npm-installed packages always resolve through `node_modules`
+---
+
+## 2026-02-24 16:25 PST - US-026
+- Added a dim hint message when `opentabs logs --plugin <name>` produces no output in non-follow mode
+- When the plugin filter is active and `tailFile` returns empty content, prints: `No log output found for plugin "<name>". Check the plugin name or ensure the plugin has produced log output.`
+- The hint only appears in non-follow mode (when `--follow` is not set) — in follow mode, the user is waiting for new output which is expected behavior
+- Files changed: platform/cli/src/commands/logs.ts
+- **Learnings for future iterations:**
+  - The `tailFile` function returns `{ content, fileSize }` — empty content means no matching lines were found in the last N lines of the file
+  - The `content` variable is falsy (empty string) when no lines match the filter, making it a clean condition for the hint check
+  - Follow mode runs forever and doesn't need a "no results" hint — the user expects to wait for new output
+---
+
+## 2026-02-24 16:30 PST - US-027
+- Updated config reset success message to use styled output with `pc.green()` and `pc.dim()`
+- The success message now shows the full config file path: `pc.green('Config file deleted:') + configPath`
+- The regeneration hint is on a separate line with dim styling: `pc.dim('Run opentabs start to regenerate.')`
+- Files changed: platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - The config reset handler is at `handleConfigReset` in config.ts — uses `getConfigPath()` for the path and `Bun.file().delete()` for deletion
+  - Success messages in this codebase use `pc.green()` for the action confirmation and `pc.dim()` for follow-up instructions
+---
+
+## 2026-02-24 16:35 PST - US-028
+- Added a dim hint to `handleListTools` in config.ts suggesting `opentabs plugin list` as an alternative when the server is not running
+- The hint appears after the existing error messages and before `process.exit(1)`
+- Files changed: platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - The `handleListTools` function is triggered when the user runs `opentabs config set tool.` (with just the prefix, no tool name)
+  - Dim hints (`pc.dim()`) are used for secondary/alternative suggestions throughout the CLI
+---
+
+## 2026-02-24 16:45 PST - US-029
+- Added `checkBrowser` function to doctor.ts that detects Chromium-based browser installations
+- macOS: checks `/Applications/` for Google Chrome, Chromium, Microsoft Edge, Brave Browser `.app` bundles
+- Linux: uses `which` to check for `google-chrome`, `chromium`, `chromium-browser`, `microsoft-edge` in PATH
+- Windows: checks `Program Files` and `Program Files (x86)` for Chrome, Edge, and Brave executables
+- Integrated as check #2 in `handleDoctor`, between Bun version and config file checks
+- Added 2 unit tests: label check and macOS-specific browser detection
+- Exported `checkBrowser` for test access
+- Files changed: platform/cli/src/commands/doctor.ts, platform/cli/src/commands/doctor.test.ts
+- **Learnings for future iterations:**
+  - `existsSync` from `node:fs` works for both directories and files — used for macOS `.app` bundles and Windows `.exe` files
+  - `Bun.spawnSync` with `['which', cmd]` is a simple way to check if a command is in PATH on Linux
+  - Doctor check functions follow the pattern: return `CheckResult` (pass/warn/fail) — browser check uses `warn` (not `fail`) for missing browser since the user might be configuring remotely
+  - Ternary chains need explicit line breaks for prettier compliance
+---
+
+## 2026-02-24 16:55 PST - US-030
+- Replaced hard-coded 60-char description truncation with terminal-width-adaptive truncation in `handlePluginSearch`
+- Uses `process.stdout.columns || 80` to get terminal width
+- Computes per-result overhead (indent + label + name + version + " — " + " by " + author) and takes the max across all results
+- Description width = `Math.max(30, termWidth - maxOverhead)` — ensures minimum 30 chars even on narrow terminals
+- Falls back to 80 columns (resulting in ~50-60 char description) when `process.stdout.columns` is unavailable
+- Files changed: platform/cli/src/commands/plugin.ts
+- **Learnings for future iterations:**
+  - `process.stdout.columns` returns `undefined` when not attached to a TTY (e.g., piped output) — always provide a fallback
+  - Prettier enforces no parens around single arrow function params — `results.map(pkg => ...)` not `results.map((pkg) => ...)`
+  - ANSI escape codes in labels (e.g., `pc.blue('[official]')`) don't affect character counting since we compute overhead from the plain text lengths
+---

@@ -1,0 +1,87 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add a stat-based safety net to the file watcher system. fs.watch() is known to go stale on both macOS (FSEvents bug in long-running Bun processes) and Linux (inotify limits). Currently, when a watcher goes stale, plugin changes are silently ignored with zero detection. This PRD adds periodic mtime polling as a fallback that guarantees plugin changes are detected within 30 seconds even when fs.watch() fails.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add mtime tracking to file watcher state",
+      "description": "As a platform developer, I want the file watcher to record the last-seen mtime of each watched file so that a periodic check can detect changes that fs.watch() missed.",
+      "acceptanceCriteria": [
+        "FileWatcherEntry in state.ts includes a lastSeenMtimes field: Map<string, number> mapping file paths to mtimeMs values",
+        "When startFileWatching sets up watchers for a plugin, it stats opentabs-plugin.json and dist/adapter.iife.js and records their initial mtimes",
+        "When handleIifeChange and handleManifestChange successfully process a file, they update the mtime in lastSeenMtimes",
+        "When handlePendingPluginChange successfully discovers a plugin, its mtimes are recorded",
+        "The config watcher records config.json mtime in a configLastSeenMtime field on ServerState",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Files: platform/mcp-server/src/state.ts, platform/mcp-server/src/file-watcher.ts. Add lastSeenMtimes as a Map<string, number> to FileWatcherEntry (state.ts). Add configLastSeenMtime: number | null to ServerState (state.ts), default null. In startFileWatching (file-watcher.ts:337), after calling watchPlugin, stat the manifest and IIFE paths with statSync from node:fs, store the mtimeMs. In handleIifeChange after successful read (~line 109), stat the file and update. Same for handleManifestChange (~line 216) and handlePendingPluginChange. For config: in startConfigWatching (~line 297), stat config.json and store on state.configLastSeenMtime. Use statSync (not async) since these are one-off calls alongside the sync fs.watch setup."
+    },
+    {
+      "id": "US-002",
+      "title": "Implement periodic mtime polling as fs.watch fallback",
+      "description": "As a developer, I want the MCP server to periodically check file mtimes so that stale fs.watch() watchers don't silently ignore my plugin changes.",
+      "acceptanceCriteria": [
+        "A new startMtimePolling function runs a setInterval every 30 seconds",
+        "Each tick stats every watched file (manifest, IIFE) and config.json",
+        "If a file's mtimeMs is newer than lastSeenMtimes, the appropriate handler is called (handleManifestChange, handleIifeChange, or onConfigChanged)",
+        "The mtime is updated after the handler fires to prevent re-triggering on the next tick",
+        "Files that don't exist (stat throws ENOENT) are silently skipped",
+        "The polling timer is stored on ServerState and cleaned up by stopFileWatching",
+        "The polling interval is a named constant (MTIME_POLL_INTERVAL_MS = 30_000)",
+        "A log line is emitted when polling detects a change that fs.watch missed, including the file path and old/new mtime",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/file-watcher.ts, platform/mcp-server/src/state.ts. Add mtimePollTimerId: ReturnType<typeof setInterval> | null to ServerState, default null. Add MTIME_POLL_INTERVAL_MS = 30_000 constant. Create startMtimePolling(state, callbacks) that sets up the interval. Each tick: (1) for each FileWatcherEntry, stat manifest path (join(pluginDir, 'opentabs-plugin.json')) and IIFE path (join(pluginDir, 'dist', 'adapter.iife.js')), compare mtimeMs to lastSeenMtimes, call handleManifestChange/handleIifeChange if newer. (2) stat config.json (getConfigDir() + '/config.json'), compare to state.configLastSeenMtime, call callbacks.onConfigChanged if newer. Wrap each stat in try/catch (ENOENT = file doesn't exist = skip). Call startMtimePolling from startFileWatching after setting up fs.watch watchers. In stopFileWatching, clearInterval(state.mtimePollTimerId). The handlers already debounce and check fileWatcherGeneration, so calling them from polling is safe — they won't double-fire with fs.watch events because the debounce key deduplicates."
+    },
+    {
+      "id": "US-003",
+      "title": "Expose watcher health in /health endpoint",
+      "description": "As a developer debugging plugin issues, I want the /health endpoint to report whether the file watcher is healthy so that I can tell when watchers have gone stale.",
+      "acceptanceCriteria": [
+        "The /health response includes a fileWatcher object with: { watchedPlugins: number, pendingPlugins: number, lastPollAt: number | null, pollDetections: number }",
+        "watchedPlugins is the count of FileWatcherEntry items with active watchers",
+        "pendingPlugins is the count of pending (failed-discovery) plugin paths being watched",
+        "lastPollAt is the timestamp of the last mtime polling tick (null if polling hasn't run yet)",
+        "pollDetections is a running count of times polling detected a change that fs.watch missed",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Files: platform/mcp-server/src/state.ts, platform/mcp-server/src/http-routes.ts, platform/mcp-server/src/file-watcher.ts. Add to ServerState: mtimeLastPollAt: number | null (default null), mtimePollDetections: number (default 0). In the polling tick (US-002), set state.mtimeLastPollAt = Date.now() at the start of each tick, increment state.mtimePollDetections each time a stale-watcher change is detected. In the /health handler (http-routes.ts), add fileWatcher: { watchedPlugins: state.fileWatcherEntries.length, pendingPlugins: count entries that are pending type, lastPollAt: state.mtimeLastPollAt, pollDetections: state.mtimePollDetections }. The pendingPlugins count requires distinguishing pending vs loaded entries — either add a type field to FileWatcherEntry or count entries where the pluginName is NOT in state.plugins."
+    },
+    {
+      "id": "US-004",
+      "title": "Log warning when polling detects repeated stale-watcher events",
+      "description": "As a developer, I want the server to warn me when file watchers appear to be consistently stale so that I know to restart the server.",
+      "acceptanceCriteria": [
+        "If polling detects 3 or more changes within a 5-minute window, a warning is logged: 'File watchers may be stale — detected N changes via polling that fs.watch missed. Consider restarting the MCP server.'",
+        "The warning is logged at most once per 5-minute window (not on every detection)",
+        "The warning threshold and window are named constants",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/file-watcher.ts. Add constants STALE_WATCHER_THRESHOLD = 3 and STALE_WATCHER_WINDOW_MS = 5 * 60 * 1000. Track detections in a simple array of timestamps on state (or module-level since this doesn't need to survive hot reload — actually use state for hot-reload safety). Add mtimePollDetectionTimestamps: number[] to ServerState. On each polling detection, push Date.now(). In the check: filter to timestamps within the window, if length >= threshold and no warning has been logged in this window, log the warning. The warning should be log.warn so it shows up in opentabs logs output. Keep the detection timestamps array bounded (e.g., only keep last 20 entries) to prevent unbounded growth."
+    }
+  ]
+}

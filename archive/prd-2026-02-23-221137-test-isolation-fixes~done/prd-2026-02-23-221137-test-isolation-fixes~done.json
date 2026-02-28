@@ -1,0 +1,94 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three test isolation issues: (1) move ensureSdkVersionInManifest() from per-test fixtures to global-setup.ts to eliminate a race condition when parallel workers write to the same source-tree file, (2) deduplicate getConfigDir/getConfigPath in plugin-management.ts by importing from @opentabs-dev/shared, (3) add safety guards preventing tests from accidentally running against the real ~/.opentabs directory, and (4) expand EXTENSION_COPY_EXCLUDE_PATTERN to exclude storybook artifacts that cause flaky ENOENT failures during parallel cpSync.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Move ensureSdkVersionInManifest from fixtures.ts to global-setup.ts",
+      "description": "As a developer, I want ensureSdkVersionInManifest to run once before test workers spawn so that parallel workers don't race on writing plugins/e2e-test/dist/tools.json simultaneously.",
+      "acceptanceCriteria": [
+        "ensureSdkVersionInManifest function is defined in e2e/global-setup.ts and called from the globalSetup() function",
+        "ensureSdkVersionInManifest function and all calls to it are removed from e2e/fixtures.ts",
+        "The PLUGIN_SDK_PKG_PATH constant in e2e/fixtures.ts is removed (it was only used by ensureSdkVersionInManifest)",
+        "global-setup.ts uses Node.js fs APIs (readFileSync, writeFileSync, existsSync) since it runs under Playwright's Node.js runner",
+        "readPluginToolNames() in e2e/fixtures.ts no longer calls ensureSdkVersionInManifest",
+        "copyE2eTestPlugin() in e2e/fixtures.ts no longer calls ensureSdkVersionInManifest",
+        "Comments on readPluginToolNames and copyE2eTestPlugin are updated to explain sdkVersion is patched in global-setup.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In e2e/fixtures.ts, the function `ensureSdkVersionInManifest` (defined around line 91) patches `plugins/e2e-test/dist/tools.json` in the source tree to add an sdkVersion field. It is called from `readPluginToolNames()` (around line 226) and `copyE2eTestPlugin()` (around line 385). With `fullyParallel: true` and 8 workers in playwright.config.ts, multiple workers can race on this write.\n\nThe fix: Move the function into `e2e/global-setup.ts` which runs exactly once in the main process before any test workers are spawned. The function should use Node.js APIs (readFileSync, writeFileSync, existsSync from node:fs) since global-setup runs under Playwright's Node.js runner, not Bun. The SDK version should be read from `platform/plugin-sdk/package.json`. The tools.json path is `plugins/e2e-test/dist/tools.json`.\n\nIn global-setup.ts, call ensureSdkVersionInManifest() after the existing REQUIRED_FILES check. Add path constants: `const PLUGIN_SDK_PKG_PATH = resolve('platform/plugin-sdk/package.json');`\n\nIn fixtures.ts, remove the `ensureSdkVersionInManifest` function definition, remove the `PLUGIN_SDK_PKG_PATH` constant (line ~74), and remove both call sites. Update the JSDoc comments on `readPluginToolNames` and `copyE2eTestPlugin` to note that sdkVersion is patched once in global-setup.ts."
+    },
+    {
+      "id": "US-002",
+      "title": "Deduplicate getConfigDir/getConfigPath in plugin-management.ts",
+      "description": "As a developer, I want plugin-management.ts to import getConfigDir and getConfigPath from @opentabs-dev/shared instead of duplicating them locally, so there is a single source of truth for config path resolution.",
+      "acceptanceCriteria": [
+        "getConfigDir and getConfigPath are imported from @opentabs-dev/shared in plugin-management.ts",
+        "The local duplicate definitions of getConfigDir and getConfigPath (with the 'Duplicated from config.ts' comment) are removed from plugin-management.ts",
+        "The homedir import from node:os is preserved (it is still used elsewhere in the file for ~/path expansion)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/plugin-management.ts around line 352, there are local definitions:\n```\nconst getConfigDir = (): string => Bun.env.OPENTABS_CONFIG_DIR || join(homedir(), '.opentabs');\nconst getConfigPath = (): string => join(getConfigDir(), 'config.json');\n```\nWith a comment saying 'Duplicated from config.ts to avoid circular dependencies'. This is outdated — these functions are in @opentabs-dev/shared, which the file already imports from (line 11: `import { atomicWrite, platformExec } from '@opentabs-dev/shared';`).\n\nThe fix: Add `getConfigDir, getConfigPath` to the existing @opentabs-dev/shared import, and delete the local definitions plus the comment block above them. Keep the `homedir` import from node:os — it is still used on line ~398 for `~/` path expansion in removeLocalPlugin."
+    },
+    {
+      "id": "US-003",
+      "title": "Add safety guards against accidental host config access in tests",
+      "description": "As a developer, I want E2E tests to fail fast if they accidentally target the real ~/.opentabs directory, so that tests never corrupt my host machine's configuration.",
+      "acceptanceCriteria": [
+        "e2e/global-setup.ts has an assertNotRealConfigDir() function that throws if OPENTABS_CONFIG_DIR points to ~/.opentabs",
+        "assertNotRealConfigDir() is called at the start of the globalSetup() function, before other checks",
+        "startMcpServer() in e2e/fixtures.ts rejects the promise if configDir resolves to ~/.opentabs",
+        "The guard uses path.resolve() for comparison to handle symlinks and trailing slashes",
+        "global-setup.ts imports homedir from node:os and join, resolve from node:path",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Two guard locations:\n\n1. In e2e/global-setup.ts: Add a function `assertNotRealConfigDir` that checks `process.env['OPENTABS_CONFIG_DIR']`. If set and `resolve(configDir) === resolve(join(homedir(), '.opentabs'))`, throw an Error explaining the issue. Call this at the start of `globalSetup()`. Import `homedir` from `node:os` and `join, resolve` from `node:path` (global-setup.ts already imports `resolve` from `node:path` — add `join` to that import and add the `homedir` import).\n\n2. In e2e/fixtures.ts, in the `startMcpServer` function (around line 510): At the top of the `new Promise` callback, add a guard that checks `path.resolve(configDir) === path.resolve(path.join(os.homedir(), '.opentabs'))`. If true, call `reject(new Error(...))` and `return`. The function already has `os` and `path` imported."
+    },
+    {
+      "id": "US-004",
+      "title": "Expand EXTENSION_COPY_EXCLUDE_PATTERN to exclude storybook and non-runtime artifacts",
+      "description": "As a developer, I want the extension copy filter to exclude .storybook, storybook-static, build scripts, package.json, and CLAUDE.md so that cpSync does not fail with ENOENT when storybook-static is being modified by another process during parallel test runs.",
+      "acceptanceCriteria": [
+        "EXTENSION_COPY_EXCLUDE_PATTERN in platform/shared/src/index.ts matches .storybook and storybook-static directories",
+        "EXTENSION_COPY_EXCLUDE_PATTERN matches build-*.ts files (e.g., build-extension.ts, build-side-panel.ts)",
+        "EXTENSION_COPY_EXCLUDE_PATTERN matches package.json at root level",
+        "EXTENSION_COPY_EXCLUDE_PATTERN matches CLAUDE.md at root level",
+        "EXTENSION_COPY_EXCLUDE_PATTERN still excludes node_modules, src, .git, and tsconfig* (existing behavior preserved)",
+        "EXTENSION_COPY_EXCLUDE_PATTERN does NOT match dist, manifest.json, icons, side-panel, or offscreen (runtime files preserved)",
+        "The comment above the pattern is updated to list all exclusion categories",
+        "Validation tests in platform/shared/src/validation.test.ts are updated with test cases for .storybook, storybook-static, build-extension.ts, build-side-panel.ts, package.json, CLAUDE.md, offscreen, and offscreen/offscreen.html",
+        "createExtensionCopy in e2e/fixtures.ts uses the same regex pattern (inline, with a comment referencing EXTENSION_COPY_EXCLUDE_PATTERN as the canonical source) and uses path.relative for comparison like extension-install.ts does",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "The flaky E2E test failure is: `ENOENT: no such file or directory, copyfile '.../storybook-static/index.json' -> '...'` in createExtensionCopy (e2e/fixtures.ts:835). The storybook-static directory is not needed by Chrome at runtime but gets copied because the filter is too permissive.\n\nThree changes needed:\n\n1. **platform/shared/src/index.ts line 340**: Update the regex to:\n```\n/(?:^|[\\/])(?:node_modules|src|\\.git|\\.storybook|storybook-static)(?:[\\/]|$)|(?:^|[\\/])tsconfig[^/\\\\]*|(?:^|[\\/])build-[^/\\\\]*\\.ts$|(?:^|[\\/])package\\.json$|(?:^|[\\/])CLAUDE\\.md$/\n```\nUpdate the comment above it to describe all exclusion categories.\n\n2. **platform/shared/src/validation.test.ts**: Add test cases to the existing EXTENSION_COPY_EXCLUDE_PATTERN describe block. Add a new describe for 'storybook exclusions' with tests for '.storybook', '.storybook/main.ts', 'storybook-static', 'storybook-static/index.json'. Add a describe for 'build script and metadata exclusions' with tests for 'build-extension.ts', 'build-side-panel.ts', 'package.json', 'CLAUDE.md'. Add 'offscreen' and 'offscreen/offscreen.html' to the NOT-excluded tests.\n\n3. **e2e/fixtures.ts line ~835**: Replace the inline filter regex with the same expanded pattern. The E2E test cannot import from @opentabs-dev/shared (it uses Bun.env internally), so define the regex inline with a comment: `// This filter mirrors EXTENSION_COPY_EXCLUDE_PATTERN from @opentabs-dev/shared.` Change the filter callback to use `path.relative(EXTENSION_DIR, source)` for comparison (matching the pattern used in extension-install.ts), where empty string means the root directory itself (always include it):\n```typescript\nconst excludePattern = /...same regex.../;\nfs.cpSync(EXTENSION_DIR, extensionDir, {\n  recursive: true,\n  filter: (source: string) => {\n    const rel = path.relative(EXTENSION_DIR, source);\n    return rel === '' || !excludePattern.test(rel);\n  },\n});\n```"
+    }
+  ]
+}

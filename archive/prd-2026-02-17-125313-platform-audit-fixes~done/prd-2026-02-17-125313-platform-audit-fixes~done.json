@@ -1,0 +1,126 @@
+{
+  "project": "OpenTabs Platform Audit Fixes",
+  "description": "Fix remaining defects from the full platform audit: tab dispatch readiness fallback, missing E2E tests for critical paths, side panel error boundary, plugin SDK unit tests, and CLAUDE.md documentation correction.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix CLAUDE.md incorrect extension loading instruction",
+      "description": "As a developer, I want the CLAUDE.md setup instructions to reference the correct directory for loading the Chrome extension, so that I can follow the docs without failure.",
+      "acceptanceCriteria": [
+        "CLAUDE.md 'Loading the Extension' section says to select `platform/browser-extension` (NOT `platform/browser-extension/dist`)",
+        "The instruction matches reality: manifest.json is at browser-extension root and references dist/ paths relative to itself",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: CLAUDE.md, under '### Loading the Extension'. Step 4 currently says 'Load unpacked → select `platform/browser-extension/dist` folder'. The manifest.json is at `platform/browser-extension/manifest.json` and references `dist/background.js` relative to itself. The correct instruction is 'Load unpacked → select `platform/browser-extension` folder'. Simple one-line text fix."
+    },
+    {
+      "id": "US-002",
+      "title": "Add React error boundary to side panel",
+      "description": "As a user, I want the side panel to show a recoverable error state instead of white-screening when a rendering error occurs, so that I can recover without manually reopening the panel.",
+      "acceptanceCriteria": [
+        "A top-level ErrorBoundary component wraps the App content in side-panel/index.tsx or App.tsx",
+        "The ErrorBoundary catches render errors and displays a 'Something went wrong' message with a 'Reload' button",
+        "The 'Reload' button calls window.location.reload() to recover the panel",
+        "The ErrorBoundary is a class component (React error boundaries require componentDidCatch/getDerivedStateFromError)",
+        "The error boundary does NOT catch errors in event handlers (React limitation — this is expected)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/App.tsx or a new ErrorBoundary component. The side panel uses React 19. Create a minimal class component ErrorBoundary with getDerivedStateFromError (sets hasError state) and a render method that shows a fallback UI when hasError is true. Style it with the existing Tailwind classes used in the side panel (dark theme: bg-gray-900 text-gray-200). Wrap <App /> in index.tsx with <ErrorBoundary>. Keep it minimal — no error reporting, just catch + reload button. Follow the existing component patterns in side-panel/components/."
+    },
+    {
+      "id": "US-003",
+      "title": "Add plugin SDK unit tests",
+      "description": "As a platform maintainer, I want the plugin SDK's public API to have unit test coverage, so that refactors don't silently break the contract with plugin authors.",
+      "acceptanceCriteria": [
+        "platform/plugin-sdk/src/index.test.ts exists with tests for ToolError and defineTool",
+        "ToolError test: constructor sets .message, .code, and .name correctly",
+        "ToolError test: instanceof Error returns true",
+        "defineTool test: returns the same config object passed in (identity function)",
+        "defineTool test: returned object has name, description, input, output, handle properties",
+        "Re-export test: validatePluginName, validateUrlPattern, NAME_REGEX, RESERVED_NAMES are importable from the SDK",
+        "platform/plugin-sdk/tsconfig.test.json exists and covers the test file",
+        "Root tsconfig.json references the new tsconfig.test.json",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Follow the exact pattern from platform/shared/tsconfig.test.json for the test tsconfig. The test file should import from './index.js' (ESM). Use bun:test (import { describe, test, expect } from 'bun:test'). For defineTool, create a minimal Zod schema: z.object({ msg: z.string() }) for input and z.object({ ok: z.boolean() }) for output. The handle function can be a stub: async (params) => ({ ok: true }). For re-exports, just verify they are defined (typeof validatePluginName === 'function', etc.). Add the tsconfig.test.json reference to both platform/plugin-sdk/tsconfig.json (as a project reference) and the root tsconfig.json."
+    },
+    {
+      "id": "US-004",
+      "title": "Tool dispatch falls back to other matching tabs when best tab is not ready",
+      "description": "As a user with multiple matching tabs (e.g., Slack login page + Slack workspace), I want tool dispatch to try other matching tabs when the best-ranked tab is not ready, so that tools work when any matching tab is ready.",
+      "acceptanceCriteria": [
+        "handleToolDispatch in tool-dispatch.ts tries alternative matching tabs when the first tab returns isReady=false or adapter-not-ready errors",
+        "findMatchingTab still returns the best-ranked tab first (ranking logic unchanged)",
+        "A new helper (e.g., findAllMatchingTabs) returns all matching tabs in ranked order for fallback iteration",
+        "computePluginTabState in tab-state.ts reports 'ready' if ANY matching tab is ready (not just the best-ranked one)",
+        "If no matching tab is ready, the original 'unavailable' state is still reported",
+        "If no matching tab exists, the original 'closed' state is still reported",
+        "Existing E2E tests continue to pass (single-tab scenarios unchanged)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Files: platform/browser-extension/src/tool-dispatch.ts, platform/browser-extension/src/tab-state.ts, platform/browser-extension/src/tab-matching.ts.\n\nIn tab-matching.ts: add a `findAllMatchingTabs` export that returns all matching tabs sorted by rank (same ranking as findMatchingTab). Keep findMatchingTab as-is (it can call findAllMatchingTabs internally and return the first).\n\nIn tool-dispatch.ts: after getting the best tab from findMatchingTab and executing the script, if the result is an adapter-not-ready error (code -32002 with isReady=false message), get all matching tabs via findAllMatchingTabs and try the remaining ones in order. If any succeeds, return that result. If all fail, return the original error from the best tab.\n\nIn tab-state.ts computePluginTabState: use findAllMatchingTabs. If the best tab is not ready, check remaining tabs. Return 'ready' with the first ready tab's info. Only return 'unavailable' if ALL matching tabs are unavailable.\n\nKeep the logic simple — the fallback loop is just: for each remaining tab, run the same executeScript check. Stop at first success."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test for tab closing during active in-flight tool dispatch",
+      "description": "As a platform maintainer, I want E2E coverage for the case where a tab is closed while a tool call is actively executing, so that the error handling path in tool-dispatch.ts is verified.",
+      "acceptanceCriteria": [
+        "New test in e2e/edge-cases.e2e.ts: starts a slow tool dispatch, closes the tab mid-execution, verifies MCP client gets a clean error (not a 30s timeout)",
+        "The error message indicates the tab was closed (not a generic script failure)",
+        "A subsequent tool call after reopening the tab succeeds",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: e2e/edge-cases.e2e.ts. Use the e2e-test plugin's get_status tool with the test server in slow mode (e.g., 10s delay — long enough to close the tab, short enough to not hit the 25s SCRIPT_TIMEOUT_MS). Pattern:\n1. Set test server slow mode to 10000ms\n2. Fire tool call (don't await)\n3. Wait ~1s for the script to start executing\n4. Close the tab via page.close() or browser_close_tab\n5. Await the tool call result — should be isError: true with a message containing 'No tab with id' or 'Tab closed'\n6. Reset slow mode, reopen tab, verify a normal tool call succeeds\n\nThe catch block in tool-dispatch.ts:211-222 detects 'No tab with id' and 'Cannot access' errors and returns code -32001. This test verifies that path."
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test for MCP session invalidation after close",
+      "description": "As a platform maintainer, I want E2E coverage verifying that closing an MCP session and creating a new one works cleanly, so that session lifecycle is verified end-to-end.",
+      "acceptanceCriteria": [
+        "New test in e2e/edge-cases.e2e.ts: establishes MCP session, calls a tool successfully, closes the session, creates a new session, and verifies tool calls work on the new session",
+        "The test verifies the server handles session cleanup without affecting other sessions",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: e2e/edge-cases.e2e.ts. Use the createMcpClient helper from fixtures.ts. Pattern:\n1. Create MCP client A, initialize, call browser_list_tabs — verify success\n2. Close client A (await mcpClientA.close())\n3. Create MCP client B on the same server port, initialize\n4. Call browser_list_tabs on client B — verify success\n5. Close client B\n\nThis tests that the MCP server's session management (StreamableHTTPServerTransport) handles session creation and cleanup correctly. The server's stale session sweep timer and sessionTransportIds WeakMap should handle cleanup. The key verification is that the new session works — no stale state from the old session interferes."
+    }
+  ]
+}

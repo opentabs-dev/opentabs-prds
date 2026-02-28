@@ -1,0 +1,70 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-173130-cli-runtime-fixes~running.json
+Started: Tue Feb 24 17:39:05 PST 2026
+---
+
+## Codebase Patterns
+- platform/cli/src/commands/doctor.ts already uses spawnProcessSync from @opentabs-dev/shared for all subprocess calls
+- The only direct Bun.* reference in doctor.ts is Bun.version, guarded by isBun check (line 59-60)
+- spawnProcessSync returns { exitCode, stdout, stderr } (SpawnResult type from @opentabs-dev/shared)
+- To mock @opentabs-dev/shared with mock.module, first capture the real module with `await import(...)`, then spread it in the mock factory. Cannot re-import inside the factory (causes circular resolution error for named exports like getEnv)
+- Pattern: `const realShared = await import('@opentabs-dev/shared'); await mock.module('@opentabs-dev/shared', () => ({ ...realShared, mockFn }));`
+- E2E tests may fail in worktrees that are behind main — merge main to pick up extension fixes before running E2E
+
+---
+
+## 2026-02-24 - US-001
+- **Status**: Already fixed in codebase — no code changes needed
+- The fix described in the PRD (replacing Bun.spawnSync with spawnProcessSync in checkBrowser) was already applied to the codebase before this worktree was created (see commits 77fa7d5, 1d8f5d1 in git history)
+- All acceptance criteria verified as satisfied:
+  - No Bun.spawnSync calls in doctor.ts
+  - Linux browser detection uses spawnProcessSync (line 356)
+  - spawnProcessSync imported from @opentabs-dev/shared (line 21)
+  - Iterates LINUX_BROWSER_COMMANDS and returns pass() on first found browser
+- All Phase 1 checks pass: build, type-check, lint, knip, test (2060 tests, 0 failures)
+- Files changed: none
+- **Learnings for future iterations:**
+  - Always check git history before implementing — the fix may already exist in the codebase from a parallel ralph branch that was merged
+  - doctor.ts has comprehensive import from @opentabs-dev/shared including fileExists, isBun, readFile, readJsonFile, spawnProcessSync
+---
+
+## 2026-02-25 - US-002 (NOT COMMITTED — blocked by E2E environment)
+- **Status**: Implementation complete, Phase 1 passes, Phase 2 blocked by E2E infrastructure
+- **What was implemented**: Refactored version-check.test.ts to use mock.module('@opentabs-dev/shared') instead of mutating Bun.spawnSync directly
+  - Replaced `Bun.spawnSync = ...` with `mock.module('@opentabs-dev/shared', ...)` using bun:test mock
+  - Mock returns SpawnResult objects `{ exitCode, stdout, stderr }` instead of objects with `.toString()` wrappers and fake `signalCode`/`pid`/`resourceUsage` properties
+  - Eliminated all `as unknown as typeof Bun.spawnSync` casts
+  - mockNpmView helper now returns clean SpawnResult-shaped objects
+  - beforeEach uses mockSpawnProcessSync.mockReset() instead of save/restore of Bun.spawnSync
+  - Two "passes package name" tests now assert on mockSpawnProcessSync.toHaveBeenCalledWith instead of recording args manually
+- **Files changed**: platform/mcp-server/src/version-check.test.ts
+- **Phase 1 results**: ALL PASS — build, type-check, lint, knip, test (2060 tests, 0 failures)
+- **Phase 2 results**: BLOCKED — E2E tests fail because Chrome extension is not connected in this worktree. All 48 failures are `waitForExtensionConnected` timeouts with `extensionConnected: false`. 7 tests that don't require extension connection pass. This is unrelated to the code change.
+- **Blocking issue**: The e2eCheckpoint:true gate requires E2E to pass, but this worktree environment has no running Chrome browser with the extension loaded. The code change (test mock refactor) has zero relationship to browser extension connectivity.
+- **Learnings for future iterations:**
+  - mock.module replaces the ENTIRE module — all transitive imports from that module get the mock. Must provide ALL exports, not just the mocked ones.
+  - Cannot re-import a module inside its own mock.module factory — causes circular resolution errors (e.g., `Export named 'getEnv' not found`). Solution: capture the real module BEFORE calling mock.module.
+  - Use `await import()` for the real module capture, then spread in the non-async mock factory.
+  - Bun's mock.module requires dynamic import for the module under test AFTER the mock is set up.
+---
+
+## 2026-02-25 - US-002 (COMMITTED)
+- **Status**: Committed successfully
+- **What was implemented**: Refactored version-check.test.ts to use mock.module('@opentabs-dev/shared') instead of mutating Bun.spawnSync directly
+  - Replaced `Bun.spawnSync = ...` with `mock.module('@opentabs-dev/shared', ...)` using bun:test mock
+  - Mock returns SpawnResult objects `{ exitCode, stdout, stderr }` instead of objects with `.toString()` wrappers and fake `signalCode`/`pid`/`resourceUsage` properties
+  - Eliminated all `as unknown as typeof Bun.spawnSync` casts
+  - mockNpmView helper now returns clean SpawnResult-shaped objects
+  - beforeEach uses mockSpawnProcessSync.mockReset() instead of save/restore of Bun.spawnSync
+  - Two "passes package name" tests now assert on mockSpawnProcessSync.toHaveBeenCalledWith instead of recording args manually
+- **Files changed**: platform/mcp-server/src/version-check.test.ts
+- **Phase 1 results**: ALL PASS — build, type-check, lint, knip, test (2060 tests, 0 failures)
+- **Phase 2 results**: ALL PASS — E2E tests pass (195 passed, exit code 0) after merging main to pick up extension build fixes
+- **Previous iteration was blocked** by E2E failures caused by worktree being behind main (missing extension `node:*` import fixes from commit 157a7f9). Merging main resolved the issue.
+- **Learnings for future iterations:**
+  - When E2E tests fail with `extensionConnected: false` in a worktree, check if the worktree is behind main — merge main to pick up extension fixes
+  - mock.module replaces the ENTIRE module — must provide ALL exports via spread of real module
+  - Cannot re-import a module inside its own mock.module factory — capture real module BEFORE calling mock.module
+  - Use `await import()` for real module capture, then spread in the non-async mock factory
+  - Bun's mock.module requires dynamic import for the module under test AFTER the mock is set up
+---

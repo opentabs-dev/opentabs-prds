@@ -1,0 +1,264 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-221428-ux-improvements~running.json
+Started: Fri Feb 20 22:14:29 PST 2026
+---
+
+## Codebase Patterns
+- Config type `OpentabsConfig` is in `platform/mcp-server/src/config.ts` — the MCP server's config module
+- CLI has its own config helpers in `platform/cli/src/config.ts` — separate from the MCP server's config
+- The CLI helper `getLocalPluginsFromConfig` reads raw JSON, while the MCP server's `parseConfigRecord` does full validation
+- `config.plugins` in `state.registry.plugins` refers to the Map of RegisteredPlugin objects, NOT the config field — don't confuse them
+- Test files that use CLI commands via `runCli()` read config via `readTestConfig()` which returns raw JSON — field names must match what the CLI writes
+- Doctor tests call `checkPlugins()` directly — the function reads `localPlugins` from the raw config object passed in
+- The `create-plugin` package auto-registers scaffolded plugins in `localPlugins` via `scaffold.ts`'s `autoRegisterPlugin`
+- `Bun.spawnSync` has overloaded signatures — mocking it requires casting through a spread+unknown pattern rather than direct `mock((args: string[]) => ...)` which doesn't match the overload types
+- JSDoc comments with backtick-quoted text containing `*/` (e.g., `` `@*/opentabs-plugin-*` ``) will prematurely terminate the comment block — avoid `*/` inside backtick-quoted text in JSDoc
+- `RegisteredPlugin` and `LoadedPlugin` both have a `source: PluginSource` field ('npm' | 'local') — all test factory functions that construct these types need to include `source: 'local' as const`
+- When adding a required field to a widely-used interface (e.g., `RegisteredPlugin`), search for all `makePlugin`/`createPlugin` test helpers across the entire test suite — there are multiple independent ones scoped within different `describe` blocks
+- `plugin-tools` is standalone — cannot import from CLI or MCP server packages. Config helpers must be duplicated as lightweight versions in `build.ts`
+- `OPENTABS_CONFIG_DIR` env var is used across all packages (MCP server, CLI, plugin-tools) for test isolation of config paths
+- The `import-x/exports-last` rule requires all exports at the end of the file — use `export { ... }` blocks, not inline `export const/interface`
+- `installExtension()` in `setup.ts` is reusable — takes configDir as parameter, returns `InstallExtensionResult` with installed/firstTime/extensionDest/version
+
+---
+
+## 2026-02-21 - US-001
+- Replaced `plugins: string[]` with `localPlugins: string[]` in `OpentabsConfig` interface
+- Updated `parseConfigRecord` with migration logic: old `plugins` array has local paths extracted into `localPlugins`, npm packages dropped with log notice; `npmPlugins` entries also dropped
+- Updated `loadConfig` default config template to use `localPlugins`
+- Updated `saveToolConfig` to preserve `localPlugins` instead of `plugins`
+- Updated `reload.ts`: `config.localPlugins` instead of `config.plugins`
+- Updated CLI `config.ts`: renamed `getPluginsFromConfig` → `getLocalPluginsFromConfig`
+- Updated CLI commands: `config.ts`, `plugin.ts`, `doctor.ts`, `scaffold.ts`
+- Updated all unit tests: `config.test.ts` (MCP server), `config.test.ts` (CLI), `plugin.test.ts`, `doctor.test.ts`, `index.test.ts` (create-plugin)
+- Files changed: 12 files across platform/mcp-server, platform/cli, platform/create-plugin
+- **Learnings for future iterations:**
+  - The `replace_all` Edit flag is useful for bulk renames but doesn't catch string literals inside test data objects — need to manually review test fixtures
+  - Multiple test files reference config fields via raw JSON (e.g., `config.plugins as string[]`) rather than typed interfaces — these are easy to miss
+  - The linter auto-fixes import names when exports are renamed, but test body references to old property names don't auto-fix
+---
+
+## 2026-02-21 - US-002
+- Added `discoverGlobalNpmPlugins()` function to `platform/mcp-server/src/resolver.ts`
+- Scans both npm (`npm root -g`) and bun (`bun pm -g bin` → derive node_modules) global directories
+- Matches unscoped `opentabs-plugin-*` and scoped `@scope/opentabs-plugin-*` packages
+- Validates each match has `package.json` with an `opentabs` field (quick check, not full validation)
+- Caches global paths per process lifetime via module-level variable with `resetGlobalPathsCache()` for tests
+- Returns `{ dirs: string[], errors: string[] }` — errors collected, never thrown
+- Added 8 unit tests covering: unscoped discovery, scoped discovery, filtering by opentabs field, ignoring non-plugins, empty results, non-existent dirs, deduplication, caching
+- Also exported `resetGlobalPathsCache` for test isolation
+- Files changed: `platform/mcp-server/src/resolver.ts`, `platform/mcp-server/src/discovery.test.ts`
+- **Learnings for future iterations:**
+  - `Bun.spawnSync` has complex overloaded types; mocking requires `((...args: unknown[]) => ...)` cast pattern
+  - JSDoc backtick-quoted text with `*/` prematurely terminates the comment — use plain text instead
+  - The import-x/order ESLint rule requires type imports to come after value imports of the same package group; run `lint:fix` to auto-sort
+---
+
+## 2026-02-21 - US-003
+- Rewrote `discoverPlugins` in `discovery.ts` to take `localPlugins: string[]` instead of `specifiers: string[]`
+- Phase 1: calls `discoverGlobalNpmPlugins()` for npm auto-discovery from global node_modules
+- Phase 2+3: resolves local plugins via `resolvePluginPath` and loads all in parallel
+- Phase 4: merges npm + local — local plugins override npm plugins of the same name
+- Added `PluginSource` type (`'npm' | 'local'`) to `state.ts`
+- Added `source: PluginSource` field to `RegisteredPlugin` (state.ts) and `LoadedPlugin` (loader.ts)
+- `loadPlugin` now takes a third `source` parameter
+- `npmTrustTier` replaces old `determineTrustTier` — determines trust by directory path (official for @opentabs-dev/, community otherwise)
+- Removed `isLocalPath` from resolver.ts exports (no longer needed externally)
+- Updated `file-watcher.ts` to pass `'local'` source to `loadPlugin`
+- Updated 8 test files to add `source: 'local' as const` to all `RegisteredPlugin` factory functions
+- Updated `discovery.test.ts`: replaced `determineTrustTier` tests with `npmTrustTier` tests
+- Files changed: 14 files (discovery.ts, loader.ts, state.ts, resolver.ts, file-watcher.ts, + 9 test files)
+- **Learnings for future iterations:**
+  - When adding a required field to a widely-used interface like `RegisteredPlugin`, there are ~6 independent `makePlugin`/`createPlugin` factory functions across different test files — each needs updating
+  - The `extension-protocol.test.ts` file has 5 separate `makePlugin` functions scoped in different `describe` blocks
+  - Prettier wants `Promise.all([a, b])` on one line if it fits within the line limit
+---
+
+## 2026-02-21 - US-004
+- Verified that `reload.ts` already uses `config.localPlugins` throughout (lines 165, 169, 181)
+- No references to `config.plugins` remain in the file — the migration was completed in US-001
+- No code changes needed; all quality checks pass (build, type-check, lint, knip, 841/841 tests)
+- **Learnings for future iterations:**
+  - US-001 already updated reload.ts as a downstream consumer of config.localPlugins — this story was pre-completed
+  - When a story's work was already done by a dependency story, still verify quality checks pass before marking it done
+---
+
+## 2026-02-21 - US-005
+- Removed the `isDev()` gate and 405 response from the `POST /reload` handler in `http-routes.ts`
+- Updated the comment above the handler from "dev mode only" to just the endpoint description
+- Updated the `index.ts` module-level comment to remove "(dev mode only)" from the /reload endpoint description
+- Updated `http-routes.test.ts`: replaced the test that asserted on the 405 dev-mode response with a test that verifies 401 is returned without bearer auth
+- The `isDev` import remains in `http-routes.ts` because it's still used in the `/health` endpoint to report mode
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`, `platform/mcp-server/src/index.ts`
+- **Learnings for future iterations:**
+  - Small ungating changes still require updating comments and tests — search for the gated feature name across the codebase to find all references
+  - The `/reload` endpoint still has bearer auth and rate limiting (10 req/min) as security controls
+---
+
+## 2026-02-21 - US-006
+- Added `registerInConfig()` and `notifyServer()` functions to `platform/plugin-tools/src/commands/build.ts`
+- `registerInConfig()`: reads `~/.opentabs/config.json`, computes relative path from config dir to plugin dir, adds to `localPlugins` array if not present, writes atomically via tmp+rename
+- `notifyServer()`: reads `secret` from config, calls `POST http://localhost:<port>/reload` with bearer auth; fails silently if server is not running
+- After initial build in `handleBuild()`: registers in config (once) then notifies server
+- In `--watch` mode: `notifyServer()` called after each successful rebuild inside `rebuild()`, but registration only happens once (initial build)
+- Both steps are non-fatal — wrapped in try/catch with warning messages; build succeeds even if config missing or server down
+- Added lightweight config helpers (`getConfigDir`, `getConfigPath`, `atomicWriteConfig`) that mirror CLI/MCP server patterns but are self-contained (plugin-tools cannot depend on CLI or MCP server packages)
+- Port resolution: uses `OPENTABS_PORT` env var with 9515 default (same as CLI's `resolvePort`)
+- Exported `registerInConfig` and `notifyServer` for testability
+- Files changed: `platform/plugin-tools/src/commands/build.ts`
+- **Learnings for future iterations:**
+  - The plugin-tools package is standalone — it cannot import from `@opentabs-dev/cli` or the MCP server. Config helpers (atomic write, config path resolution) must be duplicated as lightweight versions.
+  - The `OPENTABS_CONFIG_DIR` env var is respected for test isolation (same pattern as MCP server and CLI).
+  - ESLint import-x/order requires `node:fs` before `node:fs/promises`, and `node:os` before `node:path` — alphabetical ordering within the `node:` group.
+---
+
+## 2026-02-21 - US-007
+- Extracted `installExtension()` from `setup.ts` into a reusable function that both `setup` and `start` commands can call
+- `installExtension(configDir)` takes the config directory as a parameter, checks for existing manifest + version marker, and skips if already up-to-date
+- Returns `InstallExtensionResult` with `installed`, `firstTime`, `extensionDest`, and `version` fields
+- Updated `start.ts` with `autoInitialize()` that creates `~/.opentabs/` and calls `installExtension()` before spawning the server
+- On first run (no prior extension), prints first-time setup instructions (Chrome extension loading + MCP client config)
+- On subsequent runs with same version, skips installation silently
+- Extension install failure is non-fatal — warns and continues to start the server
+- Moved all exports in `setup.ts` to end of file to satisfy `import-x/exports-last` rule
+- Files changed: `platform/cli/src/commands/setup.ts`, `platform/cli/src/commands/start.ts`
+- **Learnings for future iterations:**
+  - The `import-x/exports-last` ESLint rule requires ALL exports (including interfaces and types) to be at the end of the file. Use `export { ... }` and `export type { ... }` at the bottom instead of inline `export` on declarations.
+  - When extracting logic from one module for reuse, prefer taking the state directory as a parameter rather than having the function compute `homedir()` — this makes the function testable and decoupled from the calling context.
+  - `import-x/order` requires relative imports starting with `./` before those starting with `../` — same-directory imports sort before parent-directory imports.
+---
+
+## 2026-02-21 - US-008
+- Removed `config init` subcommand from `config.ts` — deleted `handleConfigInit`, `ConfigInitOptions`, unused imports (`existsSync`, `mkdirSync`, `getConfigDir`)
+- Removed `plugin add`, `plugin remove`, `plugin list` subcommands from `plugin.ts` — rewrote to only register `plugin create`; removed all handler functions, unused imports (`atomicWriteConfig`, `getConfigPath`, `getLocalPluginsFromConfig`, `readConfig`, `resolvePluginPath`, `existsSync`, `mkdirSync`, `dirname`, `join`, `relative`, `resolve`)
+- Removed `registerSetupCommand` and `handleSetup` from `setup.ts` — kept `installExtension()` for use by `start.ts`; removed unused imports (`pc`, `homedir`, `Command`); updated module doc comment
+- Removed `registerSetupCommand` from `commands/index.ts` barrel export
+- Removed `registerSetupCommand` import and registration from `cli.ts`
+- Deleted `commands/plugin.test.ts` entirely (tested add/remove/list which no longer exist)
+- Updated error messages across codebase: "opentabs config init" → "opentabs start", "opentabs setup" → "opentabs start", "opentabs plugin add" → "opentabs-plugin build"
+- Updated `doctor.ts`: config-missing hint, extension-missing hints, plugins-empty hint
+- Updated `doctor.test.ts`: two test assertions matching updated hint messages
+- Updated `start.ts`: removed reference to "opentabs setup" in catch block comment + message
+- Updated `scaffold.ts`: fallback message changed from "opentabs plugin add" to "bun run build"
+- Files changed: 10 files (cli.ts, config.ts, doctor.ts, doctor.test.ts, index.ts, plugin.ts, plugin.test.ts [deleted], setup.ts, start.ts, scaffold.ts)
+- **Learnings for future iterations:**
+  - When removing a CLI command, search the entire codebase for the command name in error messages, hints, comments, and test assertions — there are typically 5-10 references beyond the handler itself
+  - The `doctor.ts` check functions contain hint messages that reference other CLI commands — these need updating when commands are removed
+  - The `scaffold.ts` auto-register fallback message also references CLI commands
+  - Test file deletion reduces test count (830 from 841) — the deleted tests specifically covered the removed commands
+---
+
+## 2026-02-21 - US-009
+- Added `source` field to `/health` endpoint's `pluginDetails` array — reads directly from `RegisteredPlugin.source` ('npm' | 'local')
+- Updated `opentabs status` CLI to display source labels: `(local)` or `(npm)` next to each plugin name
+- Added failed plugins display section in `opentabs status` — shows path and error message for plugins that failed discovery
+- Updated `HealthResponse` type and assertions in `http-routes.test.ts` to include `source` field
+- `--json` mode inherits the source field automatically since it passes through raw health endpoint JSON
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`, `platform/cli/src/commands/status.ts`
+- **Learnings for future iterations:**
+  - The `/health` endpoint already returned `failedPlugins` and `discoveryErrors` but the CLI status command wasn't displaying them — when adding new data to an endpoint, check if consumers are making use of existing data too
+  - The `RegisteredPlugin.source` field was already added in US-003, so the `/health` endpoint just needed to expose it — no derivation from trust tier needed
+  - Prettier requires ternary expressions to fit on one line if possible — multi-line ternaries with short branches get flagged
+---
+
+## 2026-02-21 - US-010
+- Added `source: 'npm' | 'local'` field to `ConfigStatePlugin` interface in `platform/shared/src/index.ts`
+- Added `source: p.source` to `handleConfigGetState` response in `platform/mcp-server/src/extension-protocol.ts`
+- Added a subtle "DEV" badge in `PluginCard.tsx` that renders next to the plugin display name when `source === 'local'`
+- Badge uses `text-muted-foreground bg-muted` colors, 9px font, rounded pill shape — minimal and non-intrusive
+- npm plugins show no badge (they are the default)
+- Updated `extension-protocol.test.ts`: added `source` field to response type assertion and added `expect(plugin.source).toBe('local')` assertion
+- `PluginState` type alias in `bridge.ts` inherits the new field automatically from `ConfigStatePlugin`
+- Files changed: `platform/shared/src/index.ts`, `platform/mcp-server/src/extension-protocol.ts`, `platform/mcp-server/src/extension-protocol.test.ts`, `platform/browser-extension/src/side-panel/components/PluginCard.tsx`
+- **Learnings for future iterations:**
+  - `PluginState` in `bridge.ts` is a simple type alias for `ConfigStatePlugin` — changes to the shared type automatically flow through to the side panel
+  - Prettier enforces Tailwind CSS class ordering — `font-medium leading-none` must be `leading-none font-medium`
+  - The `source` field was already on `RegisteredPlugin` from US-003, so only the wire protocol type and the mapping function needed updating
+---
+
+## 2026-02-21 - US-011
+- Removed `autoRegisterPlugin` function from `scaffold.ts` (lines 325-356)
+- Removed the try/catch block calling `autoRegisterPlugin` from `scaffoldPlugin` (lines 413-420)
+- Removed the "Registered in ~/.opentabs/config.json" console output
+- Removed unused imports: `atomicWriteConfig`, `getConfigPath`, `readConfig` from `./config.js`, and `relative` from `node:path`
+- Updated `create-plugin/src/index.test.ts`: replaced the "plugin is auto-registered" test with a test verifying scaffold does NOT create a config file (registration now happens at build time per US-006)
+- "Next steps" output still shows: cd, bun install, bun run build
+- Files changed: `platform/cli/src/scaffold.ts`, `platform/create-plugin/src/index.test.ts`
+- **Learnings for future iterations:**
+  - When removing a feature from shared scaffolding code, check the `create-plugin` package's tests — they run the actual CLI binary and may assert on the removed behavior
+  - The `create-plugin` tests use `OPENTABS_CONFIG_DIR` env var for isolation, so the test verifying config absence checks the isolated dir
+---
+
+## 2026-02-21 - US-012
+- Simplified `scripts/publish.sh` to use a single `~/.npmrc` token instead of separate session/publish tokens
+- Removed `PUBLISH_NPMRC` variable, `SESSION_NPMRC` variable, existence checks for both files
+- Removed the `cp`/backup/restore logic that swapped `~/.npmrc` with `~/.npmrc.publish` before publishing
+- Removed the `cleanup()` function and `trap cleanup EXIT` handler
+- Replaced with a simple `npm whoami` check at the start to verify authentication
+- Updated header comments to explain simplified single-token setup
+- Files changed: `scripts/publish.sh`
+- **Learnings for future iterations:**
+  - Shell scripts are not covered by `bun run type-check` or `bun run lint`, but `bash -n` validates syntax
+  - The token swap pattern was fragile — if the script crashed mid-publish, the session token could be lost; single token is safer
+---
+
+## 2026-02-21 - US-013
+- Searched entire CLI, plugin-tools, and create-plugin codebases for 'auto', 'detect', 'automatically' references
+- Verified 16 occurrences across 6 files — all are accurate after US-008 (removed commands) and US-011 (removed scaffold auto-registration)
+- Fixed one stale comment in `scaffold.test.ts:47`: changed "auto-registration doesn't touch real config" to "test isolation" — auto-registration was removed in US-011
+- Confirmed `opentabs plugin create` output does not mention auto-registration (removed in US-011)
+- Confirmed no references to removed commands (`opentabs setup`, `config init`, `plugin add/remove/list`) remain in CLI output
+- Confirmed all remaining `auto-` references are accurate: `auto-create config` (start does this), `auto-install extension` (start does this), `auto-discovered` (npm plugins are), `auto-register` (build does this)
+- Files changed: `platform/cli/src/scaffold.test.ts` (one comment updated)
+- **Learnings for future iterations:**
+  - US-008 and US-011 already removed the most problematic messages — this story was mainly verification
+  - When verifying message accuracy, search for the patterns across all three related packages (cli, plugin-tools, create-plugin) not just the CLI
+---
+
+## 2026-02-21 - US-014
+- Renamed `plugins` → `localPlugins` in the `OpentabsConfig` interface in `e2e/fixtures.ts`
+- Updated `createTestConfigDir()` to use `localPlugins: [absPluginPath]` in the config object
+- Updated `setupIsolatedIifeTest()` in `e2e/helpers.ts` to use `localPlugins` in writeTestConfig calls
+- Updated all `writeTestConfig()` calls across 7 E2E test files to use `localPlugins` instead of `plugins`
+- Updated all `config.plugins` mutations (push, assign, filter) to `config.localPlugins` in hot-reload-dynamic, iife-injection, and strict-csp E2E tests
+- Left `HealthResponse.plugins` (plugin count from health endpoint) unchanged — this is a separate field, not the config field
+- All quality checks pass: build, type-check, lint, knip, 830 unit tests, 232 E2E tests
+- Files changed: 9 files (fixtures.ts, helpers.ts, config-watcher.e2e.ts, hot-reload-dynamic.e2e.ts, iife-injection.e2e.ts, strict-csp.e2e.ts, side-panel-plugin-toggle.e2e.ts, side-panel-data-flow.e2e.ts, side-panel-live-update.e2e.ts)
+- **Learnings for future iterations:**
+  - The `{ plugins:` replace_all pattern misses `plugins:` keys inside multi-line objects where the key isn't immediately after `{` — manually check for these
+  - `config.plugins` replace_all pattern misses `updatedConfig.plugins` — need to search for all variable names holding config objects
+  - `HealthResponse.plugins` (a number) and `OpentabsConfig.plugins` (a string[]) share the same field name — be careful to only rename the config field, not the health response field
+---
+
+## 2026-02-21 - US-015
+- Updated CLAUDE.md to reflect all UX improvements from US-001 through US-014
+- **Plugin discovery section**: Replaced old `plugins` array description with two-source model (npm auto-discovery + `localPlugins` config field)
+- **CLI description**: Updated commands list from `start, status, doctor, setup, logs, plugin, config` to `start, status, doctor, logs, plugin create, config show/set/path`
+- **Plugin Tools description**: Added auto-registration and `/reload` notification to `opentabs-plugin build` description
+- **Dev vs production mode**: Updated to reflect `POST /reload` being ungated (available in both modes)
+- **Hot reload**: Added note about `POST /reload` triggering plugin rediscovery in both modes
+- **Adding a New Plugin**: Removed step 5 (manual registration) — build now auto-registers and notifies server
+- **Publishing section**: Simplified from two-token setup (session + granular) to single-token setup
+- **Plugin Changes workflow**: Updated from dev-mode-only file watcher to `POST /reload` triggered by build in both modes
+- **Extension reload note**: Updated to reflect plugin adapter changes picked up via `/reload` in both modes
+- Files changed: `CLAUDE.md`
+- **Learnings for future iterations:**
+  - CLAUDE.md is documentation-only — no type-check, lint, or knip needed, but all quality gates still must pass since they cover the whole repo
+  - When updating documentation, search for the same concept described in multiple sections (e.g., `/reload` mentioned in Key Concepts, Starting the Server, Development Workflow, and Reloading Extension sections)
+---
+
+## 2026-02-21 - US-016
+- Ran full quality suite: build, type-check, lint, knip (all exit 0)
+- Unit tests: 830 pass, 0 fail
+- E2E tests: 232 pass, 0 fail
+- Verified CLI help output: `opentabs --help` shows start, status, doctor, logs, plugin, config; `opentabs plugin --help` shows only create; `opentabs config --help` shows set, path, show
+- Found and fixed 6 stale `"plugins"` config field references in test files:
+  - `reload.test.ts`: `writeConfig()` helper wrote `{ plugins }` instead of `{ localPlugins }`
+  - `file-watcher.test.ts`: 5 `writeFileSync` calls with `'{"plugins":...}'` instead of `'{"localPlugins":...}'`
+- Searched for `opentabs setup`, `config init`, `plugin add/remove/list` references — none found in source
+- No references to old `plugins` array (without `local` prefix) in config handling code
+- Files changed: `platform/mcp-server/src/reload.test.ts`, `platform/mcp-server/src/file-watcher.test.ts`
+- **Learnings for future iterations:**
+  - Migration logic in `parseConfigRecord` silently handles old `plugins` fields, so tests using the old format still pass — search for raw JSON config strings in tests after a config field rename
+  - The `"plugins":` pattern in `JSON.stringify({ plugins, ... })` is subtle because the JS shorthand makes the key name implicit from the variable name
+---

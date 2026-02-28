@@ -1,0 +1,29 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix ghost network capture state caused by missing chrome.debugger.onDetach handler. When the debugger detaches externally (user opens DevTools, Chrome terminates it), the captures Map retains stale entries, causing startCapture to reject and CDP-dependent commands to fail silently.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Handle chrome.debugger.onDetach to clean up stale capture state",
+      "description": "As a platform developer, I want the network capture module to handle external debugger detach events so that capture state stays consistent and subsequent enableNetworkCapture calls succeed after a detach.",
+      "acceptanceCriteria": [
+        "chrome.debugger.onDetach listener is registered in network-capture.ts that deletes the captures Map entry for the detached tab",
+        "After external detach (e.g. user opens DevTools), isCapturing() returns false for that tab",
+        "After external detach, startCapture() succeeds for that tab without requiring stopCapture() first",
+        "The onDetach handler does NOT call chrome.debugger.detach() (the debugger is already detached — calling detach again would throw)",
+        "Existing chrome.tabs.onRemoved cleanup still works unchanged (onRemoved fires for closed tabs, onDetach fires for debugger-specific detach)",
+        "Unit test verifies that capture state is cleaned up when onDetach fires for an actively capturing tab",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/network-capture.ts\n\nThe bug: The module registers chrome.debugger.onEvent (line 159) and chrome.tabs.onRemoved (line 328) listeners, but does NOT register a chrome.debugger.onDetach listener. When the debugger detaches for any reason other than tab close (user opens DevTools, Chrome kills it under memory pressure, chrome.debugger.detach called by another extension), the captures Map entry for that tabId persists as a ghost.\n\nConsequences:\n1. startCapture() (line 349) checks `captures.has(tabId)` and throws 'Network capture already active' — so enableNetworkCapture fails\n2. isCapturing() (line 414) returns true — so withDebugger() in dispatch-helpers.ts skips chrome.debugger.attach, then CDP commands fail because no debugger is actually attached\n\nFix: Add a chrome.debugger.onDetach.addListener near the existing chrome.tabs.onRemoved listener (around line 328). The callback receives (source: chrome.debugger.Debuggee, reason: string). Extract tabId from source.tabId, check if captures.has(tabId), and if so delete the entry. Do NOT call chrome.debugger.detach() inside this handler — the debugger is already detached.\n\nThe handler signature is: chrome.debugger.onDetach.addListener((source, reason) => { ... })\nThe reason parameter is a string like 'target_closed', 'canceled_by_user', or 'replaced_with_devtools'.\n\nFor the unit test, check the existing test file pattern at platform/browser-extension/src/*.test.ts. The test should verify that after manually triggering the onDetach callback, captures.has(tabId) returns false and startCapture succeeds."
+    }
+  ]
+}

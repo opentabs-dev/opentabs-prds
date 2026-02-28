@@ -1,0 +1,122 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix CLI user experience issues: unhandled audit error, status formatting, plugin remove false positive, config set browser-tool naming friction, config set tool. port resolution, and config set port restart message",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Handle invalid --since duration gracefully in audit command",
+      "description": "As a user, I want a clean error message when I provide an invalid --since value to opentabs audit, so that I understand what format is expected without seeing a stack trace",
+      "acceptanceCriteria": [
+        "Running `opentabs audit --since invalid` prints a user-friendly error message (not a stack trace) and exits with code 1",
+        "Running `opentabs audit --file --since invalid` also prints a clean error and exits with code 1",
+        "Valid --since values (e.g., 30m, 1h, 2d) continue to work correctly",
+        "The error message includes the invalid value and the expected format (e.g., 30m, 1h, 2d)",
+        "No eslint-disable comments are used",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/audit.ts\n\nThe `parseDuration` function (lines 52-59) throws a Commander `InvalidArgumentError` when the format doesn't match `^(\\d+)([smhd])$`. This is called at runtime inside `handleAudit` (line 204) and `handleAuditFromFile` (line 125), NOT during Commander's option parsing phase, so Commander doesn't catch it.\n\nFix: Wrap the `parseDuration(options.since)` calls in both `handleAudit` (line 204) and `handleAuditFromFile` (line 125) in a try/catch. On `InvalidArgumentError`, print the error cleanly using `console.error(pc.red(...))` and `process.exit(1)`. Re-throw any other error types.\n\nAlternative cleaner approach: change `parseDuration` to NOT throw — instead return `null` on invalid input. Then the callers check for null and print the error. This avoids try/catch boilerplate. Either approach is fine."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix 'Plugin reloads' label padding in status output",
+      "description": "As a user, I want the status output to be properly aligned so that all labels and values are consistently formatted",
+      "acceptanceCriteria": [
+        "Running `opentabs status` shows a space between 'Plugin reloads' and its value (e.g., 'Plugin reloads  0' not 'Plugin reloads0')",
+        "All other status labels remain properly aligned",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/status.ts\n\nLine 30: `const pad = (label: string) => \\`  ${pc.cyan(label.padEnd(14))}\\`;`\nLine 104: `console.log(\\`${pad('Plugin reloads')}${String(data.reloadCount)}\\`);`\n\n'Plugin reloads' is exactly 14 characters, so `padEnd(14)` adds zero padding. Fix: change `padEnd(14)` to `padEnd(16)` on line 30. This gives 2 spaces of gap for the longest label and more for shorter ones. All other labels are shorter than 14 chars so they'll just get slightly more padding, which is fine."
+    },
+    {
+      "id": "US-003",
+      "title": "Warn when plugin remove targets a plugin that is not installed",
+      "description": "As a user, I want opentabs plugin remove to tell me when the plugin I'm trying to remove is not installed, so that I don't get a misleading 'Successfully removed' message",
+      "acceptanceCriteria": [
+        "Running `opentabs plugin remove nonexistent-plugin --confirm` prints an error like 'Plugin <name> is not installed globally' and exits with code 1",
+        "Running `opentabs plugin remove slack --confirm` when slack IS installed succeeds as before",
+        "The check uses `npm list -g <pkg> --depth=0` or equivalent to verify installation before attempting removal",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/plugin.ts\n\nFunction `handlePluginRemove` (lines 177-207). The issue is that `npm uninstall -g <pkg>` exits 0 even when the package isn't installed.\n\nFix: After line 195 (`console.log(\\`Removing ${pc.bold(pkg)}...\\`);`) and before line 197 (the `spawnInherit` call), add a check:\n\n```typescript\nconst checkResult = spawnProcessSync(platformExec('npm'), ['list', '-g', pkg, '--depth=0']);\nif (checkResult.exitCode !== 0) {\n  console.error(pc.red(`Plugin ${pkg} is not installed globally.`));\n  process.exit(1);\n}\n```\n\n`spawnProcessSync` and `platformExec` are already imported from `@opentabs-dev/shared` (lines 26-29)."
+    },
+    {
+      "id": "US-004",
+      "title": "Auto-prefix browser tool shorthand names in config set",
+      "description": "As a user, I want to type `opentabs config set browser-tool.screenshot_tab disabled` without the redundant `browser_` prefix, so that the config key naming is intuitive",
+      "acceptanceCriteria": [
+        "`opentabs config set browser-tool.screenshot_tab disabled` works (auto-prefixes to `browser_screenshot_tab`)",
+        "`opentabs config set browser-tool.browser_screenshot_tab disabled` still works (already prefixed)",
+        "`opentabs config set browser-tool.extension_id enabled` still works (extension_ prefix)",
+        "The error message for empty names still works correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/config.ts\n\nFunction `handleSetBrowserTool` (lines 240-272). The validation on lines 242-246 rejects names that don't start with `browser_` or `extension_`.\n\nFix: Replace the hard rejection with auto-prefixing. After line 241 (`const toolName = key.slice(BROWSER_TOOL_PREFIX.length);`), change to:\n\n```typescript\nlet toolName = key.slice(BROWSER_TOOL_PREFIX.length);\nif (toolName && !toolName.startsWith('browser_') && !toolName.startsWith('extension_')) {\n  toolName = `browser_${toolName}`;\n}\n```\n\nKeep the empty-name check (`if (!toolName)`) but remove the prefix check since we now auto-prefix. The `const` on line 241 must become `let`."
+    },
+    {
+      "id": "US-005",
+      "title": "Pass port option through to handleListTools in config set",
+      "description": "As a user, I want `opentabs config set tool.` to respect my --port flag and configured port, so that it can reach the server when it's running on a non-default port",
+      "acceptanceCriteria": [
+        "`opentabs config set tool. --port 8080` queries the server on port 8080 for available tools",
+        "`OPENTABS_PORT=8080 opentabs config set tool.` queries the server on port 8080",
+        "Default port (9515) still works when no port is specified",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/config.ts\n\nThe issue is in `handleConfigSet` (around line 394-396). When `key === TOOL_PREFIX`, it calls `handleListTools()` with no arguments:\n```typescript\nif (key === TOOL_PREFIX) {\n  return handleListTools();\n}\n```\n\nBut `options` (which contains the parsed `--port`) is available in `handleConfigSet`'s parameters.\n\nFix:\n1. Change `handleListTools` signature (line 174) from `async (): Promise<void>` to `async (options: { port?: number }): Promise<void>`\n2. Change line 175 from `resolvePort({})` to `resolvePort(options)`\n3. Change the call site (line 396) from `return handleListTools();` to `return handleListTools(options);`"
+    },
+    {
+      "id": "US-006",
+      "title": "Show restart-required message when changing port via config set",
+      "description": "As a user, I want to be told that a server restart is required after changing the port, so that I don't assume the change takes effect immediately",
+      "acceptanceCriteria": [
+        "`opentabs config set port 8080` prints the new port value AND a message indicating a restart is needed (e.g., 'Restart the MCP server for the port change to take effect.')",
+        "The restart message is visually distinct (e.g., yellow/dim) from the confirmation",
+        "The `notifyServer` call is either removed (since port changes can't take effect via reload) or kept but the restart message is still shown",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/config.ts\n\nFunction `handleSetPort` (lines 274-288). Currently line 286 prints `port: <value>` and line 287 calls `notifyServer`.\n\nFix: After line 286 (`console.log(\\`port: ${pc.cyan(String(newPort))}\\`);`), add:\n```typescript\nconsole.log(pc.yellow('Restart the MCP server for the port change to take effect.'));\n```\n\nThe `notifyServer` call on line 287 can be kept (it triggers a config reload on the server which picks up other config changes), but the restart message must be prominent. Alternatively, remove the `notifyServer` call since the server can't rebind its port without restarting — keeping it is harmless but slightly misleading."
+    }
+  ]
+}

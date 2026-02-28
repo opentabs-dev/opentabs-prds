@@ -1,0 +1,52 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-204636-seamless-bun-dev~running.json
+Started: Wed Feb 18 21:34:05 PST 2026
+---
+
+## Codebase Patterns
+- `tsconfig.scripts.json` covers `scripts/**/*.ts` — new scripts are automatically type-checked
+- `tsconfig.base.json` includes `"types": ["bun-types"]` — Bun APIs available in all packages
+- Root `package.json` scripts referenced by knip automatically — no need to add script entries to knip config
+- Use `Bun.spawn()` for child processes in scripts (not `node:child_process`)
+- For `{ write(data: string): boolean }` as a type for output streams instead of `typeof process.stdout` (which is too narrow for stderr)
+- `bun run format` fixes prettier issues; always run it before lint checks
+- ESLint enforces `void` operator on fire-and-forget promises (`@typescript-eslint/no-floating-promises`)
+- Use `node:fs` `watch()` with `{ recursive: true }` for watching dist directories — matches the pattern in `file-watcher.ts`
+- The `build:side-panel` script in browser-extension already chains `build:tailwind` — no need to run Tailwind separately
+- MCP server `/extension/reload` endpoint requires Bearer auth with wsSecret from `~/.opentabs/config.json`
+- The extension pipeline runs: build:bundle → build:side-panel (includes Tailwind) → install-extension → POST /extension/reload
+
+---
+
+## 2026-02-18 21:37 - US-001
+- Created `scripts/dev.ts` dev orchestrator that spawns `tsc --build --watch` and `bun --hot platform/mcp-server/dist/index.js`
+- Script waits for tsc's "Watching for file changes" sentinel before starting the MCP server
+- All output is piped with `[tsc]` and `[mcp]` prefixes
+- SIGINT/SIGTERM cleanup kills both child processes
+- Updated root `package.json` `dev` script to `bun scripts/dev.ts`
+- Files changed: `scripts/dev.ts` (new), `package.json` (modified)
+- **Learnings for future iterations:**
+  - `typeof process.stdout` resolves to `WriteStream & { fd: 1 }` which is incompatible with `process.stderr` (`fd: 2`). Use a minimal interface `{ write(data: string): boolean }` instead.
+  - ESLint requires `void` on fire-and-forget async calls. Use `void pipeWithPrefix(...)` pattern.
+  - `lines.pop()` triggers `no-non-null-assertion`; use `?? ''` instead of `!`.
+  - The `tsc.exited` promise resolves with the exit code directly (number), not null — `?? 1` triggers `no-unnecessary-condition`.
+---
+
+## 2026-02-18 21:43 - US-002
+- Extended `scripts/dev.ts` to auto-rebuild and auto-reload the Chrome extension on source changes
+- Added `node:fs` `watch()` on `platform/browser-extension/dist/` and `platform/shared/dist/` with `{ recursive: true }` to detect tsc output changes
+- Debounced at 300ms to avoid redundant rebuilds from rapid tsc output
+- Extension pipeline: build:bundle → build:side-panel (includes Tailwind) → install-extension → POST /extension/reload
+- Reads wsSecret from `~/.opentabs/config.json` for Bearer auth on the reload endpoint
+- Handles MCP server not running (fetch failure → warn and continue) and extension not connected (503 → warn and continue)
+- MCP-server-only changes in `platform/mcp-server/dist/` do NOT trigger the extension pipeline — bun --hot handles those
+- Initial extension build runs once after tsc initial compilation, before starting the MCP server
+- Console output shows `[ext] Rebuilding extension...` and `[ext] Extension reloaded.` with clear status messages
+- FSWatcher instances are tracked and cleaned up on SIGINT/SIGTERM alongside child processes
+- Files changed: `scripts/dev.ts` (modified)
+- **Learnings for future iterations:**
+  - `node:fs` `watch()` with `{ recursive: true }` works on macOS via FSEvents — good for watching entire dist trees
+  - `build:side-panel` in the extension's package.json already chains `build:tailwind` — no separate Tailwind step needed
+  - Use a `buildInProgress` guard to prevent overlapping extension builds when tsc emits rapidly
+  - When a build is in progress and new changes arrive, reschedule rather than skip — ensures no changes are lost
+---

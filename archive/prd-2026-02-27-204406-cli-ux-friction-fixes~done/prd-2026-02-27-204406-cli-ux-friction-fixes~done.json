@@ -1,0 +1,70 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fixes CLI UX friction points discovered during fresh-user experience testing. Three issues: (1) the 'opentabs start' subsequent-run hint tells users to run 'opentabs config show --show-secret' to see MCP client configuration, but that command only displays raw config fields — it does not print the formatted MCP client config snippets users need to copy-paste; (2) 'opentabs audit' when the server is offline prints an error but doesn't suggest the '--file' flag as an alternative for reading the persistent disk log; (3) 'opentabs config show' dumps the 'permissions' config key as a collapsed single-line JSON string, making it unreadable.\n\nLOW severity issues documented but no stories created: (a) 'opentabs config show' permissions formatting is a cosmetic issue — users can use '--json | jq' for structured output.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add formatted MCP client config output to 'opentabs config show --show-secret'",
+      "description": "As a user who has already completed first-time setup, I want 'opentabs config show --show-secret' to display the formatted MCP client config snippets (Claude Code, OpenCode, Cursor, Windsurf) so that I can copy-paste them without restarting the server.",
+      "acceptanceCriteria": [
+        "Running 'opentabs config show --show-secret' displays the formatted MCP client config blocks (Claude Code, OpenCode, Cursor, Windsurf) with the correct URL and Authorization header, below the existing config fields",
+        "Running 'opentabs config show' (without --show-secret) does NOT display MCP client configs (the secret is masked so the configs would be non-functional)",
+        "The MCP client config output reuses the same printMcpClientConfigs function from start.ts to avoid duplication",
+        "The port used in the MCP URL is read from the config file (config.port field) with fallback to DEFAULT_PORT (9515)",
+        "The hint in start.ts line 269 ('Run opentabs config show --show-secret to see MCP client configuration') remains accurate after this change",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The issue: start.ts:269 prints 'Run opentabs config show --show-secret to see MCP client configuration' but config.ts handleConfigShow only displays raw config fields + the secret. It does NOT print the formatted MCP client snippets that printMcpClientConfigs generates.\n\nFix approach:\n1. Extract printMcpClientConfigs from platform/cli/src/commands/start.ts (around line 160) into a shared module (or export it from start.ts and import in config.ts)\n2. In platform/cli/src/commands/config.ts handleConfigShow (around line 37), after the existing config display and secret display (line 104-107), add a section that calls printMcpClientConfigs when options.showSecret is true\n3. The MCP URL should be constructed using the port from config (config.port as number, or DEFAULT_PORT from @opentabs-dev/shared)\n4. The secret is already available in the displaySecret variable (line 53) — use the full secret (not masked) for the Authorization header\n\nKey files:\n- platform/cli/src/commands/config.ts (lines 37-109) — handleConfigShow\n- platform/cli/src/commands/start.ts (lines 160-206) — printMcpClientConfigs to extract/export\n\nWatch out for: knip may flag unused exports if printMcpClientConfigs was previously only used locally in start.ts."
+    },
+    {
+      "id": "US-002",
+      "title": "Suggest '--file' flag when 'opentabs audit' fails due to offline server",
+      "description": "As a user whose MCP server is not running, I want the 'opentabs audit' error message to suggest '--file' as an alternative so that I can read the persistent disk log without starting the server.",
+      "acceptanceCriteria": [
+        "When 'opentabs audit' fails because the server is not running (ECONNREFUSED), the error output includes a hint about the '--file' flag, e.g. 'Use --file to read from the persistent disk log'",
+        "When 'opentabs audit' fails due to timeout, the same '--file' hint is shown",
+        "The hint is displayed as a dim secondary line (using pc.dim), consistent with existing hint patterns in the CLI",
+        "The existing error messages ('MCP server is not running' / 'Server not responding') are preserved unchanged — the hint is added as an additional line",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in platform/cli/src/commands/audit.ts, in the catch block around lines 287-303.\n\nCurrently the ECONNREFUSED handler (line 290-291) prints:\n  'MCP server is not running.'\n  Start hint\n\nAnd the timeout handler (line 293-295) prints:\n  'Server not responding (timed out). Is the server running?'\n  Timeout detail\n\nAdd a third line after each existing error message, something like:\n  console.error(pc.dim('Tip: Use --file to read audit history from the persistent disk log.'))\n\nThis matches the pattern used elsewhere in the CLI (e.g., status.ts provides actionable follow-up hints). Only add the hint to the ECONNREFUSED and timeout cases — the generic error case (line 298) doesn't need it since the server might be running but have a different issue.\n\nKey file: platform/cli/src/commands/audit.ts (lines 287-303)"
+    },
+    {
+      "id": "US-003",
+      "title": "Pretty-print 'permissions' config key in 'opentabs config show'",
+      "description": "As a user viewing my OpenTabs config, I want the 'permissions' field to be displayed with readable formatting (like localPlugins and tools) so that I can understand my permission settings without using --json.",
+      "acceptanceCriteria": [
+        "Running 'opentabs config show' displays the permissions field with nested keys on separate lines, similar to how tools and browserToolPolicy are displayed",
+        "The trustedDomains and sensitiveDomains arrays are shown as bulleted lists (like localPlugins), with '(none)' when empty",
+        "The toolPolicy and domainToolPolicy objects are shown as key-value pairs (like tools/browserToolPolicy), with '(none)' when empty",
+        "The --json output is unchanged",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In platform/cli/src/commands/config.ts, the handleConfigShow function (around lines 63-101) has special formatting for 'localPlugins', 'tools', and 'browserToolPolicy' but falls through to a generic JSON.stringify for everything else (lines 95-100). The 'permissions' field is a nested object: { trustedDomains: string[], sensitiveDomains: string[], toolPolicy: Record<string, string>, domainToolPolicy: Record<string, Record<string, string>> }.\n\nAdd an 'else if' branch for 'permissions' (before the generic else at line 95) that formats it nicely:\n\n  permissions\n    trustedDomains\n      - localhost\n      - 127.0.0.1\n    sensitiveDomains\n      (none)\n    toolPolicy\n      (none)\n    domainToolPolicy\n      (none)\n\nFollow the same visual patterns used for localPlugins (arrays as bulleted lists) and tools (objects as key-value pairs). The permissions type is defined in @opentabs-dev/shared — read the PermissionsConfig type to understand the shape.\n\nKey file: platform/cli/src/commands/config.ts (lines 63-101)"
+    }
+  ]
+}

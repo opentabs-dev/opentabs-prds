@@ -1,0 +1,197 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add MCP Resources and Prompts support to the OpenTabs platform. Currently the MCP server only exposes tools. This PRD adds defineResource() and definePrompt() to the plugin SDK, updates the build tool to extract resource/prompt definitions, registers MCP resources/list, resources/read, prompts/list, and prompts/get handlers on the server, extends the Chrome extension dispatch to handle resource reads and prompt gets, and adds E2E test coverage. The dispatch mechanism mirrors tool dispatch: MCP server -> WebSocket -> extension -> adapter -> page context. The MCP SDK is @modelcontextprotocol/sdk ^1.26.0 and the server uses the low-level Server class (not McpServer) because plugin manifests provide raw JSON Schema, not Zod schemas.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add defineResource and definePrompt to plugin SDK",
+      "description": "As a plugin developer, I want defineResource() and definePrompt() factory functions in the plugin SDK so that I can declare resources and prompts alongside tools in my plugin.",
+      "acceptanceCriteria": [
+        "defineResource({ uri, name, description?, mimeType?, read: (uri) => Promise<ResourceContent> }) factory function is exported from @opentabs-dev/plugin-sdk",
+        "definePrompt({ name, description?, arguments?: PromptArgument[], render: (args) => Promise<PromptMessage[]> }) factory function is exported from @opentabs-dev/plugin-sdk",
+        "ResourceDefinition type includes: uri (string), name (string), description (string | undefined), mimeType (string | undefined), read (function)",
+        "PromptDefinition type includes: name (string), description (string | undefined), arguments (PromptArgument[] | undefined), render (function)",
+        "PromptArgument type includes: name (string), description (string | undefined), required (boolean | undefined)",
+        "PromptMessage type includes: role ('user' | 'assistant'), content: { type: 'text', text: string }",
+        "ResourceContent type includes: uri (string), text (string | undefined), blob (string | undefined), mimeType (string | undefined)",
+        "OpenTabsPlugin class has optional resources: ResourceDefinition[] property",
+        "OpenTabsPlugin class has optional prompts: PromptDefinition[] property",
+        "All new types are exported from @opentabs-dev/plugin-sdk",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts. Add ResourceContent, PromptArgument, PromptMessage, ResourceDefinition, and PromptDefinition types. The defineResource() factory should validate that uri and name are provided and return a ResourceDefinition object. The definePrompt() factory should validate that name is provided and return a PromptDefinition object. These mirror the existing defineTool() pattern. The read() and render() functions are the runtime handlers that execute in the browser page context (inside the adapter IIFE), same as tool handle() functions. Update the OpenTabsPlugin base class to accept optional resources and prompts arrays in its constructor or as class properties. Ensure all types align with the MCP protocol: ResourceContent matches ReadResourceResult.contents[n], PromptMessage matches GetPromptResult.messages[n]. Export everything from the package entry point."
+    },
+    {
+      "id": "US-002",
+      "title": "Update build tool to extract resources and prompts",
+      "description": "As a plugin developer, I want opentabs-plugin build to extract resource and prompt definitions from my plugin module and include them in the build output so that the MCP server can discover them at runtime.",
+      "acceptanceCriteria": [
+        "opentabs-plugin build extracts resource definitions (uri, name, description, mimeType) from the plugin module's resources array",
+        "opentabs-plugin build extracts prompt definitions (name, description, arguments) from the plugin module's prompts array",
+        "dist/tools.json is extended to include top-level resources and prompts arrays alongside the existing tools array",
+        "Resource entries in tools.json contain: uri, name, description, mimeType (no read function — that stays in the IIFE)",
+        "Prompt entries in tools.json contain: name, description, arguments (no render function — that stays in the IIFE)",
+        "Validation: resource URIs must be non-empty strings, prompt names must be non-empty strings matching [a-z0-9_-]+ pattern",
+        "Validation: prompt argument names must be non-empty strings",
+        "If a plugin has no resources or prompts, the arrays are empty [] in tools.json",
+        "The adapter IIFE exposes resources and prompts alongside tools in its runtime shape",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/plugin-tools/src/commands/build.ts. After the existing tool extraction logic, add resource and prompt extraction. The plugin module is already loaded (via the IIFE evaluation or direct import) to extract tool schemas. Add similar extraction for resources (map each to { uri, name, description, mimeType }) and prompts (map each to { name, description, arguments }). The read/render functions are NOT serialized — they exist only in the IIFE runtime. Update the tools.json write to include the new arrays. Consider whether to rename tools.json to manifest.json or plugin.json — since the file now contains more than tools, a rename may be clearer. If renaming, update all consumers (loader.ts in mcp-server, any references in docs). The IIFE adapter shape should expose: { tools: [...], resources: [...], prompts: [...] } where resources have { uri, name, read() } and prompts have { name, render() }. This mirrors how tools expose { name, handle() }."
+    },
+    {
+      "id": "US-003",
+      "title": "Add resource and prompt types to shared package",
+      "description": "As a platform developer, I want shared types for manifest resources and prompts so that the MCP server, extension, and other packages use consistent type definitions.",
+      "acceptanceCriteria": [
+        "ManifestResource type exported: { uri: string, name: string, description?: string, mimeType?: string }",
+        "ManifestPrompt type exported: { name: string, description?: string, arguments?: ManifestPromptArgument[] }",
+        "ManifestPromptArgument type exported: { name: string, description?: string, required?: boolean }",
+        "PluginManifest type (or equivalent) is updated to include optional resources: ManifestResource[] and prompts: ManifestPrompt[] arrays",
+        "All new types are exported from @opentabs-dev/shared",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/shared/src/index.ts (or the appropriate types file in the shared package). Add ManifestResource, ManifestPrompt, and ManifestPromptArgument types. Update any existing PluginManifest or Manifest type to include the new fields. These types represent the serialized form (what's in tools.json / manifest.json) — no functions, just data. They are used by the MCP server's loader, registry, and MCP setup modules. Keep them aligned with the MCP protocol types but as plain interfaces (no MCP SDK dependency in shared)."
+    },
+    {
+      "id": "US-004",
+      "title": "Register MCP resource and prompt handlers on server",
+      "description": "As an AI agent, I want the MCP server to expose resources/list, resources/read, prompts/list, and prompts/get handlers so that I can read plugin resources and get plugin prompts through the MCP protocol.",
+      "acceptanceCriteria": [
+        "Server capabilities include resources: { listChanged: true } alongside existing tools and logging",
+        "Server capabilities include prompts: { listChanged: true } alongside existing tools and logging",
+        "resources/list handler returns all resources from all registered plugins with prefixed URIs (e.g., opentabs-plugin-slack+slack://channels becomes plugin-prefixed)",
+        "resources/read handler receives a URI, looks up the owning plugin and original URI, dispatches to extension via WebSocket (same pattern as tool dispatch), returns ResourceContent",
+        "prompts/list handler returns all prompts from all registered plugins with prefixed names (e.g., slack_greet)",
+        "prompts/get handler receives a prompt name and arguments, looks up the owning plugin and original name, dispatches to extension via WebSocket, returns PromptMessage[]",
+        "Resource URI prefixing scheme: plugin name is prepended to make URIs globally unique across plugins",
+        "Prompt name prefixing follows the same convention as tools: <plugin>_<promptName>",
+        "Error handling: if plugin has no matching tab or tab is not ready, return appropriate MCP error",
+        "After hot reload / plugin update, resources/list-changed and prompts/list-changed notifications are sent",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/mcp-setup.ts. Add server.setRequestHandler for resources/list (ListResourcesRequestSchema), resources/read (ReadResourceRequestSchema), prompts/list (ListPromptsRequestSchema), and prompts/get (GetPromptRequestSchema). These are imported from @modelcontextprotocol/sdk/types.js. The resources/list handler iterates all registered plugins, collects their resources, and prefixes URIs. The resources/read handler parses the prefixed URI to find the owning plugin, then dispatches via the extension protocol (similar to how tool.call dispatches). For resource URI prefixing, consider a scheme like: prepend the plugin name to the URI path, or use a custom scheme like opentabs://<plugin>/<original-uri>. The prompts/list and prompts/get handlers follow the same pattern as tools — prefix names with plugin_, dispatch to extension. Update the capabilities object in the Server constructor to include resources and prompts. When the registry changes (reload, plugin update), call server.notification({ method: 'notifications/resources/list_changed' }) and server.notification({ method: 'notifications/prompts/list_changed' })."
+    },
+    {
+      "id": "US-005",
+      "title": "Update extension to dispatch resource reads and prompt gets",
+      "description": "As a platform developer, I want the Chrome extension to handle resource.read and prompt.get dispatch messages so that the MCP server can reach plugin adapters in browser tabs for resource and prompt operations.",
+      "acceptanceCriteria": [
+        "message-router.ts (or equivalent dispatch module) handles resource.read messages from the MCP server",
+        "message-router.ts handles prompt.get messages from the MCP server",
+        "resource.read dispatch: find the matching tab for the plugin, send a message to the content script, content script calls adapter's resource read() function in page context",
+        "prompt.get dispatch: find the matching tab for the plugin, send a message to the content script, content script calls adapter's prompt render() function in page context",
+        "Adapter runtime shape is extended: { tools: [{name, handle()}], resources: [{uri, read()}], prompts: [{name, render()}] }",
+        "The content script bridge handles resource.read and prompt.get message types",
+        "Error handling: if adapter doesn't have the requested resource/prompt, return an error",
+        "Response format matches what the MCP server expects to return to MCP clients",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Edit platform/browser-extension/src/background.ts (or message-router.ts if dispatch is modularized there). Add cases for resource.read and prompt.get in the message dispatch switch/handler. The pattern is identical to tool.call: (1) receive { type: 'resource.read', pluginName, uri } or { type: 'prompt.get', pluginName, promptName, arguments }, (2) find the tab registered for that plugin, (3) send a message to the content script in that tab, (4) content script executes in page context via the adapter IIFE, (5) return the result. The adapter IIFE already exposes tools — extend it to also expose resources and prompts arrays. Each resource has { uri, read(uri) } and each prompt has { name, render(args) }. The content script bridge needs new message types for resource read and prompt get. Keep the dispatch DRY — consider extracting a shared dispatch function that tool.call, resource.read, and prompt.get all use, parameterized by the operation type."
+    },
+    {
+      "id": "US-006",
+      "title": "Update registry and state for resources and prompts",
+      "description": "As a platform developer, I want the plugin registry to track resources and prompts alongside tools so that MCP handlers can look up resources and prompts efficiently.",
+      "acceptanceCriteria": [
+        "RegisteredPlugin type includes resources: ManifestResource[] and prompts: ManifestPrompt[] arrays",
+        "PluginRegistry has O(1) resource lookup by prefixed URI",
+        "PluginRegistry has O(1) prompt lookup by prefixed name",
+        "PluginRegistry exposes allResources() and allPrompts() methods for list handlers",
+        "loadPlugin in loader.ts reads resources and prompts from dist/tools.json (or dist/manifest.json)",
+        "If tools.json has no resources or prompts keys, default to empty arrays (backwards compatibility)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/registry.ts. Add resourcesByUri: Map<string, { plugin: RegisteredPlugin, resource: ManifestResource }> and promptsByName: Map<string, { plugin: RegisteredPlugin, prompt: ManifestPrompt }> to PluginRegistry. In the build/constructor, iterate each plugin's resources and prompts and build the lookup maps with prefixed keys. Add allResources() returning all resources with prefixed URIs and plugin info, allPrompts() returning all prompts with prefixed names and plugin info, lookupResource(prefixedUri) and lookupPrompt(prefixedName) methods. Edit platform/mcp-server/src/loader.ts to read resources and prompts from the manifest file. The manifest file currently has { tools: [...] } — extend parsing to also read resources and prompts arrays, defaulting to [] if not present for backwards compatibility with plugins built before this change."
+    },
+    {
+      "id": "US-007",
+      "title": "Add E2E tests for resources and prompts",
+      "description": "As a platform developer, I want E2E tests that verify resource listing/reading and prompt listing/getting work end-to-end so that the full dispatch pipeline is covered.",
+      "acceptanceCriteria": [
+        "e2e-test plugin has a test resource: URI 'test://items', returns a JSON list of items from the test server page",
+        "e2e-test plugin has a test prompt: name 'greet', takes a 'name' string argument, returns a user prompt message like 'Hello, {name}!'",
+        "E2E test: list resources includes the test resource with correct prefixed URI, name, and description",
+        "E2E test: read resource with the test resource URI returns expected JSON data",
+        "E2E test: list prompts includes the test prompt with correct prefixed name and description",
+        "E2E test: get prompt with the test prompt name and { name: 'World' } returns expected messages",
+        "E2E test: resource read with nonexistent URI returns an MCP error",
+        "E2E test: prompt get with nonexistent name returns an MCP error",
+        "bun run test:e2e passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Edit plugins/e2e-test/src/index.ts to add a test resource and test prompt using defineResource() and definePrompt(). The test resource reads data from the test server page (the E2E test server that the test plugin's adapter is injected into). The test prompt generates a simple greeting message. Rebuild the e2e-test plugin: cd plugins/e2e-test && bun run build. Create a new E2E test file e2e/resources-prompts.e2e.ts (or add tests to an existing file). Use the MCP client fixture to call resources/list, resources/read, prompts/list, prompts/get. Verify the full pipeline: MCP client -> MCP server -> WebSocket -> extension -> adapter -> page context -> result. Test error cases: reading a nonexistent resource URI, getting a nonexistent prompt."
+    },
+    {
+      "id": "US-008",
+      "title": "Publish updated packages and update plugins",
+      "description": "As a platform developer, I want to publish the updated shared, plugin-sdk, plugin-tools, and cli packages so that plugins can use defineResource and definePrompt.",
+      "acceptanceCriteria": [
+        "Bump version in all platform packages (shared, plugin-sdk, plugin-tools, cli) to next minor",
+        "Publish in dependency order: shared -> plugin-sdk -> plugin-tools -> cli",
+        "Wait for npm propagation between publishes (retry with delays if install fails)",
+        "Update e2e-test plugin dependencies to use the new versions",
+        "Update slack plugin dependencies to use the new versions",
+        "e2e-test plugin builds successfully with new dependencies",
+        "slack plugin builds successfully with new dependencies",
+        "All quality gates pass: build, type-check, lint, knip, test"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "Use scripts/publish.sh to publish all packages. The publish order must follow the dependency graph: shared first (no deps on other platform packages), then plugin-sdk (depends on shared), then plugin-tools (depends on plugin-sdk), then cli (depends on shared). After publishing, wait for npm propagation — this can take 10-60 seconds. Retry bun install in plugin directories if the new version isn't immediately available. The npm token in ~/.npmrc does both read and write. If you get 401 or 403 errors, retry — do NOT assume the token is expired. Propagation delays are the most common cause of install failures after publishing. After plugins are updated and built, run all quality gates to verify everything works end-to-end."
+    },
+    {
+      "id": "US-009",
+      "title": "Update CLAUDE.md for resources and prompts",
+      "description": "As a platform developer, I want CLAUDE.md to document defineResource and definePrompt and the resource/prompt dispatch flow so that future development has accurate context.",
+      "acceptanceCriteria": [
+        "Plugin SDK section documents defineResource() and definePrompt() factories",
+        "Architecture section mentions resources and prompts alongside tools in the dispatch flow",
+        "Key Concepts section explains resource URI prefixing and prompt name prefixing",
+        "Adding a New Plugin section mentions resources and prompts as optional capabilities",
+        "No inaccurate references to tools-only capabilities remain",
+        "CLAUDE.md remains plugin-agnostic (no specific plugin names in new content)"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Edit CLAUDE.md. Update the Plugin SDK description to mention defineResource and definePrompt alongside defineTool. Update the Architecture section to show that the dispatch flow handles tools, resources, and prompts. Update Key Concepts to explain resource URI prefixing (analogous to tool name prefixing) and prompt name prefixing. Update the Adding a New Plugin section to mention that plugins can optionally define resources and prompts in addition to tools. Update the MCP server description to mention resource and prompt handler registration. Keep changes minimal and focused — don't rewrite sections that don't need updating."
+    }
+  ]
+}

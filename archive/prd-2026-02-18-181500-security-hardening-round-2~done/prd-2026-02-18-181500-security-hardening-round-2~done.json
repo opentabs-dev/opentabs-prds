@@ -1,0 +1,149 @@
+{
+  "project": "OpenTabs Platform — Security Hardening Round 2",
+  "description": "Fix 7 remaining security vulnerabilities identified by comprehensive audit. Covers WebSocket path validation, sender verification, regex centralization, method allowlist automation, frame size limits, debugger permission documentation, and schema validation timeout.",
+  "userStories": [
+    {
+      "id": "US-023",
+      "title": "Validate WebSocket URL path in offscreen document",
+      "description": "As a security engineer, I want the offscreen document to validate the WebSocket URL path (not just host) so that a compromised /ws-info response cannot redirect the connection to an arbitrary endpoint on the same host.",
+      "acceptanceCriteria": [
+        "isValidWsOrigin() in offscreen/index.ts checks parsed.pathname === '/ws' after host validation",
+        "URLs like ws://localhost:9515/evil or ws://localhost:9515/ws/extra are rejected",
+        "ws://localhost:9515/ws is accepted",
+        "Warning is logged when path validation fails (similar to existing protocol/host warnings)",
+        "All 3 call sites of isValidWsOrigin continue to work (lines ~214, ~349, ~365)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts lines 69-88. The function currently only checks parsed.protocol and parsed.host. Add a third check: `if (parsed.pathname !== '/ws') { console.warn(...); return false; }`. The server's WebSocket endpoint is always at /ws — this is hardcoded in http-routes.ts. The offscreen document is NOT covered by bun:test (it's a Chrome extension context), so add a comment explaining the validation and why the path must be /ws."
+    },
+    {
+      "id": "US-024",
+      "title": "Add sender validation to offscreen chrome.runtime.onMessage",
+      "description": "As a security engineer, I want the offscreen document's message listener to validate that messages come from our own extension so that content scripts or other extensions cannot send ws:send messages to the MCP server.",
+      "acceptanceCriteria": [
+        "chrome.runtime.onMessage listener checks sender.id === chrome.runtime.id at the top of the handler",
+        "Messages from other senders are rejected with sendResponse({ sent: false, reason: 'unauthorized sender' }) or silently ignored",
+        "A comment explains this is defense-in-depth (Chrome already isolates extension message passing)",
+        "ws:send, ws:getState, and ws:setUrl message types are all protected by the check",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts line 322. The listener currently uses `_sender` (unused). Change to `sender` and add at the top of the listener body: `if (sender.id !== chrome.runtime.id) { console.warn('[opentabs:offscreen] Rejected message from unauthorized sender:', sender.id); return false; }`. The `sender` parameter has type `chrome.runtime.MessageSender` which has an `id?: string` field. Use optional chaining for safety: `sender.id !== chrome.runtime.id`. Return `true` at the end to indicate async response if needed — check existing return value pattern."
+    },
+    {
+      "id": "US-025",
+      "title": "Centralize plugin name validation regex in browser extension",
+      "description": "As a developer, I want the plugin name validation regex to be defined in one place within the browser extension so that inconsistencies between files cannot create validation bypass vulnerabilities.",
+      "acceptanceCriteria": [
+        "A single VALID_PLUGIN_NAME regex is exported from a shared location within the browser extension (e.g., src/constants.ts or src/validation.ts)",
+        "iife-injection.ts imports it instead of defining its own SAFE_PLUGIN_NAME",
+        "message-router.ts imports it instead of using inline regex at lines 101 and 507",
+        "side-panel/App.tsx imports it instead of defining its own VALID_PLUGIN_NAME",
+        "No inline plugin name regex patterns remain in any browser extension source file",
+        "The isSafePluginName function in iife-injection.ts continues to also check RESERVED_NAMES",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": "Current duplication: (1) iife-injection.ts:5 defines SAFE_PLUGIN_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/; (2) message-router.ts:101 uses inline !/^[a-z0-9]+(-[a-z0-9]+)*$/.test(obj.name); (3) message-router.ts:507 uses same inline regex; (4) side-panel/App.tsx:14 defines VALID_PLUGIN_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/. Create platform/browser-extension/src/constants.ts with `export const VALID_PLUGIN_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;` and `export const isValidPluginName = (name: string): boolean => VALID_PLUGIN_NAME.test(name);`. Import in all 4 files. The extension can't use @opentabs-dev/shared at runtime (browser context), so the constant must live within the extension. Also export the RESERVED_NAMES set from constants.ts if iife-injection.ts needs it alongside the regex."
+    },
+    {
+      "id": "US-027",
+      "title": "Add test to verify ALLOWED_METHODS covers all methodHandlers",
+      "description": "As a developer, I want a test that catches when a new method handler is added to message-router.ts but ALLOWED_METHODS in offscreen/index.ts is not updated, preventing silent 30-second timeouts from dropped messages.",
+      "acceptanceCriteria": [
+        "A shared constants file (e.g., src/known-methods.ts) exports the complete set of WebSocket method names used by the extension",
+        "Both ALLOWED_METHODS in offscreen/index.ts and methodHandlers in message-router.ts derive from or are checked against this shared set",
+        "A unit test verifies that every key in methodHandlers is present in ALLOWED_METHODS",
+        "A unit test verifies that every entry in ALLOWED_METHODS either exists in methodHandlers or is in a documented exempt list (e.g., 'pong' which is handled directly, not via methodHandlers)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": "Approach: Create platform/browser-extension/src/known-methods.ts that exports a const array of all method names. In offscreen/index.ts, import it and build ALLOWED_METHODS = new Set(KNOWN_METHODS). In message-router.ts, the methodHandlers Map keys should be a subset of KNOWN_METHODS. Write a test in a new file (e.g., src/known-methods.test.ts) that imports both KNOWN_METHODS and the methodHandlers keys, then asserts they're in sync. The offscreen ALLOWED_METHODS also includes 'pong' which is handled by the offscreen ws.onmessage handler directly (not routed through message-router), so the test should account for that. Methods in KNOWN_METHODS that are NOT in methodHandlers need to be explicitly listed as 'offscreen-only' or 'direct-handled'."
+    },
+    {
+      "id": "US-028",
+      "title": "Set WebSocket maxPayloadLength in Bun.serve config",
+      "description": "As a security engineer, I want the MCP server to enforce a WebSocket frame size limit at the transport layer so that oversized messages are dropped before being buffered into memory.",
+      "acceptanceCriteria": [
+        "Bun.serve() websocket config includes maxPayloadLength: 10 * 1024 * 1024 (10MB)",
+        "This matches the existing MAX_MESSAGE_SIZE check in extension-protocol.ts",
+        "Messages exceeding 10MB are dropped by Bun before reaching the message handler",
+        "A comment explains why 10MB matches the application-level check in extension-protocol.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": "File: platform/mcp-server/src/index.ts lines 181-191. The websocket config currently only has open/message/close handlers. Add `maxPayloadLength: 10 * 1024 * 1024` to the websocket config object. Bun's WebSocket server supports this option (see Bun.serve docs). This is FROZEN CORE code — the comment block says changes require a full process restart. That's fine for a security fix. The existing MAX_MESSAGE_SIZE in extension-protocol.ts (line 37) is also 10MB — keep them in sync. Consider defining a shared constant, but since index.ts is frozen core and extension-protocol.ts is hot-reloadable, a simple duplicate with a comment is acceptable."
+    },
+    {
+      "id": "US-029",
+      "title": "Document debugger permission usage in manifest.json",
+      "description": "As a security auditor, I want the manifest.json to document why the debugger permission is required so that future audits don't flag it as unnecessary attack surface.",
+      "acceptanceCriteria": [
+        "manifest.json has a comment (or a separate PERMISSIONS.md reference) documenting that 'debugger' is used by network-capture.ts for chrome.debugger.attach/detach/sendCommand",
+        "Since JSON doesn't support comments, add a '_permissions_notes' field in manifest.json OR create a brief note in the CLAUDE.md architecture section about which permissions are used and why",
+        "The documentation mentions: debugger is used for Network.enable and Runtime.enable via Chrome DevTools Protocol for network capture functionality",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": "The debugger permission IS actively used in platform/browser-extension/src/network-capture.ts: chrome.debugger.attach (line 168), chrome.debugger.sendCommand for Network.enable and Runtime.enable (lines 177-178), chrome.debugger.detach (lines 149, 180, 201), and chrome.debugger.onEvent.addListener (line 73). This is legitimate — it's used for the browser.captureNetworkTraffic tool. Since JSON doesn't support comments, the best approach is to add a short note in CLAUDE.md under the Chrome Extension section explaining the permission. Keep it brief — just mention debugger is required for network capture via Chrome DevTools Protocol."
+    },
+    {
+      "id": "US-030",
+      "title": "Add timeout guard on Ajv schema validation",
+      "description": "As a security engineer, I want tool input validation to have a timeout so that pathological schemas cannot hang the MCP server indefinitely.",
+      "acceptanceCriteria": [
+        "The validate(args) call in mcp-setup.ts is wrapped in a timeout mechanism",
+        "If validation takes longer than 5 seconds, the tool call is rejected with an error message containing 'validation timed out'",
+        "Normal schemas (which complete in microseconds) are not affected by the timeout",
+        "The timeout cleanup is handled properly (no leaked timers)",
+        "A unit test verifies that normal validation completes successfully under the timeout",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": "File: platform/mcp-server/src/mcp-setup.ts around line 309. Currently `const valid = lookup.validate(args);` is synchronous. Ajv's validate() is synchronous so wrapping in Promise.race won't help directly. Instead, use a different approach: since Ajv validation is synchronous and the actual risk is very low (schemas are compiled at discovery time from plugin manifests we've already validated), consider one of: (1) Add a max schema complexity check at compilation time (reject schemas with more than N levels of nesting or M allOf/oneOf branches). (2) Wrap the synchronous call in a try-catch with a comment explaining it's safe because schemas are pre-validated. (3) Use AbortController with a worker thread for true timeout. Option 1 is the most practical — add a maxDepth check when compiling the Ajv validator. The validate() itself is already fast for well-formed schemas. If going with runtime timeout, note that Bun supports `setTimeout` in a Promise.race pattern, but the synchronous validate() would need to be run in a worker. A pragmatic approach: add a maxItems/maxProperties constraint to the compiled schema to prevent combinatorial explosion."
+    }
+  ]
+}

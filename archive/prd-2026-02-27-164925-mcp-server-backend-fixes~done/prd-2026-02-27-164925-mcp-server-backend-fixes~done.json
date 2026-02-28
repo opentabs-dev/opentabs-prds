@@ -1,0 +1,123 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource leaks, dead code, and missing guards discovered during backend audit of the MCP server package.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix cleanupStaleAdapterFiles unreachable rejection branch and inaccurate delete count",
+      "description": "As a developer, I want the stale adapter file cleanup to accurately report deletion results so that log messages reflect actual outcomes, not always-success counts.",
+      "acceptanceCriteria": [
+        "Promise.allSettled in cleanupStaleAdapterFiles wraps unlink calls WITHOUT an inner .catch(() => {}), so rejected results are properly surfaced",
+        "The deleted count in the log message reflects only actually successful deletions, not the total number of stale files",
+        "Same fix applied to the Promise.allSettled in writeAdapterFile (line 74) — remove inner .catch(() => {})",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/adapter-files.ts\n\nBug: Lines 74 and 132 wrap unlink() calls with .catch(() => {}) INSIDE Promise.allSettled(). Since .catch() converts rejections to fulfilled promises, the allSettled results always have status 'fulfilled' — the 'rejected' branch on line 135-138 is dead code. The `deleted` counter always equals `staleFiles.length` regardless of actual deletion success.\n\nFix: Remove the inner .catch(() => {}) from both locations. Let unlink rejections surface naturally through Promise.allSettled, so the rejection branch works correctly and the count is accurate.\n\nLine 74: `await Promise.allSettled(oldFiles.map(f => unlink(join(adaptersDir, f)).catch(() => {})));`\n→ `await Promise.allSettled(oldFiles.map(f => unlink(join(adaptersDir, f))));`\n\nLine 132: `const results = await Promise.allSettled(staleFiles.map(f => unlink(join(adaptersDir, f)).catch(() => {})));`\n→ `const results = await Promise.allSettled(staleFiles.map(f => unlink(join(adaptersDir, f))));`\n\nAlso line 219 in cleanupStaleExecFiles has the same pattern — fix there too, and add a count of successful deletions to the log message (currently always logs the total)."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix extension_force_reconnect tool always timing out",
+      "description": "As a user, I want the extension_force_reconnect browser tool to return success immediately so that it does not always produce a misleading 30-second timeout error.",
+      "acceptanceCriteria": [
+        "extension_force_reconnect uses fire-and-forget dispatch (sends the JSON-RPC message directly via state.extensionWs) instead of dispatchToExtension which expects a response",
+        "The tool returns a success message immediately after sending the disconnect signal, similar to how reload-extension.ts works",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/extension-force-reconnect.ts\n\nBug: Line 19 uses `dispatchToExtension(state, 'extension.forceReconnect', {})` which creates a pending dispatch with a 30s timeout and waits for a response. But force-reconnect kills the WebSocket connection, so the response never arrives — the tool ALWAYS returns a timeout error after 30 seconds, even on success.\n\nFix: Follow the pattern used by reload-extension.ts (platform/mcp-server/src/browser-tools/reload-extension.ts lines 20-33), which sends the message directly via state.extensionWs.send() and returns immediately with a success message. Do NOT use dispatchToExtension.\n\nThe handler should:\n1. Check state.extensionWs is connected\n2. Send the JSON-RPC notification directly: `state.extensionWs.send(JSON.stringify({ jsonrpc: '2.0', method: 'extension.forceReconnect', id: getNextRequestId() }))`\n3. Return a success message like 'Force reconnect signal sent — the extension will disconnect and reconnect.'\n4. Catch WebSocket send errors and return an appropriate error message\n\nImport getNextRequestId from '../state.js' and sendToExtension from '../extension-handlers.js' if needed."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix logger duplicating error message in debug stack trace output",
+      "description": "As a developer, I want debug log output to show the error message exactly once so that stack traces are clean and readable.",
+      "acceptanceCriteria": [
+        "When logging at debug level with an Error argument, the error message appears exactly once (not duplicated before the stack trace)",
+        "The stack trace (which already includes the message as its first line in V8) is used directly without prepending last.message",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/logger.ts\n\nBug: Line 47: `return [...rest, last.message + '\\n  ' + last.stack];`\n\nIn V8 (Node.js), Error.stack already includes the error message as the first line (format: `ErrorType: message\\n  at ...`). Prepending `last.message + '\\n  '` before `last.stack` produces output like:\n  `Some error\\n  Error: Some error\\n  at ...`\n\nFix: Change line 47 to use just the stack:\n  `return [...rest, last.stack];`\n\nThis produces clean output:\n  `Error: Some error\\n  at ...`"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix removeLocalPlugin error being swallowed from caller",
+      "description": "As a developer, I want removeLocalPlugin to correctly propagate errors to callers so that removePlugin reports the real failure instead of a misleading 'not found in localPlugins' error.",
+      "acceptanceCriteria": [
+        "When the async IIFE inside removeLocalPlugin throws (e.g., atomicWrite fails), the error is propagated to the caller (removePlugin)",
+        "The configWriteMutex is correctly reset to a resolved promise on failure so subsequent writes are not blocked",
+        "The `removed` variable is correctly communicated across the async boundary",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/mcp-server/src/plugin-management.ts\n\nBug: Lines 354-428. The pattern is:\n```\nstate.configWriteMutex = (async () => {\n  await prev;\n  // ... do work, set `removed = true` ...\n})().catch((err) => {\n  state.configWriteMutex = Promise.resolve(); // reset mutex\n  log.warn(...);\n  throw err; // re-throw\n});\nawait state.configWriteMutex; // line 427\nreturn removed; // line 428\n```\n\nThe problem: when .catch() re-throws, the promise returned by .catch() rejects. But line 422 already reassigned `state.configWriteMutex = Promise.resolve()`. So line 427 `await state.configWriteMutex` awaits the resolved promise (not the rejected one from the .catch() throw). The error is swallowed.\n\nAdditionally, `removed` is a local variable outside the async IIFE. If the IIFE throws after setting `removed = true` (e.g., atomicWrite fails after matching), the caller sees `removed = true` and thinks it succeeded.\n\nFix approach: Restructure to properly propagate errors. One approach:\n```\nconst prev = state.configWriteMutex;\nlet resolveGuard!: () => void;\nstate.configWriteMutex = new Promise<void>(resolve => { resolveGuard = resolve; });\ntry {\n  await prev;\n  // ... do work ...\n  return removed;\n} catch (err) {\n  log.warn(...);\n  throw err;\n} finally {\n  resolveGuard();\n}\n```\n\nThis ensures: (1) errors propagate to caller, (2) mutex is always released, (3) `removed` is returned only on success."
+    },
+    {
+      "id": "US-005",
+      "title": "Add timeout to spawnSync calls in version-check.ts",
+      "description": "As a server operator, I want npm version check commands to have a timeout so that a hanging npm process does not block the entire MCP server indefinitely.",
+      "acceptanceCriteria": [
+        "spawnSync in fetchLatestVersion has a timeout option (e.g., 10 seconds)",
+        "If the timeout is exceeded, fetchLatestVersion returns null (same as other failure modes)",
+        "The timeout is logged at debug level when it fires",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/version-check.ts\n\nBug: Line 27: `spawnSync('npm', ['view', packageName, 'version'], { stdio: ['ignore', 'pipe', 'pipe'] })` has no timeout. If npm hangs (DNS resolution, registry auth prompt, network issue), the entire Node.js event loop blocks indefinitely. This is called during reload for each npm plugin.\n\nFix: Add `timeout: 10_000` to the spawnSync options:\n`spawnSync('npm', ['view', packageName, 'version'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 10_000 })`\n\nWhen timeout fires, spawnSync returns with `raw.signal === 'SIGTERM'` and `raw.status === null`. The existing check `raw.error || raw.status !== 0` will catch this (status is null which is not 0).\n\nAlso apply the same fix to searchNpmPlugins in plugin-management.ts line 153:\n`spawnSync(platformExec('npm'), ['search', searchTerm, '--json'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 15_000 })`\n\nUse 15s for search since npm search is inherently slower than npm view.\n\nAlso fix getGlobalNodeModulesPaths in resolver.ts — find the spawnSync('npm', ['root', '-g'], ...) call and add timeout: 10_000."
+    },
+    {
+      "id": "US-006",
+      "title": "Fix mtime polling timer ID race between generations",
+      "description": "As a developer running in dev mode, I want mtime polling self-cleanup to never accidentally cancel the new generation's timer so that file change detection remains reliable across hot reloads.",
+      "acceptanceCriteria": [
+        "The old generation's interval callback does NOT call clearInterval on state.fileWatching.mtimePollTimerId (which may belong to the new generation)",
+        "Instead, the old interval only returns early without clearing any state — stopFileWatching already handles cleanup before the new generation starts",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/file-watcher.ts\n\nBug: Lines 602-609 in startMtimePolling:\n```\nif (state.fileWatching.generation !== gen) {\n  if (state.fileWatching.mtimePollTimerId !== null) {\n    clearInterval(state.fileWatching.mtimePollTimerId);\n    state.fileWatching.mtimePollTimerId = null;\n  }\n  return;\n}\n```\n\nThe race: if the old generation's interval callback fires after the new generation's startMtimePolling has already set a new mtimePollTimerId, `clearInterval(state.fileWatching.mtimePollTimerId)` kills the NEW generation's timer. This is possible because setInterval callbacks from the old generation can fire after stopFileWatching (which clears timers) and startMtimePolling (which creates new ones).\n\nFix: The old generation should just bail out without touching shared state:\n```\nif (state.fileWatching.generation !== gen) {\n  return;\n}\n```\n\nThe stopFileWatching function (called before each startFileWatching) is responsible for cleaning up the old timer. The self-cleanup is redundant and introduces this race."
+    }
+  ]
+}

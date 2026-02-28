@@ -1,0 +1,69 @@
+# Ralph Progress Log
+PRD: prd-2026-02-17-225636-platform-audit-fixes~running.json
+Started: Tue Feb 17 22:57:49 PST 2026
+---
+
+## Codebase Patterns
+- Platform packages are in platform/, plugins in plugins/
+- Tests use bun:test and follow pattern `*.test.ts` alongside source files
+- Test tsconfigs (`tsconfig.test.json`) include `src/**/*.test.ts` with noEmit
+- scaffold.ts exports `scaffoldPlugin`, `ScaffoldError`, and helpers needed for testing
+- The cli package at platform/cli/ has its own tsconfig.test.json for test type-checking
+
+## 2026-02-17 23:00 - US-001
+- Added `toTitleCase` helper next to `toPascalCase` in `platform/cli/src/scaffold.ts`
+- Updated both `generatePluginIndex` (line 178) and `generateExampleTool` (line 208) to use `toTitleCase(args.name)` instead of naive `charAt(0).toUpperCase() + slice(1)`
+- Exported `toTitleCase` for testing
+- Created `platform/cli/src/scaffold.test.ts` with 3 test cases: hyphenated multi-word, single word, two-part name
+- Files changed: `platform/cli/src/scaffold.ts`, `platform/cli/src/scaffold.test.ts` (new)
+- **Learnings for future iterations:**
+  - `toPascalCase` is used for class names (joins without separator), `toTitleCase` for display names (joins with space)
+  - The scaffold has two independent locations that generate displayName — both must be updated in sync
+  - Test files are auto-discovered by `tsconfig.test.json` glob pattern — no config changes needed
+---
+
+## 2026-02-17 23:05 - US-002
+- Changed `console.warn` to `throw new Error` in `platform/browser-extension/src/iife-injection.ts` (line 147) for post-retry adapter hash mismatch
+- The error message includes plugin name, expected hash, and actual hash
+- The caller `injectPluginIntoMatchingTabs` uses `Promise.allSettled`, so the rejection is safely captured and the tab is excluded from `injectedTabIds`
+- Files changed: `platform/browser-extension/src/iife-injection.ts`
+- **Learnings for future iterations:**
+  - `injectPluginIntoMatchingTabs` uses `Promise.allSettled` — thrown errors are captured as rejected promises, not unhandled rejections
+  - The injection pipeline has a retry-once pattern: inject → verify hash → retry inject → verify hash → throw if still mismatched
+  - `readAdapterHash` reads the hash from the page's `__openTabs.adapters[pluginName].__adapterHash`
+---
+
+## 2026-02-17 23:10 - US-003
+- Replaced `Date.now() % 2000 < 500` with elapsed-time tracking in `e2e/helpers.ts` (`openTestAppTab` function)
+- Added `let lastDiagnosticTime = 0;` before the while loop
+- Changed condition to `now - lastDiagnosticTime >= 2000` with `lastDiagnosticTime = now;` update inside the block
+- Files changed: `e2e/helpers.ts`
+- **Learnings for future iterations:**
+  - E2E helpers are in `e2e/helpers.ts`, not in `platform/` — they use Playwright's Node.js environment
+  - The `openTestAppTab` function polls every 500ms and collects diagnostics periodically for timeout error messages
+  - E2E files are type-checked via `tsconfig.configs.json` (or a dedicated e2e tsconfig), not the platform tsconfigs
+---
+
+## 2026-02-17 23:15 - US-004
+- Added `wsInfo.wsUrl !== ''` guard to three locations that parse wsUrl from /ws-info:
+  1. `offscreen/index.ts` refreshWsUrl (line 169) — already had `!== mcpServerUrl` but empty string would pass
+  2. `offscreen/index.ts` URL-changed handler (line 298) — added guard + console.warn for empty string
+  3. `background.ts` ws-url resolution (line 109) — added guard + console.warn for empty string
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`, `platform/browser-extension/src/background.ts`
+- **Learnings for future iterations:**
+  - wsUrl is parsed in THREE locations, not just the two mentioned in the PRD notes — `refreshWsUrl`, the URL-changed message handler, and background.ts
+  - The offscreen document has its own `refreshWsUrl` that runs before each reconnect attempt
+  - background.ts resolves the ws-url for the offscreen document via `GET_WS_URL` message handler
+---
+
+## 2026-02-17 23:20 - US-005
+- Added `log.warn` check on `sendToExtension` return value in both `sendSyncFull` and `sendPluginUpdate` in `platform/mcp-server/src/extension-protocol.ts`
+- `sendSyncFull`: captures return value as `sent`, logs `'Failed to send sync.full — extension not connected'` if false
+- `sendPluginUpdate`: same pattern, logs `'Failed to send plugin.update — extension not connected'`
+- Verified the warning fires correctly in existing tests (extension-protocol.test.ts calls sendSyncFull without a connected extension)
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`
+- **Learnings for future iterations:**
+  - `sendToExtension` already returns a boolean — callers just need to check it
+  - `log` is imported from `./logger.js` in extension-protocol.ts
+  - Response-type callers of `sendToExtension` don't need the check — they only fire when the extension is connected
+---

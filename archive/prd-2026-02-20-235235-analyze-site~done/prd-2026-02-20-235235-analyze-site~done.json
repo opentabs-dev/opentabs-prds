@@ -1,0 +1,327 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add a plugin_analyze_site browser tool that comprehensively analyzes a web page to help plugin developers understand authentication methods, API patterns, page framework, DOM structure, and storage — producing actionable intelligence for building OpenTabs plugins. Includes extensive E2E tests with test servers simulating 15 real-world auth and API patterns.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Create authentication detection module",
+      "description": "As a plugin developer, I want the site analyzer to detect all common authentication methods so that I know how the target site authenticates users.",
+      "acceptanceCriteria": [
+        "New file platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts",
+        "Detects cookie-based sessions: scans document.cookie for known session cookie patterns (d=, _session_id, connect.sid, JSESSIONID, __Secure-, __Host-, sid, session, token)",
+        "Detects JWT in localStorage: scans all keys, identifies values with 3 dot-separated base64 segments",
+        "Detects JWT in sessionStorage: same pattern as localStorage",
+        "Detects OAuth2 Bearer headers: finds Authorization: Bearer <token> in captured network requests",
+        "Detects API key headers: finds X-API-Key, Api-Key, apikey, X-Api-Key headers in network requests",
+        "Detects CSRF tokens: finds meta tags (csrf-token, _csrf, csrf_token), hidden inputs (authenticity_token, _token, csrfmiddlewaretoken, __RequestVerificationToken), and X-CSRF-Token/X-XSRF-Token headers",
+        "Detects Basic Auth: finds Authorization: Basic headers",
+        "Detects custom auth headers: identifies non-standard headers that appear on most requests and contain token-like values",
+        "Detects auth data in window globals: probes __NEXT_DATA__, __NUXT__, __INITIAL_STATE__, __APP_STATE__ for keys containing user, session, token, auth",
+        "Each detected method includes: type string, human-readable details, extraction hint (code snippet showing how to get the auth value)",
+        "Returns an authenticated boolean (true if any auth method detected) and an array of detected methods",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Create platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts. This module exports a function that takes captured network requests (from browser_enable_network_capture), page execution results (from browser_execute_script), and returns structured auth analysis. The function itself doesn't call browser tools — it analyzes data that the orchestrator (US-005) will collect. Keep it as a pure analysis function: takes data in, returns structured results out. The extractionHint should be working JavaScript code that a plugin developer can copy into their tool handler, e.g., \"document.cookie.match(/d=([^;]+)/)?.[1]\" for a cookie extraction."
+    },
+    {
+      "id": "US-002",
+      "title": "Create API pattern detection module",
+      "description": "As a plugin developer, I want the site analyzer to detect API patterns so that I know what endpoints the site uses and how to call them.",
+      "acceptanceCriteria": [
+        "New file platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts",
+        "Classifies captured network requests by protocol: REST (JSON), GraphQL (POST to /graphql with query field), gRPC-Web (application/grpc-web content type), JSON-RPC (body with jsonrpc field), tRPC (requests to /api/trpc/ or /trpc/ paths), WebSocket, SSE (text/event-stream), form submissions",
+        "Groups requests by base URL path (deduplicates repeated calls to same endpoint)",
+        "Captures: URL, HTTP method, content type, protocol classification, auth header used, request body sample (truncated to 500 chars), response status, call count",
+        "Filters out noise: static assets (js/css/images/fonts), analytics (google-analytics, segment, mixpanel), tracking pixels, browser extension requests, CDN requests",
+        "Detects the primary API base URL (most common host/path prefix for API calls)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Create platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts. This is a pure analysis function: takes an array of captured network requests (the format returned by browser_get_network_requests), classifies and groups them. The noise filtering is important — a typical page load generates 50+ requests but only 5-10 are actual API calls. Filter by: ignore GET requests for *.js, *.css, *.png, *.jpg, *.svg, *.woff; ignore requests to known analytics domains; focus on XHR/fetch requests (resourceType 'xmlhttprequest' or 'fetch')."
+    },
+    {
+      "id": "US-003",
+      "title": "Create framework and globals detection module",
+      "description": "As a plugin developer, I want to know what framework the site uses and what interesting globals exist.",
+      "acceptanceCriteria": [
+        "New file platform/mcp-server/src/browser-tools/analyze-site/detect-framework.ts",
+        "Detects: React (+ version from __REACT_DEVTOOLS_GLOBAL_HOOK__), Next.js (__NEXT_DATA__), Vue (__VUE__), Nuxt (__NUXT__), Angular (ng-version attribute), Svelte (__svelte_meta), jQuery (window.jQuery), Ember, Backbone",
+        "Detects SPA vs MPA: checks for client-side routing (single root element, pushState usage)",
+        "Detects SSR: checks for __NEXT_DATA__, __NUXT__, hydration markers",
+        "New file platform/mcp-server/src/browser-tools/analyze-site/detect-globals.ts",
+        "Scans window.* for non-standard properties (filters out browser builtins)",
+        "For each interesting global: reports path, typeof, whether it contains auth-related keys (user, session, token, auth, account, profile), and sample top-level keys for objects",
+        "Limits scanning depth to 2 levels to avoid performance issues",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Create two files in platform/mcp-server/src/browser-tools/analyze-site/. The framework detection runs as a script in the page context via browser_execute_script. It checks for well-known globals and DOM markers. The globals detection scans Object.keys(window) and filters out the ~200 standard browser globals (use a known list). For each remaining key, check typeof and if it's an object, get the top-level keys. This needs to be fast — set a 3-second timeout. The auth-data detection within globals looks for keys matching /user|session|token|auth|account|profile|login|credential/i."
+    },
+    {
+      "id": "US-004",
+      "title": "Create DOM and storage analysis module",
+      "description": "As a plugin developer, I want to know about forms, interactive elements, and storage usage.",
+      "acceptanceCriteria": [
+        "New file platform/mcp-server/src/browser-tools/analyze-site/detect-dom.ts",
+        "Detects all forms: action URL, method, field names and types",
+        "Detects interactive elements: buttons, links with onclick, input fields, select dropdowns (limited to first 50)",
+        "Detects unique data-* attribute names used in the page (useful for querying elements)",
+        "New file platform/mcp-server/src/browser-tools/analyze-site/detect-storage.ts",
+        "Lists all cookie names with isAuth flag (matches auth-related patterns)",
+        "Lists all localStorage keys with isAuth flag",
+        "Lists all sessionStorage keys with isAuth flag",
+        "Does NOT read storage values (security) — only reports key names",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Create two files. DOM analysis runs as page scripts. For forms: querySelectorAll('form'), extract action/method and all input/select/textarea names within each form. For interactive elements: query buttons, [onclick], a[href^='javascript:'], input, select, textarea — limit to 50 most relevant. For data attributes: scan all elements' datasets and collect unique attribute names. Storage analysis: list keys from document.cookie (parse names only), Object.keys(localStorage), Object.keys(sessionStorage). The isAuth flag uses the same pattern matching as auth detection: /session|token|auth|jwt|csrf|user|login|credential|sid|key|secret/i."
+    },
+    {
+      "id": "US-005",
+      "title": "Create plugin_analyze_site browser tool orchestrator",
+      "description": "As a plugin developer, I want a single tool that orchestrates all analysis modules and produces a comprehensive site report.",
+      "acceptanceCriteria": [
+        "New browser tool: plugin_analyze_site with input { url: string, waitSeconds?: number }",
+        "Registered in platform/mcp-server/src/browser-tools/index.ts",
+        "Orchestration flow: open tab (or reuse existing) → wait for load → enable network capture → wait N seconds (default 5) for API calls → run all detection scripts in page → get network requests → disable network capture → analyze all collected data → return structured result",
+        "Output type matches the comprehensive schema: url, title, auth, apis, framework, globals, dom, storage, suggestions",
+        "The suggestions array contains tool ideas generated from the analysis: if REST APIs found, suggest tools for each major endpoint; if GraphQL found, suggest query/mutation tools; if forms found, suggest form-submission tools",
+        "Total execution time is under 15 seconds for typical sites",
+        "Tool description clearly explains what it does and when to use it",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Create platform/mcp-server/src/browser-tools/analyze-site/index.ts as the orchestrator and platform/mcp-server/src/browser-tools/analyze-site.ts as the browser tool definition. The orchestrator uses existing browser tool handlers internally: call the handlers for browser_open_tab, browser_enable_network_capture, browser_execute_script (multiple times for different probes), browser_get_network_requests, browser_disable_network_capture. Import the detection modules from the analyze-site/ directory. The suggestion generator should be smart: if it sees POST /api/conversations.list in captured APIs, suggest a 'list_conversations' tool that calls that endpoint. If it sees GraphQL, suggest tools based on the query names observed. If it sees forms, suggest form submission tools. Keep suggestions actionable — each should include the API endpoint and a brief approach description."
+    },
+    {
+      "id": "US-006",
+      "title": "Create E2E test server with cookie session auth",
+      "description": "As a platform developer, I want a test server simulating cookie-based session auth so that I can verify auth detection works.",
+      "acceptanceCriteria": [
+        "New test server scenario in e2e/test-servers/cookie-session.ts (or added to existing test-server)",
+        "Server has: login page with form, POST /login endpoint that sets session cookie, protected pages that require session cookie, logout endpoint that clears cookie",
+        "Session cookie uses a recognizable name (connect.sid or session_id) with HttpOnly flag",
+        "Protected page has API endpoints that return JSON data (for API detection testing)",
+        "Protected page includes a CSRF meta tag",
+        "E2E test: navigate to protected page (pre-authenticated), run plugin_analyze_site, verify auth.methods includes cookie-based session with correct cookie name",
+        "E2E test: verify CSRF token is detected",
+        "bun run test:e2e passes for these tests"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Extend the existing e2e test infrastructure. The e2e/test-server.ts already exists and serves test pages. Add new routes or a new server instance for each auth scenario. For cookie session: use a simple in-memory session store. The login can be pre-performed in the test setup (set cookie via page context). The test should verify that plugin_analyze_site correctly identifies the session cookie by name and reports authenticated: true."
+    },
+    {
+      "id": "US-007",
+      "title": "Create E2E test server with JWT localStorage auth",
+      "description": "As a platform developer, I want a test server simulating JWT in localStorage so that I can verify JWT detection works.",
+      "acceptanceCriteria": [
+        "Test server scenario: login endpoint returns JWT, client-side JS stores in localStorage, API requests include Authorization: Bearer header",
+        "JWT is a valid 3-segment base64 format (header.payload.signature)",
+        "Protected page has API endpoints that check Bearer header",
+        "E2E test: plugin_analyze_site detects JWT in localStorage with correct key name",
+        "E2E test: plugin_analyze_site detects Bearer header in API calls",
+        "E2E test: extractionHint for localStorage JWT is working code",
+        "bun run test:e2e passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "The test page should store a JWT in localStorage on load (simulating a post-login state). The JWT should have a valid structure (base64url encoded header + payload + signature). The page should make fetch() calls to API endpoints with Authorization: Bearer <jwt> header. The test verifies both the localStorage detection AND the Bearer header detection in network requests."
+    },
+    {
+      "id": "US-008",
+      "title": "Create E2E test server with GraphQL API",
+      "description": "As a platform developer, I want a test server with a GraphQL endpoint so that I can verify GraphQL detection works.",
+      "acceptanceCriteria": [
+        "Test server scenario: POST /graphql endpoint accepting GraphQL queries",
+        "Supports at least 2 queries and 1 mutation for variety",
+        "Client page makes GraphQL requests on load",
+        "E2E test: plugin_analyze_site classifies requests as protocol: 'graphql'",
+        "E2E test: suggestions include GraphQL-specific tool ideas",
+        "bun run test:e2e passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "The GraphQL server can be minimal — use a simple POST handler that parses { query, variables } from the body. Support queries like '{ users { id name } }' and '{ items { id title } }' and mutation '{ createItem(title: ...) { id } }'. The client page should make these queries via fetch on load. The test verifies that detect-apis classifies these as GraphQL."
+    },
+    {
+      "id": "US-009",
+      "title": "Create E2E test server with JSON-RPC API",
+      "description": "As a platform developer, I want a test server with JSON-RPC endpoints so that I can verify JSON-RPC detection works.",
+      "acceptanceCriteria": [
+        "Test server scenario: POST /rpc endpoint accepting JSON-RPC 2.0 requests",
+        "Supports at least 2 methods (e.g., getItems, createItem)",
+        "Client page makes JSON-RPC calls on load",
+        "E2E test: plugin_analyze_site classifies requests as protocol: 'jsonrpc'",
+        "bun run test:e2e passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Minimal JSON-RPC server: parse { jsonrpc: '2.0', method, params, id } from body, return { jsonrpc: '2.0', result, id }. The client page makes calls on load. Test verifies classification."
+    },
+    {
+      "id": "US-010",
+      "title": "Create E2E test server with Next.js-style SSR app",
+      "description": "As a platform developer, I want a test server simulating a Next.js-style SSR app so that I can verify framework and globals detection.",
+      "acceptanceCriteria": [
+        "Test server scenario: page includes window.__NEXT_DATA__ with props containing user data",
+        "Page has a div#__next root element",
+        "window.__NEXT_DATA__ includes a session/user object with auth-related data",
+        "E2E test: plugin_analyze_site detects framework as nextjs",
+        "E2E test: detects SSR: true, SPA: true",
+        "E2E test: detects auth data in __NEXT_DATA__ global",
+        "E2E test: globals include __NEXT_DATA__ with hasAuthData: true",
+        "bun run test:e2e passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "The test page just needs to set window.__NEXT_DATA__ = { props: { pageProps: { session: { user: { id: '1', name: 'Test' }, accessToken: 'fake-token' } } } } and have a div#__next. No actual Next.js needed — just the globals and DOM structure that the detector looks for."
+    },
+    {
+      "id": "US-011",
+      "title": "Create E2E test server with API key header auth",
+      "description": "As a platform developer, I want a test server using API key headers so that I can verify API key detection.",
+      "acceptanceCriteria": [
+        "Test server scenario: API endpoints require X-API-Key header",
+        "Client page makes API calls with X-API-Key header",
+        "E2E test: plugin_analyze_site detects api-key-header auth method",
+        "E2E test: extractionHint mentions the X-API-Key header name",
+        "bun run test:e2e passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "Simple test: server checks X-API-Key header, returns 401 without it. Client page stores key in a JS variable and includes it in fetch calls. The test verifies detection of the custom auth header pattern."
+    },
+    {
+      "id": "US-012",
+      "title": "Create E2E test server with tRPC API",
+      "description": "As a platform developer, I want a test server with tRPC-style endpoints so that I can verify tRPC detection.",
+      "acceptanceCriteria": [
+        "Test server scenario: endpoints at /api/trpc/<procedure> paths",
+        "Client page makes tRPC-style batch requests",
+        "E2E test: plugin_analyze_site classifies requests as protocol: 'trpc'",
+        "bun run test:e2e passes"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "tRPC requests go to paths like /api/trpc/user.list, /api/trpc/item.create. They can be GET (queries) or POST (mutations) with JSON body. The test page makes these calls on load. No actual tRPC framework needed — just the URL pattern."
+    },
+    {
+      "id": "US-013",
+      "title": "Create E2E test server with mixed auth (cookie + CSRF + Bearer)",
+      "description": "As a platform developer, I want a test server with mixed auth patterns so that I can verify detection of complex real-world auth setups.",
+      "acceptanceCriteria": [
+        "Test server scenario: cookie session for page auth, CSRF token for form submissions (in hidden input AND meta tag), Bearer token for XHR API calls (extracted from a window global)",
+        "Client page makes both form submissions (with CSRF) and API calls (with Bearer)",
+        "E2E test: plugin_analyze_site detects all three auth methods",
+        "E2E test: auth.methods has entries for cookie, csrf-token, and bearer-header",
+        "E2E test: auth.csrfToken includes correct location and name",
+        "bun run test:e2e passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "This simulates a real-world app like Slack that uses multiple auth mechanisms. The page has a session cookie, a CSRF meta tag, AND the client-side JS reads a token from a window global to make API calls with Authorization: Bearer. This is the most complex scenario and tests that the detector correctly identifies and reports all three methods."
+    },
+    {
+      "id": "US-014",
+      "title": "Create E2E test server with WebSocket real-time connection",
+      "description": "As a platform developer, I want a test server with WebSocket so that I can verify WebSocket detection.",
+      "acceptanceCriteria": [
+        "Test server scenario: page establishes WebSocket connection with auth token in URL or protocol",
+        "WebSocket server sends periodic messages (simulating real-time updates)",
+        "E2E test: plugin_analyze_site detects WebSocket connection in API analysis",
+        "E2E test: apis includes a websocket entry",
+        "bun run test:e2e passes"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": "The test page creates a WebSocket connection: new WebSocket('ws://localhost:<port>/ws?token=fake-token'). The server accepts and sends a couple of messages. The network capture should detect the WebSocket upgrade. Note: Chrome's network capture via CDP may capture the HTTP upgrade request but not individual WS frames. Test what's detectable."
+    },
+    {
+      "id": "US-015",
+      "title": "Create E2E test for SPA with client-side routing",
+      "description": "As a platform developer, I want to verify SPA detection with client-side routing.",
+      "acceptanceCriteria": [
+        "Test server scenario: SPA page with pushState navigation between 'routes'",
+        "Page has a single root element and uses history.pushState for navigation",
+        "Has React-like globals (simulated __REACT_DEVTOOLS_GLOBAL_HOOK__)",
+        "E2E test: plugin_analyze_site detects SPA: true",
+        "E2E test: framework detection identifies React",
+        "bun run test:e2e passes"
+      ],
+      "priority": 15,
+      "passes": true,
+      "notes": "Simple SPA simulation: one div#root, JS that handles link clicks with pushState, simulated React globals. No actual React needed."
+    },
+    {
+      "id": "US-016",
+      "title": "Create E2E test for suggestion generation quality",
+      "description": "As a platform developer, I want to verify that the tool suggestions are actionable and relevant.",
+      "acceptanceCriteria": [
+        "E2E test with a server that has: REST API endpoints (GET /api/items, POST /api/items, GET /api/users), a form, and a search feature",
+        "plugin_analyze_site returns suggestions array with at least 3 suggestions",
+        "Each suggestion has: toolName (snake_case), description, approach (with specific API endpoint), complexity",
+        "Suggestions are relevant to the detected APIs (not generic)",
+        "REST endpoint GET /api/items generates a 'list_items' tool suggestion",
+        "POST endpoint generates a 'create_item' tool suggestion",
+        "bun run test:e2e passes"
+      ],
+      "priority": 16,
+      "passes": true,
+      "notes": "This test verifies the suggestion generation logic. The test server has clear REST endpoints. The suggestions should reference these specific endpoints and describe how to call them. The toolName should follow OpenTabs naming conventions (snake_case). The approach should include enough detail for an AI agent to implement the tool."
+    },
+    {
+      "id": "US-017",
+      "title": "Create E2E test for sessionStorage JWT and Basic Auth",
+      "description": "As a platform developer, I want to verify detection of sessionStorage JWT and Basic Auth patterns.",
+      "acceptanceCriteria": [
+        "Test server with two scenarios: (a) JWT stored in sessionStorage, (b) Basic Auth header",
+        "E2E test for sessionStorage JWT: plugin_analyze_site detects jwt-sessionstorage auth method",
+        "E2E test for Basic Auth: plugin_analyze_site detects basic-auth method from Authorization: Basic header in network requests",
+        "bun run test:e2e passes"
+      ],
+      "priority": 17,
+      "passes": true,
+      "notes": "Two additional auth pattern tests. For sessionStorage JWT: page stores JWT in sessionStorage.setItem('auth_token', 'eyJ...'). For Basic Auth: page makes fetch with Authorization: Basic btoa('user:pass'). Both should be correctly detected and classified."
+    },
+    {
+      "id": "US-018",
+      "title": "Update CLAUDE.md to document plugin_analyze_site",
+      "description": "As a platform developer, I want CLAUDE.md to document the new tool.",
+      "acceptanceCriteria": [
+        "CLAUDE.md mentions plugin_analyze_site in the browser tools section",
+        "Documents what it detects: auth, APIs, framework, globals, DOM, storage, suggestions",
+        "Documents when to use it: when developing a new plugin for a website"
+      ],
+      "priority": 18,
+      "passes": true,
+      "notes": "Brief addition to CLAUDE.md. The full documentation will be in the docs site."
+    }
+  ]
+}

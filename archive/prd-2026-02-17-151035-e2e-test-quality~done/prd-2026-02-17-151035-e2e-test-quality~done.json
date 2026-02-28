@@ -1,0 +1,182 @@
+{
+  "project": "OpenTabs E2E Test Quality",
+  "description": "Fix resource leaks, eliminate duplicated helpers, remove dead code, and improve test robustness across the e2e test suite.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix testServer and strictCspServer fixtures missing try/finally cleanup",
+      "description": "As a developer, I want test server fixtures to always clean up subprocesses so that port exhaustion and orphaned processes don't cause flaky test runs.",
+      "acceptanceCriteria": [
+        "testServer fixture in e2e/fixtures.ts wraps use() in try/finally with srv.kill() in the finally block",
+        "strictCspServer fixture in e2e/fixtures.ts wraps use() in try/finally with srv.kill() in the finally block",
+        "Pattern matches the existing mcpServer fixture (lines 888-893) which already uses try/finally",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "In e2e/fixtures.ts, the mcpServer fixture (lines 888-893) already uses the correct pattern: `try { await use(srv); } finally { await srv.kill(); }`. The testServer fixture (lines 907-911) and strictCspServer fixture (lines 913-917) do `await use(srv); await srv.kill();` without try/finally, so if the test throws, the subprocess leaks. Apply the same try/finally pattern from mcpServer."
+    },
+    {
+      "id": "US-002",
+      "title": "Extract duplicated getExtensionId, openSidePanel, and setupAdapterSymlink into helpers.ts",
+      "description": "As a developer, I want shared test helpers defined once so that changes to extension ID extraction or side panel opening logic only need to be made in one place.",
+      "acceptanceCriteria": [
+        "getExtensionId is defined once in e2e/helpers.ts and imported by lifecycle.e2e.ts, side-panel-data-flow.e2e.ts, side-panel-plugin-toggle.e2e.ts, side-panel-live-update.e2e.ts, and iife-injection.e2e.ts",
+        "openSidePanel is defined once in e2e/helpers.ts and imported by side-panel-data-flow.e2e.ts, side-panel-plugin-toggle.e2e.ts, and side-panel-live-update.e2e.ts",
+        "setupAdapterSymlink is defined once in e2e/helpers.ts (or fixtures.ts alongside the fixture that already does the same thing) and imported by the 3 side-panel test files",
+        "All 5 previous copies of getExtensionId are removed from their respective test files",
+        "All 3 previous copies of openSidePanel are removed from their respective test files",
+        "All 3 previous copies of setupAdapterSymlink are removed from their respective test files",
+        "No behavior change — just extraction",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "getExtensionId appears identically in 5 files: lifecycle.e2e.ts:680-689, side-panel-data-flow.e2e.ts:35-45, side-panel-plugin-toggle.e2e.ts:41-51, side-panel-live-update.e2e.ts:42-52, iife-injection.e2e.ts:244-254. openSidePanel appears in the 3 side-panel files. setupAdapterSymlink appears in the 3 side-panel files and is also partially in helpers.ts setupIsolatedIifeTest and fixtures.ts extensionContext fixture. When extracting, make sure the function signature works for all call sites. The function takes a BrowserContext and returns the extension ID string."
+    },
+    {
+      "id": "US-003",
+      "title": "Extract shared test server utilities into e2e/test-server-utils.ts",
+      "description": "As a developer, I want shared server helpers (Invocation interface, jsonResponse, readBody, recordInvocation, requireAuth) defined once so that bug fixes apply to both test servers.",
+      "acceptanceCriteria": [
+        "New file e2e/test-server-utils.ts exports: Invocation interface, jsonResponse, readBody, recordInvocation, requireAuth",
+        "e2e/test-server.ts imports from test-server-utils.ts instead of defining its own copies",
+        "e2e/strict-csp-test-server.ts imports from test-server-utils.ts instead of defining its own copies",
+        "The strict-csp server's jsonResponse intentionally omits CORS headers — this difference must be preserved (either via a parameter or by having the strict-csp server wrap the shared helper)",
+        "No behavior change to either server",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "The 5 duplicated items are: Invocation interface (test-server.ts:36-41 vs strict-csp-test-server.ts:42-47), jsonResponse (test-server.ts:105-112 vs strict-csp-test-server.ts:71-75 — NOTE: test-server includes CORS header, strict-csp does not), readBody (test-server.ts:114-120 vs strict-csp-test-server.ts:77-83), recordInvocation (test-server.ts:122-129 vs strict-csp-test-server.ts:85-92), requireAuth (test-server.ts:157-166 vs strict-csp-test-server.ts:94-103). For jsonResponse, make the CORS header optional via a parameter like `cors?: boolean` defaulting to false."
+    },
+    {
+      "id": "US-004",
+      "title": "Remove dead errorMode from strict-csp-test-server.ts",
+      "description": "As a developer, I want dead code removed so that the server implementation only contains reachable functionality.",
+      "acceptanceCriteria": [
+        "errorMode field removed from ServerState interface in strict-csp-test-server.ts",
+        "maybeShortCircuit function removed from strict-csp-test-server.ts (or simplified to only handle slowMode if that remains reachable)",
+        "createDefaultState no longer includes errorMode",
+        "No test relies on errorMode in the strict-CSP server (verify by searching for set-error in strict-csp test files)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "In e2e/strict-csp-test-server.ts, the ServerState interface has errorMode: boolean (line 51) and maybeShortCircuit checks it (line 106), but there is no /control/set-error endpoint. The only way errorMode becomes true is if someone modifies createDefaultState. The regular test-server.ts HAS a /control/set-error endpoint, but the strict-csp server does not. Check if slowMode is also unreachable — if there's no /control/set-slow endpoint either, remove that too."
+    },
+    {
+      "id": "US-005",
+      "title": "Remove unused defaultUrl variable in createExtensionCopy",
+      "description": "As a developer, I want dead variables removed so that the code accurately reflects what is actually used.",
+      "acceptanceCriteria": [
+        "The defaultUrl variable on line 621 of e2e/fixtures.ts is removed",
+        "The error message that currently references defaultUrl uses the literal string directly (or the regex pattern string is extracted into a named constant that is shared between the regex and the error message)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "In e2e/fixtures.ts line 621, `const defaultUrl = 'ws://localhost:9515/ws'` is declared but the regex on lines 626 and 634 uses the hardcoded pattern `ws:\\/\\/localhost:9515\\/ws` directly. The error message on line 628 does reference defaultUrl via template literal. The fix is to either: (a) remove defaultUrl and hardcode the string in the error message too, or (b) use defaultUrl to construct the regex pattern. Option (a) is simpler since the regex is already hardcoded."
+    },
+    {
+      "id": "US-006",
+      "title": "Rename McpServer.distDir to wrapperDir",
+      "description": "As a developer, I want field names to accurately describe their values so that the interface is self-documenting.",
+      "acceptanceCriteria": [
+        "McpServer interface field renamed from distDir to wrapperDir in e2e/fixtures.ts",
+        "All references to mcpServer.distDir across all e2e test files updated to mcpServer.wrapperDir",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "In e2e/fixtures.ts, the McpServer interface (around line 256) has a distDir field. It is set to wrapperDir (around line 375), which is a temp directory containing a hot-reload wrapper script, not the actual dist directory. Search all e2e files for 'distDir' to find all usage sites that need updating. The real dist directory is referenced elsewhere as a path.resolve() to platform/mcp-server/dist."
+    },
+    {
+      "id": "US-007",
+      "title": "Add timeout parameter to createMcpClient to eliminate duplicated MCP protocol parsing",
+      "description": "As a developer, I want a configurable timeout on the MCP client so that tests needing longer timeouts don't have to reimplement the entire MCP protocol.",
+      "acceptanceCriteria": [
+        "createMcpClient in e2e/fixtures.ts accepts an optional timeout parameter (or callTool accepts a per-request timeout override)",
+        "The 130+ line inline mcpRequest function in dispatch-resilience.e2e.ts (around lines 498-551) is replaced with a call to the standard MCP client with a longer timeout",
+        "The test behavior is preserved — it still uses a 45s timeout for the long-running dispatch test",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "In dispatch-resilience.e2e.ts (the renamed edge-cases.e2e.ts), the 'Server-side dispatch timeout' test (around line 468) creates an inline mcpRequest function (lines 498-551) that duplicates the entire MCP SSE request/response parsing from createMcpClient in fixtures.ts (lines 717-774). The reason is needing a 45s fetch timeout instead of the default 30s. The fix is to add an optional timeout param to createMcpClient's callTool method, e.g. `callTool(name, args, { timeout?: number })`. Then the test can simply pass `{ timeout: 45_000 }`."
+    },
+    {
+      "id": "US-008",
+      "title": "Remove redundant 1s sleep in iife-injection.e2e.ts invalid uninstall test",
+      "description": "As a developer, I want tests to use observable assertions instead of arbitrary sleeps so that tests are reliable under varying load conditions.",
+      "acceptanceCriteria": [
+        "The 1-second sleep on line 375 of e2e/iife-injection.e2e.ts is removed",
+        "The test still verifies the adapter survived by successfully calling a tool (which the test already does on lines 386-388)",
+        "Test still passes reliably",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "In e2e/iife-injection.e2e.ts around line 375, there's a `await new Promise(r => setTimeout(r, 1_000))` used to prove that invalid plugin.uninstall messages don't remove the adapter. However, the test already calls a tool successfully on lines 386-388, which is a stronger proof that the adapter is still alive. The sleep is both redundant and unreliable. Simply remove it."
+    },
+    {
+      "id": "US-009",
+      "title": "Add try/catch cleanup to createExtensionCopy for temp directory leak prevention",
+      "description": "As a developer, I want temp directories cleaned up even when extension patching fails so that stale temp dirs don't accumulate.",
+      "acceptanceCriteria": [
+        "createExtensionCopy in e2e/fixtures.ts wraps the file patching logic (readFileSync/writeFileSync calls) in a try/catch",
+        "On failure, the catch block removes tmpBase (which contains both extensionDir and userDataDir) using fs.rmSync with recursive and force options, then re-throws",
+        "Normal success path is unaffected",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "In e2e/fixtures.ts, createExtensionCopy (around lines 600-646) creates temp directories tmpBase, extensionDir, userDataDir. Then it copies the extension and patches offscreen.js and background.js. If fs.readFileSync or fs.writeFileSync throws (e.g., extension wasn't built, file not found), the temp directories are leaked. Wrap the patching block (after mkdtempSync/cpSync) in try/catch, and in the catch block: `fs.rmSync(tmpBase, { recursive: true, force: true }); throw error;`"
+    }
+  ]
+}

@@ -1,0 +1,154 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Overhaul the build/dev/check command surface to be minimal, intuitive, and correct. Reduce 28 scripts to ~12, fix the dev --dev flag bug, make type-check a true noEmit check, remove double-work in check, parallelize independent build steps, speed up pre-commit, and standardize conventions across platform/docs/plugins.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix dev orchestrator missing --dev flag for MCP server",
+      "description": "As a platform developer, I want `bun run dev` to start the MCP server in dev mode so that dev-mode features (file watchers, config watching, hot reload) work correctly in full dev mode.",
+      "acceptanceCriteria": [
+        "In scripts/dev.ts, the MCP server spawn command includes '--dev' as a CLI argument (after the script path, not before)",
+        "Running `bun run dev` starts the MCP server with --dev (visible in the spawn args)",
+        "The existing behavior of dev:mcp ('bun --hot platform/mcp-server/dist/index.js --dev') is unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In scripts/dev.ts:263, the MCP server is spawned as:\n\n```ts\nconst mcp = Bun.spawn(['bun', '--hot', 'platform/mcp-server/dist/index.js'], {\n```\n\nBut it should be:\n\n```ts\nconst mcp = Bun.spawn(['bun', '--hot', 'platform/mcp-server/dist/index.js', '--dev'], {\n```\n\nThe `--dev` flag must come AFTER the script path (it's a script argument, not a bun argument). Compare with the dev:mcp script in root package.json which correctly has `--dev` at the end. This is a one-line fix."
+    },
+    {
+      "id": "US-002",
+      "title": "Make type-check a true --noEmit check and fix check pipeline",
+      "description": "As a platform developer, I want `type-check` to be a fast non-emitting check and `check` to not do double work, so that the verification pipeline is correct and fast.",
+      "acceptanceCriteria": [
+        "The root type-check script runs 'tsc --build --noEmit' (no file emission, fast verification only)",
+        "The root check script runs build first, then lint, format:check, knip, and test — but NOT type-check (because build already type-checks via tsc --build)",
+        "The root build script uses 'tsc --build' (incremental by default, no --force) for faster rebuilds",
+        "A new 'build:force' script exists for full clean rebuilds: 'tsc --build --force && ...' (the current build behavior)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Current state in root package.json:\n- `build`: `tsc --build --force && ...` (always full rebuild — slow)\n- `type-check`: `tsc --build` (incremental, but EMITS files — not a true type-check)\n- `check`: runs both `build` AND `type-check` back-to-back (double work)\n\nTarget state:\n- `build`: `tsc --build && ...` (incremental by default — fast for iterative development)\n- `build:force`: `tsc --build --force && ...` (full rebuild for CI or troubleshooting only)\n- `type-check`: `tsc --build --noEmit` (fast, no file emission, pure verification — note: --noEmit with --build requires TypeScript 5.x+ which is already in use)\n- `check`: `bun run build && bun run lint && bun run format:check && bun run knip && bun run test` (build already type-checks, so type-check is removed from the pipeline)\n\nIMPORTANT: When changing `build` from `--force` to incremental, keep the full extension pipeline chain: `tsc --build && bun run --cwd platform/browser-extension build:bundle && bun run --cwd platform/browser-extension build:side-panel && bun run build:icons && bun run build:install-extension`.\n\nAlso verify that `tsc --build --noEmit` works correctly with the project references setup in tsconfig.json. Run it manually to confirm."
+    },
+    {
+      "id": "US-003",
+      "title": "Consolidate and clean up root package.json scripts",
+      "description": "As a platform developer, I want a clean, minimal set of top-level scripts so that I can quickly understand and use the available commands without cognitive overload.",
+      "acceptanceCriteria": [
+        "The 'build:tsc' script is removed (redundant with 'build' and the new 'build:force')",
+        "The 'test:unit' script is removed (exact duplicate of 'test')",
+        "The 'build:e2e-plugin' script is removed from top-level; its command is inlined into 'test:e2e'",
+        "The 'build:icons' script is removed from top-level; it is only called internally by 'build' and scripts/dev.ts",
+        "The 'build:install-extension' script is removed from top-level; it is only called internally by 'build' and scripts/dev.ts",
+        "The 'check:tsconfig-coverage' script is removed from top-level (it remains usable via 'bun scripts/check-tsconfig-coverage.ts' directly)",
+        "After removing scripts, update the build script to inline the icon generation and install-extension commands (since they can no longer be referenced as 'bun run build:icons')",
+        "The build script chain uses direct 'bun scripts/generate-icons.ts' and 'bun scripts/install-extension.ts' calls instead of 'bun run build:icons' and 'bun run build:install-extension'",
+        "scripts/dev.ts does NOT reference any removed script names (verify it calls extension build steps directly, which it already does)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The goal is to reduce the script surface from 28 to ~12-14 meaningful commands. Remove these scripts from root package.json:\n\n1. `build:tsc` — redundant with `build` (which starts with tsc) and the new `build:force`\n2. `test:unit` — exact alias of `test`\n3. `build:e2e-plugin` — inline into `test:e2e`: change `test:e2e` to `cd plugins/e2e-test && bun install --frozen-lockfile && bun run build && bunx playwright test`\n4. `build:icons` — internal detail, called by build chain and dev.ts. In the build chain, replace `bun run build:icons` with `bun scripts/generate-icons.ts`\n5. `build:install-extension` — internal detail. In the build chain, replace `bun run build:install-extension` with `bun scripts/install-extension.ts`\n6. `check:tsconfig-coverage` — maintenance utility, not a daily workflow. Developers can run `bun scripts/check-tsconfig-coverage.ts` directly\n\nAfter removal, the build script becomes:\n```\ntsc --build && bun run --cwd platform/browser-extension build:bundle && bun run --cwd platform/browser-extension build:side-panel && bun scripts/generate-icons.ts && bun scripts/install-extension.ts\n```\n\nIMPORTANT: Verify scripts/dev.ts does not depend on any of the removed script names. Looking at dev.ts, it calls the extension build steps directly via Bun.spawn (not via `bun run build:icons`), so it should be unaffected. But double-check by reading the file.\n\nAlso check if knip.ts or any other config references these script names."
+    },
+    {
+      "id": "US-004",
+      "title": "Unify check commands and rename check:all to check:everything",
+      "description": "As a platform developer, I want clear naming for verification commands so that I know exactly what each check covers without guessing.",
+      "acceptanceCriteria": [
+        "The 'check' script runs the platform verification suite: build + lint + format:check + knip + test (the daily driver for platform developers)",
+        "The 'check:all' script is renamed to 'check:everything' and runs: bun run check && bun run test:e2e && bun run check:docs && bun run check:plugins (the CI/pre-release full suite)",
+        "The 'check:docs' script remains but is simplified to just 'bun run --cwd docs check' (delegates to docs' own check script instead of duplicating the command list)",
+        "The 'check:plugins' script remains unchanged",
+        "bun run check passes",
+        "bun run check:everything passes (or at least the command structure is correct)",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Current state:\n- `check`: `bun run build && bun run type-check && bun run lint && bun run format:check && bun run knip && bun run test` (type-check is double work after build)\n- `check:all`: `bun run build && bun run type-check && bun run lint && bun run format:check && bun run knip && bun run test && bun run test:e2e && bun run check:docs && bun run check:plugins`\n- `check:docs`: `bun run --cwd docs build && bun run --cwd docs type-check && bun run --cwd docs lint && bun run --cwd docs knip && bun run --cwd docs format:check` (duplicates what `docs/package.json` check script already does)\n\nTarget state:\n- `check`: `bun run build && bun run lint && bun run format:check && bun run knip && bun run test` (no type-check since build already does it)\n- `check:everything`: `bun run check && bun run test:e2e && bun run check:docs && bun run check:plugins`\n- `check:docs`: `bun run --cwd docs check` (delegates to docs' own check script)\n- `check:plugins`: stays as is (runs scripts/plugins.ts --check)\n\nAlso update CLAUDE.md references to check:all → check:everything. Search for 'check:all' in:\n- Root CLAUDE.md\n- Root package.json (the script itself)\n- .ralph/__SKILL__.md (references default suite)\n- Any other files that mention check:all\n\nIMPORTANT: The ralph skill file (.ralph/__SKILL__.md) should NOT be modified. It references the default verification suite generically — check if it mentions 'check:all' by name."
+    },
+    {
+      "id": "US-005",
+      "title": "Remove knip from pre-commit hook",
+      "description": "As a platform developer, I want fast git commits so that the pre-commit hook doesn't slow me down with a full-project unused-code scan on every commit.",
+      "acceptanceCriteria": [
+        "The .husky/pre-commit file no longer runs 'bun run knip'",
+        "The .husky/pre-commit file still runs lint-staged (formatting + linting of staged files)",
+        "The .husky/pre-commit file still has the ralph state file guard",
+        "knip still runs as part of 'bun run check' (so it's not lost, just moved out of the commit hook)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Current .husky/pre-commit:\n```bash\n# Reject ralph state files — these are gitignored ephemeral working files\nif git diff --cached --name-only | grep -qE '\\.ralph/(prd\\.json|progress\\.txt)$'; then\n  echo \"ERROR: Ralph state files must not be committed:\"\n  git diff --cached --name-only | grep -E '\\.ralph/(prd\\.json|progress\\.txt)$'\n  echo \"\"\n  echo \"Run: git rm --cached <file> to untrack them.\"\n  exit 1\nfi\n\nbunx lint-staged --allow-empty\nbun run knip\n```\n\nJust remove the last line (`bun run knip`). Knip is a project-wide analysis tool that scans all files — it's not scoped to staged changes like lint-staged is. Running it on every commit adds significant latency (often 5-15 seconds) with no targeted benefit. It belongs in `bun run check` (where it already is) and in CI, not in the commit hook."
+    },
+    {
+      "id": "US-006",
+      "title": "Add safety guard to dev:mcp for missing dist/",
+      "description": "As a platform developer, I want `bun run dev:mcp` to give a clear error if dist/ is missing, so that I'm not confused by cryptic runtime errors when I haven't built yet.",
+      "acceptanceCriteria": [
+        "The dev:mcp script checks for platform/mcp-server/dist/index.js before starting bun --hot",
+        "If the file is missing, it prints a clear message like 'Error: dist/ not found. Run `bun run build` first.' and exits with code 1",
+        "If the file exists, it proceeds normally with bun --hot",
+        "The implementation is a small wrapper script (e.g., scripts/dev-mcp.ts) that the dev:mcp script calls",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Current dev:mcp script: `bun --hot platform/mcp-server/dist/index.js --dev`\n\nIf dist/ doesn't exist, bun will throw a module resolution error that looks like a bug rather than a setup issue.\n\nCreate a small scripts/dev-mcp.ts:\n```ts\nimport { resolve } from 'node:path';\n\nconst distPath = resolve(import.meta.dirname, '..', 'platform', 'mcp-server', 'dist', 'index.js');\nconst exists = await Bun.file(distPath).exists();\n\nif (!exists) {\n  console.error('Error: platform/mcp-server/dist/index.js not found.');\n  console.error('Run `bun run build` first to compile the project.');\n  process.exit(1);\n}\n\n// Re-exec with bun --hot\nconst proc = Bun.spawn(['bun', '--hot', distPath, '--dev'], {\n  stdio: ['inherit', 'inherit', 'inherit'],\n});\nprocess.exit(await proc.exited);\n```\n\nThen update the dev:mcp script to: `bun scripts/dev-mcp.ts`\n\nMake sure the new script file is covered by tsconfig.scripts.json (which covers scripts/*.ts files). Read tsconfig.scripts.json to confirm its include pattern."
+    },
+    {
+      "id": "US-007",
+      "title": "Update CLAUDE.md to reflect the new command surface",
+      "description": "As a platform developer (or AI agent reading CLAUDE.md), I want the documentation to accurately reflect the new commands so that I don't run obsolete or incorrect commands.",
+      "acceptanceCriteria": [
+        "The Commands section in root CLAUDE.md reflects the actual scripts in package.json after all previous stories",
+        "Removed scripts (build:tsc, test:unit, build:icons, build:install-extension, build:e2e-plugin, check:tsconfig-coverage) are no longer listed",
+        "check:all references are updated to check:everything",
+        "The 'type-check' description clarifies it's a fast --noEmit check (no file emission)",
+        "The 'build' description clarifies it's incremental by default",
+        "The new 'build:force' script is documented",
+        "The Verification section still lists the correct commands to run (build, type-check, lint, knip, test, test:e2e)",
+        "No references to removed scripts remain in CLAUDE.md",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "Read the root CLAUDE.md and update the Commands section and any other references to match the new script surface.\n\nThe Commands section currently lists:\n```\nbun run build           # Build all packages\nbun run build:tsc       # TypeScript only\nbun run build:icons     # Generate extension icons\nbun run build:plugins   # Build all plugins\nbun run build:docs      # Build docs site\nbun run dev             # Full dev mode\nbun run dev:mcp         # MCP server only with hot reload\nbun run dev:docs        # Docs dev server\nbun run check           # Root checks\nbun run check:all       # Everything\nbun run check:docs      # Docs checks\nbun run check:plugins   # Plugin checks\nbun run type-check      # TypeScript check\nbun run lint            # ESLint check\nbun run lint:fix        # ESLint auto-fix\nbun run format          # Prettier format\nbun run format:check    # Prettier check\nbun run knip            # Unused code detection\nbun run test            # Unit tests\nbun run test:unit       # Alias for test\nbun run test:e2e        # E2E tests\nbun run clean           # Remove build artifacts\nbun run clean:all       # clean + remove node_modules\nbun run storybook       # Launch Storybook\n```\n\nAfter changes, it should list only the scripts that actually exist, organized clearly. Also update the Verification section which references 'check:all'.\n\nSearch for 'check:all' and 'build:tsc' and 'test:unit' throughout CLAUDE.md to find all references."
+    }
+  ]
+}

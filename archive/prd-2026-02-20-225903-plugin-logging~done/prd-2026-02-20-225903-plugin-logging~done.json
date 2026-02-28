@@ -1,0 +1,152 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add plugin-level logging that flows from tool handlers in page context through the Chrome extension to the MCP server, where logs are forwarded to MCP clients via the logging capability and surfaced in the opentabs logs CLI. Currently, plugin tool handlers use console.log which only appears in the page's DevTools console — invisible to the MCP server and AI agents. This feature adds a structured sdk.log API to the plugin SDK, wires log transport through the adapter runtime and extension WebSocket, and integrates with the MCP logging capability and CLI log viewer.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add sdk.log API to plugin SDK",
+      "description": "As a plugin developer, I want a structured logging API available in tool handlers and lifecycle hooks so that my log output reaches the MCP server instead of disappearing into the page console.",
+      "acceptanceCriteria": [
+        "sdk.log is a namespace object exported from @opentabs-dev/plugin-sdk",
+        "sdk.log.debug(message, ...args) logs at debug level",
+        "sdk.log.info(message, ...args) logs at info level",
+        "sdk.log.warn(message, ...args) logs at warning level",
+        "sdk.log.error(message, ...args) logs at error level",
+        "The logger is available inside tool handle() functions via sdk.log",
+        "The logger is available in plugin lifecycle hooks (onReady, isReady, etc.)",
+        "Log levels match the MCP LoggingLevel enum: debug, info, warning, error",
+        "The SDK logger implementation is a thin shim that buffers log entries — actual transport is wired by the adapter runtime (US-002)",
+        "Each log entry captures: level, message, args (serializable data)",
+        "The logger falls back to console methods when not running inside the adapter runtime (for unit testing and standalone use)",
+        "Types are exported: LogLevel, LogEntry",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts. Add a log namespace object with debug/info/warn/error methods. Internally, the logger should maintain a pluggable transport function: (entry: LogEntry) => void. The default transport calls the corresponding console method (console.debug, console.info, console.warn, console.error). The adapter runtime (US-002) will replace this transport with one that sends entries to the extension. Export a _setLogTransport(fn) function marked with @internal JSDoc — this is for the adapter runtime only, not for plugin authors. The log methods should serialize args safely (handle circular refs, DOM nodes, etc.) since the entries will be sent over postMessage. Consider using structuredClone-safe serialization or a simple JSON.stringify with a replacer. The sdk.log object should be frozen after creation to prevent plugins from accidentally overwriting methods."
+    },
+    {
+      "id": "US-002",
+      "title": "Wire log messages from adapter runtime to extension",
+      "description": "As a platform developer, I want the adapter runtime to intercept sdk.log calls and send log entries to the Chrome extension so that logs can flow upstream to the MCP server.",
+      "acceptanceCriteria": [
+        "The adapter runtime calls _setLogTransport() to replace the default console transport",
+        "The custom transport batches log entries and sends them to the extension background script",
+        "Transport uses window.postMessage with a distinct message type (e.g., 'opentabs:plugin-logs') that the content script relays to the background",
+        "Each log entry includes: level, pluginName, timestamp (ISO 8601), message, data (serialized args)",
+        "Batching: logs are flushed every 100ms or when batch reaches 50 entries, whichever comes first",
+        "The content script listens for 'opentabs:plugin-logs' messages and forwards to background via chrome.runtime.sendMessage",
+        "The background script receives batched log entries and stores them for forwarding (US-003)",
+        "If the extension is not connected, log entries are dropped silently (no error, no memory leak)",
+        "The batch timer is cleaned up when the adapter is destroyed",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "The adapter IIFE runs in MAIN world (page context) and cannot directly use chrome.runtime.sendMessage. The established pattern is: adapter posts to window via postMessage, the content script (which runs in the same tab but in the ISOLATED world) listens and relays to the background script via chrome.runtime.sendMessage. Check how existing tool call responses flow from adapter to extension — the log transport should follow the same channel. Edit platform/plugin-tools/src/commands/build.ts (the IIFE wrapper template) to inject the log transport setup. The adapter runtime wrapper should: (1) import _setLogTransport from the SDK, (2) create a batching transport that collects entries and flushes via postMessage, (3) call _setLogTransport with the batching transport before initializing the plugin. Edit platform/browser-extension/src/background.ts to handle the new 'plugin.logs' message type from content scripts. The pluginName should be injected by the adapter wrapper since it knows which plugin it belongs to."
+    },
+    {
+      "id": "US-003",
+      "title": "Forward plugin logs from extension to MCP server",
+      "description": "As a platform developer, I want plugin logs to flow from the Chrome extension to the MCP server and then to MCP clients so that AI agents can see plugin diagnostic output.",
+      "acceptanceCriteria": [
+        "Extension background script forwards log entries to MCP server via WebSocket JSON-RPC: { method: 'plugin.log', params: { plugin, level, message, data, ts } }",
+        "MCP server handles 'plugin.log' messages in extension-protocol.ts",
+        "MCP server calls server.sendLoggingMessage({ level, logger: 'plugin:<pluginName>', data: message }) for each entry",
+        "MCP server stores logs in a circular buffer: last 1000 entries per plugin",
+        "The circular buffer is a simple array with a write pointer, no external dependencies",
+        "Log entries in the buffer include: level, plugin, message, data, timestamp",
+        "The /health endpoint includes a logBufferSize field per plugin showing how many entries are buffered",
+        "Log levels are mapped from sdk levels to MCP LoggingLevel: debug->debug, info->info, warning->warning, error->error",
+        "If the WebSocket is disconnected, extension drops log entries (no queuing to avoid memory issues)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/browser-extension/src/background.ts — when log entries arrive from a content script, forward them over the WebSocket connection to the MCP server. Use the same JSON-RPC format as other extension->server messages. Edit platform/mcp-server/src/extension-protocol.ts — add a handler for 'plugin.log' method. The handler should: (1) validate the log entry, (2) store in circular buffer, (3) call server.sendLoggingMessage(). Create a new file platform/mcp-server/src/log-buffer.ts for the circular buffer implementation. The buffer should be per-plugin, stored in a Map<string, CircularBuffer>. The CircularBuffer class is simple: fixed-size array, write index, size counter. Export functions: appendLog(plugin, entry), getLogs(plugin, limit?), getLogCount(plugin). The MCP server already declares logging: {} in its capabilities (check mcp-setup.ts), so sendLoggingMessage should work. The logger field in sendLoggingMessage should use 'plugin:<name>' format so MCP clients can filter by plugin."
+    },
+    {
+      "id": "US-004",
+      "title": "Surface plugin logs in opentabs logs CLI",
+      "description": "As an end user, I want to see plugin logs in the opentabs logs output so that I can debug plugin behavior from the terminal.",
+      "acceptanceCriteria": [
+        "MCP server writes plugin log entries to ~/.opentabs/server.log alongside existing server logs",
+        "Log format: [plugin:<name>] LEVEL message (e.g., [plugin:slack] INFO Fetching channels...)",
+        "opentabs logs shows plugin logs interleaved with server logs in chronological order",
+        "opentabs logs --plugin <name> filters to show only logs from a specific plugin",
+        "opentabs logs --plugin <name> can be combined with --follow for real-time plugin log tailing",
+        "Plugin log entries are written using the same log file writer as server logs (no separate file)",
+        "Log levels are uppercased in the file output: DEBUG, INFO, WARNING, ERROR",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/extension-protocol.ts (or the log-buffer.ts module) — when a plugin log arrives, also write it to the server log file using the existing logging infrastructure. Check how the MCP server currently writes to server.log (likely in index.ts or a logging utility) and use the same mechanism. The log line format should be: ISO_TIMESTAMP [plugin:<name>] LEVEL message data. Edit platform/cli/src/commands/logs.ts — add a --plugin <name> flag. When set, filter log lines to only show those matching '[plugin:<name>]'. The filter is a simple string match on each line. The --follow mode should also apply the filter. If the logs command currently just tails the file, the filter can be applied line-by-line."
+    },
+    {
+      "id": "US-005",
+      "title": "Add E2E tests for plugin logging",
+      "description": "As a platform developer, I want E2E tests verifying the full logging pipeline so that regressions are caught automatically.",
+      "acceptanceCriteria": [
+        "The e2e-test plugin uses sdk.log.info() inside a tool handler to emit a test log message",
+        "E2E test verifies: calling the tool produces log entries that arrive at the MCP server",
+        "E2E test verifies: MCP client receives logging/message notifications with correct level and logger fields",
+        "E2E test verifies: log entries include the correct plugin name in the logger field",
+        "E2E test verifies: multiple log levels (debug, info, warning, error) are forwarded correctly",
+        "The e2e-test plugin adds a dedicated tool (e.g., test_log_levels) that emits one log at each level",
+        "bun run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Edit plugins/e2e-test/src/tools/ — add a new tool file (e.g., log-levels.ts) that calls sdk.log.debug(), sdk.log.info(), sdk.log.warn(), sdk.log.error() with distinct messages. Rebuild the e2e-test plugin: cd plugins/e2e-test && bun run build. Edit e2e/ — add a new test file (e.g., plugin-logging.e2e.ts) or add test cases to an existing file. The test should: (1) call the test_log_levels tool via MCP, (2) wait for logging notifications to arrive on the MCP client, (3) assert that notifications include the expected level, logger ('plugin:e2e-test'), and message content. To capture MCP logging notifications, the test may need to register a notification handler on the MCP client — check how the existing E2E fixtures set up the MCP client and whether notification handlers are supported. If the MCP client SDK supports onNotification or similar, use that. Otherwise, check if there is a way to poll the /health endpoint's log buffer."
+    },
+    {
+      "id": "US-006",
+      "title": "Publish updated packages and update plugins",
+      "description": "As a platform developer, I want to publish the updated platform packages and update plugin dependencies so that plugins can use the new sdk.log API.",
+      "acceptanceCriteria": [
+        "Publish packages in dependency order: shared -> plugin-sdk -> plugin-tools -> cli",
+        "Wait for npm propagation between publishes (npm view to verify)",
+        "Update all plugins in plugins/ to use the new @opentabs-dev/plugin-sdk version",
+        "Rebuild all plugins after dependency update",
+        "All quality gates pass: bun run build, type-check, lint, knip, test",
+        "bun run test:e2e passes with the published versions"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Use ./scripts/publish.sh with the next version number. The publish order is: shared first (if changed), then plugin-sdk (which has the new sdk.log API), then plugin-tools (if the adapter wrapper changed), then cli (if log commands changed). After publishing, cd into each plugin directory (plugins/slack, plugins/e2e-test, etc.), run bun update @opentabs-dev/plugin-sdk @opentabs-dev/plugin-tools, then bun run build. Verify the built adapter.iife.js includes the log transport wiring."
+    },
+    {
+      "id": "US-007",
+      "title": "Update CLAUDE.md for plugin logging",
+      "description": "As a platform developer, I want CLAUDE.md to document the plugin logging architecture so that future development follows the established patterns.",
+      "acceptanceCriteria": [
+        "Architecture section mentions log flow: adapter -> extension -> MCP server -> MCP client",
+        "Key Concepts section explains sdk.log API and its transport mechanism",
+        "Plugin SDK section documents the sdk.log namespace and available methods",
+        "Log buffer and MCP logging capability are mentioned in MCP Server section",
+        "CLI section documents opentabs logs --plugin flag",
+        "No implementation details that would become stale — focus on architecture and patterns"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Edit CLAUDE.md. Add a brief mention of plugin logging in the Architecture section (log flow path). In Key Concepts, add a 'Plugin logging' paragraph explaining: sdk.log API in plugin-sdk, transport via adapter postMessage -> content script -> background -> WebSocket -> MCP server, forwarding to MCP clients via sendLoggingMessage, and surfacing in opentabs logs. Keep it concise — 3-5 sentences max. Update the CLI commands section to include the --plugin flag for opentabs logs."
+    }
+  ]
+}

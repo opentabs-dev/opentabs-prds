@@ -1,0 +1,62 @@
+## Codebase Patterns
+- Browser extension test files use `.js` extension in imports (ES modules) even though sources are `.ts`
+- `tsconfig.test.json` includes `src/**/*.test.ts`; root `vitest.config.ts` discovers all `platform/**/*.test.ts`
+- `tab-matching.test.ts` is the canonical example for browser extension test patterns: mock chrome globals via `globalThis.chrome = {...}` in `beforeEach`, no vi.mock needed for pure functions
+- `offscreen/index.ts` has heavy side effects (chrome API calls at module load time); pure utility functions were extracted to `offscreen/ws-utils.ts` to enable unit testing without mocking the entire chrome API
+- TypeScript 5.9 broke `tsc --build --noEmit` with composite project references (TS6310). Fix: change `type-check` script to `tsc --build` (which already type-checks and is incremental). The CLI `--noEmit` flag now cascades to all referenced composite projects in TypeScript 5.9, conflicting with composite project requirements.
+- Import order rule: `./` (same-directory) imports come BEFORE `../` (parent-directory) imports in eslint-import-x/order
+- `plugin-storage.ts` has an in-memory cache (`metaCache`). Tests using real plugin-storage must call `invalidatePluginCache()` in `beforeEach` to reset state between tests.
+- Dispatch test pattern (tool/resource/prompt): mock `messaging.js` + `sanitize-error.js`, provide Chrome API stubs (`scripting.executeScript`, `tabs.query`, `tabs.get`, `storage.local.get/set`), import module under test. See `tool-dispatch.test.ts` and `resource-prompt-dispatch.test.ts` for examples.
+- Stateful module testing pattern (confirmation-badge, rate-limiter): set up chrome mocks BEFORE the `await import(...)` at module top level, use the module's own reset function (`clearAllConfirmationBadges`, `resetRateLimiter`) in `beforeEach`, use `vi.useFakeTimers()` / `vi.useRealTimers()` for timeout control.
+- Background-message-handlers module state reset: `wsConnected` is module-level state; reset by calling `handleWsState({ connected: false }, () => {})` in `beforeEach`, then `vi.clearAllMocks()` to wipe side-effect calls from the reset. Use `vi.hoisted` + `vi.mock` for all imported dependencies (messaging, tab-state, confirmation-badge, message-router, tool-dispatch).
+
+# Ralph Progress Log
+PRD: prd-2026-02-27-192736-browser-ext-unit-tests~running.json
+Started: Sat Feb 28 03:28:01 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- What was implemented: Unit tests for `isValidWsOrigin` and `wsToHttpBase` pure utility functions from `offscreen/index.ts`
+- Files changed:
+  - `platform/browser-extension/src/offscreen/ws-utils.ts` (new): extracted `isValidWsOrigin` and `wsToHttpBase` with `export` keywords
+  - `platform/browser-extension/src/offscreen/index.ts`: removed inline function definitions, added import from `./ws-utils.js`
+  - `platform/browser-extension/src/offscreen/index.test.ts` (new): 11 tests covering all validation paths and conversion cases
+  - `package.json`: changed `type-check` from `tsc --build --noEmit` to `tsc --build` to fix pre-existing TypeScript 5.9 TS6310 regression
+- **Learnings for future iterations:**
+  - `offscreen/index.ts` runs `chrome.runtime.onMessage.addListener()` and an auto-executing IIFE at module load time — importing it in tests would require extensive chrome API mocking. Extract pure utilities to a separate module instead.
+  - TypeScript 5.9 (5.9.3 in this repo) introduced a breaking change: `tsc --build --noEmit` now cascades `--noEmit` to all referenced composite projects, causing TS6310. The fix is `tsc --build` (no `--noEmit`). This was a pre-existing failure introduced by the platform-deps update.
+  - The import order rule requires `./` (same-level) imports before `../` (parent-level) imports. The `--fix` option handles this automatically.
+---
+
+## 2026-02-28 - US-002
+- What was implemented: Unit tests for `handleResourceRead` and `handlePromptGet` in `resource-prompt-dispatch.ts`
+- Files changed:
+  - `platform/browser-extension/src/resource-prompt-dispatch.test.ts` (new): 21 tests covering parameter validation, plugin resolution, adapter dispatch (success/error), argument coercion, and edge cases
+- **Learnings for future iterations:**
+  - The `plugin-storage.ts` module uses an in-memory write-through cache (`metaCache`). Tests that use the real module (not mocked) must call `invalidatePluginCache()` in `beforeEach` to prevent stale cache from earlier tests poisoning subsequent test runs.
+  - When mocking `chrome.scripting.executeScript` with `vi.fn<() => Promise<...>>()`, TypeScript infers the call signature has no parameters. To access `mock.calls[0]` elements, cast through `unknown`: `mock.calls[0] as unknown as [{ args: unknown[] }]`.
+  - The `dispatchWithTabFallback` helper in `dispatch-helpers.ts` performs TOCTOU URL revalidation via `chrome.tabs.get()` — test setup must mock both `chrome.tabs.query` (for `findAllMatchingTabs`) and `chrome.tabs.get` (for TOCTOU check) to reach the `executeOnTab` callback.
+  - The test pattern for resource/prompt dispatch mirrors `tool-dispatch.test.ts`: mock `messaging.js` + `sanitize-error.js`, provide Chrome API stubs for the real `plugin-storage.js` and `tab-matching.js`, then import the module under test.
+---
+
+## 2026-02-28 - US-003
+- What was implemented: Unit tests for `notifyConfirmationRequest`, `clearConfirmationBadge`, `clearConfirmationBackgroundTimeout`, and `clearAllConfirmationBadges` in `confirmation-badge.ts`
+- Files changed:
+  - `platform/browser-extension/src/confirmation-badge.test.ts` (new): 18 tests covering badge count management, Chrome notification creation, timeout auto-clear, double-clear prevention, and full reset
+- **Learnings for future iterations:**
+  - Chrome API mocks for this module must be set up at module top level (before `await import(...)`) because the module has no side effects at load time — the top-level assignment just declares module-level variables. No `beforeEach` reassignment needed.
+  - `vi.useFakeTimers()` / `vi.useRealTimers()` must be paired in `beforeEach` / `afterEach` respectively. Without `useRealTimers()` in afterEach, fake timers can leak into subsequent test files.
+  - `clearAllConfirmationBadges()` is the canonical way to reset module state between tests — it zeroes `pendingConfirmationCount` and clears `confirmationTimeouts` map, making it a perfect `beforeEach` state reset.
+  - The `CONFIRMATION_BACKGROUND_TIMEOUT_BUFFER_MS` constant is 2000ms — background timeouts fire at `timeoutMs + 2000`. Tests must advance by exactly that amount to trigger the auto-clear.
+---
+
+## 2026-02-28 - US-004
+- What was implemented: Unit tests for `handleWsState`, `handlePluginLogs`, `handleToolProgress`, `handleSpConfirmationResponse`, `handleSpConfirmationTimeout`, and `handleBgGetConnectionState` in `background-message-handlers.ts`
+- Files changed:
+  - `platform/browser-extension/src/background-message-handlers.test.ts` (new): 30 tests covering connection state transitions, tab state cache clearing, log forwarding validation, tool progress dispatch, confirmation response handling, and badge management
+- **Learnings for future iterations:**
+  - `background-message-handlers.ts` has module-level `wsConnected` state that persists across tests. Reset via `handleWsState({ connected: false }, () => {})` + `vi.clearAllMocks()` in `beforeEach`. This reliably drives state to false regardless of prior test state.
+  - The `handleWsState` disconnect-only-clears-when-was-connected guard (`if (!nowConnected && wasConnected)`) means tests for clearTabStateCache/clearAllConfirmationBadges must first connect then disconnect — not just disconnect.
+  - Nested `expect.objectContaining({ params: expect.objectContaining({...}) })` triggers `@typescript-eslint/no-unsafe-assignment` because `expect.objectContaining` returns `any`. Fix by using full exact match instead of the nested objectContaining.
+  - Use `vi.hoisted` + `vi.mock` for all imported module dependencies; chrome API stubs can be plain `vi.fn()` on `globalThis.chrome`.
+---

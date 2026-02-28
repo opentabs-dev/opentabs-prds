@@ -1,0 +1,152 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Refactor the Chrome extension codebase for cleanliness, modularity, and unit test friendliness. Extract duplicated dispatch logic into shared helpers, split the monolithic browser-commands.ts into domain-grouped modules, extract reusable param validation and script result extraction helpers, and add unit tests for all new modules.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Extract shared dispatch helpers for tab-fallback loop",
+      "description": "As a developer, I want the duplicated tab-fallback dispatch loop extracted into a shared module so that tool.dispatch, resource.read, and prompt.get handlers are DRY and easier to maintain.",
+      "acceptanceCriteria": [
+        "A new file platform/browser-extension/src/dispatch-helpers.ts exists with: dispatchWithTabFallback(), executeWithTimeout(), requireStringParam(), resolvePlugin(), isAdapterNotReady(), and the DispatchResult type",
+        "dispatchWithTabFallback() accepts a config object with id, pluginName, plugin, operationName, and an executeOnTab callback — encapsulating the entire find-tabs → iterate → TOCTOU-revalidate → fallback → send-response loop",
+        "executeWithTimeout() wraps a chrome.scripting.executeScript promise with a configurable timeout and extracts the first result, returning a DispatchResult",
+        "requireStringParam() validates a required non-empty string param and sends a JSON-RPC -32602 error if invalid, returning null",
+        "resolvePlugin() looks up plugin metadata by name and sends a JSON-RPC -32603 error if not found, returning null",
+        "resource-prompt-dispatch.ts is refactored to use dispatchWithTabFallback() and executeWithTimeout() — the duplicated tab iteration loop, TOCTOU recheck, adapter-not-ready fallback, and error handling are removed from this file",
+        "tool-dispatch.ts is refactored to use dispatchWithTabFallback(), requireStringParam(), and resolvePlugin() — the duplicated tab iteration loop and param validation are removed. The tool-specific progress listener injection/removal and extended timeout logic remain in tool-dispatch.ts since they are unique to tool dispatch",
+        "All three dispatch handlers (handleToolDispatch, handleResourceRead, handlePromptGet) produce identical JSON-RPC responses as before — no behavioral changes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The duplicated code is in three places:\n\n1. platform/browser-extension/src/tool-dispatch.ts lines 342-512 (handleToolDispatch) — tab iteration loop with TOCTOU recheck, adapter-not-ready fallback, tab-gone detection, error response\n2. platform/browser-extension/src/resource-prompt-dispatch.ts lines 252-362 (handleResourceRead) — nearly identical loop\n3. platform/browser-extension/src/resource-prompt-dispatch.ts lines 369-492 (handlePromptGet) — nearly identical loop\n\nThe per-tab execution functions (executeToolOnTab, executeResourceReadOnTab, executePromptGetOnTab) each have unique MAIN-world script logic but share the same timeout+race+result-extraction wrapper. Extract the wrapper as executeWithTimeout().\n\nFor tool-dispatch.ts specifically: the progress listener injection (injectProgressListener/removeProgressListener) and the extended timeout with progressCallbacks are unique to tool dispatch. handleToolDispatch should call dispatchWithTabFallback with an executeOnTab callback that wraps the progress listener setup around executeToolOnTab. The progress callback and MAX_SCRIPT_TIMEOUT_MS logic stays in tool-dispatch.ts.\n\nThe DispatchResult type exists separately in both tool-dispatch.ts (as ToolResult) and resource-prompt-dispatch.ts (as DispatchResult). Unify them into a single exported type.\n\nKey constraint: the existing tests in message-router.test.ts mock tool-dispatch and resource-prompt-dispatch via mock.module — make sure the export signatures remain compatible.\n\nDo NOT change browser-commands.ts in this story."
+    },
+    {
+      "id": "US-002",
+      "title": "Add unit tests for dispatch-helpers.ts",
+      "description": "As a developer, I want unit tests for the new dispatch-helpers module so that the shared dispatch logic is verified independently of the Chrome extension environment.",
+      "acceptanceCriteria": [
+        "A new file platform/browser-extension/src/dispatch-helpers.test.ts exists",
+        "Tests for requireStringParam: validates non-empty string, rejects missing/empty/non-string params with -32602 error via sendToServer mock",
+        "Tests for resolvePlugin: returns plugin meta on success, sends -32603 error and returns null when plugin not found",
+        "Tests for isAdapterNotReady: returns true for error results with code -32002, false for success results and other error codes",
+        "Tests for dispatchWithTabFallback: (a) sends -32001 error when no matching tabs, (b) calls executeOnTab for matching tab and sends success result, (c) falls back to next tab on adapter-not-ready error, (d) falls back to next tab on tab-gone error, (e) sends first error when all tabs fail, (f) sends -32001 for undefined-ID tabs",
+        "All tests use bun:test with mock.module for chrome API and module dependencies",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Follow the existing test patterns in platform/browser-extension/src/message-router.test.ts for how to mock chrome APIs and module dependencies with mock.module.\n\nThe test file must be covered by platform/browser-extension/tsconfig.test.json (it already includes src/**/*.test.ts).\n\nFor dispatchWithTabFallback tests, mock:\n- platform/browser-extension/src/tab-matching.js (findAllMatchingTabs, urlMatchesPatterns)\n- platform/browser-extension/src/messaging.js (sendToServer)\n- platform/browser-extension/src/plugin-storage.js (getPluginMeta)\n\nProvide a mock chrome.tabs.get that returns tab objects with URLs.\n\nTest the TOCTOU recheck by having chrome.tabs.get return a URL that no longer matches the plugin's urlPatterns."
+    },
+    {
+      "id": "US-003",
+      "title": "Split browser-commands.ts into domain-grouped modules",
+      "description": "As a developer, I want browser-commands.ts split into focused modules grouped by domain so that each module is independently readable, maintainable, and testable.",
+      "acceptanceCriteria": [
+        "platform/browser-extension/src/browser-commands/tab-commands.ts contains: handleBrowserListTabs, handleBrowserOpenTab, handleBrowserCloseTab, handleBrowserNavigateTab, handleBrowserFocusTab, handleBrowserGetTabInfo",
+        "platform/browser-extension/src/browser-commands/content-commands.ts contains: handleBrowserGetTabContent, handleBrowserGetPageHtml, handleBrowserGetStorage, handleBrowserScreenshotTab",
+        "platform/browser-extension/src/browser-commands/interaction-commands.ts contains: handleBrowserClickElement, handleBrowserTypeText, handleBrowserSelectOption, handleBrowserWaitForElement, handleBrowserQueryElements, handleBrowserPressKey, handleBrowserScroll, handleBrowserHoverElement, handleBrowserHandleDialog",
+        "platform/browser-extension/src/browser-commands/cookie-commands.ts contains: handleBrowserGetCookies, handleBrowserSetCookie, handleBrowserDeleteCookies",
+        "platform/browser-extension/src/browser-commands/network-commands.ts contains: handleBrowserEnableNetworkCapture, handleBrowserGetNetworkRequests, handleBrowserDisableNetworkCapture, handleBrowserGetConsoleLogs, handleBrowserClearConsoleLogs",
+        "platform/browser-extension/src/browser-commands/resource-commands.ts contains: handleBrowserListResources, handleBrowserGetResourceContent, and the CDP helper types/functions (CdpFrame, CdpResource, CdpFrameResourceTree, findFrameForResource, withDebugger, isTextMimeType, TEXT_MIME_PREFIXES, TEXT_MIME_EXACT)",
+        "platform/browser-extension/src/browser-commands/extension-commands.ts contains: handleExtensionGetState, handleExtensionGetLogs, handleExtensionGetSidePanel, handleExtensionCheckAdapter, handleExtensionForceReconnect, handleBrowserExecuteScript",
+        "platform/browser-extension/src/browser-commands/index.ts re-exports all handlers from the submodules so the import in message-router.ts can switch from './browser-commands.js' to './browser-commands/index.js' (or just './browser-commands/index.js') with no other changes to message-router.ts",
+        "The original platform/browser-extension/src/browser-commands.ts file is deleted",
+        "message-router.ts import path is updated to './browser-commands/index.js'",
+        "No behavioral changes — all handlers produce identical results",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The current browser-commands.ts is 2200+ lines with 30+ exported handler functions. This is a pure file-restructuring story — no logic changes.\n\nImportant details:\n- message-router.ts (line 1-37) has a large import block from './browser-commands.js'. Update this to import from './browser-commands/index.js'.\n- Each new submodule needs its own imports. Many handlers use: sendToServer from '../messaging.js', sanitizeErrorMessage from '../sanitize-error.js', toErrorMessage from '@opentabs-dev/shared', and constants from '../constants.js'.\n- The withDebugger helper and CDP types (CdpFrame, CdpResource, CdpFrameResourceTree, findFrameForResource, isTextMimeType, TEXT_MIME_PREFIXES, TEXT_MIME_EXACT) are only used by resource-commands.ts (handleBrowserListResources, handleBrowserGetResourceContent) and handleBrowserHandleDialog. Export withDebugger from resource-commands.ts and import it in interaction-commands.ts for handleBrowserHandleDialog.\n- background-log-state.ts is imported only by the handlers going to extension-commands.ts.\n- network-capture.ts exports are imported only by the handlers going to network-commands.ts.\n- plugin-storage.ts and tab-state.ts are imported only by extension-commands.ts handlers.\n- The tsconfig.json already includes src/**/*.ts so new files in src/browser-commands/ are automatically covered.\n- message-router.test.ts mocks './browser-commands.js' — update the mock path to './browser-commands/index.js'.\n\nKeep handleBrowserExecuteScript in extension-commands.ts since it's a low-level extension capability (file-based script injection), not a DOM interaction command."
+    },
+    {
+      "id": "US-004",
+      "title": "Extract browser command helpers for param validation and script result extraction",
+      "description": "As a developer, I want reusable helper functions for the repetitive param validation and script result extraction patterns in browser command handlers so that each handler is shorter and the shared logic is testable.",
+      "acceptanceCriteria": [
+        "A new file platform/browser-extension/src/browser-commands/helpers.ts exists with: requireTabId(), requireSelector(), requireUrl(), extractScriptResult(), sendErrorResult(), and sendSuccessResult()",
+        "requireTabId(params, id) validates params.tabId is a number, sends -32602 error if not, returns tabId or null",
+        "requireSelector(params, id) validates params.selector is a non-empty string, sends -32602 error if not, returns selector or null",
+        "requireUrl(params, id) validates params.url is a string and not a blocked URL scheme, sends -32602 error if not, returns url or null",
+        "extractScriptResult<T>(results, id, fallbackMsg) extracts results[0]?.result, sends -32603 error if null, checks for result.error field and sends -32602 if present, returns the typed result or null",
+        "sendErrorResult(id, err) sends a JSON-RPC -32603 error with sanitized error message (wraps the repeated catch block pattern)",
+        "sendSuccessResult(id, result) sends a JSON-RPC 2.0 success response",
+        "At least 5 browser command handlers in the split modules are refactored to use these helpers, demonstrating the pattern (e.g., handleBrowserClickElement, handleBrowserCloseTab, handleBrowserGetTabContent, handleBrowserGetCookies, handleBrowserHoverElement)",
+        "All remaining handlers can be migrated in future work but need not all be converted in this story",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "The repeated patterns in browser-commands.ts:\n\n1. Tab ID validation (appears ~25 times):\n```ts\nconst tabId = params.tabId;\nif (typeof tabId !== 'number') {\n  sendToServer({ jsonrpc: '2.0', error: { code: -32602, message: 'Missing or invalid tabId parameter' }, id });\n  return;\n}\n```\n\n2. Selector validation (appears ~8 times):\n```ts\nconst selector = params.selector;\nif (typeof selector !== 'string' || selector.length === 0) {\n  sendToServer({ jsonrpc: '2.0', error: { code: -32602, message: 'Missing or invalid selector parameter' }, id });\n  return;\n}\n```\n\n3. URL validation with blocked scheme check (appears ~5 times):\n```ts\nif (typeof url !== 'string') { ... }\nif (isBlockedUrlScheme(url)) { ... }\n```\n\n4. Script result extraction (appears ~15 times):\n```ts\nconst result = results[0]?.result as SomeType | undefined;\nif (!result) {\n  sendToServer({ jsonrpc: '2.0', error: { code: -32603, message: 'No result from script execution' }, id });\n  return;\n}\nif (result.error) {\n  sendToServer({ jsonrpc: '2.0', error: { code: -32602, message: result.error }, id });\n  return;\n}\n```\n\n5. Error catch block (appears ~30 times):\n```ts\ncatch (err) {\n  sendToServer({ jsonrpc: '2.0', error: { code: -32603, message: sanitizeErrorMessage(toErrorMessage(err)) }, id });\n}\n```\n\nOnly convert 5+ handlers as a demonstration — converting all 30+ handlers in one story is too large. Pick handlers from different submodules to prove the pattern works across modules.\n\nImport the helpers in the submodule files. The helpers file imports sendToServer from '../messaging.js', sanitizeErrorMessage from '../sanitize-error.js', toErrorMessage and isBlockedUrlScheme from '@opentabs-dev/shared'."
+    },
+    {
+      "id": "US-005",
+      "title": "Add unit tests for browser command helpers",
+      "description": "As a developer, I want unit tests for the browser command helper functions so that the shared param validation and result extraction logic is verified independently.",
+      "acceptanceCriteria": [
+        "A new file platform/browser-extension/src/browser-commands/helpers.test.ts exists",
+        "Tests for requireTabId: accepts valid number, rejects missing/non-number with -32602 error",
+        "Tests for requireSelector: accepts non-empty string, rejects missing/empty/non-string with -32602 error",
+        "Tests for requireUrl: accepts valid URL, rejects missing/non-string, rejects blocked schemes (javascript:, data:, file:, chrome:, blob:)",
+        "Tests for extractScriptResult: extracts valid result, returns null and sends error for undefined result, returns null and sends error for result with error field",
+        "Tests for sendErrorResult: sends -32603 error with sanitized message",
+        "Tests for sendSuccessResult: sends JSON-RPC 2.0 success with result payload",
+        "All tests use bun:test with mock.module for sendToServer and shared dependencies",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Follow the test patterns in platform/browser-extension/src/sanitize-error.test.ts for simple utility function tests.\n\nMock sendToServer via mock.module for platform/browser-extension/src/messaging.js.\n\nThe test file lives at platform/browser-extension/src/browser-commands/helpers.test.ts and is covered by tsconfig.test.json (which includes src/**/*.test.ts).\n\nFor requireUrl tests, import isBlockedUrlScheme from @opentabs-dev/shared to verify the blocked scheme list — or just test with known blocked schemes (javascript:alert(1), data:text/html, file:///etc/passwd, chrome://settings, blob:http://example.com)."
+    },
+    {
+      "id": "US-006",
+      "title": "Migrate remaining browser command handlers to use shared helpers",
+      "description": "As a developer, I want all browser command handlers to use the shared helpers so that the codebase is fully consistent and the boilerplate is eliminated everywhere.",
+      "acceptanceCriteria": [
+        "Every browser command handler that validates tabId uses requireTabId()",
+        "Every browser command handler that validates selector uses requireSelector()",
+        "Every browser command handler that validates url with blocked scheme check uses requireUrl()",
+        "Every browser command handler that extracts script results uses extractScriptResult()",
+        "Every browser command handler catch block uses sendErrorResult()",
+        "No handler in the browser-commands/ directory has inline tabId/selector/url validation boilerplate",
+        "No behavioral changes — all handlers produce identical JSON-RPC responses as before",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "This is the completion story that converts all remaining handlers after the 5+ demonstrated in US-004.\n\nGo through each file in platform/browser-extension/src/browser-commands/ and mechanically replace the boilerplate patterns with helper calls.\n\nHandlers to convert (those not already done in US-004):\n- tab-commands.ts: handleBrowserListTabs (no tabId), handleBrowserOpenTab, handleBrowserNavigateTab, handleBrowserFocusTab, handleBrowserGetTabInfo\n- content-commands.ts: handleBrowserGetPageHtml, handleBrowserGetStorage, handleBrowserScreenshotTab\n- interaction-commands.ts: handleBrowserTypeText, handleBrowserSelectOption, handleBrowserWaitForElement, handleBrowserQueryElements, handleBrowserPressKey, handleBrowserScroll\n- cookie-commands.ts: handleBrowserSetCookie, handleBrowserDeleteCookies\n- network-commands.ts: handleBrowserEnableNetworkCapture, handleBrowserGetNetworkRequests, handleBrowserDisableNetworkCapture, handleBrowserGetConsoleLogs, handleBrowserClearConsoleLogs\n- resource-commands.ts: handleBrowserListResources, handleBrowserGetResourceContent\n- extension-commands.ts: handleBrowserExecuteScript, handleExtensionCheckAdapter\n\nSome handlers (like handleBrowserListTabs) don't take a tabId — skip requireTabId for those. Some have custom validation (e.g., handleBrowserSelectOption needs value OR label) — keep custom logic where the helpers don't fit.\n\nThis is the final story so it has e2eCheckpoint: true to run the full E2E suite before merge."
+    }
+  ]
+}

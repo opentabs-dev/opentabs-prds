@@ -1,0 +1,127 @@
+{
+  "project": "Side Panel Data Flow — Final Design + E2E Tests",
+  "description": "Implement the final event-driven invalidation data flow for the side panel with three data path types: (1) server-originated state uses invalidate + re-fetch via config.getState, (2) extension-originated tab state is pushed directly from background to side panel, (3) user-initiated tool toggles use optimistic local updates. Then add comprehensive E2E tests covering every data path to make the flow bulletproof.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Forward tab.stateChanged to side panel from background",
+      "description": "As a user, I want the side panel tab state dots to update in real-time when I open, close, or navigate tabs so that I always see accurate plugin status without waiting for unrelated events.",
+      "acceptanceCriteria": [
+        "After checkTabStateChanges sends tab.stateChanged to the MCP server via sendToServer, it also calls forwardToSidePanel with the same tab.stateChanged data wrapped in sp:serverMessage",
+        "The forwardToSidePanel call happens in the same code block, immediately after the sendToServer call",
+        "In sendTabSyncAll, after sending tab.syncAll to the server, individual tab.stateChanged messages are forwarded to the side panel for each plugin so the side panel gets initial tab states on connect",
+        "In handlePluginUpdate in message-router.ts, after computing the new tab state and sending to server (around line 316), also forward to the side panel",
+        "The side panel's existing tab.stateChanged handler in App.tsx (lines 83-93) already handles these messages correctly — no changes needed on the side panel side",
+        "No new message types or InternalMessage variants are introduced — uses existing sp:serverMessage with tab.stateChanged method",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Three places need changes:\n\n1. platform/browser-extension/src/tab-state.ts — checkTabStateChanges (around line 220-229):\nAfter the sendToServer call, add:\nforwardToSidePanel({\n  type: 'sp:serverMessage',\n  data: {\n    jsonrpc: '2.0',\n    method: 'tab.stateChanged',\n    params: { plugin: plugin.name, state: newState.state, tabId: newState.tabId, url: newState.url },\n  },\n});\nImport forwardToSidePanel from './messaging.js'.\n\n2. platform/browser-extension/src/tab-state.ts — sendTabSyncAll (around line 107-113):\nAfter sending tab.syncAll to the server, loop through entries and forward each as tab.stateChanged to the side panel:\nfor (const [pluginName, stateInfo] of entries) {\n  forwardToSidePanel({\n    type: 'sp:serverMessage',\n    data: {\n      jsonrpc: '2.0',\n      method: 'tab.stateChanged',\n      params: { plugin: pluginName, state: stateInfo.state, tabId: stateInfo.tabId, url: stateInfo.url },\n    },\n  });\n}\n\n3. platform/browser-extension/src/message-router.ts — handlePluginUpdate (around line 316):\nAfter the sendToServer call for tab.stateChanged, add the same forwardToSidePanel call:\nforwardToSidePanel({\n  type: 'sp:serverMessage',\n  data: {\n    jsonrpc: '2.0',\n    method: 'tab.stateChanged',\n    params: { plugin: meta.name, state: newState.state, tabId: newState.tabId, url: newState.url },\n  },\n});\n\nThe side panel App.tsx already has the handler at lines 83-93 that updates the specific plugin's tabState in the plugins array. No changes needed there."
+    },
+    {
+      "id": "US-002",
+      "title": "Optimistic local toggle for tool enable/disable",
+      "description": "As a user, I want tool toggles to feel instant by updating the UI immediately when I click, instead of waiting for a server round-trip.",
+      "acceptanceCriteria": [
+        "PluginCard's handleToggleAll and handleToggleTool update local plugins state optimistically before the server request completes",
+        "The .then(onRefresh) chain is removed from both toggle handlers — no fetchConfigState() round-trip on successful toggle",
+        "If the server request fails, the optimistic update is reverted (toggle flips back) and the error toast is shown",
+        "A setPlugins updater function is passed down through PluginList to PluginCard instead of onRefresh for toggle operations",
+        "The onRefresh prop can be removed from PluginList and PluginCard if no longer needed, or kept if used for other purposes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Pass setPlugins down from App.tsx through PluginList to PluginCard.\n\nIn App.tsx:\n- Pass setPlugins to PluginList (in addition to or instead of onRefresh)\n\nIn PluginList.tsx:\n- Accept setPlugins: React.Dispatch<React.SetStateAction<PluginState[]>> prop\n- Pass it through to PluginCard\n\nIn PluginCard.tsx:\n- Accept setPlugins prop\n- handleToggleAll becomes:\n  const handleToggleAll = (e: React.MouseEvent) => {\n    e.stopPropagation();\n    const newEnabled = !allEnabled;\n    setPlugins(prev => prev.map(p =>\n      p.name === plugin.name\n        ? { ...p, tools: p.tools.map(t => ({ ...t, enabled: newEnabled })) }\n        : p\n    ));\n    void setAllToolsEnabled(plugin.name, newEnabled).catch(() => {\n      setPlugins(prev => prev.map(p =>\n        p.name === plugin.name\n          ? { ...p, tools: p.tools.map(t => ({ ...t, enabled: !newEnabled })) }\n          : p\n      ));\n      showToggleError('Failed to toggle all tools');\n    });\n  };\n- handleToggleTool becomes similar: optimistic flip of the specific tool, revert on error\n- Remove .then(onRefresh) chains\n- If onRefresh is no longer used anywhere, remove it from the component chain. But check if loadPlugins is still needed in App.tsx for plugins.changed invalidation — it is, but it doesn't need to be passed as onRefresh to PluginCard.\n\nNote: The plugin prop to PluginCard is derived from the plugins state array in App.tsx, so setPlugins updates will cause re-renders with fresh data automatically."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: side panel shows connected/disconnected status",
+      "description": "As a developer, I want E2E tests verifying the side panel correctly shows connection status when the MCP server starts, stops, and reconnects.",
+      "acceptanceCriteria": [
+        "Test opens side panel, verifies 'Connected' text and green dot are visible when MCP server is running",
+        "Test kills the MCP server, verifies side panel shows 'Disconnected' within a reasonable timeout",
+        "Test restarts the MCP server, verifies side panel shows 'Connected' again after reconnect",
+        "Test verifies the plugin list is cleared on disconnect and repopulated on reconnect",
+        "Tests are in a new file e2e/side-panel-data-flow.e2e.ts",
+        "Tests use the existing patterns from side-panel-live-update.e2e.ts (getExtensionId, openSidePanel helpers)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Create e2e/side-panel-data-flow.e2e.ts. Follow the patterns in e2e/side-panel-live-update.e2e.ts for setup.\n\nThe test file should import from fixtures.ts and helpers.ts. Use the same getExtensionId and openSidePanel helpers (copy them or extract to helpers.ts).\n\nTest structure:\ntest.describe('Side panel data flow — connection status', () => {\n  test('shows connected status and transitions on server stop/restart', async () => {\n    // 1. Start MCP server with e2e-test plugin\n    // 2. Launch extension context\n    // 3. Open side panel\n    // 4. Verify 'Connected' text visible\n    // 5. Verify plugin card visible (e.g., 'E2E Test')\n    // 6. Kill MCP server\n    // 7. Verify 'Disconnected' text appears (within 30s — pong timeout is 5s + reconnect backoff)\n    // 8. Verify plugin list is cleared (no plugin cards visible)\n    // 9. Restart MCP server on same port\n    // 10. Verify 'Connected' text reappears\n    // 11. Verify plugin card reappears\n  });\n});\n\nUse expect(page.locator('text=Connected')).toBeVisible() and expect(page.locator('text=Disconnected')).toBeVisible() with appropriate timeouts.\n\nFor restart: use startMcpServer with the same configDir to start a new server on the same port. The offscreen document's reconnect logic will find it.\n\nIMPORTANT: The side panel file needs to be added to the tsconfig that covers E2E tests. Check if e2e/ files are already covered by a tsconfig. Look at tsconfig.configs.json or the root tsconfig.json project references."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: side panel receives tab state changes in real-time",
+      "description": "As a developer, I want E2E tests verifying the side panel tab state dots update when tabs are opened and closed, using the direct push from background.",
+      "acceptanceCriteria": [
+        "Test opens side panel, verifies initial tab state is 'closed' (red dot) when no matching tab is open",
+        "Test opens a matching tab (test server URL), verifies the tab state dot transitions to 'ready' (green dot) in the side panel",
+        "Test closes the matching tab, verifies the tab state dot transitions back to 'closed' (red dot)",
+        "Tests are in e2e/side-panel-data-flow.e2e.ts (same file as US-003)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Add to e2e/side-panel-data-flow.e2e.ts in a new test.describe block.\n\nThe tab state dots in the side panel use these CSS classes (from PluginCard.tsx):\n- ready: 'bg-emerald-400' (green)\n- unavailable: 'bg-amber-400' (amber)\n- closed: 'bg-red-400' (red)\n\nTest structure:\ntest.describe('Side panel data flow — tab state changes', () => {\n  test('tab state dot updates when matching tab opens and closes', async () => {\n    // 1. Start MCP server with e2e-test plugin, start test server\n    // 2. Launch extension context\n    // 3. Wait for extension connected\n    // 4. Open side panel\n    // 5. Verify plugin card is visible with 'E2E Test'\n    // 6. Verify the red dot (bg-red-400) is visible (tab closed state)\n    //    Use: page.locator('.bg-red-400') inside the plugin card area\n    // 7. Open a new tab to testServer.url\n    // 8. Wait for the green dot (bg-emerald-400) to appear (tab ready state)\n    //    The adapter needs to be injected and isReady() must return true\n    //    This may take a few seconds — use toBeVisible({ timeout: 15_000 })\n    // 9. Close the matching tab\n    // 10. Verify the red dot (bg-red-400) reappears\n  });\n});\n\nThis test depends on US-001 (tab.stateChanged forwarding to side panel). Without US-001, the side panel would only update on the next fetchConfigState() round-trip, which is triggered by plugins.changed (not by tab events). With US-001, the tab state dot updates immediately via the direct push.\n\nThe test server must be started so the e2e-test plugin has a matching URL to target. Use the test server from fixtures.ts.\n\nIMPORTANT: Need to set up the adapter symlink between config dir and extension dir, same as in side-panel-live-update.e2e.ts."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: side panel plugin list updates on sync.full invalidation",
+      "description": "As a developer, I want E2E tests verifying the side panel plugin list updates when plugins are added or removed via config.json changes, using the invalidation + re-fetch pattern.",
+      "acceptanceCriteria": [
+        "Test starts with no plugins, opens side panel, verifies empty state",
+        "Test adds a plugin via config.json, verifies the side panel shows the plugin card within 30s",
+        "Test removes the plugin via config.json, verifies the side panel shows empty state again",
+        "This test already exists in e2e/side-panel-live-update.e2e.ts — verify these existing tests still pass after US-001 and US-002 changes",
+        "Run bun run test:e2e and confirm the side-panel-live-update tests pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "This story is primarily a verification story. The existing e2e/side-panel-live-update.e2e.ts already tests the config.json → sync.full → plugins.changed → fetchConfigState() → side panel update path.\n\nVerify that the existing tests still pass after the changes from US-001 and US-002. Run:\nbun run test:e2e -- --grep 'Side panel live-update'\n\nIf they pass, mark this story as complete.\n\nIf they fail, investigate and fix. Common issues:\n- The existing tests depend on the ws:message fallback (App.tsx lines 122-134) which uses a 1.5s setTimeout. This fallback is still present (we did not remove it in this batch). If it's unreliable, the test may need longer timeouts or we need to ensure the primary plugins.changed path works.\n- Timing issues with config watcher detection\n\nAlso run the full E2E suite to catch any regressions:\nbun run test:e2e"
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: tool invocation animation appears in side panel",
+      "description": "As a developer, I want an E2E test verifying that tool invocation spinner animations appear in the side panel when a tool is called via MCP.",
+      "acceptanceCriteria": [
+        "Test opens side panel, expands a plugin card to show tools",
+        "Test calls a tool via the MCP client",
+        "Test verifies the spinning animation element appears during tool execution",
+        "Test verifies the animation disappears after tool execution completes",
+        "Test is in e2e/side-panel-data-flow.e2e.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Add to e2e/side-panel-data-flow.e2e.ts.\n\nThe invocation animation in ToolRow.tsx:\n- Active tools get the class 'animate-tool-pulse' on the row div\n- Active tools show a spinning div with class 'animate-spin'\n\nTest structure:\ntest.describe('Side panel data flow — tool invocation animation', () => {\n  test('shows spinner during tool call and removes it after', async () => {\n    // 1. Full setup: MCP server + test server + extension + MCP client\n    // 2. Open test app tab, wait for adapter injection and ready state\n    // 3. Open side panel\n    // 4. Wait for plugin card to appear\n    // 5. Click the plugin card to expand it (click the button[aria-expanded])\n    // 6. Verify tool rows are visible\n    // 7. Use the test server to add a delay to tool responses (e.g., 3 seconds)\n    //    The test server has a /control endpoint — check if there's a way to add delay\n    //    If not, just call a tool and check quickly\n    // 8. Call a tool via mcpClient.callTool() in parallel with checking the DOM\n    //    Use Promise.all([toolCall, spinnerCheck]) where spinnerCheck polls for .animate-spin\n    // 9. After tool completes, verify .animate-spin is gone\n  });\n});\n\nThe tricky part is timing — the tool call may complete very fast. The e2e-test plugin's get_status tool returns immediately. To observe the spinner:\n- Option A: Use Promise.race — start the tool call, immediately check for spinner, don't wait for tool to complete\n- Option B: Use the test server's delay mechanism if available\n- Option C: Just verify the spinner appears at some point during execution using polling\n\nCheck the test server (e2e/test-server.ts) for any delay/slow response mechanism. If the test server has no delay mechanism, the tool may complete too fast to observe the spinner. In that case, the test can verify the animate-tool-pulse class briefly appears using a Playwright polling assertion or by slowing down the response.\n\nLooking at test-server.ts, there's a 'mode' system that controls responses. Check if there's an 'errorMode' or 'slowMode'. If not, this test may need to rely on quick polling or use a different approach.\n\nAlternative approach: Instead of testing the visual animation, test that the activeTools state is updated by checking the DOM class. Use page.locator('.animate-tool-pulse') and verify it appears during the tool call."
+    }
+  ]
+}

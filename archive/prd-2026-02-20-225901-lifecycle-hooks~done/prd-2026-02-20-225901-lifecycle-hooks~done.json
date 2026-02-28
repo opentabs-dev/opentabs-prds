@@ -1,0 +1,141 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add comprehensive plugin lifecycle hooks to the plugin SDK and adapter runtime. Plugins can optionally implement onNavigate (URL changes), onActivate/onDeactivate (injection lifecycle), and onToolInvocationStart/onToolInvocationEnd (tool execution observability). The adapter IIFE build wires all hooks automatically. Full E2E test coverage via the e2e-test plugin.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add onNavigate hook to plugin SDK and adapter runtime",
+      "description": "As a plugin developer, I want an onNavigate hook so my plugin can react to in-page URL changes (SPA navigations, hash changes) without requiring a full page reload.",
+      "acceptanceCriteria": [
+        "OpenTabsPlugin base class in platform/plugin-sdk/src/index.ts has optional onNavigate?(url: string): void",
+        "The hook is called when the page URL changes via pushState, replaceState, popstate, or hashchange",
+        "The hook receives the new URL as a string argument",
+        "If the plugin does not implement onNavigate, no listeners are set up (no overhead)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts — add `onNavigate?(url: string): void` to the OpenTabsPlugin abstract class, alongside the existing teardown?() method. Add a JSDoc comment explaining that this hook fires on in-page URL changes (pushState, replaceState, popstate, hashchange) and runs in the page context. The hook signature takes the new URL as a string. This story only adds the SDK interface — the wiring happens in US-004. Publish will happen in US-006."
+    },
+    {
+      "id": "US-002",
+      "title": "Add onActivate and onDeactivate hooks",
+      "description": "As a plugin developer, I want onActivate/onDeactivate hooks so my plugin can set up and tear down resources tied to the adapter's injection lifecycle.",
+      "acceptanceCriteria": [
+        "OpenTabsPlugin has optional onActivate?(): void",
+        "OpenTabsPlugin has optional onDeactivate?(): void",
+        "onActivate is called once when the adapter is first injected and registered on globalThis.__openTabs.adapters",
+        "onDeactivate is called when the adapter is being removed (before teardown, or when navigating away)",
+        "onDeactivate fires before teardown() if both are defined",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts — add `onActivate?(): void` and `onDeactivate?(): void` to OpenTabsPlugin. onActivate JSDoc: 'Called once after the adapter is registered on globalThis.__openTabs.adapters. Use for setting up page-level event listeners, observers, or other resources that should exist for the adapter's lifetime.' onDeactivate JSDoc: 'Called when the adapter is being removed — either before teardown() on plugin update, or when the tab navigates away from a matching URL. Use for cleanup of resources set up in onActivate.' Note the relationship: onDeactivate is called BEFORE teardown. If a plugin implements both onDeactivate and teardown, onDeactivate fires first for lifecycle-aware cleanup, then teardown fires for the existing cleanup path. This story only adds the SDK interface — wiring happens in US-004."
+    },
+    {
+      "id": "US-003",
+      "title": "Add onToolInvocationStart and onToolInvocationEnd hooks",
+      "description": "As a plugin developer, I want hooks around tool invocations so I can implement logging, metrics, or UI feedback when tools are called.",
+      "acceptanceCriteria": [
+        "OpenTabsPlugin has optional onToolInvocationStart?(toolName: string): void",
+        "OpenTabsPlugin has optional onToolInvocationEnd?(toolName: string, success: boolean, durationMs: number): void",
+        "onToolInvocationStart is called before tool.handle() executes",
+        "onToolInvocationEnd is called after tool.handle() completes (success or failure)",
+        "durationMs measures the wall-clock time of tool.handle() in milliseconds",
+        "success is true if handle() resolved, false if it threw",
+        "If onToolInvocationStart or onToolInvocationEnd throw, the error is logged but does not affect tool execution",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts — add `onToolInvocationStart?(toolName: string): void` and `onToolInvocationEnd?(toolName: string, success: boolean, durationMs: number): void` to OpenTabsPlugin. JSDoc for onToolInvocationStart: 'Called before each tool.handle() execution. Runs in the page context. Receives the tool name (unprefixed, e.g. \"send_message\" not \"slack_send_message\"). Errors thrown here are caught and logged — they do not prevent tool execution.' JSDoc for onToolInvocationEnd: 'Called after each tool.handle() completes, whether it succeeded or threw. Receives the tool name, a boolean indicating success, and the duration in milliseconds. Errors thrown here are caught and logged.' This story only adds the SDK interface — the wiring (wrapping tool.handle in the IIFE) happens in US-004."
+    },
+    {
+      "id": "US-004",
+      "title": "Update adapter IIFE build to wire lifecycle hooks",
+      "description": "As the platform, I want the opentabs-plugin build command to generate IIFE code that automatically wires all lifecycle hooks so plugin developers get them for free.",
+      "acceptanceCriteria": [
+        "The generated IIFE wrapper in bundleIIFE (platform/plugin-tools/src/commands/build.ts) sets up all lifecycle hooks",
+        "onActivate: called after the adapter is registered on globalThis.__openTabs.adapters[name]",
+        "onDeactivate: called during teardown (before plugin.teardown() if both exist)",
+        "onNavigate: intercepts history.pushState, history.replaceState, and listens for popstate + hashchange events; calls plugin.onNavigate(location.href) on URL changes",
+        "onToolInvocationStart/End: wraps each tool.handle() to call the hooks before and after execution with timing",
+        "All hook calls are wrapped in try-catch to prevent hook errors from breaking tool execution or adapter registration",
+        "Cleanup: the teardown function removes URL change listeners and restores original history methods",
+        "The onNavigate listener setup only happens if the plugin implements onNavigate (checked at runtime)",
+        "The tool wrapping only happens if the plugin implements onToolInvocationStart or onToolInvocationEnd",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Edit platform/plugin-tools/src/commands/build.ts — modify the wrapperCode template string in bundleIIFE(). The current wrapper code is at lines 256-266. It imports the plugin, sets up __openTabs.adapters, calls teardown on existing adapter, deletes old entry, and registers new one. The new wrapper needs to:\n\n1. AFTER `adapters[name] = plugin` (line 265): call `plugin.onActivate()` if it exists, wrapped in try-catch.\n\n2. BEFORE that line, modify the teardown of the OLD adapter: if the old adapter has onDeactivate, call it BEFORE teardown. The current code (lines 261-262) only calls existing.teardown(). Change to: if (existing.onDeactivate) try { existing.onDeactivate() } catch(e) { ... }; if (existing.teardown) try { existing.teardown() } catch(e) { ... };\n\n3. AFTER adapter registration + onActivate: if plugin.onNavigate exists, set up URL change detection:\n   - Save originals: const origPushState = history.pushState; const origReplaceState = history.replaceState;\n   - let lastUrl = location.href;\n   - const checkUrl = () => { const newUrl = location.href; if (newUrl !== lastUrl) { lastUrl = newUrl; try { plugin.onNavigate(newUrl); } catch(e) { console.warn(...); } } };\n   - history.pushState = function(...args) { origPushState.apply(this, args); checkUrl(); };\n   - history.replaceState = function(...args) { origReplaceState.apply(this, args); checkUrl(); };\n   - window.addEventListener('popstate', checkUrl);\n   - window.addEventListener('hashchange', checkUrl);\n   - Store cleanup refs on the adapter object (e.g., adapter.__cleanupNavigation) so teardown can restore originals and remove listeners.\n\n4. AFTER adapter registration: if plugin.onToolInvocationStart or plugin.onToolInvocationEnd exists, wrap each tool.handle():\n   - for (const tool of plugin.tools) { const origHandle = tool.handle; tool.handle = async function(params) { const startTime = performance.now(); try { plugin.onToolInvocationStart?.(tool.name); } catch(e) { console.warn(...); } let success = true; try { const result = await origHandle.call(this, params); return result; } catch(err) { success = false; throw err; } finally { const duration = performance.now() - startTime; try { plugin.onToolInvocationEnd?.(tool.name, success, duration); } catch(e) { console.warn(...); } } }; }\n   - IMPORTANT: This wrapping must happen BEFORE Object.freeze(tool) in the hashAndFreeze snippet (line 376). Currently the freeze happens in a separate appended snippet. Since the tool wrapping happens in the main IIFE and the freeze happens in the hashAndFreeze snippet (appended after), the ordering is correct.\n\n5. Update the teardown wrapper: the adapter's teardown needs to also call onDeactivate and clean up navigation listeners. Modify the existing teardown pattern so that when THIS adapter is later torn down (by a future re-injection), onDeactivate fires first, then navigation cleanup, then teardown.\n   - One approach: wrap the plugin's original teardown in a new function that calls onDeactivate first, then cleans up navigation, then calls original teardown. Assign this wrapper as adapter.teardown.\n   - E.g.: const origTeardown = plugin.teardown?.bind(plugin); plugin.teardown = function() { try { plugin.onDeactivate?.(); } catch(e) { ... } if (adapter.__cleanupNavigation) adapter.__cleanupNavigation(); if (origTeardown) origTeardown(); };\n\nThe key architectural insight: all hook wiring happens in the IIFE wrapper that bundleIIFE generates. The SDK only defines the interface. The build tool generates the runtime code that actually calls the hooks. This is the correct place because the IIFE runs in the page context where all the DOM APIs (history, events) are available."
+    },
+    {
+      "id": "US-005",
+      "title": "Add E2E tests for all lifecycle hooks",
+      "description": "As a platform developer, I want E2E tests verifying all lifecycle hooks fire correctly with the expected arguments so I can prevent regressions.",
+      "acceptanceCriteria": [
+        "e2e-test plugin implements all lifecycle hooks (onActivate, onDeactivate, onNavigate, onToolInvocationStart, onToolInvocationEnd)",
+        "Each hook sets markers on globalThis for E2E verification (e.g., __opentabs_onActivate_called, __opentabs_onNavigate_urls, etc.)",
+        "E2E test: onActivate fires when adapter is injected — verify __opentabs_onActivate_called is true after navigating to a matching tab",
+        "E2E test: onDeactivate fires on adapter removal — verify __opentabs_onDeactivate_called is true after plugin.update triggers re-injection (the old adapter's onDeactivate fires before the new one's onActivate)",
+        "E2E test: onNavigate fires on pushState — call history.pushState in the page, verify __opentabs_onNavigate_urls contains the new URL",
+        "E2E test: onToolInvocationStart fires before tool execution — call e2e-test_echo tool, verify __opentabs_tool_invocation_start contains 'echo'",
+        "E2E test: onToolInvocationEnd fires after tool execution with correct args — verify __opentabs_tool_invocation_end contains { toolName: 'echo', success: true, durationMs: <number> }",
+        "E2E test: onToolInvocationEnd reports failure for a failing tool — call e2e-test_failing_tool, verify success is false",
+        "bun run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Two files to modify:\n\n1. plugins/e2e-test/src/index.ts — add all lifecycle hooks to E2eTestPlugin:\n   ```\n   override onActivate(): void {\n     (globalThis as any).__opentabs_onActivate_called = true;\n   }\n\n   override onDeactivate(): void {\n     (globalThis as any).__opentabs_onDeactivate_called = true;\n   }\n\n   override onNavigate(url: string): void {\n     const g = globalThis as any;\n     if (!g.__opentabs_onNavigate_urls) g.__opentabs_onNavigate_urls = [];\n     g.__opentabs_onNavigate_urls.push(url);\n   }\n\n   override onToolInvocationStart(toolName: string): void {\n     const g = globalThis as any;\n     if (!g.__opentabs_tool_invocation_start) g.__opentabs_tool_invocation_start = [];\n     g.__opentabs_tool_invocation_start.push(toolName);\n   }\n\n   override onToolInvocationEnd(toolName: string, success: boolean, durationMs: number): void {\n     const g = globalThis as any;\n     if (!g.__opentabs_tool_invocation_end) g.__opentabs_tool_invocation_end = [];\n     g.__opentabs_tool_invocation_end.push({ toolName, success, durationMs });\n   }\n   ```\n   Then rebuild the e2e-test plugin: cd plugins/e2e-test && bun install && bun run build (need updated SDK first).\n\n2. Create e2e/lifecycle-hooks.e2e.ts — new E2E test file:\n   - Use existing fixtures (mcpServer, extensionContext, testServer, mcpClient)\n   - Use helpers (setupToolTest, callToolExpectSuccess, waitFor, waitForToolResult)\n   - Test structure:\n     ```\n     test.describe('Lifecycle hooks', () => {\n       test('onActivate fires when adapter is injected', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n         const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n         const activated = await page.evaluate(() => (globalThis as any).__opentabs_onActivate_called);\n         expect(activated).toBe(true);\n       });\n\n       test('onNavigate fires on pushState URL change', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n         const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n         await page.evaluate(() => history.pushState({}, '', '/new-path'));\n         await page.waitForTimeout(100); // allow event to propagate\n         const urls = await page.evaluate(() => (globalThis as any).__opentabs_onNavigate_urls);\n         expect(urls).toContainEqual(expect.stringContaining('/new-path'));\n       });\n\n       test('onToolInvocationStart and onToolInvocationEnd fire around tool calls', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n         const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n         await callToolExpectSuccess(mcpClient, mcpServer, 'e2e-test_echo', { message: 'test' });\n         const starts = await page.evaluate(() => (globalThis as any).__opentabs_tool_invocation_start);\n         expect(starts).toContain('echo');\n         const ends = await page.evaluate(() => (globalThis as any).__opentabs_tool_invocation_end);\n         expect(ends).toEqual(expect.arrayContaining([expect.objectContaining({ toolName: 'echo', success: true })]));\n         expect(ends[0].durationMs).toBeGreaterThanOrEqual(0);\n       });\n\n       test('onToolInvocationEnd reports failure for failing tools', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n         const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n         // Call the failing tool — it will return an error through tool dispatch\n         await mcpClient.callTool('e2e-test_failing_tool', {});\n         const ends = await page.evaluate(() => (globalThis as any).__opentabs_tool_invocation_end);\n         expect(ends).toEqual(expect.arrayContaining([expect.objectContaining({ toolName: 'failing_tool', success: false })]));\n       });\n\n       test('onDeactivate fires on adapter re-injection (plugin.update)', async ({ ... }) => {\n         // This is trickier — need to trigger a plugin.update which re-injects.\n         // Use hot reload or direct plugin.update message to force re-injection.\n         // After re-injection, the OLD adapter's onDeactivate should have fired.\n         // Since onDeactivate is wired through teardown, and teardown is called\n         // on re-injection (forceReinject=true), the marker should be set.\n         // Check __opentabs_onDeactivate_called after triggering plugin.update.\n       });\n     });\n     ```\n   - For the onDeactivate test, the approach is: (a) setup the tool test (adapter injected, onActivate fires), (b) trigger a hot reload on the MCP server which sends sync.full → extension re-injects adapters with forceReinject=true → old adapter teardown is called → onDeactivate fires before teardown → new adapter registered → new onActivate fires. Check __opentabs_onDeactivate_called. Note: since the constructor clears teardown markers, use __opentabs_onDeactivate_called which is NOT cleared by the constructor (add it to the list of markers NOT cleared).\n\n   IMPORTANT: The e2e-test plugin must be rebuilt with the updated SDK BEFORE running E2E tests. The build order is: (1) build platform packages (includes plugin-sdk), (2) publish SDK, (3) update e2e-test plugin deps, (4) rebuild e2e-test plugin, (5) run E2E tests. Since this is in development, we can use a local path override or workspace link temporarily."
+    },
+    {
+      "id": "US-006",
+      "title": "Publish packages and update plugins",
+      "description": "As a platform developer, I want to publish the updated SDK and plugin-tools packages so that the e2e-test plugin can depend on the new lifecycle hooks.",
+      "acceptanceCriteria": [
+        "Bump version in platform/shared, platform/plugin-sdk, platform/plugin-tools",
+        "Publish packages in dependency order: shared → plugin-sdk → plugin-tools",
+        "Wait for npm propagation",
+        "Update plugins/e2e-test/package.json to use the new SDK version",
+        "cd plugins/e2e-test && bun install && bun run build succeeds",
+        "All platform quality gates pass: bun run build, type-check, lint, knip, test"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Use the existing publish script: ./scripts/publish.sh <new-version>. The script publishes shared, plugin-sdk, and plugin-tools in dependency order. After publishing, wait ~30s for npm CDN propagation. Then update plugins/e2e-test/package.json dependencies: @opentabs-dev/shared and @opentabs-dev/plugin-sdk to the new version. Run bun install in plugins/e2e-test to fetch the updated packages. Run bun run build (which runs tsc && opentabs-plugin build) to verify the e2e-test plugin compiles and bundles correctly with the new lifecycle hooks. Also update plugins/slack if it exists, same process. Run all platform quality gates to verify nothing broke."
+    },
+    {
+      "id": "US-007",
+      "title": "Update CLAUDE.md with lifecycle hooks documentation",
+      "description": "As a platform developer, I want CLAUDE.md to document the new lifecycle hooks so that anyone working on the codebase understands the available plugin hooks.",
+      "acceptanceCriteria": [
+        "CLAUDE.md Key Concepts section mentions lifecycle hooks",
+        "Lists available hooks: onNavigate, onActivate, onDeactivate, onToolInvocationStart, onToolInvocationEnd",
+        "Explains that hooks are optional and wired automatically by the IIFE build",
+        "Does not enumerate individual plugins — keeps the documentation plugin-agnostic",
+        "All quality gates pass"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Edit CLAUDE.md — add a 'Lifecycle hooks' subsection under Key Concepts (after the 'Tab state machine' section). Keep it concise:\n\n**Lifecycle hooks**: Plugins can optionally implement lifecycle hooks on the `OpenTabsPlugin` base class. All hooks are wired automatically by the `opentabs-plugin build` command in the generated IIFE wrapper — plugin authors only need to implement the methods.\n\n- `onActivate()` — called once after the adapter is registered on `globalThis.__openTabs.adapters`\n- `onDeactivate()` — called when the adapter is being removed (before `teardown()`)\n- `onNavigate(url)` — called on in-page URL changes (pushState, replaceState, popstate, hashchange)\n- `onToolInvocationStart(toolName)` — called before each `tool.handle()` execution\n- `onToolInvocationEnd(toolName, success, durationMs)` — called after each `tool.handle()` completes\n\nAll hooks run in the page context. Errors in hooks are caught and logged — they do not affect adapter registration or tool execution."
+    }
+  ]
+}

@@ -1,0 +1,89 @@
+# Ralph Progress Log
+Started: Tue Feb 17 12:25:10 PST 2026
+
+## Codebase Patterns
+- Platform packages are in `platform/`, plugins in `plugins/`
+- `manifest.json` is at `platform/browser-extension/manifest.json` (extension root, not dist/)
+- Build outputs go to `dist/` directories within each package
+- Quality checks: build → type-check → lint → knip → test (all must pass)
+- Test tsconfig pattern: extends base, `rootDir: "src"`, `noEmit: true`, `include: ["src/**/*.test.ts"]`, `references: [{ "path": "." }]`
+- Use `() => Promise.resolve(...)` for async stubs to avoid `@typescript-eslint/require-await` lint errors
+- Prettier enforces single-line imports when they fit — write them on one line
+- `Array.toSorted()` requires ES2023 lib — use `.slice().sort()` instead in browser-extension code
+- Prettier enforces single-line arrow functions when they fit — write them on one line to avoid formatting diffs
+- `findAllMatchingTabs` returns all matching tabs sorted by rank; `findMatchingTab` wraps it returning just the first
+- `testServer.setSlow(ms)` delays all API endpoints except `/api/auth.check` — isReady probes work instantly while tool fetches are blocked
+
+---
+
+## 2026-02-17 - US-001
+- Fixed CLAUDE.md 'Loading the Extension' step 4: changed `platform/browser-extension/dist` to `platform/browser-extension`
+- Files changed: CLAUDE.md
+- **Learnings for future iterations:**
+  - The manifest.json is at the browser-extension root and references `dist/` paths relative to itself — so the extension load path is the root, not dist/
+  - All quality checks (build, type-check, lint, knip, test) passed with no issues on a clean run
+---
+
+## 2026-02-17 — US-002
+- Created ErrorBoundary class component at `platform/browser-extension/src/side-panel/components/ErrorBoundary.tsx`
+- Wrapped `<App />` with `<ErrorBoundary>` in `platform/browser-extension/src/side-panel/index.tsx`
+- ErrorBoundary uses `getDerivedStateFromError` to catch render errors and displays a recoverable fallback UI with a "Reload" button that calls `window.location.reload()`
+- Styled with existing Tailwind dark theme classes (text-gray-200, text-amber-400, bg-amber-500) and lucide-react `AlertTriangle` icon
+- Files changed: platform/browser-extension/src/side-panel/components/ErrorBoundary.tsx (new), platform/browser-extension/src/side-panel/index.tsx
+- **Learnings for future iterations:**
+  - React error boundaries MUST be class components — there is no hook-based API for getDerivedStateFromError/componentDidCatch
+  - ESLint's `jsx-ast-utils` does not support private class fields (#field) in JSX event handlers — use arrow functions inline or regular methods instead
+  - Prettier reformats JSX `<p>` content to single lines when it fits the print width — write content as single-line to avoid formatting diffs
+  - The side panel uses lucide-react for icons and Tailwind CSS 4 for styling — follow existing component patterns in `components/`
+  - All quality checks (build, type-check, lint, knip, test) pass with 384 unit tests
+---
+
+## 2026-02-17 — US-003
+- Created `platform/plugin-sdk/src/index.test.ts` with 8 unit tests covering ToolError, defineTool, and shared re-exports
+- Created `platform/plugin-sdk/tsconfig.test.json` following the shared package pattern
+- Added `platform/plugin-sdk/tsconfig.test.json` reference to root `tsconfig.json`
+- Files changed: platform/plugin-sdk/src/index.test.ts (new), platform/plugin-sdk/tsconfig.test.json (new), tsconfig.json
+- **Learnings for future iterations:**
+  - Follow `platform/shared/tsconfig.test.json` as the pattern for test tsconfigs: extends base, rootDir=src, noEmit=true, includes test files, references the package itself
+  - Use `() => Promise.resolve(...)` instead of `async () => (...)` for stub handlers to avoid `@typescript-eslint/require-await` lint errors
+  - Prettier enforces single-line imports when they fit within print width — write imports on one line to avoid formatting diffs
+  - Total test count is now 392 (up from 384)
+---
+
+## 2026-02-17 — US-004
+- Added `findAllMatchingTabs` to `platform/browser-extension/src/tab-matching.ts` — returns all matching tabs sorted by rank (best first), `findMatchingTab` now wraps it
+- Refactored `handleToolDispatch` in `platform/browser-extension/src/tool-dispatch.ts` — extracted `executeToolOnTab` helper, added fallback loop that tries other matching tabs when adapter-not-ready (code -32002) or tab-gone errors occur
+- Updated `computePluginTabState` in `platform/browser-extension/src/tab-state.ts` — extracted `probeTabReadiness` helper, now checks all matching tabs and reports 'ready' if ANY is ready
+- Files changed: platform/browser-extension/src/tab-matching.ts, platform/browser-extension/src/tool-dispatch.ts, platform/browser-extension/src/tab-state.ts
+- **Learnings for future iterations:**
+  - `Array.toSorted()` requires ES2023 lib — the browser-extension tsconfig targets ES2022, so use `.slice().sort()` instead
+  - TypeScript union narrowing: `isAdapterNotReady(result)` (a boolean function) doesn't narrow the union type; check `result.type === 'success'` first to properly narrow, then handle error cases
+  - Prettier enforces single-line arrow functions when the expression fits within print width — write them on one line
+  - The `ignoreExportsUsedInFile: true` knip config means exports used within the same file (like `findMatchingTab` calling `findAllMatchingTabs`) are not flagged as unused
+  - All 147 E2E tests pass — single-tab scenarios are unaffected by the multi-tab fallback logic
+  - All 392 unit tests pass
+---
+
+## 2026-02-17 — US-005
+- Added E2E test "tab closed mid-execution returns clean error, not 30s timeout" in `e2e/edge-cases.e2e.ts`
+- Test pattern: set test server to 10s delay → fire tool call (don't await) → wait 2s → close tab → await result → verify isError=true and elapsed < 15s → reset slow mode → reopen tab → verify recovery
+- Verifies the catch block in `tool-dispatch.ts` that detects "No tab with id"/"Cannot access" errors and returns code -32001
+- Files changed: e2e/edge-cases.e2e.ts
+- **Learnings for future iterations:**
+  - `testServer.setSlow(ms)` delays all API endpoints EXCEPT `/api/auth.check` — this means isReady probes still work instantly while tool fetches are blocked, which is perfect for testing in-flight dispatch scenarios
+  - When closing a tab during an in-flight `chrome.scripting.executeScript`, Chrome rejects the promise with "No tab with id" — the extension's catch block returns this as a clean -32001 error
+  - The test completes in ~3-5s (not 25-30s) because the tab closure immediately rejects the executeScript promise
+  - All 148 E2E tests pass (up from 147), all 392 unit tests pass
+---
+
+## 2026-02-17 — US-006
+- Added E2E test "closing MCP session and creating a new one works cleanly" in `e2e/edge-cases.e2e.ts`
+- Test pattern: wait for extension connected → create client A → initialize → call browser_list_tabs (verify success) → close client A → create client B → initialize → call browser_list_tabs (verify success) → close client B
+- Verifies the MCP server's StreamableHTTPServerTransport handles session creation and cleanup correctly — no stale state from old session interferes with new session
+- Files changed: e2e/edge-cases.e2e.ts
+- **Learnings for future iterations:**
+  - `createMcpClient` from fixtures.ts creates an independent MCP client with its own session state — each call produces a fresh client
+  - `browser_list_tabs` requires the extension to be connected (otherwise returns "Extension not connected" error) — use `extensionContext` fixture even if unused directly
+  - The `mcpClient` fixture auto-initializes one client, but for session lifecycle tests you need to create/close clients manually via `createMcpClient`
+  - All 149 E2E tests pass (up from 148), all 392 unit tests pass
+---

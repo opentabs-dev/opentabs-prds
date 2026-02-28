@@ -1,0 +1,147 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add support for optional custom SVG icons in plugins. Plugins provide icon.svg (active); the build auto-generates a grayscale inactive variant via luminance conversion, or the author can override with a manual icon-inactive.svg. The manifest carries both as inline SVG strings, and the side panel renders them inside the existing PluginIcon frame with the letter avatar as fallback.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add SVG icon fields to shared manifest and wire types",
+      "description": "As a platform developer, I want the shared type definitions to support optional SVG icon strings so that the full pipeline can carry plugin icons from build to UI.",
+      "acceptanceCriteria": [
+        "PluginOpentabsField in platform/shared/src/manifest.ts no longer has the unused icon?: string field (remove it)",
+        "ManifestPlugin type is added to platform/shared/src/manifest.ts with optional iconSvg?: string and iconInactiveSvg?: string fields",
+        "PluginManifest type (the shape of dist/tools.json) gains optional iconSvg?: string and iconInactiveSvg?: string at the top level alongside sdkVersion",
+        "LoadedPlugin in platform/mcp-server/src/loader.ts gains optional iconSvg?: string and iconInactiveSvg?: string",
+        "RegisteredPlugin in platform/mcp-server/src/state.ts gains optional iconSvg?: string and iconInactiveSvg?: string",
+        "WirePluginPayload in platform/shared/src/index.ts gains optional iconSvg?: string and iconInactiveSvg?: string",
+        "ConfigStatePlugin in platform/shared/src/index.ts gains optional iconSvg?: string and iconInactiveSvg?: string",
+        "PluginMeta in platform/browser-extension/src/types.ts gains optional iconSvg?: string and iconInactiveSvg?: string",
+        "ValidatedPluginPayload in platform/browser-extension/src/message-router.ts gains optional iconSvg?: string and iconInactiveSvg?: string, and validatePluginPayload extracts them (typeof string check)",
+        "toPluginMeta in platform/browser-extension/src/message-router.ts passes iconSvg and iconInactiveSvg through",
+        "All existing tests continue to pass — no test should break from adding optional fields",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "This story adds the type plumbing only — no SVG reading, no validation, no rendering yet. Every new field is optional (string | undefined) so existing plugins without icons continue to work unchanged.\n\nKey files and their current shapes:\n- platform/shared/src/manifest.ts: PluginOpentabsField (line ~13), parsePluginPackageJson (line ~49). Remove the existing unused icon?: string from PluginOpentabsField. Add a new PluginManifest interface (or rename the existing PluginManifestOutput) that includes the top-level icon fields.\n- platform/shared/src/index.ts: WirePluginPayload (line ~141), ConfigStatePlugin (line ~196).\n- platform/mcp-server/src/loader.ts: LoadedPlugin interface (line ~24).\n- platform/mcp-server/src/state.ts: RegisteredPlugin interface (line ~40).\n- platform/browser-extension/src/types.ts: PluginMeta (line ~124).\n- platform/browser-extension/src/message-router.ts: validatePluginPayload (line ~114), toPluginMeta (line ~98).\n\nThe field names must be exactly iconSvg and iconInactiveSvg everywhere — consistent naming across the entire pipeline."
+    },
+    {
+      "id": "US-002",
+      "title": "Add SVG validation and auto-grayscale generation utilities to plugin-tools",
+      "description": "As a plugin developer, I want the build tool to validate my SVG icons and automatically generate a grayscale inactive variant so that I only need to provide a single icon.svg file.",
+      "acceptanceCriteria": [
+        "A new file platform/plugin-tools/src/validate-icon.ts exports validateIconSvg, validateInactiveIconColors, and generateInactiveIcon",
+        "validateIconSvg(content: string, filename: string) returns { valid: false } | { valid: false; errors: string[] }",
+        "validateIconSvg rejects: files >8KB, missing viewBox, non-square viewBox, <image> elements, <script> elements, event handler attributes (onclick, onload, onerror, onmouseover, etc.)",
+        "validateInactiveIconColors(content: string) returns { valid: false } | { valid: false; errors: string[] }",
+        "validateInactiveIconColors rejects SVGs with saturated colors in fill, stroke, stop-color, flood-color attributes and inline style properties — only achromatic values allowed",
+        "generateInactiveIcon(svgContent: string): string converts all color values to luminance-equivalent grays using ITU-R BT.709 (gray = 0.2126*R + 0.7152*G + 0.0722*B)",
+        "generateInactiveIcon output always passes both validateIconSvg and validateInactiveIconColors",
+        "Unit tests in platform/plugin-tools/src/validate-icon.test.ts with at least 50 test cases across three describe blocks: validateIconSvg, validateInactiveIconColors, and generateInactiveIcon",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "This story has three components: validation, color validation, and grayscale generation. The generation function is the most critical — it must be robust across all CSS color formats.\n\n## validateIconSvg tests (at least 12 cases)\n\n1. Valid square SVG (viewBox=\"0 0 32 32\") — passes\n2. Valid square SVG with different dimensions (viewBox=\"0 0 100 100\") — passes\n3. Missing viewBox attribute — fails with 'viewBox' in error\n4. Non-square viewBox (viewBox=\"0 0 32 24\") — fails with 'square' in error\n5. viewBox with non-zero min-x/min-y (viewBox=\"10 10 32 32\") — passes (width=height)\n6. File exceeding 8KB — fails with 'size' in error\n7. File exactly at 8KB — passes\n8. Contains <image> element — fails with 'image' in error\n9. Contains <script> element — fails with 'script' in error\n10. Contains onclick attribute — fails with 'event handler' in error\n11. Contains onload attribute — fails\n12. Contains onerror attribute — fails\n13. Multiple violations — returns all errors, not just the first\n\n## validateInactiveIconColors tests (at least 12 cases)\n\n1. fill=\"#333333\" (R=G=B) — passes\n2. fill=\"#333\" (shorthand, R=G=B) — passes\n3. fill=\"#ff0000\" (saturated red) — fails\n4. fill=\"#aabbcc\" (R≠G≠B) — fails\n5. stroke=\"rgb(100, 100, 100)\" (equal channels) — passes\n6. stroke=\"rgb(255, 0, 0)\" (unequal) — fails\n7. fill=\"hsl(0, 0%, 50%)\" (zero saturation) — passes\n8. fill=\"hsl(120, 50%, 50%)\" (nonzero saturation) — fails\n9. Named color 'gray' — passes\n10. Named color 'red' — fails\n11. fill=\"none\" — passes\n12. fill=\"currentColor\" — passes\n13. fill=\"transparent\" — passes\n14. fill=\"inherit\" — passes\n15. No color attributes at all (inherits from parent) — passes\n16. Colors in style=\"fill: #ff0000\" inline styles — fails\n17. Colors in stop-color (SVG gradients) — validated\n\n## generateInactiveIcon tests (at least 25 cases)\n\nThese tests are the most important. Each test should verify the exact output.\n\n### Hex color conversion\n1. fill=\"#ff0000\" (pure red) → luminance = round(0.2126*255) = 54 → fill=\"#363636\"\n2. fill=\"#00ff00\" (pure green) → luminance = round(0.7152*255) = 182 → fill=\"#b6b6b6\"\n3. fill=\"#0000ff\" (pure blue) → luminance = round(0.0722*255) = 18 → fill=\"#121212\"\n4. fill=\"#ffffff\" (white) → luminance = 255 → fill=\"#ffffff\" (unchanged)\n5. fill=\"#000000\" (black) → luminance = 0 → fill=\"#000000\" (unchanged)\n6. fill=\"#808080\" (mid gray) → luminance = 128 → fill=\"#808080\" (unchanged — already gray)\n7. fill=\"#f00\" (shorthand red) → same as #ff0000 → fill=\"#363636\"\n8. fill=\"#4F46E5\" (indigo) → compute exact luminance, verify output is #GGGGGG where G matches\n\n### rgb()/rgba() conversion\n9. fill=\"rgb(255, 0, 0)\" → output uses equivalent #363636 or rgb(54, 54, 54)\n10. fill=\"rgb(100, 200, 50)\" → compute luminance, verify all channels equal in output\n11. fill=\"rgba(255, 0, 0, 0.5)\" → gray conversion preserves alpha: rgba(54, 54, 54, 0.5)\n12. stroke=\"rgb(0, 128, 255)\" → verify stroke attribute is converted (not just fill)\n\n### hsl()/hsla() conversion\n13. fill=\"hsl(0, 100%, 50%)\" (pure red via HSL) → saturation set to 0%: hsl(0, 0%, 50%)\n14. fill=\"hsl(120, 80%, 40%)\" → hsl(120, 0%, 40%) — hue is irrelevant when S=0, lightness preserved\n15. fill=\"hsla(240, 100%, 50%, 0.8)\" → hsla(240, 0%, 50%, 0.8) — alpha preserved\n16. fill=\"hsl(0, 0%, 50%)\" (already gray) → unchanged\n\n### Named color conversion\n17. fill=\"red\" → lookup red=#ff0000, compute luminance → fill=\"#363636\"\n18. fill=\"blue\" → lookup blue=#0000ff → fill=\"#121212\"\n19. fill=\"white\" → fill=\"#ffffff\" (unchanged)\n20. fill=\"black\" → fill=\"#000000\" (unchanged)\n21. fill=\"gold\" → lookup gold=#ffd700, compute luminance → verify correct gray\n\n### Passthrough values (must not be modified)\n22. fill=\"none\" → fill=\"none\" (unchanged)\n23. fill=\"currentColor\" → fill=\"currentColor\" (unchanged)\n24. fill=\"transparent\" → fill=\"transparent\" (unchanged)\n25. fill=\"inherit\" → fill=\"inherit\" (unchanged)\n26. fill=\"url(#gradient)\" → fill=\"url(#gradient)\" (unchanged — references are not colors)\n\n### Multi-element SVG (integration)\n27. SVG with rect fill=\"#ff0000\" and circle fill=\"#00ff00\" → rect gets #363636, circle gets #b6b6b6 (different grays proving luminance-based conversion, not uniform wash)\n28. SVG with both fill and stroke on the same element → both converted independently\n29. SVG with colors in inline style attribute (style=\"fill: #ff0000; stroke: #00ff00\") → both converted\n30. SVG with stop-color in gradient stops → stop-color values converted\n31. SVG with flood-color attribute → flood-color value converted\n\n### Roundtrip validation\n32. Take any multi-colored SVG, run generateInactiveIcon, then run validateInactiveIconColors on the output → must pass\n33. Take any valid SVG, run generateInactiveIcon, then run validateIconSvg on the output → must pass (structure preserved)\n\n### Edge cases\n34. SVG with no color attributes at all → returned unchanged\n35. SVG with mixed color formats (hex fill, rgb stroke, hsl stop-color) → all converted correctly\n36. Color values with extra whitespace: fill=\" #ff0000 \" → handled correctly\n37. Empty SVG (just <svg></svg>) → returned unchanged\n\n## Implementation notes\n\nFor SVG parsing, use regex — no XML parser dependency needed. Key regexes:\n- Attribute colors: /(fill|stroke|stop-color|flood-color)=\"([^\"]*)\"/g\n- Inline style colors: /(fill|stroke|stop-color|flood-color)\\s*:\\s*([^;\"]+)/g\n\nFor the named color lookup table, include at least the 17 CSS2.1 colors (aqua, black, blue, fuchsia, gray, green, lime, maroon, navy, olive, orange, purple, red, silver, teal, white, yellow) plus common extended names (gold, indigo, coral, crimson, tomato, etc.).\n\nThe luminance formula: gray = Math.round(0.2126 * R + 0.7152 * G + 0.0722 * B). Output as two-digit hex: #GGGGGG where GG is the hex of the gray value.\n\nFor hsl/hsla, the simplest correct approach is to set saturation to 0% and keep lightness. This produces the same perceptual result as the luminance formula for solid colors.\n\nThe achromatic color whitelist for validateInactiveIconColors: none, transparent, currentColor, inherit, unset, black, white, gray, grey, silver, dimgray, dimgrey, darkgray, darkgrey, lightgray, lightgrey, gainsboro, whitesmoke."
+    },
+    {
+      "id": "US-003",
+      "title": "Read, validate, and auto-generate icons during opentabs-plugin build",
+      "description": "As a plugin developer, I want opentabs-plugin build to automatically pick up icon.svg, validate it, auto-generate a grayscale inactive variant, and embed both in dist/tools.json — or use my manual icon-inactive.svg override if I provide one.",
+      "acceptanceCriteria": [
+        "opentabs-plugin build looks for icon.svg in the plugin root directory (same level as package.json)",
+        "opentabs-plugin build looks for icon-inactive.svg in the plugin root directory",
+        "If icon.svg exists and no icon-inactive.svg exists: icon.svg is validated via validateIconSvg, an inactive variant is auto-generated via generateInactiveIcon, and both are embedded in dist/tools.json as iconSvg and iconInactiveSvg",
+        "If both icon.svg and icon-inactive.svg exist: both are validated via validateIconSvg, icon-inactive.svg is additionally validated via validateInactiveIconColors, and both are embedded in dist/tools.json",
+        "If icon-inactive.svg exists but icon.svg does not, the build fails with a clear error: icon-inactive.svg requires icon.svg to also be present",
+        "If neither icon file exists, the build succeeds with no iconSvg or iconInactiveSvg in tools.json (backward compatible)",
+        "If validation fails for either icon, the build fails with all validation errors listed",
+        "The SVG content is minified before embedding — strip XML comments, collapse whitespace between tags, remove unnecessary whitespace",
+        "The build output logs which icon strategy was used: auto-generated inactive icon, manual override, or no icons",
+        "The generated dist/tools.json includes iconSvg and iconInactiveSvg as top-level string fields when icons are present",
+        "Unit tests cover: no icons present (default), icon.svg only (auto-generates inactive), both icons (manual override), icon-inactive.svg without icon.svg (error), invalid icon.svg (error), invalid icon-inactive.svg colors (error)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "The build command is in platform/plugin-tools/src/commands/build.ts. The main function is runBuild() starting around line 599.\n\nThe icon reading should happen after package.json validation (line ~615) and before manifest generation (line ~697). Use Bun.file() for reading.\n\nFor SVG minification, a simple approach: remove <!-- comments -->, collapse runs of whitespace to single spaces, trim leading/trailing whitespace. Do NOT use a dependency — keep it as a small inline function.\n\nThe build should log the icon strategy to give plugin authors visibility:\n- 'Plugin icon: icon.svg found, auto-generating inactive variant'\n- 'Plugin icon: icon.svg + icon-inactive.svg found (manual override)'\n- 'Plugin icon: none (using letter avatar)'\n\nThe manifest generation is in generateManifest() which returns PluginManifestOutput. Add the icon fields there.\n\nFile layout in a plugin:\n```\nplugins/my-plugin/\n├── package.json\n├── icon.svg           ← optional active icon\n├── icon-inactive.svg  ← optional manual inactive override (requires icon.svg)\n├── src/\n│   └── index.ts\n└── dist/\n    ├── adapter.iife.js\n    └── tools.json     ← iconSvg and iconInactiveSvg embedded here\n```\n\nThe icon file names are fixed conventions — not configurable via package.json. This keeps the DX simple."
+    },
+    {
+      "id": "US-004",
+      "title": "Thread SVG icon data through server discovery and extension protocol",
+      "description": "As a platform developer, I want the MCP server to read icon data from the plugin manifest and pass it through to the Chrome extension so that the side panel can render custom icons.",
+      "acceptanceCriteria": [
+        "loadPlugin() in platform/mcp-server/src/loader.ts reads iconSvg and iconInactiveSvg from the parsed tools.json manifest and includes them in the returned LoadedPlugin",
+        "buildRegistry() in platform/mcp-server/src/registry.ts preserves iconSvg and iconInactiveSvg in RegisteredPlugin (no code change needed if the type was updated in US-001 — just verify it flows through)",
+        "sendSyncFull() in platform/mcp-server/src/extension-protocol.ts includes iconSvg and iconInactiveSvg in the WirePluginPayload sent to the extension",
+        "handleConfigGetState() in platform/mcp-server/src/extension-protocol.ts includes iconSvg and iconInactiveSvg in the ConfigStatePlugin response",
+        "The extension's message-router.ts validates and extracts iconSvg and iconInactiveSvg from incoming sync.full payloads (added in US-001 — verify it works end-to-end)",
+        "The extension's plugin-storage.ts stores and retrieves iconSvg and iconInactiveSvg in PluginMeta",
+        "Unit tests verify that icon data round-trips through loader and extension-protocol",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "This story wires the data through the existing pipeline. Most of the type changes were done in US-001 — this story adds the actual runtime code to read and pass the data.\n\nKey code paths:\n\n1. platform/mcp-server/src/loader.ts loadPlugin() around line 276-305: After reading and parsing tools.json, extract manifest.iconSvg and manifest.iconInactiveSvg.\n\n2. platform/mcp-server/src/extension-protocol.ts sendSyncFull() around line 206-221: The plugin mapping needs to include ...(p.iconSvg ? { iconSvg: p.iconSvg } : {}), ...(p.iconInactiveSvg ? { iconInactiveSvg: p.iconInactiveSvg } : {}) to avoid sending undefined over the wire.\n\n3. platform/mcp-server/src/extension-protocol.ts handleConfigGetState() around line 619-640: Same conditional spread pattern.\n\n4. The extension side was partially handled in US-001 (type definitions and validatePluginPayload). Verify the data actually flows from WebSocket message through validation to storage.\n\nFollow the existing pattern: optional fields use conditional spread (...(value ? { key: value } : {})) rather than including undefined values."
+    },
+    {
+      "id": "US-005",
+      "title": "Render custom SVG icons in PluginIcon with inactive treatment",
+      "description": "As a user, I want to see custom plugin icons in the side panel when plugin authors provide them, with the auto-generated or manual inactive variant when the plugin is not ready, and the letter avatar as fallback.",
+      "acceptanceCriteria": [
+        "PluginIcon component accepts optional iconSvg?: string and iconInactiveSvg?: string props",
+        "When iconSvg is provided and the plugin is ready, the SVG is rendered via dangerouslySetInnerHTML inside the existing border-2 border-border rounded frame at the same size",
+        "When the plugin is not ready and iconInactiveSvg is provided, iconInactiveSvg is rendered (this covers both auto-generated and manually provided inactive icons)",
+        "When no iconSvg is provided, the existing letter avatar renders regardless of ready state (current behavior preserved exactly)",
+        "The SVG is constrained to the container size — the inner SVG must not overflow the frame",
+        "The background color is transparent when an SVG icon is used (the SVG provides its own visuals), but colored for letter avatars",
+        "PluginCard.tsx passes plugin.iconSvg and plugin.iconInactiveSvg to PluginIcon",
+        "PluginIcon.stories.tsx is updated with new stories: WithIcon (active SVG, ready), WithIconInactive (inactive SVG, not ready), and the existing letter avatar stories are preserved",
+        "PluginIcon.test.ts is updated — no logic tests needed for rendering, but getAvatarVar and getAvatarLetter tests remain unchanged",
+        "The SVG rendering uses a consistent inner size of approximately 60% of the container (same ratio as the letter avatar font size) to maintain visual consistency between icon and letter-avatar plugins in a list",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "platform/browser-extension/src/side-panel/components/PluginIcon.tsx currently renders a letter avatar. The component needs to branch: if iconSvg is provided, render the SVG; otherwise render the letter.\n\nThe frame (border-2 border-border rounded, fixed size) stays the same regardless of content. The background color should be transparent when an SVG icon is used (the SVG provides its own visuals), but keep the colored background for letter avatars.\n\nFor SVG rendering, use dangerouslySetInnerHTML on a div. The SVG string from the manifest is already validated at build time (no <script>, no event handlers). Wrap the SVG in a container div with overflow-hidden and set width/height to constrain it.\n\nSince the build now always produces iconInactiveSvg when iconSvg exists (either auto-generated or manual), the component logic is simpler than before — no CSS grayscale filter needed. Just render iconSvg when ready, iconInactiveSvg when not ready.\n\nFor the Storybook stories, create small inline test SVGs (a colored circle for active, a gray circle for inactive) rather than importing real brand icons.\n\nPluginCard.tsx (around line 114) already passes pluginName and displayName — add iconSvg={plugin.iconSvg} iconInactiveSvg={plugin.iconInactiveSvg}.\n\nThe PluginState type (aliased from ConfigStatePlugin in bridge.ts) gains the icon fields automatically from US-001."
+    },
+    {
+      "id": "US-006",
+      "title": "Update plugin scaffolding and documentation comments",
+      "description": "As a plugin developer creating a new plugin, I want the scaffold template to mention icon support in comments and the generated README so that I know custom icons are available.",
+      "acceptanceCriteria": [
+        "The scaffold template in platform/cli/src/scaffold.ts adds a comment in the generated package.json near the opentabs field explaining icon.svg and icon-inactive.svg are optional",
+        "The generated README.md includes a section about custom icons: file names, placement, validation rules, auto-generation behavior, and the fallback behavior",
+        "The scaffold does NOT generate placeholder icon files — the letter avatar default is the right experience for new plugins",
+        "The parsePluginPackageJson function in platform/shared/src/manifest.ts no longer validates the removed icon field from PluginOpentabsField (cleaned up in US-001, verify here)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "The scaffold template is in platform/cli/src/scaffold.ts. The package.json template starts around line 66, the README template is generated around line 280.\n\nKeep the documentation concise — plugin developers should understand the feature in 30 seconds of reading. Key points to cover:\n1. Place icon.svg in the plugin root (same directory as package.json)\n2. The build auto-generates a grayscale inactive variant — no extra work needed\n3. Optionally provide icon-inactive.svg to override the auto-generated version\n4. Icons must be square SVG with a viewBox attribute, max 8KB\n5. No embedded images, scripts, or event handlers allowed\n6. Manual icon-inactive.svg must use only grayscale colors\n7. If no icon.svg is provided, a colored letter avatar is generated automatically\n\nDo NOT update CLAUDE.md — the project instructions say to keep it plugin-agnostic and high-level. Icon support is a feature detail, not an architectural concept."
+    }
+  ]
+}

@@ -1,0 +1,204 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-225903-plugin-logging~running.json
+Started: Sat Feb 21 01:01:07 PST 2026
+---
+
+## Codebase Patterns
+- Plugin SDK utility modules follow: types/interfaces at top (non-exported), implementation in middle, exports at bottom (`import-x/exports-last` rule)
+- ESLint import order: value imports from local modules first, then external (bun:test, etc.), then type-only imports
+- Use optional chaining (`?.`) instead of non-null assertions (`!`) in test files — `@typescript-eslint/no-non-null-assertion` is enforced
+- `ignoreExportsUsedInFile: true` in knip config — internal exports used within the same file are fine
+- Use `func-style` as arrow expressions (`const fn = () => ...`) not function declarations
+- `@typescript-eslint/restrict-template-expressions` enforced — template literal interpolations must be string-typed (use `?? ''` for `string | undefined`)
+- `@typescript-eslint/no-base-to-string` enforced — don't use `String(value)` on objects, use targeted serialization
+- Avoid `(v as bigint)` casts when TypeScript already narrows the type via `typeof` checks
+- Extension has NO content scripts — uses `chrome.scripting.executeScript` from background to interact with tabs in both MAIN and ISOLATED worlds
+- When IIFE wrapper needs SDK internals, use `globalThis.__openTabs` registration instead of direct imports (plugins may have older SDK versions installed from npm)
+- New InternalMessage types must be added to exhaustiveness switch in both `background.ts` AND `offscreen/index.ts`
+- Use `window as unknown as Record<string, unknown>` (not `window as Record<string, unknown>`) in ISOLATED world scripts for TypeScript type safety
+- `McpServerInstance` in `mcp-setup.ts` is a hand-typed interface subset — adding methods requires updating ALL mock objects in test files (extension-protocol, http-routes, mcp-setup, mcp-setup-dispatch, reload tests)
+- `McpCallbacks` bridges extension-protocol to MCP sessions — new callbacks need `createMcpCallbacks` in `http-routes.ts` + all test mocks
+- E2E tests verify logging via MCP server stdout logs (`mcpServer.logs`) and `/health` endpoint `logBufferSize` — the streamable HTTP MCP client doesn't support async notifications
+- When e2e-test plugin needs unreleased SDK features, use `bun link` to link local platform packages (`@opentabs-dev/plugin-sdk`, `@opentabs-dev/plugin-tools`) — then rebuild the plugin
+- Register new SDK runtime objects on `globalThis.__openTabs` (e.g., `ot.log = log`) so plugins can access them via globalThis when the npm SDK version doesn't export them yet
+- `HealthResponse` in `e2e/fixtures.ts` must be extended when new fields are added to the `/health` endpoint (e.g., `pluginDetails` with `logBufferSize`)
+
+## 2026-02-21 09:07 - US-001
+- Implemented `sdk.log` API: `log.debug()`, `log.info()`, `log.warn()`, `log.error()` in `platform/plugin-sdk/src/log.ts`
+- Types exported: `LogLevel`, `LogEntry`, `LogTransport`
+- Internal `_setLogTransport(transport)` function for adapter runtime (returns restore function)
+- Safe serialization handles: circular refs, DOM nodes, functions, symbols, bigints, errors, long strings (4096 cap), arg count (10 cap)
+- Default transport falls back to `console.debug/info/warn/error` with `[sdk.log]` prefix
+- `log` object is `Object.freeze()`-d to prevent accidental mutation
+- Files changed:
+  - `platform/plugin-sdk/src/log.ts` (new — logger implementation)
+  - `platform/plugin-sdk/src/log.test.ts` (new — 16 tests covering all levels, transport, serialization)
+  - `platform/plugin-sdk/src/index.ts` (added log exports)
+- All quality checks pass: build, type-check, lint, knip, test (916 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The `import-x/exports-last` rule requires all `export` statements at the bottom of the file — define types/consts without `export` keyword, then re-export them at the end
+  - ESLint import ordering is: value imports (local first, then external), then type-only imports last
+  - Avoid unnecessary type assertions inside `typeof` guards — TS narrows automatically
+  - The JSON.stringify replacer receives `unknown`-typed values so `typeof` checks provide automatic narrowing
+---
+
+## 2026-02-21 09:25 - US-002
+- Wired log messages from adapter runtime (MAIN world) through ISOLATED world relay to extension background script
+- Three-layer pipeline: adapter postMessage → ISOLATED relay → chrome.runtime.sendMessage → background → WebSocket
+- Adapter IIFE wrapper (`build.ts`):
+  - Batching transport: flushes every 100ms or at 50 entries
+  - Uses `globalThis.__openTabs._setLogTransport` (not direct import) to avoid SDK version mismatch
+  - Teardown: clears timer, flushes remaining logs, restores default transport
+  - Always wraps teardown now (both onNavigate and non-onNavigate branches) for log cleanup
+- Log relay (`iife-injection.ts`):
+  - Injects ISOLATED world script before adapter IIFE for each tab
+  - Idempotent guard (`__opentabs_log_relay`) prevents duplicate listeners
+  - Listens for `opentabs:plugin-logs` postMessages, forwards via chrome.runtime.sendMessage
+- Background handling (`background.ts`):
+  - Handles `plugin:logs` messages from relay
+  - Forwards each entry as `plugin.log` JSON-RPC notification to MCP server via WebSocket
+  - Drops silently when WebSocket not connected
+- SDK registration (`log.ts`):
+  - `_setLogTransport` registered on `globalThis.__openTabs._setLogTransport` at module import time
+  - Allows wrapper to access transport without explicit SDK import (works with any installed SDK version)
+- Type system (`types.ts`):
+  - Added `PluginLogsMessage` to `InternalMessage` discriminated union
+  - Added exhaustiveness case in both `background.ts` and `offscreen/index.ts`
+- Files changed:
+  - `platform/plugin-tools/src/commands/build.ts` (log transport in IIFE wrapper)
+  - `platform/browser-extension/src/iife-injection.ts` (ISOLATED world relay injection)
+  - `platform/browser-extension/src/background.ts` (plugin:logs handler)
+  - `platform/browser-extension/src/types.ts` (PluginLogsMessage type)
+  - `platform/browser-extension/src/offscreen/index.ts` (exhaustiveness case)
+  - `platform/plugin-sdk/src/log.ts` (globalThis registration)
+- All quality checks pass: build, type-check, lint, knip, test (916 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The extension has NO content scripts — all tab interaction uses `chrome.scripting.executeScript` from the background service worker
+  - For adapter-to-extension communication, inject an ISOLATED world relay script (via executeScript) that listens to postMessage and forwards via chrome.runtime.sendMessage
+  - IIFE wrapper CANNOT import from `@opentabs-dev/plugin-sdk` directly — plugins may have older npm SDK versions without the new export. Use globalThis registration pattern instead.
+  - TypeScript in ISOLATED world scripts requires `window as unknown as Record<string, unknown>` (double cast), not `window as Record<string, unknown>` (TS2352 error)
+  - When adding new InternalMessage variants, update exhaustiveness switch in BOTH background.ts AND offscreen/index.ts
+  - The build-e2e tests copy the e2e-test plugin with symlinked node_modules — new SDK exports must be available via published npm OR globalThis registration
+---
+
+## 2026-02-21 09:30 - US-003
+- Implemented plugin log forwarding from Chrome extension to MCP server and MCP clients
+- Created `platform/mcp-server/src/log-buffer.ts` — per-plugin circular ring buffer (1000 entries max per plugin)
+  - Functions: `appendLog`, `getLogs`, `getLogCount`, `getBufferedPlugins`, `clearAllLogs`
+  - Ring buffer uses fixed-size array with write pointer for O(1) append
+- Added `plugin.log` handler in `extension-protocol.ts`
+  - Validates incoming log entries (plugin, level, message fields)
+  - Only accepts valid MCP log levels: debug, info, warning, error
+  - Stores in circular buffer via `appendLog`
+  - Forwards to MCP clients via `onPluginLog` callback
+- Extended `McpCallbacks` interface with `onPluginLog(entry)` callback
+  - Implementation in `http-routes.ts` iterates over all session servers
+  - Calls `sendLoggingMessage({ level, logger: 'plugin:<name>', data: message })` on each
+- Added `sendLoggingMessage` to `McpServerInstance` interface in `mcp-setup.ts`
+- Added `logBufferSize` field to `/health` endpoint per plugin in `pluginDetails`
+- Updated all test files with mock `McpCallbacks` and `McpServerInstance` objects
+- Files changed:
+  - `platform/mcp-server/src/log-buffer.ts` (new — circular buffer implementation)
+  - `platform/mcp-server/src/extension-protocol.ts` (plugin.log handler, McpCallbacks extension)
+  - `platform/mcp-server/src/http-routes.ts` (onPluginLog callback, logBufferSize in health)
+  - `platform/mcp-server/src/mcp-setup.ts` (sendLoggingMessage on McpServerInstance)
+  - `platform/mcp-server/src/extension-protocol.test.ts` (added onPluginLog to mocks)
+  - `platform/mcp-server/src/http-routes.test.ts` (added sendLoggingMessage to mocks)
+  - `platform/mcp-server/src/mcp-setup.test.ts` (added sendLoggingMessage to mocks)
+  - `platform/mcp-server/src/mcp-setup-dispatch.test.ts` (added onPluginLog and sendLoggingMessage to mocks)
+  - `platform/mcp-server/src/reload.test.ts` (added sendLoggingMessage to mocks)
+- All quality checks pass: build, type-check, lint, knip, test (916 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The `McpServerInstance` interface is a hand-typed subset of the MCP SDK's Server class — when adding new methods (like `sendLoggingMessage`), add to this interface and update ALL mock objects in test files
+  - `McpCallbacks` is the bridge between extension-protocol and MCP sessions — adding callbacks here requires updating `createMcpCallbacks` in `http-routes.ts` and all test mock objects
+  - The MCP SDK `sendLoggingMessage` takes `{ level, logger?, data? }` where `data` is `unknown` (JSON-serializable), and level must be from the MCP LoggingLevel enum (debug, info, notice, warning, error, critical, alert, emergency)
+  - The `plugin.log` messages arrive as JSON-RPC notifications (no id) from the extension WebSocket — they go through `handleExtensionMessage` which routes by method name
+---
+
+## 2026-02-21 09:35 - US-004
+- Surfaced plugin logs in `opentabs logs` CLI output
+- MCP server `onPluginLog` callback now writes to console in addition to forwarding to MCP clients
+  - Format: `[plugin:<name>] <timestamp> LEVEL message [data]`
+  - Flows to `~/.opentabs/server.log` via `start.ts` tee pipeline (same as all server logs)
+- Added `--plugin <name>` flag to `opentabs logs` command
+  - Filters log lines by matching `[plugin:<name>]` string
+  - Works in both initial tail output and follow mode
+  - Follow mode buffers partial lines to avoid splitting filtered lines at chunk boundaries
+- Files changed:
+  - `platform/mcp-server/src/http-routes.ts` (console.log in onPluginLog callback)
+  - `platform/cli/src/commands/logs.ts` (--plugin filter flag, tailFile/followFile filter support)
+- All quality checks pass: build, type-check, lint, knip, test (916 tests, 0 failures)
+- **Learnings for future iterations:**
+  - Server logs reach `server.log` through a tee pipeline: MCP server → console.log/warn/error → `start.ts` captures stdout/stderr → writes to both terminal and log file
+  - To add new log output to `server.log`, simply call `console.log()` from anywhere in the MCP server process — no special file writing needed
+  - The `logs.ts` command uses a reverse-seek tail (64KB buffer from end of file) for efficient file reading, with `node:fs.watch` for follow mode
+  - Follow mode uses `createReadStream` with a start offset — when filtering, chunks must be split into lines and partial lines buffered across reads
+---
+
+## 2026-02-21 09:42 - US-005
+- Added E2E tests verifying the full plugin logging pipeline
+- Created `plugins/e2e-test/src/tools/log-levels.ts` — dedicated tool that emits one log at each level
+  - Accesses `sdk.log` via `globalThis.__openTabs.log` (not direct import) since the npm SDK doesn't have `log` yet
+  - Each call emits: debug, info, warning, error with a unique prefix for test isolation
+- Added `ot.log = log` registration in `platform/plugin-sdk/src/log.ts` to expose the log namespace on globalThis
+- Created `e2e/plugin-logging.e2e.ts` with 4 test cases:
+  1. `log_levels tool emits log entries that arrive at MCP server` — verifies all 4 levels + level tags in server stdout
+  2. `log buffer count increases after log_levels tool call` — polls `/health` endpoint's `logBufferSize` per plugin
+  3. `log entries include correct plugin name in logger field` — verifies `[plugin:e2e-test]` prefix in every log line
+  4. `multiple log_levels invocations accumulate in buffer` — verifies buffer accumulation across calls
+- Extended `HealthResponse` interface in `e2e/fixtures.ts` with `pluginDetails` and `PluginDetail` types
+- Used `bun link` to connect e2e-test plugin to local platform packages (unreleased SDK with log module)
+- Files changed:
+  - `plugins/e2e-test/src/tools/log-levels.ts` (new — log levels test tool)
+  - `plugins/e2e-test/src/index.ts` (registered logLevels tool)
+  - `platform/plugin-sdk/src/log.ts` (added `ot.log = log` globalThis registration)
+  - `e2e/plugin-logging.e2e.ts` (new — 4 E2E tests)
+  - `e2e/fixtures.ts` (extended HealthResponse with pluginDetails)
+- All quality checks pass: build, type-check, lint, knip, test (916 unit tests), test:e2e (248 E2E tests)
+- **Learnings for future iterations:**
+  - The streamable HTTP MCP client in fixtures.ts does individual POST requests — it cannot receive async server-initiated notifications like `notifications/message` (logging). Verify logs via server stdout (`mcpServer.logs`) and `/health` endpoint instead.
+  - When the e2e-test plugin needs features from unreleased SDK versions, use `bun link @opentabs-dev/plugin-sdk @opentabs-dev/plugin-tools` in the plugin directory to link to local workspace packages. Then rebuild the plugin.
+  - Register new SDK runtime objects on `globalThis.__openTabs` (e.g., `ot.log = log`) so the IIFE-bundled code makes them accessible even if the plugin's npm SDK version is older.
+  - The `HealthResponse` interface in fixtures.ts is a subset of the actual health response — extend it when tests need access to new fields.
+---
+
+## 2026-02-21 09:55 - US-006
+- Published all four @opentabs-dev packages at v0.0.13: shared, plugin-sdk, plugin-tools, cli
+- Used `./scripts/publish.sh 0.0.13` which handles dependency order (shared → plugin-sdk → plugin-tools → cli)
+- Verified all packages propagated to npm registry via `npm view`
+- Updated both plugins (e2e-test, slack) from `^0.0.12` to `^0.0.13` for `@opentabs-dev/plugin-sdk` and `@opentabs-dev/plugin-tools`
+- Removed bun-linked packages in e2e-test plugin (was symlinked from US-005 work) — clean reinstall from npm
+- Rebuilt both plugins and verified adapter.iife.js includes log transport wiring (`_setLogTransport`, `opentabs:plugin-logs`)
+- Files changed:
+  - `platform/shared/package.json` (version 0.0.12 → 0.0.13)
+  - `platform/plugin-sdk/package.json` (version 0.0.12 → 0.0.13)
+  - `platform/plugin-tools/package.json` (version 0.0.12 → 0.0.13)
+  - `platform/cli/package.json` (version 0.0.12 → 0.0.13)
+  - `plugins/e2e-test/package.json` (deps ^0.0.12 → ^0.0.13)
+  - `plugins/e2e-test/bun.lock` (resolved versions updated)
+  - `plugins/slack/package.json` (deps ^0.0.12 → ^0.0.13)
+- All quality checks pass: build, type-check, lint, knip, test (916 tests), test:e2e (248 tests)
+- **Learnings for future iterations:**
+  - `./scripts/publish.sh <version>` handles the full publish lifecycle: auth check, build, version bump in all package.json files (including cross-references), rebuild, publish in dependency order
+  - After publishing, clean-install plugins with `rm -rf node_modules bun.lock && bun install` to remove any bun-linked packages from dev iterations
+  - The slack plugin's bun.lock may not change if its semver range already covered the new version (^0.0.12 matches 0.0.13)
+  - Verify log transport wiring in built adapter.iife.js by grepping for `_setLogTransport` and `opentabs:plugin-logs`
+---
+
+## 2026-02-21 09:56 - US-007
+- Updated CLAUDE.md to document the plugin logging architecture
+- Changes made:
+  - **Architecture section**: Updated MCP Server description to mention log entry forwarding and MCP logging capability
+  - **CLI section**: Added `opentabs logs --plugin <name>` flag documentation
+  - **Directory structure**: Added `log-buffer.ts` to MCP server listing, `log.ts` to plugin-sdk listing, `plugin-logging.e2e.ts` to e2e listing
+  - **Key Concepts**: Added "Plugin logging" paragraph describing the full transport chain (adapter → postMessage → ISOLATED relay → background → WebSocket → MCP server → MCP clients + server.log)
+  - **SDK utilities**: Changed category count from "five" to "six", added Logging utilities section documenting `log.debug/info/warn/error` methods
+  - **Usage example**: Added `log` to import statement and included `log.info()` call in the example
+- Files changed:
+  - `CLAUDE.md` (documentation updates)
+- All quality checks pass: build, type-check, lint, knip, test (916 tests), test:e2e (248 tests)
+- **Learnings for future iterations:**
+  - CLAUDE.md has a "Keeping CLAUDE.md Up to Date" section at the bottom that mandates plugin-agnostic documentation — never list individual plugins by name
+  - The directory structure in CLAUDE.md is a curated subset, not a full listing — only include files that are architecturally significant
+  - The SDK utilities section uses a consistent format: italicized category name with file path, then bullet list of functions with signatures and descriptions
+---

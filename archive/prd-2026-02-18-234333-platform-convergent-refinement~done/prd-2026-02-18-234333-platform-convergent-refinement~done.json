@@ -1,0 +1,128 @@
+{
+  "project": "OpenTabs Platform — Convergent Refinement",
+  "description": "Fix 7 genuine defects found during a comprehensive platform audit: broken CI pipeline, a bug in adapter inspection, incorrect text decoding, a regex bug in Slack auth, missing IP address support in URL validation, a confusing error message, and dead ESLint config.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Remove non-existent script references from CI pipeline",
+      "description": "As a contributor, I want the CI pipeline to pass so that pull requests get reliable feedback.",
+      "acceptanceCriteria": [
+        "Line 28 of .github/workflows/ci.yml no longer references bun run build:plugins",
+        "Line 46 of .github/workflows/ci.yml no longer references bun run type-check:plugins",
+        "Line 131 of .github/workflows/ci.yml no longer references bun run build:plugins",
+        "All 7 CI jobs reference only scripts that exist in root package.json",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: .github/workflows/ci.yml\n\nThe Build job (line 28), Type Check job (line 46), and E2E Tests job (line 131) reference scripts that do not exist in root package.json: `build:plugins` and `type-check:plugins`.\n\nPer CLAUDE.md: 'The root tooling (bun run build, bun run lint, etc.) does NOT cover plugins. When changing platform packages that plugins depend on, publish new versions to npm and update plugin dependencies.' Plugins are standalone projects with their own build pipelines.\n\nThe fix: remove these three lines entirely. Do NOT add new scripts — the architecture deliberately excludes plugins from root tooling.\n\n- Remove `- run: bun run build:plugins` from the `build` job (after line 27)\n- Remove `- run: bun run type-check:plugins` from the `type-check` job (after line 45)\n- Remove `- run: bun run build:plugins` from the `e2e-tests` job (after line 130)\n\nDo not skip E2E tests in acceptance criteria — they require a built extension and plugins, but the E2E fixtures handle plugin building internally via the test infrastructure."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix extension_check_adapter to return actual tool names instead of array indices",
+      "description": "As a developer debugging adapter state, I want extension_check_adapter to return tool names so that I can verify which tools are registered.",
+      "acceptanceCriteria": [
+        "handleExtensionCheckAdapter returns actual tool name strings (e.g., 'send_message') not array index strings ('0', '1')",
+        "The toolNames array contains the name property from each ToolDefinition in the tools array",
+        "toolCount still correctly reflects the number of tools",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/browser-commands.ts, lines 1994-1998\n\nCurrent code:\n```\nif (typeof adapter.tools === 'object' && adapter.tools !== null) {\n  for (const key of Object.keys(adapter.tools as Record<string, unknown>)) {\n    toolNames.push(key);\n  }\n}\n```\n\nThe problem: `adapter.tools` is an Array<ToolDefinition> at runtime (confirmed by plugin-sdk/src/index.ts line 52 and the freeze snippet in cli/src/commands/build.ts line 242 which does `Array.isArray(a.tools)`). Object.keys on an array returns string indices ['0', '1', ...], not tool names.\n\nThe fix: Replace with array-aware extraction. Since this runs in page MAIN world where types are not available, use defensive runtime checks:\n\n```\nif (Array.isArray(adapter.tools)) {\n  for (const tool of adapter.tools as Array<Record<string, unknown>>) {\n    if (tool && typeof tool === 'object' && typeof tool.name === 'string') {\n      toolNames.push(tool.name);\n    }\n  }\n}\n```\n\nThis matches the actual runtime shape: an array of objects where each has a `name` string property."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix getResourceContent base64 text decoding to handle non-ASCII correctly",
+      "description": "As a user inspecting page resources, I want browser_get_resource_content to correctly display non-ASCII text (CJK, emoji, accented characters).",
+      "acceptanceCriteria": [
+        "Base64-encoded text resources are decoded via Uint8Array + TextDecoder pattern, not bare atob()",
+        "The decoding pattern matches the established one in network-capture.ts lines 204-205",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/browser-commands.ts, lines 1758-1760\n\nCurrent code:\n```\nif (base64Encoded && isTextMimeType(match.mimeType)) {\n  try {\n    content = atob(content);\n    base64Encoded = false;\n  } catch {\n```\n\nThe problem: `atob()` returns a Latin1 string, which corrupts multi-byte UTF-8 characters. The same codebase already solves this correctly in network-capture.ts lines 204-205:\n```\nconst body = res.base64Encoded\n  ? new TextDecoder().decode(Uint8Array.from(atob(res.body), c => c.charCodeAt(0)))\n  : res.body;\n```\n\nThe fix: Replace `content = atob(content)` with:\n```\ncontent = new TextDecoder().decode(Uint8Array.from(atob(content), c => c.charCodeAt(0)));\n```\n\nThis is the canonical pattern for base64 → UTF-8 decoding in browsers. It is already established in this codebase."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix Slack localStorage scan regex to include underscores in token character class",
+      "description": "As a Slack plugin user, I want auth token extraction from localStorage to work correctly when tokens contain underscores.",
+      "acceptanceCriteria": [
+        "The regex at the localStorage brute-force scan includes underscore in the character class: [a-zA-Z0-9_-]+",
+        "The regex matches the character class used in extractAuthFromScriptText at line 157",
+        "bun run build passes (run from plugins/slack/)",
+        "bun run type-check passes (run from plugins/slack/)"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: plugins/slack/src/slack-api.ts, line 248\n\nCurrent code:\n```\nconst tokenMatch = /(xoxc-[a-zA-Z0-9-]+)/.exec(raw);\n```\n\nThe equivalent regex at line 157 correctly uses `[a-zA-Z0-9_-]+` (includes underscore). Slack xoxc tokens can contain underscores, so this regex would truncate the token at the first underscore.\n\nThe fix: Change `[a-zA-Z0-9-]+` to `[a-zA-Z0-9_-]+`.\n\nIMPORTANT: This is a plugin file. Plugins are standalone projects excluded from root tooling. Run build and type-check from plugins/slack/ directory:\n```\ncd plugins/slack && bun run build\n```\nDo NOT run root bun run build/type-check/lint/knip/test for this story — they don't cover plugins."
+    },
+    {
+      "id": "US-005",
+      "title": "Add IP address host support to URL pattern validation",
+      "description": "As a plugin developer targeting a local dev server or internal tool at an IP address, I want my URL patterns like *://192.168.1.1/* to pass validation.",
+      "acceptanceCriteria": [
+        "validateUrlPattern accepts patterns with IPv4 hosts like *://192.168.1.1/*",
+        "validateUrlPattern accepts patterns with IPv4 hosts with ports like *://192.168.1.1:8080/*",
+        "validateUrlPattern still rejects invalid patterns (existing tests pass)",
+        "Unit tests added for IP address host patterns in platform/shared/src/validation.test.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: platform/shared/src/index.ts, lines 322-328\n\nCurrent code:\n```\nif (\n  host !== '*' &&\n  !/^localhost(:\\d+)?$/.test(host) &&\n  !/^(\\*\\.)?[a-z0-9]+([-.]?[a-z0-9]+)*\\.[a-z]{2,}$/i.test(host)\n) {\n  return `URL pattern \"${pattern}\" has an invalid host \"${host}\"`;\n}\n```\n\nThe fix: Add an IPv4 branch following the existing localhost pattern:\n```\nif (\n  host !== '*' &&\n  !/^localhost(:\\d+)?$/.test(host) &&\n  !/^\\d{1,3}(\\.\\d{1,3}){3}(:\\d+)?$/.test(host) &&\n  !/^(\\*\\.)?[a-z0-9]+([-.]?[a-z0-9]+)*\\.[a-z]{2,}$/i.test(host)\n) {\n```\n\nThis matches Chrome's native match pattern support for IP addresses. The regex validates the structure (4 dot-separated groups of 1-3 digits, optional port) without fully validating each octet is 0-255 — Chrome itself does not validate octets, so matching Chrome's behavior is correct.\n\nAdd tests in platform/shared/src/validation.test.ts in the 'valid patterns' section:\n- `*://192.168.1.1/*` should pass\n- `https://10.0.0.1:8080/*` should pass\n- `*://127.0.0.1/*` should pass"
+    },
+    {
+      "id": "US-006",
+      "title": "Improve validateUrlPattern error message to mention path requirement",
+      "description": "As a plugin developer, I want the error message for invalid URL patterns to tell me that a path starting with / is required so I know to add a trailing slash.",
+      "acceptanceCriteria": [
+        "The error message for patterns missing a path mentions the path requirement",
+        "The error message includes an example showing the correct format with a trailing slash",
+        "Existing tests that check the error message are updated if needed",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: platform/shared/src/index.ts, lines 300-302\n\nCurrent code:\n```\nconst match = pattern.match(/^(\\*|https?):\/\\/(.+?)(\\/.*)$/);\nif (!match) {\n  return `URL pattern \"${pattern}\" is not a valid Chrome match pattern (expected: <scheme>://<host>/<path>, scheme must be *, http, or https)`;\n}\n```\n\nThe regex requires a path starting with `/`. The pattern `*://example.com` (no trailing slash) is rejected, but the error message doesn't explicitly say the path portion is mandatory.\n\nThe fix: Update the error message to be more specific:\n```\nreturn `URL pattern \"${pattern}\" is not a valid Chrome match pattern — expected <scheme>://<host>/<path> where scheme is *, http, or https and path starts with / (e.g., https://example.com/*)`;\n```\n\nCheck validation.test.ts for any tests that assert the exact error message text and update them to match."
+    },
+    {
+      "id": "US-007",
+      "title": "Remove dead ESLint override for plugins/**/*.ts",
+      "description": "As a maintainer, I want the ESLint config to not contain dead overrides that could confuse future contributors.",
+      "acceptanceCriteria": [
+        "The 'plugins/**/*.ts' entry is removed from the browser globals override files array in eslint.config.ts",
+        "No other references to plugins/ paths exist in eslint.config.ts overrides (the global ignore at line 41 already handles it)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "File: eslint.config.ts, around line 128\n\nThe global ignores block (line 41) already excludes `plugins/**` from all ESLint processing. The browser-globals override at line 128 lists `plugins/**/*.ts` in its `files` array, but this will never match any file because ESLint skips `plugins/**` before reaching any override.\n\nThe fix: Remove the `'plugins/**/*.ts'` entry from the files array in the browser globals override block. The exact line depends on the surrounding context — look for the block that sets `globals: { ...globals.browser }` and has a `files` array containing browser extension and plugin paths.\n\nThis is a one-line removal. Do NOT restructure the ESLint config or make other changes."
+    }
+  ]
+}

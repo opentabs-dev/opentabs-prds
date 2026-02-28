@@ -1,0 +1,87 @@
+## 2026-02-19 - US-008
+- Renamed test to `'browser_execute_script triggers an actual browser dialog'`
+- Test: opens interactive page, registers `page.on('dialog')` listener that accepts immediately, schedules `window.alert("test-dialog")` via `setTimeout`, waits for `dialogHandled` promise, verifies message is `"test-dialog"`, verifies `browser_execute_script` works after dismissal, verifies `browser_handle_dialog` returns expected "No JavaScript dialog" error
+- Files changed: `e2e/browser-tools.e2e.ts`
+- **Learnings for future iterations:**
+  - Chrome's CDP gives Playwright's primary CDP session EXCLUSIVE priority for dialog handling. When `page.on('dialog')` is registered (preventing auto-dismiss), Chrome BLOCKS `Page.handleJavaScriptDialog` from all other sessions (including `chrome.debugger`). Those commands hang indefinitely until the MCP client 30s timeout fires.
+  - The block is permanent: even if the extension's session received `Page.javascriptDialogOpening` (because `Page.enable` was active), Chrome still blocks it when Playwright holds the dialog.
+  - Without `page.on('dialog')` (hasHandlers=false): Playwright calls `dialog.close()` → async CDP auto-dismiss → extension's MCP round-trip (HTTP → WebSocket → extension → chrome.debugger → Chrome) is too slow to win the race.
+  - The extension's `browser_handle_dialog` happy path (dialog is open, extension dismisses it) CANNOT be tested in Playwright-controlled Chrome.
+  - Pragmatic test: register `page.on('dialog', d => { d.accept(); resolve() })`, schedule the alert, wait for dismissal, then verify post-dialog page behavior and `browser_handle_dialog` pipeline health (error case).
+  - Use `void dialog.accept()` inside the listener since the listener cannot return a Promise (Playwright's `Page.emit('dialog')` is synchronous).
+---
+
+## Codebase Patterns
+- `{ __proto__: ... }` in JS object literals sets the prototype chain, not an own key. Use `JSON.parse('{"__proto__":"val"}')` to simulate deserialized JSON with dangerous keys in tests.
+- Check own property existence with `Object.hasOwn(obj, key)` not `'key' in obj` — `in` traverses the prototype chain and `__proto__` is always accessible via `Object.prototype`.
+- `sanitizeOutput` uses `Object.entries()` which only yields own enumerable properties, so dangerous keys in JSON-deserialized objects (own keys) are filtered, but prototype-set `__proto__` would not appear in entries at all.
+- To add a new export to `mcp-setup.ts`, add to the named export list at the bottom (line ~498).
+- `getNextRequestId()` in state.ts uses `crypto.randomUUID()` — request IDs are UUID strings, NOT numbers. Mock WS checking for request IDs must use `parsed['id'] !== undefined` NOT `typeof parsed['id'] === 'number'`.
+- Resolving a `new Promise()` from within its own executor synchronously (even via queueMicrotask) does NOT work in Bun 1.3.9. Use `setTimeout(fn, 0)` to defer response settlement in mock WS objects.
+- `mock.module('./extension-protocol.js', ...)` leaks across test workers in Bun 1.3.9. Prefer no module mocking: use self-completing mock WS objects that call `handleExtensionMessage` via `setTimeout(fn, 0)`.
+- When using `mock.module()`, always include ALL exports from the mocked module — partial mocks break other test files that import missing exports.
+
+# Ralph Progress Log
+PRD: prd-2026-02-19-145818-test-coverage-gaps~running.json
+Started: Thu Feb 19 15:33:22 PST 2026
+---
+
+## 2026-02-19 - US-006
+- Added 7 tests to `platform/cli/src/commands/build.test.ts` in the existing `describe('validatePlugin', ...)` block
+- Files changed: `platform/cli/src/commands/build.test.ts`
+- **Learnings for future iterations:**
+  - `icon` is typed as `LucideIconName` (a union of string literals) — need `as unknown as LucideIconName` to pass an invalid string value in tests.
+  - `@typescript-eslint/no-unsafe-assignment` blocks `as any` — use `as unknown as TargetType` instead.
+---
+
+## 2026-02-19 - US-002
+- Created `platform/mcp-server/src/mcp-setup-dispatch.test.ts` with 17 tests covering all dispatch pipeline paths
+- Files changed: `platform/mcp-server/src/mcp-setup-dispatch.test.ts`
+- **Learnings for future iterations:**
+  - Request IDs in `extension-protocol.ts` are UUID strings (`crypto.randomUUID()`), NOT numbers. This affects how mock WS objects detect requests vs notifications.
+  - Bun 1.3.9: cannot resolve a Promise synchronously from within its own executor — even queueMicrotask doesn't work. Use `setTimeout(fn, 0)`.
+  - Bun 1.3.9: `mock.module()` leaks across test worker boundaries. Avoid module mocking entirely; use real implementations with mock WS objects instead.
+  - The `handleExtensionMessage` function from extension-protocol.ts is the clean way to settle dispatches — it handles both resolve and reject cases, clears timers, and manages pendingDispatches.
+---
+
+## 2026-02-19 - US-005
+- Exported `handleManifestChange` as named export from `platform/mcp-server/src/file-watcher.ts`
+- Added 6 tests in `platform/mcp-server/src/file-watcher.test.ts` in new `describe('handleManifestChange', ...)` block
+- Files changed: `platform/mcp-server/src/file-watcher.ts`, `platform/mcp-server/src/file-watcher.test.ts`
+- **Learnings for future iterations:**
+  - `await expect(promise).resolves.toBeUndefined()` triggers `@typescript-eslint/await-thenable` when `promise` is `Promise<void>` — TypeScript types `.toBeUndefined()` as `void` in Bun's test types. Use `await handleManifestChange(...)` directly; if no throw occurs, that's sufficient to verify the "no crash" property.
+  - `await expect(...).resolves.toBeUndefined()` also triggers `no-confusing-void-expression`. Keep tests simple.
+---
+
+## 2026-02-19 - US-004
+- Exported `fetchLatestVersion` as named export from `platform/mcp-server/src/version-check.ts`
+- Added 13 tests in `platform/mcp-server/src/version-check.test.ts`:
+  - 7 `fetchLatestVersion` tests: unscoped URL, scoped %2F encoding, success, non-200 null, malformed JSON null, network error null, missing dist-tags.latest null
+  - 6 `checkForUpdates` tests: local plugins skipped, outdated added, up-to-date not added, null fetch skipped, empty map, mixed fulfilled/rejected
+- Files changed: `platform/mcp-server/src/version-check.ts`, `platform/mcp-server/src/version-check.test.ts`
+- **Learnings for future iterations:**
+  - Bun's `typeof fetch` includes a `preconnect` property — cannot directly assign `async (...) => Response` to `globalThis.fetch`. Cast with `as unknown as typeof globalThis.fetch`.
+  - `@typescript-eslint/require-await` lint rule: don't use `async` on functions that don't have `await`. For mock fetch, use `() => Promise.resolve(...)` and `() => Promise.reject(...)` instead of `async () => { throw ... }` or `async () => value`.
+  - Import order matters: `./state.js` alphabetically before `./version-check.js` — ESLint's `import-x/order` enforces this.
+---
+
+## 2026-02-19 - US-003
+- Added 13 tests to `platform/mcp-server/src/http-routes.test.ts`:
+  - 5 wsClose tests: matching ws sets extensionWs to null, rejects pending dispatches with 'Extension disconnected', clears timeout timers, stale close is a no-op, no pending dispatches is a no-op
+  - 4 wsOpen tests: assigns new ws, replaces previous ws, ordering (new ws assigned BEFORE close() called), no previous connection works
+  - 4 CORS protection tests: evil.com blocked, attacker.io blocked, chrome-extension origin passes, no Origin header passes
+- Files changed: `platform/mcp-server/src/http-routes.test.ts`
+- **Learnings for future iterations:**
+  - TypeScript narrows `let` variables to `undefined` inside closures — use a wrapper object `const capture = { ws: null as WsHandle | null }` and mutate `capture.ws` inside callbacks to avoid narrowing issues.
+  - wsOpen already handles sendSyncFull through the real `sendSyncFull` function from extension-protocol.ts — no mocking required since the test mock state has `extensionWs` set by the wsOpen handler itself, and sendSyncFull is a no-op when there's no MCP connection.
+---
+
+## 2026-02-19 - US-001
+- Exported `sanitizeOutput` as a named export from `platform/mcp-server/src/mcp-setup.ts`
+- Added 11 tests in `platform/mcp-server/src/mcp-setup.test.ts` in `describe('sanitizeOutput', ...)` block
+- Files changed: `platform/mcp-server/src/mcp-setup.ts`, `platform/mcp-server/src/mcp-setup.test.ts`
+- **Learnings for future iterations:**
+  - Object literals `{ __proto__: value }` in JavaScript set the prototype chain — they don't create an enumerable own property with that key name. For testing prototype pollution prevention, use `JSON.parse(...)` to create objects with literal `"__proto__"` string keys.
+  - Use `Object.hasOwn(obj, key)` instead of `key in obj` when checking that a key was stripped — the `in` operator checks the prototype chain, so `'__proto__' in anyObject` is always `true` because `Object.prototype` has `__proto__` as a getter.
+  - The depth limit in sanitizeOutput: at `depth > 50`, the object is returned raw (unsanitized). Two separate tests are needed: one showing the boundary still sanitizes at depth 50, and one showing the raw return at depth 51.
+---

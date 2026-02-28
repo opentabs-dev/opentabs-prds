@@ -1,0 +1,261 @@
+# Ralph Progress Log
+PRD: prd-2026-02-22-161135-fix-codebase-bugs~running.json
+Started: Sun Feb 22 16:23:19 PST 2026
+---
+
+## Codebase Patterns
+- `executeInTab` returns `inner?.value ?? null`, so results must be null-guarded before casting to typed arrays/objects
+- `dispatchToExtension` returns `Promise<unknown>` — always validate the shape at runtime before using the result
+- The `/ws-info` endpoint must return `wsSecret` when auth is configured; E2E lifecycle tests depend on this for raw WebSocket connections
+- E2E tests in `lifecycle.e2e.ts` and `dispatch-resilience.e2e.ts` use raw WebSocket connections via `fetchWsInfo()` to get the URL and secret
+- Some unit tests (build-e2e.test.ts) can be flaky when run as part of the full suite but pass in isolation — likely temp file timing issues
+- All three dispatch handlers (tool, resource, prompt) share the same tab-loop pattern: iterate matching tabs, skip undefined IDs, try execution, fall through to `firstError` check. The `else` fallback after `if (firstError)` is essential to guarantee a response when all tabs have undefined IDs.
+- PluginRegistry is Object.freeze'd but the freeze is shallow — Map entries (RegisteredPlugin objects) are not frozen. To preserve immutability, always create new plugin objects via spread and rebuild the registry via buildRegistry() rather than mutating plugin fields directly. See handlePendingPluginChange for the canonical pattern.
+- `chrome.runtime.sendMessage` broadcasts to ALL onMessage listeners across all extension contexts (background, offscreen, side panel). Use distinct message types for each target context to prevent handlers in the wrong context from responding. The background script's switch statement has an exhaustiveness section for message types it doesn't handle.
+- Module-level variables in `bun --hot` mode reset on every re-evaluation. To persist state across hot reloads, store on globalThis with a unique key (e.g., `__opentabs_<name>__`). Use getter/setter functions. For Maps, use lazy init in the getter to avoid replacing existing data on reload.
+- For async polling, always use recursive setTimeout (not setInterval) to prevent overlapping calls. The `exports-last` ESLint rule requires private helpers to either be grouped before all exports or nested inside the consuming function.
+- GLOBALS_SCAN_SCRIPT filter convention: single `_` prefix = private (filter), double `__` prefix = framework globals like `__NEXT_DATA__` (keep), `__zone` prefix = Zone.js internals (filter). The correct compound condition is `startsWith('__zone') || (startsWith('_') && !startsWith('__'))`.
+- In Zod 4, `instanceof z.ZodOptional` / `z.ZodDefault` are unreliable. Use `schema.safeParse(undefined).success` to detect optionality — it covers optional, default, and union-with-undefined schemas.
+- When using secondary lookup maps for circular buffer arrays, store direct object references (not array indices) — `shift()` invalidates all indices but object references remain stable.
+- JSON-RPC error responses from the extension are `unknown` at runtime — always validate `typeof code === 'number'` and `typeof message === 'string'` before constructing `DispatchError`, providing defaults for malformed responses.
+- `::ffff:127.0.0.1` (IPv4-mapped IPv6) must be in `ALLOWED_HOSTS` for DNS rebinding protection on dual-stack sockets.
+- `Bun.file(path).size` is synchronous and efficient for pre-read size checks; use it to guard against OOM from unbounded file reads.
+- Browser tool handler validation errors should use `throw new Error(...)` — mcp-setup.ts catches handler exceptions and formats them as MCP error responses. Returning error objects from handlers would double-wrap them.
+
+## 2026-02-22 - US-001
+- Implemented null safety for all executeInTab calls in analyze-site/index.ts
+- Each executeInTab call now has `?? []` (or appropriate default) to handle null returns
+- Each executeInTab call is individually wrapped in try-catch for partial analysis resilience
+- Added runtime validation for the openTab result (checks `typeof id === 'number'`)
+- Fixed /ws-info endpoint to return wsSecret when auth is configured (was omitted)
+- Updated http-routes.test.ts to match new /ws-info behavior and WsInfoResponse type
+- Files changed:
+  - platform/mcp-server/src/browser-tools/analyze-site/index.ts
+  - platform/mcp-server/src/http-routes.ts
+  - platform/mcp-server/src/http-routes.test.ts
+- **Learnings for future iterations:**
+  - The /ws-info endpoint was missing wsSecret in its response, causing 10 E2E test failures in lifecycle.e2e.ts and dispatch-resilience.e2e.ts
+  - These tests create raw WebSocket connections using the secret from /ws-info and fail when wsSecret is undefined
+  - When E2E tests fail consistently on both clean and modified branches, check if there's a missing server feature the tests depend on
+---
+
+## 2026-02-22 - US-002
+- Added fallback JSON-RPC error responses in all three dispatch handlers when all matching tabs have undefined IDs
+- Wrapped JSON.stringify(input) in try-catch in handleToolDispatch to send -32602 error on serialization failure
+- Files changed:
+  - platform/browser-extension/src/tool-dispatch.ts
+  - platform/browser-extension/src/resource-prompt-dispatch.ts
+- **Learnings for future iterations:**
+  - The tab loop pattern `for (const tab of matchingTabs) { if (tab.id === undefined) continue; ... }` can silently skip all tabs if Chrome returns tabs with undefined IDs, leaving `firstError` unset and no response sent
+  - Always ensure dispatch handlers have exhaustive response paths — every code path must call `sendToServer` exactly once
+  - JSON.stringify can throw on circular references; any call in a request handler should be wrapped in try-catch
+---
+
+## 2026-02-22 - US-003
+- Fixed deleteJSON to handle 204 No Content responses by adding an early return in fetchJSONImpl
+- fetchJSONImpl now returns undefined for responses with status 204 or content-length: 0
+- Updated DeleteJSON interface return type to `Promise<T | undefined>` for the non-schema overload
+- Files changed:
+  - platform/plugin-sdk/src/fetch.ts
+- **Learnings for future iterations:**
+  - The fix was applied in fetchJSONImpl (shared implementation) rather than only in deleteJSON, because any HTTP method can return 204 No Content
+  - The content-length: 0 check provides additional coverage for servers that return 200 with empty body
+  - Only the DeleteJSON type was updated to `T | undefined` since DELETE is the most common method to return 204; other methods (POST, PUT, PATCH) typically return a body
+---
+
+## 2026-02-22 - US-004
+- Fixed waitForSelector and waitForSelectorRemoval to observe document.documentElement instead of document.body
+- document.body can be null during early page lifecycle (before <body> is parsed); document.documentElement is always available when scripts execute
+- Timer cleanup was already correct in both functions via the `settled` guard pattern
+- Files changed:
+  - platform/plugin-sdk/src/dom.ts (lines 56, 91)
+- **Learnings for future iterations:**
+  - document.documentElement is the safest MutationObserver target for utilities that may run during navigation — it's always non-null when scripts execute
+  - The settled-flag + clearTimeout + observer.disconnect pattern in waitForSelector/waitForSelectorRemoval is robust against double-settling
+---
+
+## 2026-02-22 - US-005
+- Fixed handleIifeChange and handleToolsJsonChange in file-watcher.ts to create new plugin objects instead of mutating existing ones
+- Both handlers now collect updated fields in a `Partial<RegisteredPlugin>`, create a new plugin via spread, and atomically rebuild the registry via `buildRegistry()`
+- This matches the existing pattern in handlePendingPluginChange (line 375-376) which already did atomic swaps correctly
+- Files changed:
+  - platform/mcp-server/src/file-watcher.ts
+- **Learnings for future iterations:**
+  - Object.freeze on PluginRegistry is shallow — Map entries (RegisteredPlugin objects) are mutable, so direct mutation silently violates the immutability contract
+  - The canonical pattern for updating a plugin is: spread into new object, map over all plugins replacing the target, call buildRegistry() to rebuild tool/resource/prompt lookup maps
+  - handlePendingPluginChange already used the correct pattern; handleIifeChange and handleToolsJsonChange were the only two places that mutated directly
+---
+
+## 2026-02-22 - US-006
+- Renamed `bg:getLogs` message type to `offscreen:getLogs` to prevent the background script from responding to its own broadcast
+- Renamed `BgGetLogsMessage` interface to `OffscreenGetLogsMessage` in extension-messages.ts
+- Updated the sender in browser-commands.ts to send `offscreen:getLogs` instead of `bg:getLogs`
+- Updated the offscreen document handler in offscreen/index.ts to respond to `offscreen:getLogs`
+- Removed the now-unnecessary `bg:getLogs` handler from background.ts and added `offscreen:getLogs` to the exhaustiveness section
+- Removed unused `bgLogCollector` import from background.ts
+- Files changed:
+  - platform/browser-extension/src/extension-messages.ts
+  - platform/browser-extension/src/browser-commands.ts
+  - platform/browser-extension/src/background.ts
+  - platform/browser-extension/src/offscreen/index.ts
+- **Learnings for future iterations:**
+  - `chrome.runtime.sendMessage` broadcasts to ALL onMessage listeners in all extension contexts (background, offscreen, side panel). Both the background and offscreen handlers were responding to `bg:getLogs`, but only the first response is received by the sender
+  - The background script's switch statement has an exhaustiveness section (fall-through cases) that lists message types handled by other listeners — new message types must be added there for TypeScript exhaustiveness checking
+  - The `EXTENSION_ONLY_TYPES` set in background.ts gates which message types are rejected from non-extension senders — new extension-internal message types should be added there
+---
+
+## 2026-02-22 - US-007
+- Fixed httpStatusToToolError to mark HTTP 5xx errors as retryable by adding a `status >= 500` check before the default fallback
+- For 503 Service Unavailable, the Retry-After header is parsed and included as `retryAfterMs`
+- Updated existing test to expect `retryable: true` for 500 status
+- Added test route and test case for 503 with Retry-After header
+- Files changed:
+  - platform/plugin-sdk/src/fetch.ts (httpStatusToToolError function)
+  - platform/plugin-sdk/src/fetch.test.ts (updated 500 test, added 503 test + route)
+- **Learnings for future iterations:**
+  - The httpStatusToToolError function is the central mapping for HTTP status codes to ToolError metadata — all fetch utilities (fetchFromPage, fetchJSON, postJSON, etc.) flow through it
+  - 4xx errors have specific handling (401/403 → auth, 404 → notFound, 429 → rateLimited), while the default case catches everything else including 5xx
+  - The parseRetryAfterMs helper already existed for 429 rate limiting — it was reused for 503 Retry-After parsing
+---
+
+## 2026-02-22 - US-008
+- Fixed log buffers in log-buffer.ts to survive bun --hot reloads by storing the Map on globalThis via `__opentabs_log_buffers__` key
+- Fixed cached global paths in resolver.ts to survive bun --hot reloads by storing on globalThis via `__opentabs_global_paths__` key
+- Both follow the same pattern as `__opentabs_hot_state__` in index.ts — using globalThis keys with lazy initialization
+- All existing tests pass without modification (clearAllLogs and resetGlobalPathsCache still work correctly)
+- Files changed:
+  - platform/mcp-server/src/log-buffer.ts (replaced module-level `buffers` Map with globalThis-backed `getBuffers()`)
+  - platform/mcp-server/src/resolver.ts (replaced module-level `cachedGlobalPaths` with globalThis-backed `getCachedGlobalPaths()`/`setCachedGlobalPaths()`)
+- **Learnings for future iterations:**
+  - Module-level variables in `bun --hot` mode reset on every module re-evaluation; only globalThis survives
+  - The codebase pattern for hot-reload persistence is: define a unique string key, use getter/setter functions that read/write `(globalThis as Record<string, unknown>)[KEY]`
+  - For Maps/Sets, use lazy initialization in the getter (`if (!map) { map = new Map(); g[KEY] = map; }`) to avoid replacing existing data
+  - For nullable primitives, the getter returns `?? null` to normalize undefined to null
+---
+
+## 2026-02-22 - US-009
+- Fixed waitUntil to use recursive setTimeout instead of setInterval, preventing overlapping async predicate calls
+- Fixed retry to check the abort signal during sleep delays via a new `abortableSleep` helper (local to retry)
+- `abortableSleep` races the timer against the AbortSignal, cleaning up the listener on normal completion
+- Restructured the file: moved `sleep` before `retry`, made `abortableSleep` a local function inside `retry`
+- Used `isSettled()` getter function in waitUntil to prevent TypeScript's `no-unnecessary-condition` from narrowing the mutable `settled` variable
+- Files changed:
+  - platform/plugin-sdk/src/timing.ts
+- **Learnings for future iterations:**
+  - `setInterval` + async callbacks is a classic bug: if the async callback takes longer than the interval, calls overlap. Always use recursive setTimeout for async polling.
+  - TypeScript's `@typescript-eslint/no-unnecessary-condition` tracks mutation of local variables through synchronous code flow, but doesn't understand that async boundaries (await) allow timer callbacks to mutate shared state. Wrapping the variable read in a function (`isSettled()`) defeats the narrowing.
+  - The `exports-last` ESLint rule flags non-exported declarations that sit between exported ones. To avoid this, either keep private helpers inside the exported function that uses them, or group all private code before all exports.
+  - `AbortSignal.addEventListener('abort', fn, { once: true })` with manual `removeEventListener` in the timer callback is the correct pattern for abort-racing — it avoids leaked listeners and handles both pre-aborted signals and signals aborted during the wait.
+- Advisory file locking on POSIX: `mkdirSync(path)` is atomic and fails with EEXIST if the directory exists. This provides safe mutual exclusion without race conditions (unlike Bun.write which has no O_EXCL semantics). `rmSync` cleans up the lock on release.
+- The CLI's `localPlugins.add` stores absolute paths while `registerInConfig` previously stored relative paths. When comparing stored paths across tools, always resolve to absolute before comparison, handling `/`, `~/`, and relative path formats.
+---
+
+## 2026-02-22 - US-010
+- Fixed TOCTOU race condition in `registerInConfig` by adding advisory file locking via atomic `mkdir`
+- Lock uses `mkdirSync` (EEXIST on conflict) with retry (50ms delay, 20 retries max), released via `rmSync`
+- Normalized `registerInConfig` to store absolute paths (was storing relative paths via `relative(configDir, projectDir)`)
+- Both `registerInConfig` and CLI's `handleSetLocalPluginsAdd` now store absolute paths consistently
+- Duplicate detection in both tools resolves stored paths to absolute form before comparison, handling mixed formats (absolute, relative, `~/`)
+- Updated `handleSetLocalPluginsRemove` to find entries by resolved absolute path, so it can remove plugins regardless of which tool registered them
+- Files changed:
+  - platform/plugin-tools/src/commands/build.ts (registerInConfig + acquireConfigLock + resolvePluginPathForComparison)
+  - platform/cli/src/commands/config.ts (resolveStoredPluginPath + handleSetLocalPluginsAdd + handleSetLocalPluginsRemove)
+- **Learnings for future iterations:**
+  - `mkdirSync` is the correct POSIX primitive for advisory locking — it's atomic and fails with EEXIST, unlike file creation which may overwrite
+  - `Bun.write` does not support O_EXCL (exclusive create) semantics — cannot be used for lock file creation
+  - The resolver in `platform/mcp-server/src/resolver.ts` already handles both absolute and relative paths via `isLocalPath` + `resolveLocalPath`, so changing the stored format from relative to absolute doesn't break discovery
+  - When adding async lock release functions, ensure they don't violate `@typescript-eslint/require-await` — if the cleanup is synchronous (rmSync), use a regular function
+---
+
+## 2026-02-22 - US-011
+- Fixed sanitizeOutput in mcp-setup.ts to return `'[Object too deep]'` instead of the unsanitized object when recursion depth exceeds 50
+- Separated the depth check from the null/undefined/non-object check so that primitive pass-through still works correctly
+- Fixed _setLogTransport in log.ts to only restore the previous transport if the current transport matches the one being restored
+- The restore closure now captures `previous` (the transport active at install time) and checks `activeTransport === transport` before restoring
+- Updated the test in mcp-setup.test.ts to expect the safe placeholder string instead of the raw leaf object
+- Files changed:
+  - platform/mcp-server/src/mcp-setup.ts (sanitizeOutput depth handling)
+  - platform/mcp-server/src/mcp-setup.test.ts (updated depth-limit test)
+  - platform/plugin-sdk/src/log.ts (_setLogTransport restore logic)
+- **Learnings for future iterations:**
+  - sanitizeOutput is used to prevent prototype pollution in MCP client JSON deserialization — the depth limit must return a safe value, not pass through the unsanitized object
+  - The _setLogTransport restore pattern follows the same principle as React cleanup functions: only undo your own effect if nothing newer has superseded it
+  - Tests that validate buggy behavior need to be updated when the bug is fixed — don't just fix the code, fix the test expectations too
+---
+
+## 2026-02-22 - US-012
+- Fixed `checkExtensionInstalled` in doctor.ts to use `getExtensionDir()` instead of hardcoded `join(homedir(), '.opentabs', 'extension')`
+- Fixed `readNewContent` in logs.ts to wrap `statSync(filePath)` in try-catch, returning gracefully on ENOENT (file deleted while tailing)
+- Fixed `handleLogs` to ensure `tailFile` output ends with a newline before `followFile` starts appending
+- Files changed:
+  - platform/cli/src/commands/doctor.ts (import getExtensionDir, use in checkExtensionInstalled)
+  - platform/cli/src/commands/logs.ts (try-catch around statSync, trailing newline after tailFile output)
+- **Learnings for future iterations:**
+  - The CLI config module already exports `getExtensionDir()` — prefer it over manually constructing paths with `join(getConfigDir(), 'extension')`
+  - `statSync` throws ENOENT when a file is deleted between the `existsSync` check and the stat call — in long-running follow/watch operations, always wrap stat calls in try-catch
+  - `tailFile` joins lines with `\n` which may not produce a trailing newline (depends on whether the last line in the array is empty); always ensure a trailing newline before appending follow output to prevent the first followed line from concatenating with the last tail line
+---
+
+## 2026-02-22 - US-013
+- Fixed Zone.js globals filter: changed `key.startsWith('_') && key.startsWith('__zone')` to `key.startsWith('__zone') || (key.startsWith('_') && !key.startsWith('__'))` — filters single-underscore private vars and Zone.js internals while preserving framework globals like `__NEXT_DATA__`
+- Fixed GraphQL isMutation check: changed `query.trimStart().startsWith('mutation')` to `match[0].startsWith('mutation')` for accurate operation type detection from the regex match
+- Fixed cookie name regex escaping in detect-auth.ts: cookie names with special regex characters (e.g., `connect.sid`) are now escaped in `extractionHint` strings using `String.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')`
+- Updated unit tests (detect-auth.test.ts) and E2E test (analyze-site.e2e.ts) to expect escaped cookie names in extractionHint
+- Files changed:
+  - platform/mcp-server/src/browser-tools/analyze-site/index.ts (globals filter + isMutation)
+  - platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts (regex escaping)
+  - platform/mcp-server/src/browser-tools/analyze-site/detect-auth.test.ts (updated expectations)
+  - e2e/analyze-site.e2e.ts (updated extractionHint expectation)
+- **Learnings for future iterations:**
+  - The GLOBALS_SCAN_SCRIPT filter intent: single-underscore prefix (`_private`) = filter, double-underscore prefix (`__NEXT_DATA__`) = keep (framework globals), `__zone` prefix = filter (Zone.js internals). The condition `startsWith('_') && startsWith('__zone')` was logically equivalent to just `startsWith('__zone')` since `__zone` implies `_`. Simple `||` would over-filter useful framework globals.
+  - When fixing a regex bug in a hint string, always check both unit tests and E2E tests that assert on the hint content — `toContain('connect.sid')` fails when the `.` is escaped to `\\.`
+  - GraphQL queries can have leading whitespace, comments, or other content before the operation keyword. Using the regex match result (`match[0]`) to check the operation type is more reliable than trimming the raw query string.
+---
+
+## 2026-02-22 - US-014
+- Replaced `instanceof z.ZodOptional || instanceof z.ZodDefault` in extractArgsFromSchema with `fieldSchema.safeParse(undefined).success`
+- `safeParse(undefined)` reliably detects optionality in Zod 4 without brittle instanceof checks — covers ZodOptional, ZodDefault, and any other schema that accepts undefined
+- Removed unreachable `else if (Array.isArray(parsed))` dead code branch in inspect.ts (the preceding guard at line 57 already throws for arrays)
+- Files changed:
+  - platform/plugin-tools/src/commands/build.ts (extractArgsFromSchema)
+  - platform/plugin-tools/src/commands/inspect.ts (removed dead branch)
+- **Learnings for future iterations:**
+  - In Zod 4, `instanceof z.ZodOptional` and `instanceof z.ZodDefault` are unreliable because Zod 4 restructured its internal class hierarchy. The `isOptional()` method exists but is deprecated — the recommended approach is `schema.safeParse(undefined).success`
+  - `safeParse(undefined).success` is the canonical way to check optionality because it tests the actual runtime behavior of the schema, not its class identity — it works for `z.optional()`, `z.default()`, `z.union()` with undefined variants, and any future constructs
+  - Dead code in `else if` branches that follow a guard that already rejects the same condition (like `Array.isArray(parsed)` after it was already thrown on) can be safely removed — the branch is provably unreachable
+---
+
+## 2026-02-22 - US-015
+- Fixed network capture data loss: replaced index-based `requestIdToIndex` map with direct object reference `requestIdToRequest` map
+- When the circular buffer shifts out old entries, indices became stale, causing response bodies from `Network.loadingFinished` to be silently lost or attached to wrong requests
+- With object references, the `CapturedRequest` reference remains valid regardless of array shifts — the `loadingFinished` handler always finds the correct request
+- Removed the index decrementing logic in both the `responseReceived` and `webSocketCreated` handlers since it's no longer needed
+- Added validation guard in `select-option.ts` handler to throw an error when neither `value` nor `label` is provided
+- Used `throw new Error(...)` rather than returning an error object, consistent with how other browser tool handlers report validation failures
+- Files changed:
+  - platform/browser-extension/src/network-capture.ts (requestIdToIndex → requestIdToRequest)
+  - platform/mcp-server/src/browser-tools/select-option.ts (handler guard)
+- **Learnings for future iterations:**
+  - Storing array indices in a secondary lookup map is fragile when the array is a circular buffer with `shift()` — always store direct object references instead
+  - Browser tool handler validation errors should `throw new Error(...)`, not return MCP error objects — mcp-setup.ts catches handler exceptions and formats them into proper MCP error responses
+  - The `defineBrowserTool` handler signature returns `Promise<unknown>` and the result goes through `sanitizeOutput` + `JSON.stringify` in mcp-setup.ts, so returning an MCP error shape would double-wrap the error
+---
+
+## 2026-02-22 - US-016
+- Fixed extension JSON-RPC error validation: `parsed.error` in `handleExtensionMessage` is now shape-validated before constructing `DispatchError` — `code` defaults to `-32603` if not a number, `message` defaults to `'Unknown extension error'` if not a string, `data` is validated as a non-array object
+- Fixed prompt args coercion: `rawArgs` in `handlePromptGet` now iterates entries and calls `String(val)` on each value instead of blindly casting `Record<string, unknown>` to `Record<string, string>`
+- Fixed `isLocalhostHost` to handle `::ffff:127.0.0.1` (IPv4-mapped IPv6) by adding it to the `ALLOWED_HOSTS` set — this is the address Bun reports when an IPv4 client connects to a dual-stack socket
+- Added file size guard in `handleAuditFromFile`: checks `auditFile.size` against a 10MB limit before reading, preventing OOM on large audit logs
+- Added unit tests for `::ffff:127.0.0.1` in bracket notation with and without port
+- Files changed:
+  - platform/mcp-server/src/extension-protocol.ts (error shape validation)
+  - platform/browser-extension/src/resource-prompt-dispatch.ts (prompt args coercion)
+  - platform/mcp-server/src/http-routes.ts (ALLOWED_HOSTS set)
+  - platform/mcp-server/src/http-routes.test.ts (IPv4-mapped IPv6 tests)
+  - platform/cli/src/commands/audit.ts (file size guard)
+- **Learnings for future iterations:**
+  - JSON-RPC error responses from the extension are `unknown` at runtime — always validate shape before constructing typed errors. The safe pattern is: check `typeof` for each field, provide sensible defaults
+  - `::ffff:127.0.0.1` is the IPv4-mapped IPv6 representation that appears when a loopback IPv4 connection arrives on a dual-stack IPv6 socket — Node.js/Bun can report this as the remote address
+  - `Bun.file(path).size` is a synchronous property (not a method) that returns the file size without reading content — efficient for pre-read size checks
+  - Prompt arguments from MCP clients may contain non-string values (numbers, booleans) if the MCP client doesn't coerce them — always `String()` each value before passing to adapter code that expects `Record<string, string>`
+---

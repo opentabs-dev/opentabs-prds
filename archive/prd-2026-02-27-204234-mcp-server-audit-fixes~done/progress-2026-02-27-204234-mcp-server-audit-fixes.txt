@@ -1,0 +1,75 @@
+# Ralph Progress Log
+PRD: prd-2026-02-27-204234-mcp-server-audit-fixes~running.json
+Started: Sat Feb 28 04:43:04 UTC 2026
+---
+## Codebase Patterns
+- permissions.ts TOOL_TIERS map is organized by comment sections (observe/interact/sensitive) — keep entries in the correct section when reclassifying
+- Tests for permissions use browser_list_tabs/browser_click_element as canonical observe/interact examples; they don't enumerate every tool by tier, so reclassifications don't break tests
+- sanitize-error.ts Unix path regex: require first segment to start with `[a-z]` (letter) to avoid false positives on numeric-only segments like `/2` in fractions (`1/2`). This allows single-segment paths like `/tmp`, `/etc`, `/var` to be caught while keeping `1/2` unchanged.
+- analyze-site/index.ts try/catch pattern: all fallible extension dispatches use `catch { // Partial analysis: X skipped }` with no logging import (file has no log object). The outer `finally` block already calls `disableNetworkCapture` + `closeTab` as safety net for any throw that escapes inner try/catch blocks.
+---
+
+## 2026-02-28 - US-001
+- Reclassified `browser_clear_console_logs`, `extension_force_reconnect`, and `extension_reload` from 'observe' to 'interact' tier in `platform/mcp-server/src/permissions.ts`
+- Files changed: `platform/mcp-server/src/permissions.ts`
+- **Learnings for future iterations:**
+  - The TOOL_TIERS map has comment sections (observe/interact/sensitive); entries should be moved to match their new tier section, not just have the value changed
+  - permissions.test.ts doesn't assert on these three specific tools' tiers — it uses other tools as tier examples — so no test updates were needed
+  - All 82 test files (2394 tests) pass after the change
+---
+
+## 2026-02-28 - US-002
+- Fixed Unix path regex in `platform/mcp-server/src/sanitize-error.ts` to match single-segment paths: `/\/[a-z][a-z0-9._-]*(?:\/[a-z0-9._-]+)*/gi` (was `+` at the end, now `*`; also requires first segment to start with a letter)
+- Fixed localhost regex to match bare `localhost` without port: `localhost(?::\d+)?` (was `localhost:\d+`)
+- Added 4 new unit tests in `sanitize-error.test.ts`: three for single-segment paths (/tmp, /etc, /var) and one for bare localhost
+- Files changed: `platform/mcp-server/src/sanitize-error.ts`, `platform/mcp-server/src/sanitize-error.test.ts`
+- **Learnings for future iterations:**
+  - The PRD note suggested `/\/[a-z0-9._-]+(?:\/[a-z0-9._-]+)*/gi` but this would break the existing test for `1/2` (fraction). Requiring first segment to start with `[a-z]` preserves the test and still catches `/tmp`, `/etc`, `/var`
+  - The URL regex (`https?://...`) runs AFTER the Unix path regex, so multi-segment URLs like `https://api.example.com/v1/users` get partially caught by the path regex first — this is pre-existing behavior
+  - All 82 test files (2398 tests) pass after the change (4 new tests added)
+---
+
+## 2026-02-28 - US-004
+- Wrapped `getNetworkRequests` dispatch in try/catch in `platform/mcp-server/src/browser-tools/analyze-site/index.ts`; catch block calls `disableNetworkCapture` as explicit cleanup, then analysis continues with empty networkRequests array
+- Wrapped `getCookies` dispatch in try/catch; catch block allows analysis to continue with empty cookies array
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site/index.ts`
+- **Learnings for future iterations:**
+  - The outer `finally` block (lines 1007-1019) already calls `disableNetworkCapture` as a safety net — the inner catch block adds an explicit call so disableNetworkCapture runs before the analysis continues (not just at function exit)
+  - No `log` object exists in this file; the pattern is `catch { // Partial analysis: X skipped }` without any logging
+  - The file has no integration tests for `analyzeSite` itself (only pure utility functions are unit tested), so no test updates were needed
+  - All 82 test files (2398 tests) pass after the change
+---
+
+## 2026-02-28 - US-003
+- The network capture race condition fix (open to about:blank, enable capture, then navigate) was already applied in a prior iteration (commit 7c70d01 introduced tests, and the code was already correct)
+- Changed `waitSeconds` max from 30 to 25 in `platform/mcp-server/src/browser-tools/analyze-site.ts` (line 37) to prevent guaranteed dispatch timeouts
+- Updated the description string from "max 30" to "max 25"
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site.ts`
+- **Learnings for future iterations:**
+  - The analyze-site tool definition is in `platform/mcp-server/src/browser-tools/analyze-site.ts` (not the index.ts inside the directory); this is where the Zod schema with waitSeconds max lives
+  - The orchestration logic is in `platform/mcp-server/src/browser-tools/analyze-site/index.ts` (the directory's index)
+  - Always use `openTab({ url: 'about:blank' })` + `enableNetworkCapture` + `navigateTab` pattern for network capture — open blank tab first, enable capture, then navigate
+  - All 82 test files (2398 tests) pass after the change
+---
+
+## 2026-02-28 - US-005
+- Fixed `BASE64URL_SEGMENT` regex in `detect-auth.ts` from `/^[A-Za-z0-9_-]+=*$/` to `/^[A-Za-z0-9_-]+$/` — removes `=*` that allowed standard base64 padding, causing false positives on non-JWT base64 strings
+- Fixed `detectBasicAuth` URL sampling to use the first request with a `Basic ` auth header prefix rather than `requestsWithAuth[0]` which could be a Bearer request
+- Added 2 new unit tests in `detect-auth.test.ts`: one verifying padded base64 strings are not detected as JWT, one verifying Basic auth URL comes from a Basic-auth request even when Bearer requests appear first
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts`, `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.test.ts`
+- **Learnings for future iterations:**
+  - `detect-auth.ts` uses `getHeaderValue(headers, 'authorization')` helper for case-insensitive header lookup — reuse this instead of direct header access
+  - The `detectBasicAuth` function already filters `requestsWithAuth` by any auth header presence; `hasBasicPrefix` confirmation + `.find(r => val.startsWith('Basic '))` pattern for the URL sample is safe because `hasBasicPrefix` guarantees `basicReq` will be found
+  - All 82 test files (2400 tests) pass after the change (2 new tests added)
+---
+
+## 2026-02-28 - US-006
+- Fixed duplicate error message in `platform/mcp-server/src/logger.ts` `formatArgs` function: line 47 changed from `last.message + '\n  ' + last.stack` to `'\n  ' + last.stack`
+- `Error.stack` already includes the message as its first line (`Error: something\n    at ...`), so prepending `last.message` caused duplication in debug output
+- Created `platform/mcp-server/src/logger.test.ts` with 4 tests verifying: info level uses message-only, error level uses message-only, debug level produces non-duplicated stack, message appears exactly once in debug output
+- Files changed: `platform/mcp-server/src/logger.ts`, `platform/mcp-server/src/logger.test.ts`
+- **Learnings for future iterations:**
+  - `formatArgs` is not exported — test logger behavior indirectly via `console.debug`/`console.log` spies
+  - `currentLevel` is evaluated at module load time; use `vi.stubEnv` + `vi.resetModules()` + dynamic `import('./logger.js')` to test debug level behavior
+  - All 83 test files (2404 tests) pass after the change (4 new logger tests added)
+---

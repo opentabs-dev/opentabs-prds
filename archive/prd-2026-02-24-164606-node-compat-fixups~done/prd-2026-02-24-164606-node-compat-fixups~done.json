@@ -1,0 +1,68 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix remaining issues from the Node.js runtime compatibility migration: one bug (unguarded Bun.spawnSync in doctor.ts), missing engines fields on published packages, and minor doc/comment inconsistencies.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix unguarded Bun.spawnSync in doctor.ts Linux browser detection",
+      "description": "As a normal user running opentabs doctor on Linux under Node.js, I want the command to work without crashing so that I can diagnose my setup.",
+      "acceptanceCriteria": [
+        "The Bun.spawnSync call at platform/cli/src/commands/doctor.ts line 355 is replaced with spawnProcessSync from @opentabs-dev/shared",
+        "spawnProcessSync is added to the import statement from @opentabs-dev/shared at the top of the file",
+        "The Linux browser detection logic works correctly: iterates LINUX_BROWSER_COMMANDS, runs 'which <cmd>' via spawnProcessSync, returns pass on exitCode 0",
+        "No direct Bun.* API calls remain in doctor.ts outside of isBun guards",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "This is a bug fix. The file is platform/cli/src/commands/doctor.ts.\n\nAt line 355, inside the `if (platform === 'linux')` block:\n```typescript\nconst result = Bun.spawnSync(['which', cmd], { stdout: 'pipe', stderr: 'pipe' });\n```\n\nReplace with:\n```typescript\nconst result = spawnProcessSync('which', [cmd]);\n```\n\nThe `spawnProcessSync` function is already exported from `@opentabs-dev/shared` (defined in platform/shared/src/runtime.ts). It returns `{ exitCode: number; stdout: string; stderr: string }`. The existing code checks `result.exitCode === 0`, which matches the spawnProcessSync return shape.\n\nAdd `spawnProcessSync` to the existing import from `@opentabs-dev/shared` at the top of the file. Check what's already imported — likely things like `ADAPTER_FILENAME`, `TOOLS_FILENAME`, etc. — and add `spawnProcessSync` to that import.\n\nVerify there are no other unguarded `Bun.` calls in the file. The `Bun.version` reference at line 59 is inside an `if (isBun)` guard, which is correct."
+    },
+    {
+      "id": "US-002",
+      "title": "Add engines field to published package.json files",
+      "description": "As a user installing @opentabs-dev/cli via npm on an older Node.js version, I want npm to warn me about version incompatibility so that I don't encounter confusing runtime errors.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/package.json has \"engines\": { \"node\": \">= 20.0.0\" }",
+        "platform/cli/package.json has \"engines\": { \"node\": \">= 20.0.0\" }",
+        "platform/plugin-tools/package.json has \"engines\": { \"node\": \">= 20.0.0\" }",
+        "platform/create-plugin/package.json has \"engines\": { \"node\": \">= 20.0.0\" }",
+        "The engines field is placed after the version field and before the description field (or in the conventional position for the file)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Simple metadata change across 4 package.json files. Add the engines field to each.\n\nFiles to modify:\n- platform/mcp-server/package.json\n- platform/cli/package.json\n- platform/plugin-tools/package.json\n- platform/create-plugin/package.json\n\nAdd this field (place it after \"version\" and before \"description\" or \"type\" — match the existing field ordering convention in each file):\n```json\n\"engines\": {\n  \"node\": \">= 20.0.0\"\n},\n```\n\nDo NOT add a \"bun\" engine requirement to these files — they are designed to run on Node.js. The root package.json already has both \"node\" and \"bun\" in engines (for the monorepo contributor context), but published packages only need \"node\".\n\nAlso do NOT add engines to platform/plugin-sdk/package.json or platform/shared/package.json — those are library packages consumed by other packages, not executed directly. And do NOT add engines to platform/browser-extension/package.json — the extension is not published to npm."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix minor doc and comment inconsistencies from migration",
+      "description": "As a plugin developer or contributor reading docs, I want consistent terminology so that I'm not confused about whether plugins require Bun or npm.",
+      "acceptanceCriteria": [
+        "platform/plugin-sdk/src/lucide-icon-names.ts line 5 comment is changed from 'bun run generate:icons' to a generic note like 'Regenerate via the generate:icons script (platform contributors only)'",
+        "platform/cli/CLAUDE.md line 36 comment changes 'bun install && bun run build' to 'npm install && npm run build'",
+        "plugins/CLAUDE.md line 13 changes 'bun.lock' to 'lock file (package-lock.json or bun.lock)' or similar",
+        "docs/content/docs/contributing/dev-setup.mdx lines 128-129 and 138-139 change plugin build commands from 'bun install'/'bun run build' to 'npm install'/'npm run build' (since plugins are standalone npm projects)",
+        "docs/content/docs/contributing/publishing.mdx lines 98-99 change plugin update commands from 'bun install'/'bun run build' to 'npm install'/'npm run build'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "notes": "This is a cleanup story for minor inconsistencies found in the migration review.\n\nFiles to modify:\n\n1. platform/plugin-sdk/src/lucide-icon-names.ts line 5:\n   Change: `* Regenerate with: bun run generate:icons`\n   To: `* Regenerate via the generate:icons script (platform contributors only).`\n   Reason: This file ships in the published npm package. Plugin devs reading SDK source shouldn't see bun-specific instructions.\n\n2. platform/cli/CLAUDE.md line 36:\n   Change: `# cd plugins/<name> && bun install && bun run build`\n   To: `# cd plugins/<name> && npm install && npm run build`\n   Reason: Plugins are standalone npm projects; this commented-out example should use npm.\n\n3. plugins/CLAUDE.md line 13:\n   Change: `Has its own \\`node_modules/\\` and \\`bun.lock\\``\n   To: `Has its own \\`node_modules/\\` and lock file`\n   Reason: External plugin developers using npm would have package-lock.json, not bun.lock.\n\n4. docs/content/docs/contributing/dev-setup.mdx lines 128-129:\n   These are under 'Build a Test Plugin' section. Change:\n   `bun install` → `npm install`\n   `bun run build` → `npm run build`\n   Reason: Plugins are standalone npm projects. Even though contributors have Bun, plugin build instructions should be consistent.\n\n5. docs/content/docs/contributing/dev-setup.mdx lines 138-139:\n   Same change for the Slack plugin section.\n\n6. docs/content/docs/contributing/publishing.mdx lines 98-99:\n   Under 'After Publishing' section. Change:\n   `bun install` → `npm install`\n   `bun run build` → `npm run build`\n   Reason: Same — plugin update instructions should use npm for consistency.\n\nThis story is marked as e2eCheckpoint: true since it's the final story."
+    }
+  ]
+}

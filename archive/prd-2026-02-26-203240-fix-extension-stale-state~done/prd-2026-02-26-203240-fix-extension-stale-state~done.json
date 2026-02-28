@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix stale UI state bugs in the Chrome extension: activeTools Set that grows unboundedly causing permanent spinning indicators, and confirmation badge count that never clears when the side panel is closed during confirmation timeout.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Prune stale activeTools entries on plugin removal and add invocation timeout",
+      "description": "As a user, I want the side panel to stop showing spinning indicators for tools that are no longer executing, so that the UI accurately reflects the current state.",
+      "acceptanceCriteria": [
+        "When plugins.changed notification arrives and loadPlugins refreshes the plugin list, activeTools entries whose plugin prefix no longer matches any loaded plugin are removed",
+        "When a tool.invocationStart adds an entry to activeTools, a 5-minute timeout is set that auto-removes the entry if tool.invocationEnd never arrives",
+        "When tool.invocationEnd arrives, the corresponding timeout is cleared alongside removing the activeTools entry",
+        "When the WebSocket disconnects (existing behavior), all timeouts are cleared alongside the activeTools Set reset",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Two changes needed:\n\n1. **Prune on plugin removal** \u2014 In `platform/browser-extension/src/side-panel/App.tsx`, in the `plugins.changed` handler (around line 135-139), after `loadPlugins()` resolves, call `setActiveTools(prev => { const next = new Set<string>(); for (const key of prev) { if (updatedPlugins.some(p => key.startsWith(p.name + ':'))) next.add(key); } return next; })`. The challenge is that `loadPlugins` is async and updates state \u2014 one approach is to have `loadPlugins` return the updated plugin list, or to add the pruning inside the `loadPlugins` `.then()` callback using the fetched result.\n\n2. **Invocation timeout** \u2014 In `platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts`, add a `useRef<Map<string, ReturnType<typeof setTimeout>>>` for invocation timeouts. In the `tool.invocationStart` handler (line 97-107), after adding to `activeTools`, set a 5-minute timeout that removes the key. In the `tool.invocationEnd` handler (line 109-123), clear the timeout. In the cleanup effect, clear all invocation timeouts. The timeout constant (5 minutes) should go in `platform/browser-extension/src/side-panel/constants.ts`.\n\nThe `setActiveTools` dispatcher is already passed to `useServerNotifications`, so no new props needed. Follow the existing pattern of `timeoutIds` ref used for confirmation timeouts in the same file."
+    },
+    {
+      "id": "US-002",
+      "title": "Clear stale confirmation badge when side panel is closed during timeout",
+      "description": "As a user, I want the extension badge to not show stale confirmation counts when confirmations time out while the side panel is closed, so that the badge accurately reflects pending actions.",
+      "acceptanceCriteria": [
+        "When a confirmation.request arrives and the side panel is not open, the badge is cleared after the confirmation's timeoutMs expires (server-side timeout means the confirmation is no longer actionable)",
+        "The background service worker tracks confirmation timeouts independently of the side panel React component",
+        "When the side panel opens and processes a confirmation, the background timeout is cleared to avoid double-clearing the badge",
+        "When sp:confirmationResponse or sp:confirmationTimeout arrives from the side panel, any background-side timeout for that confirmation is cleared",
+        "When WebSocket disconnects, all background-side confirmation timeouts are cleared alongside clearAllConfirmationBadges()",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "The root cause: `confirmation-badge.ts` increments `pendingConfirmationCount` on every `confirmation.request` but only decrements it via `clearConfirmationBadge()` which is called from `sp:confirmationResponse` and `sp:confirmationTimeout` \u2014 both sent by the side panel React component. If the side panel is closed, neither message is ever sent, and the badge count stays elevated permanently.\n\nFix in `platform/browser-extension/src/confirmation-badge.ts`:\n- Add a `Map<string, ReturnType<typeof setTimeout>>` for background-side confirmation timeouts\n- In `notifyConfirmationRequest`, extract the `timeoutMs` from params (`params.timeoutMs` is a number) and set a background timeout = `timeoutMs + 2000` (slightly longer than the server timeout + the side panel's +1000 buffer). When it fires, call `clearConfirmationBadge()` and delete the map entry.\n- Export a new `clearConfirmationBackgroundTimeout(id: string)` function that clears a specific timeout (called when the side panel handles it first).\n- In `clearAllConfirmationBadges`, also clear all background timeouts.\n\nThen in `platform/browser-extension/src/background-message-handlers.ts`:\n- Import `clearConfirmationBackgroundTimeout` from confirmation-badge.ts\n- In `handleSpConfirmationResponse` (line 162-172), call `clearConfirmationBackgroundTimeout(message.data.id)` (extract the id from message.data)\n- In `handleSpConfirmationTimeout` (line 175-178), call `clearConfirmationBackgroundTimeout(message.id)` (the id is on the message)\n\nAlso update `platform/browser-extension/src/message-router.ts` in the `confirmation.request` handler (line 450-452): pass the full params to `notifyConfirmationRequest` \u2014 it already does this. Verify that `params.timeoutMs` is present; check the MCP server's confirmation request payload.\n\nThe `notifyConfirmationRequest` function already receives `params: Record<string, unknown>`, so accessing `params.timeoutMs` and `params.id` is straightforward with typeof checks."
+    }
+  ]
+}

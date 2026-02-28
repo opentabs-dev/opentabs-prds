@@ -1,0 +1,140 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-191944-dev-prod-mode-split~running.json
+Started: Fri Feb 20 19:19:47 PST 2026
+---
+
+## Codebase Patterns
+- Dev mode detection lives in `platform/mcp-server/src/dev-mode.ts` — exports `isDev()` as a function returning a boolean determined once at startup
+- The `--dev` CLI flag and `OPENTABS_DEV` env var control dev mode; production is the default
+- `package.json` has separate scripts: `dev` (bun --hot + --dev) and `start` (production, no hot reload)
+- Module-level state in the MCP server (like dev mode flag) is evaluated once per process; under `bun --hot` the module re-evaluates so the value is re-read each time
+- In `reloadCore`, `stopFileWatching` runs unconditional (hot reload cleanup), but `startFileWatching`/`startConfigWatching` are gated on `isDev()`
+- The `devMode` const in `dev-mode.ts` is read at module evaluation time — unit tests that run without `OPENTABS_DEV` set will see production mode; dev-mode file watcher behavior is tested via E2E tests with `--dev`
+- HTTP route guards: `isDev()` is imported in `http-routes.ts` and checked early in the handler — returns 405 before auth/rate-limit checks for production-mode-only endpoints
+- Plugin format: metadata in `package.json` opentabs field, tool schemas in `dist/tools.json`, adapter bundle in `dist/adapter.iife.js` — NO standalone manifest file exists
+- docs-v2 build: clean `.next/` if stale webpack cache causes module errors; `bun run build` includes type-checking via Next.js
+
+---
+
+## 2026-02-20 - US-001
+- Created `platform/mcp-server/src/dev-mode.ts` module that reads `--dev` from `Bun.argv` or `OPENTABS_DEV` from env
+- Updated `platform/mcp-server/src/index.ts` to import `isDev()` and append `(dev mode)` to the startup log message
+- Updated `platform/mcp-server/package.json`: added `dev` script (`bun --hot dist/index.js --dev`), changed `start` to production mode (`bun dist/index.js` without `--hot`)
+- Files changed: `platform/mcp-server/src/dev-mode.ts` (new), `platform/mcp-server/src/index.ts`, `platform/mcp-server/package.json`
+- **Learnings for future iterations:**
+  - The dev-mode module is intentionally minimal (one boolean, one export) so other modules can import it without circular dependency concerns
+  - `Bun.argv` includes the full argument list including the entry point path, so `--dev` can appear anywhere after it
+  - The `start` script now runs without `bun --hot` — production mode gets no file watcher auto-reload
+---
+
+## 2026-02-20 - US-002
+- Gated `startFileWatching`, `startConfigWatching`, and `createFileWatcherCallbacks` on `isDev()` in `reloadCore` (reload.ts)
+- `stopFileWatching` remains unconditional at the top of `reloadCore` to clean up handles from previous hot reload iterations
+- Updated two unit tests in `reload.test.ts` that expected file watchers to start — they now verify production-mode behavior (no watchers)
+- Updated JSDoc comments on `reloadCore` and `performReload` to reflect the dev/production distinction
+- Files changed: `platform/mcp-server/src/reload.ts`, `platform/mcp-server/src/reload.test.ts`
+- **Learnings for future iterations:**
+  - The `devMode` constant in `dev-mode.ts` is evaluated at ESM module load time — cannot be overridden per-test since imports are hoisted above any top-level code in the test file
+  - Tests that need dev mode file watcher behavior should use E2E tests (which start the server process with `--dev`), not unit tests
+  - `createFileWatcherCallbacks` creates closures over state and session servers — no point creating them in production mode since they're never used
+---
+
+## 2026-02-20 - US-003
+- Imported `isDev` in `http-routes.ts` and gated `POST /reload` on dev mode — returns 405 with descriptive error in production
+- Added `mode: 'dev' | 'production'` field to the `/health` endpoint response
+- Updated `index.ts` JSDoc to document dev-only nature of `/reload` and mode field in `/health`
+- Added two unit tests: one for `/health` `mode` field, one for `/reload` returning 405 in production
+- Updated `HealthResponse` test interface to include the new `mode` field
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`, `platform/mcp-server/src/index.ts`
+- **Learnings for future iterations:**
+  - The dev-mode check for `/reload` runs before auth and rate-limit checks — no point authenticating a request that will be rejected anyway
+  - Unit tests naturally run in production mode (no `--dev`, no `OPENTABS_DEV`), so production-mode behavior is tested directly without mocking
+  - The `performConfigReload` function still exists and is used by the config watcher in dev mode — only the HTTP endpoint is gated
+---
+
+## 2026-02-20 - US-004
+- Updated `e2e/fixtures.ts` to pass `--dev` flag to the MCP server in `startMcpServer()`
+- Both `hot=true` and `hot=false` variants now include `--dev` after the entry file
+- Added `mode: 'dev' | 'production'` to the `HealthResponse` interface to match the /health endpoint change from US-003
+- All 232 E2E tests pass, all unit tests pass (835), build/type-check/lint/knip all green
+- Files changed: `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - The `--dev` flag is placed after the entry file in bun args (it's an app argument, not a bun runtime flag) — `Bun.argv.includes('--dev')` finds it regardless of position
+  - The `HealthResponse` interface in fixtures.ts must stay in sync with the server's /health response shape — when adding fields to /health, update both `http-routes.test.ts` and `e2e/fixtures.ts`
+  - The E2E test fixtures use `startMcpServer(configDir, hot)` where `hot` controls `--hot` but is independent of `--dev` — both `mcpServer` and `mcpServerNoHot` fixtures get dev mode
+---
+
+## 2026-02-20 - US-005
+- Replaced all `opentabs-plugin.json` references in 7 docs-v2 MDX files with the current plugin format
+- Plugin metadata: `package.json` `opentabs` field (displayName, description, urlPatterns)
+- Tool schemas: `dist/tools.json` (generated by `opentabs build`)
+- File watcher references updated: monitors `dist/tools.json` and `dist/adapter.iife.js`
+- Files changed:
+  - `docs-v2/content/docs/plugins/plugin-sdk.mdx` — Manifest type description
+  - `docs-v2/content/docs/plugins/creating-a-plugin.mdx` — build output description, file watcher reference
+  - `docs-v2/content/docs/reference/troubleshooting.mdx` — URL patterns, file watcher, build artifact verification
+  - `docs-v2/content/docs/reference/cli.mdx` — opentabs build output description
+  - `docs-v2/content/docs/reference/configuration.mdx` — plugins path requirements
+  - `docs-v2/content/docs/concepts/plugin-system.mdx` — plugin anatomy table, manifest section → metadata section, file watcher
+  - `docs-v2/content/docs/concepts/architecture.mdx` — plugin discovery, file watcher, hot reload table
+- Verified zero `opentabs-plugin.json` references remain in docs-v2/ .mdx files
+- docs-v2 build passes, root build/type-check/lint/knip/test all pass (835 tests)
+- **Learnings for future iterations:**
+  - The actual plugin format uses three files: `package.json` (opentabs field), `dist/tools.json`, and `dist/adapter.iife.js` — there is NO standalone manifest file
+  - `opentabs-plugin` references in docs that are about npm package naming conventions (e.g., `opentabs-plugin-*` packages, `opentabs-plugin` keyword) are correct and should stay
+  - The docs-v2 build requires cleaning `.next/` cache if it encounters stale webpack module errors (e.g., `Cannot find module './948.js'`)
+  - Some docs-v2 MDX files had pre-existing uncommitted changes (intro paragraph removals) — only commit files related to the current story
+---
+
+## 2026-02-20 - US-006
+- Replaced all `npmPlugins` references in 4 docs-v2 MDX files with the unified `plugins` array format
+- The `plugins` array accepts both local directory paths (starting with `./`, `../`, `/`, `~/`) and npm package names
+- Files changed:
+  - `docs-v2/content/docs/install/index.mdx` — Removed `npmPlugins` row from config table, updated `plugins` description
+  - `docs-v2/content/docs/plugins/creating-a-plugin.mdx` — Removed `npmPlugins` from config example, updated npm publishing instructions to use `plugins` array
+  - `docs-v2/content/docs/reference/configuration.mdx` — Removed `npmPlugins` table row, example, and detailed section; updated `plugins` to describe unified local+npm format
+  - `docs-v2/content/docs/concepts/plugin-system.mdx` — Rewrote Discovery section to describe unified `plugins` array instead of separate local/npm sources with allowlist
+- Verified zero `npmPlugins` references remain in docs-v2/ .mdx files
+- All quality checks pass: build, type-check, lint, knip, test (835 tests)
+- **Learnings for future iterations:**
+  - The resolver in `platform/mcp-server/src/resolver.ts` distinguishes local paths from npm names by prefix: `./`, `../`, `/`, `~/` = local; everything else = npm
+  - The `npmPlugins` config field is legacy — `config.ts` auto-migrates it into the unified `plugins` array with a deprecation log message
+  - When editing docs, be careful to only commit the files you changed — other docs may have pre-existing uncommitted changes from other stories
+---
+
+## 2026-02-20 - US-005 (Update CLAUDE.md for dev/production mode) + docs-v2 dev mode docs
+- Updated CLAUDE.md:
+  - "Starting the MCP Server" section now shows both production and dev mode commands
+  - Added `isDev()` module reference (`platform/mcp-server/src/dev-mode.ts`)
+  - Updated "Hot reload" key concept to note it's dev-mode only
+  - Updated "Reloading the Extension" section to clarify file watcher is dev-mode
+  - Updated "Development Workflow" section header to reference dev mode
+  - Updated "Plugin Changes" subsection title to "(File Watcher — Dev Mode)"
+  - Verified no `opentabs-plugin.json` or `npmPlugins` references remain
+- Also documented dev/production mode in docs-v2 (bonus, not a tracked story):
+  - `docs-v2/content/docs/reference/configuration.mdx` — Added OPENTABS_DEV env var + "Dev vs production mode" section
+  - `docs-v2/content/docs/install/index.mdx` — Updated Step 3 to show both modes
+  - `docs-v2/content/docs/reference/mcp-server.mdx` — /reload marked dev-only, /health shows `mode` field
+  - `docs-v2/content/docs/plugins/plugin-sdk.mdx` — Fixed pre-existing `</Table.cell>` → `</Table.Cell>` typo
+- Files changed: `CLAUDE.md`, `docs-v2/content/docs/reference/configuration.mdx`, `docs-v2/content/docs/install/index.mdx`, `docs-v2/content/docs/reference/mcp-server.mdx`, `docs-v2/content/docs/plugins/plugin-sdk.mdx`
+- All quality checks pass: build, type-check, lint, knip, test (835 tests)
+- **Learnings for future iterations:**
+  - The PRD may be restructured by previous iterations — always re-read the current PRD state before working
+  - The `bun run build` step runs linter hooks that can reformat MDX files — if the linter strips your additions, re-add them after the first build pass
+  - CLAUDE.md has a linter hook (prettier via lint-staged) that may add entries to the directory tree (e.g., `dev-mode.ts`) — accept those changes
+  - docs-v2 and root monorepo quality checks are independent — always run the checks specified by the PRD
+---
+
+## 2026-02-20 - US-006 (Final verification — all quality gates and E2E tests pass)
+- No code changes needed — verification-only story
+- All quality checks pass:
+  - `bun run build` — exit 0
+  - `bun run type-check` — exit 0
+  - `bun run lint` — exit 0
+  - `bun run knip` — exit 0
+  - `bun run test` — 835 tests pass
+  - `bun run test:e2e` — 232 tests pass
+- **Learnings for future iterations:**
+  - Previous iterations may commit code but fail to update the PRD `passes` field — always re-read the PRD to find the actual next story
+  - US-005 was already committed and marked `passes: true` by a prior iteration, but PRD showed it as `false` initially in this session — the file was updated between reads
+---

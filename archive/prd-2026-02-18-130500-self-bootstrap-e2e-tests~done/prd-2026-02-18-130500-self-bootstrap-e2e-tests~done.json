@@ -1,0 +1,74 @@
+{
+  "project": "OpenTabs Platform — E2E Tests for Self-Bootstrap Browser Tools",
+  "description": "Add comprehensive E2E tests for the browser tools added in the self-bootstrap PRD: network request/response body capture, browser_get_page_html, and browser_get_storage. These tools were implemented without E2E coverage and need full pipeline verification (MCP client → MCP server → WebSocket → extension → chrome API).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add E2E tests for network request and response body capture",
+      "description": "As a developer, I want E2E tests verifying that network capture includes request bodies (POST data) and response bodies so that the full pipeline for API traffic inspection is verified end-to-end.",
+      "acceptanceCriteria": [
+        "New test describe block 'Browser tools — network body capture' in browser-tools.e2e.ts",
+        "Test: captured POST requests include requestBody — enables network capture, navigates to trigger a POST /api/echo with JSON body, verifies the captured request has a non-empty requestBody field containing the sent JSON",
+        "Test: captured GET requests have no requestBody — enables capture, navigates to trigger a GET request, verifies requestBody is undefined or absent",
+        "Test: captured requests include responseBody — enables capture, navigates to trigger /api/status, verifies the captured request has a responseBody field containing valid JSON with 'ok' key",
+        "Test: responseBody is absent for non-text MIME types — if possible to trigger an image request, verify responseBody is undefined (may skip if test infrastructure doesn't serve binary resources)",
+        "Tests use the existing waitForNetworkRequests helper pattern from browser-tools.e2e.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "notes": "Follow the existing 'Browser tools — network capture lifecycle' test patterns (lines 1600-1722 in browser-tools.e2e.ts). The key pattern is:\n1. initAndListTools(mcpServer, mcpClient)\n2. openTestServerTab(mcpClient, testServer) to get a tabId\n3. browser_enable_network_capture on the tab\n4. Trigger a request — use browser_execute_script to run fetch('/api/echo', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({message:'test-body'})}) on the page\n5. waitForNetworkRequests(mcpClient, tabId) to poll until requests appear\n6. browser_get_network_requests to retrieve captured requests\n7. Find the /api/echo request and assert requestBody contains 'test-body'\n8. For responseBody: find the /api/echo request and assert responseBody contains '\"ok\":true' or parse it as JSON and check .ok\n9. Clean up: browser_disable_network_capture, browser_close_tab\n\nThe test server already has POST /api/echo that echoes back {ok: true, message: <input>}, and POST /api/status that returns {ok: true, authenticated, uptime, version}. These are perfect for testing request/response body capture.\n\nThe waitForNetworkRequests helper (line 126-156) polls browser_get_network_requests until requests appear. You may need to wait a bit longer for responseBody to be populated since it depends on Network.loadingFinished event which fires after Network.responseReceived.\n\nFor the responseBody test: the response body is captured via CDP Network.getResponseBody which is called on Network.loadingFinished. The body is stored on the CapturedRequest object. The field is 'responseBody' in the returned JSON."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E tests for browser_get_page_html",
+      "description": "As a developer, I want E2E tests verifying that browser_get_page_html returns correct HTML content so that the full pipeline for HTML extraction is verified end-to-end.",
+      "acceptanceCriteria": [
+        "New test describe block 'Browser tools — page HTML' in browser-tools.e2e.ts",
+        "Test: browser_get_page_html returns full page HTML — opens test server tab, calls the tool with just tabId, verifies result contains title, url, and html fields, html contains '<html' and '</html>', html contains '<h1>' from the test page",
+        "Test: browser_get_page_html with selector returns scoped HTML — calls with selector '#test-btn' on the /interactive page, verifies html contains 'Click me' button text but does NOT contain '<html'",
+        "Test: browser_get_page_html with non-existent selector returns error — calls with selector '#does-not-exist', verifies isError is true",
+        "Test: browser_get_page_html returns error for non-existent tab — calls with tabId 999999, verifies isError is true",
+        "'browser_get_page_html' added to BROWSER_TOOL_NAMES in helpers.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": "Follow the existing browser tool test patterns. Key patterns:\n\n1. For a basic test, use initAndListTools + openTestServerTab to get a tabId on the main test page (/), then call browser_get_page_html with {tabId}. The result should have {title: 'E2E Test App', url: <testServerUrl>, html: '<html...>...</html>'}.\n\n2. For the selector test, navigate to /interactive first using browser_navigate_tab, then call browser_get_page_html with {tabId, selector: '#test-btn'}. The returned html should be the outerHTML of the button: '<button id=\"test-btn\">Click me</button>'.\n\n3. The handler in browser-commands.ts (line 251-294) returns {title, url, html} on success, or {error: 'Element not found: <selector>'} on failure.\n\n4. For the non-existent tab test, follow the same pattern as existing error tests (e.g., 'enable network capture on non-existent tab returns error' at line 1712).\n\n5. Use openInteractivePage helper if it exists, or use openTestServerTab + browser_navigate_tab to get to /interactive.\n\nThe /interactive page (INTERACTIVE_HTML in test-server.ts) has elements like #test-btn, #test-input, #test-textarea, #test-select, #delayed-content, #status — all good targets for selector tests."
+    },
+    {
+      "id": "US-003",
+      "title": "Add E2E tests for browser_get_storage",
+      "description": "As a developer, I want E2E tests verifying that browser_get_storage reads localStorage and sessionStorage correctly so that the full pipeline for web storage inspection is verified end-to-end.",
+      "acceptanceCriteria": [
+        "New test describe block 'Browser tools — web storage' in browser-tools.e2e.ts",
+        "Test: browser_get_storage reads localStorage entries — uses browser_execute_script to set localStorage.setItem('e2e-test-key', 'e2e-test-value'), then calls browser_get_storage with {tabId, storageType: 'local'}, verifies the result contains an entry with key 'e2e-test-key' and value 'e2e-test-value'",
+        "Test: browser_get_storage reads a specific key — sets a localStorage entry via execute_script, calls browser_get_storage with {tabId, storageType: 'local', key: 'e2e-test-key'}, verifies result returns that specific key-value pair",
+        "Test: browser_get_storage reads sessionStorage — uses execute_script to set sessionStorage.setItem('e2e-session-key', 'session-value'), calls browser_get_storage with {tabId, storageType: 'session'}, verifies the entry is present",
+        "Test: browser_get_storage returns null for non-existent key — calls with key 'nonexistent-key-12345', verifies result value is null",
+        "Test: browser_get_storage returns error for non-existent tab — calls with tabId 999999, verifies isError is true",
+        "Tests clean up localStorage/sessionStorage entries via execute_script after each test",
+        "'browser_get_storage' added to BROWSER_TOOL_NAMES in helpers.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": "The pattern for storage tests:\n\n1. initAndListTools + openTestServerTab to get a tabId\n2. Use browser_execute_script to set storage: code = \"localStorage.setItem('e2e-test-key', 'e2e-test-value')\"\n3. Call browser_get_storage with {tabId, storageType: 'local'}\n4. Parse result and find the entry matching key 'e2e-test-key'\n5. Clean up with execute_script: \"localStorage.removeItem('e2e-test-key')\"\n\nThe handler in browser-commands.ts (line 296+) returns:\n- When key is specified: {key, value} where value is string or null\n- When key is omitted: {entries: [{key, value}...], count: number}\n\nValues exceeding 10000 chars are truncated. Total response capped at 500KB.\n\nFor sessionStorage: same pattern but use storageType: 'session' and sessionStorage.setItem/removeItem.\n\nFor the non-existent key test: call with {tabId, storageType: 'local', key: 'nonexistent-key-12345'} — should return {key: 'nonexistent-key-12345', value: null}.\n\nIMPORTANT: execute_script runs in world: 'MAIN' so it has access to localStorage/sessionStorage on the page's origin. This is the same-origin test server, so storage operations work."
+    }
+  ]
+}

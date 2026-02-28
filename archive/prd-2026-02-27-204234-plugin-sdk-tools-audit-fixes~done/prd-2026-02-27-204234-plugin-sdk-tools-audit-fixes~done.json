@@ -1,0 +1,105 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs found during plugin-tools and plugin-sdk code audit: onDeactivate double-invocation, history monkey-patching conflicts in multi-plugin scenarios, source map invalidation, TOCTOU race in config lock, and fetchJSON type-safety hole for 204 responses.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix onDeactivate double-invocation on plugin re-injection",
+      "description": "As a plugin developer, I want onDeactivate to fire exactly once during plugin updates so that cleanup logic does not run twice.",
+      "acceptanceCriteria": [
+        "When a plugin is re-injected (adapter update), onDeactivate is called exactly once on the old adapter",
+        "The teardown function still calls onDeactivate when invoked outside of re-injection (e.g., adapter removal)",
+        "Existing tests for lifecycle hooks pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The bug: In the generated IIFE wrapper code in platform/plugin-tools/src/commands/build.ts, on re-injection (line 719), existing.onDeactivate() is called explicitly. Then existing.teardown() is called (line ~722). But existing.teardown was previously wrapped (lines 807-821) to call origOnDeactivate as its first step. So onDeactivate fires twice: once from the explicit call, once from the teardown wrapper.\n\nFix approach: The simplest fix is to remove the explicit onDeactivate call from the re-injection path (line 719) and rely solely on the teardown wrapper calling it. The teardown() function at lines 807-821 already calls origOnDeactivate() before the rest of cleanup. Verify that teardown is always called during re-injection and that the wrapper is always in place.\n\nAlternatively, add a guard flag (e.g., let deactivateCalled = false) that prevents double invocation.\n\nThe IIFE wrapper code is generated as template strings in build.ts — search for the string 'onDeactivate' to find all relevant locations."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix history monkey-patching for multi-plugin onNavigate",
+      "description": "As a plugin developer, I want multiple plugins with onNavigate to coexist without interfering with each other's navigation listeners.",
+      "acceptanceCriteria": [
+        "history.pushState and history.replaceState are monkey-patched at most once regardless of how many plugins use onNavigate",
+        "Tearing down one plugin does not break another plugin's navigation listener",
+        "Each plugin's onNavigate callback is invoked on pushState/replaceState/popstate/hashchange",
+        "After all plugins with onNavigate are torn down, history.pushState and history.replaceState are restored to their originals",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The bug: In platform/plugin-tools/src/commands/build.ts, the generated IIFE wrapper (lines 791-800) directly replaces history.pushState and history.replaceState with wrapped versions for each plugin with onNavigate. If multiple plugins do this, each captures the previous wrapper as origPushState. Teardown restores the captured original, but if plugin B wraps plugin A's wrapper, then teardown order matters and incorrect order corrupts the chain.\n\nFix approach: Use a shared registry on globalThis.__openTabs for navigation callbacks. The first plugin that needs onNavigate checks if the shared interceptor is already installed. If not, it installs a single monkey-patch that dispatches to all registered callbacks. Each plugin registers/unregisters its callback on the shared registry. When the last callback is removed, the original methods are restored.\n\nSpecific steps:\n1. In the IIFE wrapper template, instead of directly monkey-patching history, check for globalThis.__openTabs._navigationCallbacks (a Set or Map).\n2. If it doesn't exist, create it AND install the single shared monkey-patch of pushState/replaceState.\n3. Register this plugin's checkUrl function in the shared registry.\n4. In teardown, remove this plugin's callback from the registry. If the registry is now empty, restore the original methods.\n5. The popstate and hashchange listeners should similarly use a shared approach — currently they use addEventListener which is safe for multiple listeners, but cleanup should remove only this plugin's listener.\n\nThis is architecturally significant since it changes the generated IIFE wrapper code. Use opus model."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix source map invalidation from post-esbuild append",
+      "description": "As a plugin developer, I want accurate source maps when debugging my adapter so that stack traces show correct line numbers.",
+      "acceptanceCriteria": [
+        "The sourceMappingURL comment is at the end of the generated adapter.iife.js file",
+        "The source map correctly maps all lines in the IIFE including the hashAndFreeze snippet",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The bug: In platform/plugin-tools/src/commands/build.ts (lines 1004-1007), the hashAndFreeze IIFE snippet is appended to adapter.iife.js after esbuild generates it with a source map. The source map's mappings no longer match and the sourceMappingURL comment ends up in the middle of the file.\n\nFix approach: Use esbuild's footer option to include the hashAndFreeze snippet as part of the build output. The esbuild API accepts a `footer` option: `footer: { js: hashAndFreezeCode }`. This way the source map generated by esbuild already accounts for the footer content, and the sourceMappingURL is placed after it. Check the esbuild call site (around line 849) for the build options object and add the footer there. Remove the post-build append at lines 1004-1007.\n\nAlternative: If footer doesn't work because the hashAndFreeze code needs to reference variables from the IIFE scope, another option is to strip the sourceMappingURL comment from the file, append the snippet, then re-append the sourceMappingURL comment. This doesn't fix the mapping offsets but at least makes the sourceMappingURL discoverable."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix TOCTOU race in config lock acquisition",
+      "description": "As a plugin developer running concurrent builds, I want config.json writes to be properly serialized so that no plugin registration is silently lost.",
+      "acceptanceCriteria": [
+        "Concurrent opentabs-plugin build invocations do not both acquire the lock simultaneously",
+        "Stale lock detection still works (locks older than 30 seconds are considered stale)",
+        "The lock directory contains a PID or unique identifier so freshly-acquired locks are distinguishable from stale ones",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The bug: In platform/plugin-tools/src/commands/build.ts, acquireConfigLock (lines 62-101) has a TOCTOU race. Between statSync checking the lock's age (line ~79) and rmSync removing it (line ~87), another process could have just acquired the lock. Both processes see it as stale, both remove it, both acquire.\n\nFix approach: After detecting a stale lock and removing it, use mkdirSync (which is atomic — EEXIST if the directory already exists) to re-acquire. If mkdirSync fails with EEXIST, it means another process won the race — retry the loop. Also write a file inside the lock directory (e.g., pid.txt containing process.pid) so that the staleness check can verify whether the holding process is still alive (using process.kill(pid, 0) which checks existence without sending a signal). This makes the check more robust: a lock is stale only if it's old AND the holding process is dead.\n\nKey code: acquireConfigLock function at lines 62-101 in platform/plugin-tools/src/commands/build.ts."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix fetchJSON type-safety for 204 empty responses",
+      "description": "As a plugin developer, I want TypeScript to correctly represent that fetchJSON/postJSON/putJSON/patchJSON can return undefined for 204 responses, preventing runtime TypeErrors.",
+      "acceptanceCriteria": [
+        "The no-schema overloads of fetchJSON, postJSON, putJSON, and patchJSON return Promise<T | undefined> (matching deleteJSON's existing pattern)",
+        "Existing plugin code that uses these functions compiles correctly (may require adding null checks)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The bug: In platform/plugin-sdk/src/fetch.ts, fetchJSONImpl (lines 91-117) returns undefined for 204/empty responses (lines 95-97). But the no-schema overloads of fetchJSON (lines 123-128), postJSON (lines 142-152), putJSON (lines 264-274), and patchJSON (lines 304-314) declare their return type as Promise<T>, not Promise<T | undefined>. The deleteJSON function already correctly returns Promise<T | undefined>.\n\nFix: Update the no-schema overloads of fetchJSON, postJSON, putJSON, and patchJSON to return Promise<T | undefined>, matching deleteJSON's pattern. Then check if any existing plugin code accesses properties on the return value without null-checking — if so, those call sites need to be updated. Search for usages across plugins/ directory.\n\nAlternatively, the fix could throw a ToolError on unexpected 204 for GET/POST/PUT/PATCH (since 204 is unusual for these methods), keeping the return type as Promise<T>. The choice depends on which approach is less disruptive. The overload approach (returning T | undefined) is safer and matches the existing deleteJSON pattern."
+    }
+  ]
+}

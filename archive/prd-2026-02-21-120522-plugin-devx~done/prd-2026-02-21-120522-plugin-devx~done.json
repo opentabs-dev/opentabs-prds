@@ -1,0 +1,144 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Improve plugin developer experience: source maps in IIFE, safer isReady scaffold, cross-platform dev script, interactive scaffold, inspect command, shared schema docs, side panel auto-refresh on plugin rebuild.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Generate source maps for plugin IIFE bundles",
+      "description": "As a plugin developer, I want source maps in my IIFE bundle so runtime errors in browser DevTools point to my original TypeScript source files.",
+      "acceptanceCriteria": [
+        "opentabs-plugin build generates a dist/adapter.iife.js.map file alongside the IIFE",
+        "The IIFE includes a //# sourceMappingURL=adapter.iife.js.map comment at the end (before the hash/freeze snippet)",
+        "Browser DevTools correctly maps stack traces to original .ts source files when a tool throws",
+        "The source map is a standard v3 source map",
+        "Watch mode also generates source maps on each rebuild",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/plugin-tools/src/commands/build.ts. In the bundleIIFE function, the Bun.build() call (search for 'Bun.build') needs the sourcemap option:\n\n```typescript\nconst result = await Bun.build({\n  entrypoints: [...],\n  format: 'iife',\n  sourcemap: 'external',  // ADD THIS\n  ...\n});\n```\n\nBun.build with sourcemap: 'external' produces a separate .map file. The output will have two artifacts: the IIFE JS and the source map.\n\nAfter building, the code appends the hash/freeze snippet to the IIFE. The sourceMappingURL comment should be inserted BEFORE the hash snippet, or the hash snippet should be added after the sourcemap comment. The hash is computed on the full content, so the sourcemap URL needs to be included in the hashed content.\n\nAlternatively, write the source map separately:\n1. Build with sourcemap: 'external'\n2. Extract the .map output from build artifacts\n3. Write to dist/adapter.iife.js.map\n4. The IIFE already has //# sourceMappingURL from Bun.build — leave it in place\n5. Append the hash/freeze snippet after\n\nCheck how the IIFE loading works in the extension — the extension reads the IIFE as text and injects it. Source maps with relative paths work when the browser can resolve the map URL, but for injected scripts this may not work automatically. The source map might need to be inlined (sourcemap: 'inline') instead of external for content script injection to work. Test both approaches.\n\nIf inline is needed: sourcemap: 'inline' embeds the map as a data URL in the JS file itself. This increases file size but guarantees DevTools can find it."
+    },
+    {
+      "id": "US-002",
+      "title": "Make scaffolded isReady return false by default with prominent warning",
+      "description": "As a plugin developer, I want the scaffolded isReady() to be obviously incomplete so I don't accidentally ship a plugin that reports ready when it shouldn't.",
+      "acceptanceCriteria": [
+        "The scaffolded isReady() returns false by default instead of true",
+        "A prominent comment above isReady says 'IMPORTANT: Implement this method to check if the user is authenticated'",
+        "The comment includes 2-3 example implementations (cookie check, DOM check, global variable check)",
+        "The build command produces a warning when isReady always returns false (lint-like hint)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/cli/src/scaffold.ts generatePluginIndex function (around line 268-296). Change the isReady implementation:\n\nFrom:\n```typescript\n  async isReady(): Promise<boolean> {\n    return true;\n  }\n```\n\nTo:\n```typescript\n  // IMPORTANT: Implement this check to detect when the user is authenticated.\n  // The plugin reports 'unavailable' until this returns true.\n  // Examples:\n  //   return document.cookie.includes('session=');\n  //   return document.querySelector('[data-user-id]') !== null;\n  //   return getPageGlobal('APP.currentUser') !== undefined;\n  async isReady(): Promise<boolean> {\n    return false;\n  }\n```\n\nNote: this changes the scaffold template only. Existing plugins are not affected."
+    },
+    {
+      "id": "US-003",
+      "title": "Use cross-platform dev script in scaffold",
+      "description": "As a plugin developer on Windows, I want the dev script to work without Unix-specific shell features.",
+      "acceptanceCriteria": [
+        "The scaffolded package.json dev script works on macOS, Linux, and Windows",
+        "Both tsc --watch and opentabs-plugin build --watch run concurrently",
+        "The 'concurrently' package is added to devDependencies in the scaffold template",
+        "The dev script uses concurrently instead of '&' (background process)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/cli/src/scaffold.ts generatePackageJson function (around line 65-121). Change the dev script from:\n```\n\"dev\": \"tsc --watch --preserveWatchOutput & opentabs-plugin build --watch\"\n```\nTo:\n```\n\"dev\": \"concurrently --names tsc,build --prefix-colors blue,green \\\"tsc --watch --preserveWatchOutput\\\" \\\"opentabs-plugin build --watch\\\"\"\n```\n\nAnd add 'concurrently' to devDependencies:\n```\n\"concurrently\": \"^9.1.2\"\n```\n\nThe concurrently package is a widely-used cross-platform solution for running multiple commands. It works on Windows, macOS, and Linux."
+    },
+    {
+      "id": "US-004",
+      "title": "Add interactive mode to create-opentabs-plugin",
+      "description": "As a plugin developer, I want an interactive prompt when I run create-opentabs-plugin without arguments.",
+      "acceptanceCriteria": [
+        "Running 'create-opentabs-plugin' with no arguments enters interactive mode",
+        "Interactive mode prompts for: plugin name, target domain, display name (optional), description (optional)",
+        "Each prompt has a clear label and example",
+        "After collecting inputs, scaffolding proceeds as normal",
+        "Running with all arguments (name + --domain) skips interactive mode (backward compatible)",
+        "Running with partial arguments fills in what's provided and prompts for the rest",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "This needs changes in two places:\n\n1. platform/create-plugin/src/index.ts — the standalone CLI entry point\n2. platform/cli/src/commands/plugin.ts — the 'opentabs plugin create' command\n\nFor interactive prompts, use Bun's built-in prompt() or the readline module from node:readline. Bun supports readline/promises.\n\nThe simplest approach using node:readline/promises:\n```typescript\nimport { createInterface } from 'node:readline/promises';\nconst rl = createInterface({ input: process.stdin, output: process.stdout });\nconst name = await rl.question('Plugin name (lowercase, hyphens ok): ');\nconst domain = await rl.question('Target domain (e.g., .slack.com): ');\n```\n\nIn create-plugin/src/index.ts, modify the commander setup: make the <name> argument optional. If not provided (and --domain not provided), enter interactive mode.\n\nFor plugin.ts, do the same for the 'create' subcommand."
+    },
+    {
+      "id": "US-005",
+      "title": "Add opentabs-plugin inspect command",
+      "description": "As a plugin developer, I want to inspect my built plugin manifest from the CLI for debugging.",
+      "acceptanceCriteria": [
+        "Running 'opentabs-plugin inspect' in a plugin directory pretty-prints the dist/tools.json manifest",
+        "Shows: plugin name, SDK version, tool count, resource count, prompt count",
+        "Lists each tool with name, displayName, icon, input fields, output fields",
+        "Lists each resource with URI, name, description",
+        "Lists each prompt with name, description, arguments",
+        "If dist/tools.json doesn't exist, prints a clear error: 'No manifest found. Run opentabs-plugin build first.'",
+        "Supports --json flag for raw JSON output",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Add a new command in platform/plugin-tools/src/commands/. Create platform/plugin-tools/src/commands/inspect.ts.\n\nThe command should:\n1. Read dist/tools.json from the current directory\n2. Parse and validate the JSON\n3. Pretty-print a summary: SDK version, N tools, N resources, N prompts\n4. For each tool: name (prefixed icon), displayName, description (truncated), input fields (name: type), output fields (name: type)\n5. For each resource: URI, name, mimeType\n6. For each prompt: name, description, arguments with required markers\n\nRegister the command in platform/plugin-tools/src/cli.ts alongside the existing build command.\n\nFor --json, just output the parsed tools.json with JSON.stringify(data, null, 2)."
+    },
+    {
+      "id": "US-006",
+      "title": "Document shared schema pattern for plugins",
+      "description": "As a plugin developer, I want documentation on how to share Zod schemas across multiple tools.",
+      "acceptanceCriteria": [
+        "The scaffolded README.md includes a 'Shared Schemas' section explaining the pattern",
+        "The section shows how to create a shared schema file (e.g., src/schemas/channel.ts) and import it in multiple tools",
+        "The section explains when to use shared schemas (3+ tools with the same shape)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Edit platform/cli/src/scaffold.ts generateReadme function (around line 189-266). Add a new section after 'Adding Tools':\n\n```markdown\n## Shared Schemas\n\nWhen multiple tools share the same input or output shapes, extract common Zod schemas into a shared file:\n\n```ts\n// src/schemas/channel.ts\nimport { z } from 'zod';\n\nexport const channelSchema = z.object({\n  id: z.string().describe('Channel ID'),\n  name: z.string().describe('Channel name'),\n});\n\nexport type Channel = z.infer<typeof channelSchema>;\n```\n\nThen import and reuse in tools:\n\n```ts\nimport { channelSchema } from '../schemas/channel.js';\n\nexport const listChannels = defineTool({\n  // ...\n  output: z.object({ channels: z.array(channelSchema) }),\n});\n```\n```"
+    },
+    {
+      "id": "US-007",
+      "title": "Auto-refresh side panel on plugin rebuild",
+      "description": "As a plugin developer, I want the side panel to automatically refresh when plugins are reloaded so I see the latest state without closing and reopening it.",
+      "acceptanceCriteria": [
+        "When the MCP server sends a plugins.changed notification via WebSocket, the side panel re-fetches plugin data",
+        "The re-fetch happens automatically without user interaction",
+        "Tool toggles, tab states, and plugin list update in real-time after a plugin rebuild triggers POST /reload",
+        "No visible flicker or jarring UI transitions during the refresh",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Check the current side panel behavior. In platform/browser-extension/src/side-panel/App.tsx, there should be a handler for 'plugins.changed' notifications. If the side panel already handles plugins.changed (debounced loadPlugins), the issue might be that the notification isn't being sent after POST /reload, or the WebSocket path for this notification is broken.\n\nCheck:\n1. Does the MCP server send plugins.changed after POST /reload? Look in platform/mcp-server/src/reload.ts or extension-protocol.ts.\n2. Does the extension relay plugins.changed to the side panel? Look in the background script message handling.\n3. Does the side panel App.tsx handle plugins.changed? It likely does (look for loadPlugins calls on notification).\n\nIf the notification path exists but is unreliable, the fix might be in timing (debounce) or in ensuring sync.full is sent after rediscovery completes."
+    }
+  ]
+}

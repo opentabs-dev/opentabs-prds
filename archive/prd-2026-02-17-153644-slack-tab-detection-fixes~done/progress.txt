@@ -1,0 +1,40 @@
+# Ralph Progress Log
+PRD: prd-2026-02-17-153644-slack-tab-detection-fixes~running.json
+Started: Tue Feb 17 15:57:21 PST 2026
+---
+
+## Codebase Patterns
+- Plugin auth extraction runs in the content script (injected IIFE) context, so `document`, `localStorage`, and `window` are all available as same-origin page APIs
+- The `getAuth()` function chains multiple extraction methods via `??` (nullish coalescing) — add new methods to the end of the chain
+- Plugin builds (`cd plugins/slack && bun run build`) run `tsc` then `opentabs build` which bundles `dist/adapter.iife.js` — the MCP server file watcher picks up changes automatically
+- Plugins are standalone projects: their code is NOT covered by root `bun run lint`/`bun run type-check`; use plugin-local commands to verify
+- All extraction methods must be wrapped in try/catch returning null on failure — the adapter runs in arbitrary page contexts
+- Side panel `setPlugins` updater runs synchronously inside React's batch — if `prev` is `[]`, mapping over it is a no-op and notifications are silently lost; buffer early notifications in a ref and replay after fetchConfigState resolves
+
+---
+
+## 2026-02-17 — US-001
+- Added `getAuthFromPageScripts()`: scans inline `<script>` tags for embedded JSON containing `api_token` with xoxc- token values, plus `team_id` and `team_url`
+- Added `getAuthFromLocalStorageScan()`: enumerates all localStorage keys (skipping already-handled `localConfig_v2`/`v3`) looking for any containing xoxc- tokens
+- Added `extractAuthFromObject()`: helper that recursively searches parsed JSON objects for `api_token` or `token` fields starting with `xoxc-`
+- Chained new methods into `getAuth()`: localStorage → boot_data → page scripts → full localStorage scan
+- Files changed: `plugins/slack/src/slack-api.ts`, `plugins/slack/opentabs-plugin.json` (rebuilt)
+- **Learnings for future iterations:**
+  - The modern app.slack.com client no longer populates `window.boot_data` — the SSR HTML embeds config in inline script tags instead
+  - Slack session tokens always start with `xoxc-` prefix, team IDs start with `T` followed by uppercase alphanumeric
+  - `extractAuthFromObject` recurses into nested objects but skips arrays to avoid expensive traversal of large structures
+  - The `opentabs-plugin.json` manifest is regenerated on every `bun run build` — it must be committed alongside source changes
+---
+
+## 2026-02-17 — US-002
+- Fixed race condition where `tab.stateChanged` notifications arriving before `fetchConfigState` resolves were silently lost (the `setPlugins(prev => prev.map(...))` was a no-op when `prev` was `[]`)
+- Added `pendingTabStates` ref (`Map<string, TabState>`) to buffer early tab state notifications
+- In `handleNotification`, when plugins array is empty, buffer the notification instead of applying it
+- In `loadPlugins`, after `fetchConfigState` resolves, replay any buffered states on top of the fetched plugin list before calling `setPlugins`
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - React's `setPlugins(prev => prev.map(...))` is a no-op when `prev` is `[]` — always consider the empty-array case when using functional state updates
+  - The side panel receives notifications via Chrome `runtime.onMessage` which fire independently of React's render cycle — async fetch + sync notification = classic race condition
+  - The `pendingTabStates` buffer pattern: store early data in a ref, replay after the async initialization completes, then clear the buffer
+  - Side panel changes require manual extension reload from `chrome://extensions/` + closing and reopening the side panel
+---

@@ -1,0 +1,96 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource leaks, and missing guards in the MCP server package",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix adapter file cleanup prefix collision in writeAdapterFile",
+      "description": "As a platform maintainer, I want adapter file cleanup to correctly scope to only the target plugin's files so that updating one plugin doesn't delete adapter files for plugins whose names share a prefix",
+      "acceptanceCriteria": [
+        "writeAdapterFile cleanup filter matches only files for the exact plugin name, not plugins whose names start with the same prefix (e.g., updating plugin 'foo' must not delete files for 'foo-bar')",
+        "The filter uses a regex or exact name match that accounts for the content hash suffix format ({pluginName}-{8hexchars}.js)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/adapter-files.ts line 66-67, `f.startsWith(`${pluginName}-`)` matches files for other plugins whose names share a common prefix. For example, if pluginName='foo', it matches 'foo-bar-a1b2c3d4.js' (which belongs to plugin 'foo-bar'). Fix by matching `{pluginName}-{exactly 8 hex chars}.js` pattern, e.g., using a regex like `new RegExp(`^${escapeRegex(pluginName)}-[0-9a-f]{8}\\.js`)`. Apply the same fix to the `.js.map` variant. Also note the related issue in cleanupStaleAdapterFiles (line 102): the stripHash regex `/-[0-9a-f]{8}$/` could strip part of a plugin name that ends in 8 hex chars. Consider making stripHash aware of the known plugin names set for more robust matching."
+    },
+    {
+      "id": "US-002",
+      "title": "Prune stale log buffers for removed plugins during reload",
+      "description": "As a platform maintainer, I want log buffers for removed plugins to be cleaned up during reload so that memory is not leaked over time",
+      "acceptanceCriteria": [
+        "pruneStaleState in reload.ts removes log buffer entries for plugins no longer in the registry",
+        "Log buffers for active plugins are preserved across reloads",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/reload.ts, the pruneStaleState function (line 64) prunes tabMapping, activeDispatches, toolConfig, and outdatedPlugins — but never touches the log buffer map stored on globalThis. The log buffer map is accessible via getBufferedPlugins() and a new pruneLogs(pluginNames) function should be added to platform/mcp-server/src/log-buffer.ts. Then call it from pruneStaleState with the current registry's plugin names. The log buffer module already exports getBufferedPlugins() (line 95). Add a new export like `pruneStaleBuffers(activePlugins: Set<string>)` that deletes entries from the globalThis map for plugins not in the set."
+    },
+    {
+      "id": "US-003",
+      "title": "Reject pending confirmations on shutdown",
+      "description": "As a platform maintainer, I want the shutdown handler to reject pending confirmations so that cleanup is consistent with WebSocket disconnect behavior",
+      "acceptanceCriteria": [
+        "installShutdownHandlers rejects all pending confirmations (clearing their timeout timers) before exiting",
+        "The shutdown handler's confirmation cleanup mirrors the logic in createHandleWsClose for consistency",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/shutdown.ts, the shutdown function (line 36) rejects pending dispatches but not pending confirmations. Compare with the WS disconnect handler in platform/mcp-server/src/http-routes.ts (createHandleWsClose around line 589) which calls rejectAllPendingConfirmations(state). Import and call rejectAllPendingConfirmations from platform/mcp-server/src/extension-handlers.ts in the shutdown handler, between the pending dispatches cleanup (step 1) and the sweep timer cleanup (step 2). The rejectAllPendingConfirmations function clears timeout timers and rejects promise resolvers for each pending confirmation."
+    },
+    {
+      "id": "US-004",
+      "title": "Set maxPayload on Node.js WebSocketServer to match Bun's 10MB limit",
+      "description": "As a platform maintainer, I want the Node.js WebSocket server to enforce the same 10MB message size limit as the Bun server so that oversized messages are rejected at the transport level",
+      "acceptanceCriteria": [
+        "The WebSocketServer in server-node.ts is created with maxPayload: 10 * 1024 * 1024",
+        "This matches the Bun server's maxPayloadLength of 10MB (set in index.ts)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/server-node.ts line 230, `new WebSocketServer({ noServer: true })` does not set maxPayload. The ws package defaults to 100MB. Add `maxPayload: 10 * 1024 * 1024` to the options object. The constant MAX_MESSAGE_SIZE is defined in platform/mcp-server/src/extension-protocol.ts — consider importing it or defining a shared constant. The Bun server equivalent is in platform/mcp-server/src/index.ts around line 220 with maxPayloadLength."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix npmTrustTier to check package name instead of filesystem path",
+      "description": "As a platform maintainer, I want trust tier classification to be based on the npm package name so that community plugins cannot be misclassified as official based on their installation path",
+      "acceptanceCriteria": [
+        "npmTrustTier determines trust tier based on the package's scope (extracted from the directory name or passed as a parameter) rather than doing a string include on the full path",
+        "A community plugin installed under a path containing /@opentabs-dev/ is correctly classified as 'community'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "In platform/mcp-server/src/discovery.ts line 26-28, `npmTrustTier` uses `dir.includes('/${OFFICIAL_SCOPE}/')` which matches anywhere in the path. Fix by extracting the package scope from the directory basename. The dir is a path like '/usr/local/lib/node_modules/@opentabs-dev/opentabs-plugin-slack' — the package scope is in the last two path segments. Use path.basename(path.dirname(dir)) to get the scope directory, or check if the dir's last two segments match the expected pattern. A simpler fix: use `path.basename(path.dirname(dir)) === OFFICIAL_SCOPE` for scoped packages, and return 'community' for unscoped packages."
+    }
+  ]
+}

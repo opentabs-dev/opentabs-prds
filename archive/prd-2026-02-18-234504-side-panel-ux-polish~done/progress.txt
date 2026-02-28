@@ -1,0 +1,103 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-234504-side-panel-ux-polish~running.json
+Started: Thu Feb 19 00:20:52 PST 2026
+---
+
+## Codebase Patterns
+- Side panel components live in `platform/browser-extension/src/side-panel/components/`
+- RetroUI design system components are in `components/retro/` (Accordion, Alert, Badge, Button, Empty, Input, Loader, Switch, Text, Tooltip)
+- The Input component has `py-2` vertical padding — absolute-positioned icons must be inside a `relative` container that matches the input dimensions (no extra padding)
+- When absolute-positioning icons inside inputs, use a wrapper structure: outer div for spacing (`px-3 pt-2`), inner `relative` div for positioning context
+- PluginIcon SVG `fill` attribute is on the `<svg>` element, not `<path>` — E2E tests should use `.bg-muted svg` locator with `toHaveAttribute('fill', ...)` to check icon state
+- Badge component is still used by Header.tsx (connection status) even after removing it from PluginCard
+- AccordionContent default padding is `px-4 pt-2 pb-4` — override via className prop (twMerge resolves conflicts) rather than modifying the retro/ component source
+- AccordionContent uses `bg-card text-card-foreground` (intentional deviation from RetroUI's `bg-white text-gray-700`) for dark mode support — this is the ONLY deviation from RetroUI source across all retro/ components
+
+## 2026-02-19 00:30 - US-001
+- Separated the outer spacing wrapper (`px-3 pt-2`) from the input's relative positioning container in App.tsx
+- Removed `translate-y-[4px]` hack from both Search icon and X clear button
+- Changed icon positions from `left-5`/`right-5` to `left-2`/`right-2` (relative to the input container now, not the padded wrapper)
+- Icons now use standard `top-1/2 -translate-y-1/2` centering without pixel overrides
+- Fixed flaky E2E test `get_network_requests with clear=true empties the buffer` — race condition where in-flight sub-resource requests could arrive between clear and the empty-buffer assertion; now polls with `clear=true` until buffer drains
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`, `e2e/browser-tools.e2e.ts`
+- **Learnings for future iterations:**
+  - The search input's `relative` container must not include outer spacing (padding/margin) — absolute-positioned icons use the container's full height for centering
+  - Network capture E2E tests are inherently racy because Chrome DevTools Protocol events can arrive asynchronously; always poll for expected state rather than asserting immediately
+---
+
+## 2026-02-19 08:36 - US-002
+- Redesigned PluginIcon with a `ready: boolean` prop for dual-state SVG rendering
+- Replaced the old cross/rect icon with a recognizable puzzle-piece SVG path
+- Ready state: `fill='currentColor'` + `text-foreground` (bold, filled puzzle piece)
+- Not-ready state: `fill='none'` + `text-muted-foreground` (outlined, muted puzzle piece)
+- Container retains `border-2 border-border bg-muted` for both states
+- Updated PluginCard.tsx to pass `ready={plugin.tabState === 'ready'}` to PluginIcon
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginIcon.tsx`, `platform/browser-extension/src/side-panel/components/PluginCard.tsx`
+- **Learnings for future iterations:**
+  - PluginIcon now requires `ready: boolean` — any new consumer must pass this prop
+  - The puzzle-piece SVG path uses a single `<path>` element; fill/stroke toggling is sufficient for state indication without needing multiple SVG elements
+---
+
+## 2026-02-19 08:55 - US-003
+- Removed all three Badge components (version, tab state, trust tier) from PluginCard header
+- Wrapped PluginIcon in a Tooltip showing `v{version} · {trustTier}` on hover
+- Simplified header layout to: [icon-with-tooltip] [name] [chevron] [switch]
+- Removed `tabStateBadgeVariant` and `trustBadgeVariant` helper functions
+- Removed unused `Badge` import, `TrustTier` type import, and `trustLabel` variable
+- Updated E2E tests in `side-panel-plugin-toggle.e2e.ts` and `side-panel-data-flow.e2e.ts`:
+  - Replaced `getByText('closed')`, `getByText('ready')`, `getByText('unavailable')` assertions with SVG fill attribute checks
+  - Replaced `getByText('v${version}')` assertion (version now only in tooltip)
+  - Removed `readPluginVersion` helper function from toggle test
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginCard.tsx`, `e2e/side-panel-plugin-toggle.e2e.ts`, `e2e/side-panel-data-flow.e2e.ts`
+- **Learnings for future iterations:**
+  - When removing visible UI elements, always grep E2E tests for `getByText` assertions that match the removed text — badge text removals cascade to test failures
+  - The PluginIcon SVG `fill` attribute is on the `<svg>` element, not the `<path>` — use `locator('.bg-muted svg')` not `locator('svg path[fill="..."]')` in Playwright
+  - Tooltip.Provider can be per-component without performance issues at this scale — no need to hoist to PluginList unless there are many tooltips per render
+---
+
+## 2026-02-19 09:00 - US-004
+- Changed ToolRow to show tool description as primary text instead of tool name
+- Tool name is now accessible via Tooltip on hover over the description
+- Simplified layout from two lines (name + description) to one line (description only)
+- Updated E2E tests in `side-panel-plugin-toggle.e2e.ts` and `side-panel-data-flow.e2e.ts`:
+  - Replaced `getByText('echo', { exact: true })` with `getByText('Echo a message back')` since tool names are no longer visible text
+- Files changed: `platform/browser-extension/src/side-panel/components/ToolRow.tsx`, `e2e/side-panel-plugin-toggle.e2e.ts`, `e2e/side-panel-data-flow.e2e.ts`
+- **Learnings for future iterations:**
+  - When changing what text is visible vs hidden (tooltip), always update E2E `getByText` assertions to match the new visible text
+  - Tool descriptions from the e2e-test plugin start with "Echo a message back", "Greet someone", etc. — use these for E2E assertions instead of tool names
+---
+
+## 2026-02-19 09:05 - US-005
+- Fixed switch column alignment by overriding AccordionContent's default `px-4` padding with `className="px-0"` in PluginCard
+- The root cause: AccordionContent added 16px horizontal padding, then ToolRow added its own 12px (`px-3`), placing tool switches at 28px from the card edge; header switches were at 12px
+- With `px-0` on AccordionContent, ToolRow's `px-3` now matches the header switch wrapper's `px-3` — both at 12px from the card edge
+- Added `px-3` to the filter count text div (inside AccordionContent) to compensate for the removed content padding
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginCard.tsx`
+- **Learnings for future iterations:**
+  - AccordionContent from RetroUI has `px-4 pt-2 pb-4` by default; the `cn()` utility (twMerge) allows overriding with className prop
+  - When aligning items across nested containers, calculate the total padding from the card edge for each item — AccordionContent padding stacks with ToolRow padding
+  - Prefer overriding via className prop over modifying retro/ component defaults — keeps the component matching RetroUI source
+---
+
+## 2026-02-19 09:15 - US-006
+- Fixed AccordionContent dark mode colors: replaced hardcoded `bg-white text-gray-700` with theme-aware `bg-card text-card-foreground`
+- This is the ONE intentional deviation from RetroUI source — justified because RetroUI uses hardcoded light-mode colors and the side panel needs dark mode support
+- Conducted full audit of all 10 retro/ component files against `~/Downloads/RetroUI-main/components/retroui/` source:
+  - Accordion.tsx: class strings match source (except the intentional bg-card deviation)
+  - Badge.tsx: class strings match source
+  - Button.tsx: class strings match source
+  - Input.tsx: class strings match source
+  - Switch.tsx: class strings match source
+  - Text.tsx: class strings match source
+  - Tooltip.tsx: class strings match source
+  - Alert.tsx: class strings match source
+  - Empty.tsx: class strings match source
+  - Loader.tsx: class strings match source
+- Verified lib/utils.ts uses the same logic as RetroUI source (clsx + twMerge)
+- All differences between our files and RetroUI source are cosmetic only: import paths (`../../lib/utils` vs `@/lib/utils`), `"use client"` directives removed, `React.ElementRef` → `React.ComponentRef`, function declarations → arrow expressions, type-only imports
+- Files changed: `platform/browser-extension/src/side-panel/components/retro/Accordion.tsx`
+- **Learnings for future iterations:**
+  - The only intentional deviation from RetroUI source is AccordionContent's `bg-card text-card-foreground` (instead of `bg-white text-gray-700`) for dark mode support
+  - All other retro/ components have class strings identical to RetroUI source — maintain this invariant when updating components
+  - Prettier auto-sorts Tailwind classes, so class order may differ from RetroUI source without being a functional deviation
+---

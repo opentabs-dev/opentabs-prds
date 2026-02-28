@@ -1,0 +1,83 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Publish the browser extension as a private npm package and bundle it as a CLI dependency so that `opentabs start` can auto-install the extension for users who install the CLI from npm",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Prepare browser extension package.json for npm publishing",
+      "description": "As a platform maintainer, I want the browser extension package.json to be publishable to npm, so that it can be consumed as a dependency by the CLI",
+      "acceptanceCriteria": [
+        "platform/browser-extension/package.json has a `files` field that includes only the runtime files needed by Chrome: `manifest.json`, `dist/`, `side-panel/`, `offscreen/`, `icons/`",
+        "platform/browser-extension/package.json does NOT have `\"private\": true`",
+        "platform/browser-extension/package.json version matches other platform packages (will be bumped by publish.ts)",
+        "The `exports` field is updated if needed (currently only exports `./package.json` which is fine for resolution)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/package.json\n\nCurrently the package has no `files` field, no `publishConfig`, and version is `0.0.1` while other packages are at `0.0.32`. The version will be bumped by publish.ts, so just ensure it's a valid semver.\n\nAdd a `files` field to control what goes in the npm tarball. Only include the files needed by Chrome to load the extension:\n```json\n\"files\": [\n  \"manifest.json\",\n  \"dist/\",\n  \"side-panel/\",\n  \"offscreen/\",\n  \"icons/\"\n]\n```\n\nThis excludes `src/`, `node_modules/`, `build-*.ts`, `tsconfig*`, `.storybook/`, `storybook-static/`, `CLAUDE.md`, and other dev-only files from the published tarball. The `files` field is the npm-standard way to do this (equivalent to `.npmignore` but more explicit).\n\nDo NOT add `\"private\": true` — it must be publishable. Do NOT change the access level (it will be published as restricted/private via `bun publish --access restricted` in publish.ts)."
+    },
+    {
+      "id": "US-002",
+      "title": "Add browser extension to CLI dependencies and publish pipeline",
+      "description": "As a platform maintainer, I want the browser extension published alongside other platform packages and listed as a CLI dependency, so that `import.meta.resolve('@opentabs-dev/browser-extension/package.json')` resolves when the CLI is installed from npm",
+      "acceptanceCriteria": [
+        "platform/cli/package.json lists `@opentabs-dev/browser-extension` as a `workspace:*` dependency",
+        "scripts/publish.ts includes `platform/browser-extension` in the PACKAGES array, positioned BEFORE `platform/cli` in dependency order (since CLI depends on it)",
+        "The publish order is: shared → browser-extension → mcp-server → plugin-sdk → plugin-tools → cli → create-plugin",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "Two files to edit:\n\n1. platform/cli/package.json — add `\"@opentabs-dev/browser-extension\": \"workspace:*\"` to the `dependencies` object (lines 26-33). This ensures npm installs the extension alongside the CLI.\n\n2. scripts/publish.ts — add `'platform/browser-extension'` to the PACKAGES array (lines 77-84). It must come BEFORE `'platform/cli'` since the CLI depends on it. A good position is after `'platform/shared'` since the extension depends on shared. The updated order:\n```typescript\nconst PACKAGES = [\n  'platform/shared',\n  'platform/browser-extension',\n  'platform/mcp-server',\n  'platform/plugin-sdk',\n  'platform/plugin-tools',\n  'platform/cli',\n  'platform/create-plugin',\n] as const;\n```\n\nAfter adding the dependency, run `bun install` to update the lockfile."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix setup.ts error message for missing extension",
+      "description": "As a user installing the CLI from npm, I want the error message when the extension source is missing to give me actionable guidance, not tell me to run `npm run build from the project root`",
+      "acceptanceCriteria": [
+        "The error message in setup.ts line 55 no longer says 'Run npm run build from the project root first'",
+        "The error message is actionable for an npm-installed user (e.g., suggests reinstalling the CLI or checking the installation)",
+        "The setup logic in resolveExtensionDir() still tries import.meta.resolve first, then falls back to monorepo-relative path",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/cli/src/commands/setup.ts\n\nLine 55: `throw new Error(\\`Browser extension not found at ${extensionSrc}. Run npm run build from the project root first.\\`);`\n\nThis message makes sense for monorepo contributors but is confusing for npm users. With the extension now bundled as a dependency (US-002), this error should only occur if the npm install is corrupted.\n\nChange to something like:\n```typescript\nthrow new Error(`Browser extension not found at ${extensionSrc}. Try reinstalling: npm install -g @opentabs-dev/cli`);\n```\n\nAlso check the warning message in start.ts (around line 89-93) where the error is caught and displayed — it currently says:\n```\nWarning: Could not install extension: <error.message>\nRestart opentabs start to retry extension installation.\n```\nThis is fine as-is since it just passes through the error message."
+    },
+    {
+      "id": "US-004",
+      "title": "Update CLAUDE.md documentation for extension publishing",
+      "description": "As a platform contributor, I want the documentation to reflect that the browser extension is now published to npm and bundled with the CLI",
+      "acceptanceCriteria": [
+        "The root CLAUDE.md publish order section mentions browser-extension in the correct position",
+        "The CLI CLAUDE.md mentions browser-extension as a dependency",
+        "The Architecture section or relevant docs note that the extension is distributed via npm as part of the CLI package",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "notes": "Files to update:\n\n1. platform/cli/CLAUDE.md — in the 'Publishing Platform Packages' section, update the package list and publish order to include `@opentabs-dev/browser-extension`. Current text says:\n   'shared → mcp-server → plugin-sdk → plugin-tools → cli → create-plugin'\n   Change to:\n   'shared → browser-extension → mcp-server → plugin-sdk → plugin-tools → cli → create-plugin'\n\n2. Root CLAUDE.md — if the publish order or architecture description mentions the package list, update it there too. Search for 'publish' references.\n\nKeep changes minimal and factual — just update the publish order and note the dependency relationship. Do NOT enumerate individual plugins or add excessive detail per CLAUDE.md guidelines."
+    }
+  ]
+}

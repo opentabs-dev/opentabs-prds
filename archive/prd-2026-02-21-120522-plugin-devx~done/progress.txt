@@ -1,0 +1,118 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-120522-plugin-devx~running.json
+Started: Sat Feb 21 14:17:49 PST 2026
+---
+
+## Codebase Patterns
+- Source maps flow through the full pipeline: build (dist/) → loader → RegisteredPlugin → extension-protocol → adapters dir
+- When writing adapters to the extension directory, the sourceMappingURL is rewritten from `adapter.iife.js.map` to `{pluginName}.js.map` to avoid multi-plugin filename collisions
+- The `writeAdapterFile` function in extension-protocol.ts handles atomic writes (tmp → rename) for both adapter JS and source map files
+- File watcher callbacks (FileWatcherCallbacks) propagate optional data alongside required data — use optional parameters for backward compatibility
+- The hash/freeze snippet is appended AFTER the sourceMappingURL comment — Chrome DevTools still finds it by scanning the full file
+- The scaffold logic in `platform/cli/src/scaffold.ts` is shared by both `opentabs plugin create` and `create-opentabs-plugin` — shared helpers go here
+- Interactive CLI features need `process.stdin.isTTY` guard to prevent hanging in tests and piped environments
+- The `plugins.changed` notification is synthesized by the extension background script (message-router.ts) — NOT sent by the MCP server. It's generated after handleSyncFull completes processing sync.full
+- Side panel notification pipeline: MCP server sendSyncFull → offscreen broadcasts ws:message → background handleSyncFull → forwardToSidePanel plugins.changed → side panel loadPlugins
+- POST /reload and config watcher both use performConfigReload → reloadCore → sendSyncFull — they share the identical notification path
+
+## 2026-02-21 - US-001
+- Implemented source map generation for plugin IIFE bundles
+- Files changed:
+  - `platform/plugin-tools/src/commands/build.ts` — added `sourcemap: 'external'` to Bun.build(), added source map size logging
+  - `platform/mcp-server/src/state.ts` — added `iifeSourceMap?: string` to RegisteredPlugin
+  - `platform/mcp-server/src/loader.ts` — added `iifeSourceMap` to LoadedPlugin, reads dist/adapter.iife.js.map if present
+  - `platform/mcp-server/src/extension-protocol.ts` — writeAdapterFile writes per-plugin source maps with rewritten URL, cleanupStaleAdapterFiles handles .map files
+  - `platform/mcp-server/src/file-watcher.ts` — handleIifeChange and handleToolsJsonChange read source maps alongside IIFE
+  - `platform/mcp-server/src/reload.ts` — onIifeChanged and onManifestChanged pass source maps through
+- **Learnings for future iterations:**
+  - Bun.build with `sourcemap: 'external'` auto-appends `//# sourceMappingURL=<name>.map` to the output JS
+  - Chrome extension file-based injection (`chrome.scripting.executeScript({ files: [...] })`) resolves source maps relative to the extension root, so maps must be in the adapters directory
+  - The hash/freeze snippet appended after sourceMappingURL doesn't break Chrome DevTools source map detection
+  - When adding optional fields to RegisteredPlugin, also update LoadedPlugin in loader.ts (they share the same structure via duck typing)
+---
+
+## 2026-02-21 - US-002
+- Made scaffolded isReady() return false by default with prominent IMPORTANT comment and 3 example implementations
+- Added build-time warning in `opentabs-plugin build` when isReady() returns false
+- Files changed:
+  - `platform/cli/src/scaffold.ts` — updated generatePluginIndex to return false with prominent comment and examples (cookie, DOM, getPageGlobal)
+  - `platform/plugin-tools/src/commands/build.ts` — added isReady() check after validation that warns when it returns false
+  - `platform/plugin-tools/src/commands/build-e2e.test.ts` — updated test to tolerate isReady() warning on stderr
+- **Learnings for future iterations:**
+  - `console.warn` output goes to stderr in Bun, which can break E2E tests that assert `stderr === ''`
+  - The e2e-test plugin's isReady() calls fetch which works in Bun but fails (caught) without a running test server, so it returns false at build time — any build-time isReady() check must handle this gracefully
+  - Plugin isReady() implementations that use browser-only APIs will throw at build time — wrapping the check in try/catch handles this case
+---
+
+## 2026-02-21 - US-003
+- Replaced Unix-only `&` background process in scaffolded dev script with `concurrently` for cross-platform support
+- Added `concurrently: ^9.1.2` to scaffolded devDependencies
+- Files changed:
+  - `platform/cli/src/scaffold.ts` — updated dev script and devDependencies in generatePackageJson
+- **Learnings for future iterations:**
+  - The scaffold logic in `platform/cli/src/scaffold.ts` is shared by both `opentabs plugin create` and `create-opentabs-plugin` (the latter imports via `@opentabs-dev/cli/scaffold`)
+  - Changes to scaffold.ts affect both CLI entry points without needing separate modifications
+  - The concurrently package uses `--names` for labeling and `--prefix-colors` for coloring concurrent process outputs
+---
+
+## 2026-02-21 - US-004
+- Added interactive mode to `create-opentabs-plugin` and `opentabs plugin create`
+- When name or --domain are omitted, prompts interactively; in non-interactive environments (piped stdin), throws a clear error
+- Both entry points share the same `promptForMissingArgs` helper from scaffold.ts
+- Files changed:
+  - `platform/cli/src/scaffold.ts` — added `promptForMissingArgs` function using `node:readline/promises`, exported it and the `PartialScaffoldArgs` type
+  - `platform/create-plugin/src/index.ts` — made `<name>` argument optional, `--domain` non-required, calls `promptForMissingArgs` for missing values
+  - `platform/cli/src/commands/plugin.ts` — same changes for `opentabs plugin create` subcommand
+  - `platform/create-plugin/src/index.test.ts` — updated test name for missing `--domain` in non-interactive mode
+- **Learnings for future iterations:**
+  - When adding interactive prompts via `readline`, stdin must be a TTY. Tests using `Bun.spawnSync` pipe stdin, so it's not a TTY — `process.stdin.isTTY` check prevents hanging
+  - Commander `requiredOption` becomes `option` when switching to interactive mode; commander's error handling is bypassed in favor of the shared prompt helper
+  - The `node:readline/promises` import must come after `node:path` to satisfy the `import-x/order` ESLint rule (node: imports sorted alphabetically by module name)
+---
+
+## 2026-02-21 - US-005
+- Added `opentabs-plugin inspect` command that pretty-prints the built plugin manifest
+- Reads `dist/tools.json` and `package.json` from the current directory
+- Shows: plugin name, version, SDK version, tool/resource/prompt counts
+- Lists each tool with icon, name, displayName, description (truncated to 80 chars), input fields (name: type), output fields (name: type)
+- Lists each resource with URI, name, description, MIME type
+- Lists each prompt with name, description, arguments (with required markers)
+- Clear error when `dist/tools.json` is missing: "No manifest found. Run opentabs-plugin build first."
+- Supports `--json` flag for raw JSON output
+- Files changed:
+  - `platform/plugin-tools/src/commands/inspect.ts` — new file implementing the inspect command
+  - `platform/plugin-tools/src/commands/index.ts` — added `registerInspectCommand` export
+  - `platform/plugin-tools/src/cli.ts` — imported and registered the inspect command
+- **Learnings for future iterations:**
+  - The `ManifestTool.icon` field is always a non-empty string (validated by build), so no fallback needed — using `??` triggers `@typescript-eslint/no-unnecessary-condition`
+  - JSON Schema input/output schemas have `properties` and `required` fields; extracting field names/types is straightforward via `Object.entries(properties)` + `required` set check
+  - The `PluginManifestOutput` in build.ts writes `{ sdkVersion, tools, resources, prompts }` — plugin name/version come from `package.json`, not `tools.json`
+  - The `parsePluginPackageJson` from `@opentabs-dev/shared` is the standard way to read and validate a plugin's `package.json`
+---
+
+## 2026-02-21 - US-006
+- Added "Shared Schemas" section to the scaffolded README template in `generateReadme`
+- The section explains when to use shared schemas (3+ tools with the same shape), shows how to create a shared schema file, and demonstrates importing it in tools
+- Files changed:
+  - `platform/cli/src/scaffold.ts` — added Shared Schemas section to `generateReadme` function after the Adding Tools section
+- **Learnings for future iterations:**
+  - The `generateReadme` function returns a template literal string — adding new sections is a straightforward string append before the closing backtick
+  - Markdown code blocks inside template literals need escaped backticks (`\`\`\``) — easy to miss
+  - The scaffold README serves as living documentation for plugin developers; it's a good place for patterns and conventions
+---
+
+## 2026-02-21 - US-007
+- Verified the side panel auto-refresh notification pipeline is already fully implemented
+- The complete notification chain: POST /reload → performConfigReload → reloadCore → sendSyncFull → extension handleSyncFull → synthetic plugins.changed → side panel loadPlugins → config.getState → MCP server responds → side panel re-renders
+- Updated the E2E test doc comment to document that POST /reload uses the same pipeline as the config watcher
+- Files changed:
+  - `e2e/side-panel-live-update.e2e.ts` — updated doc comment to note POST /reload coverage
+- **Learnings for future iterations:**
+  - The `plugins.changed` notification is NOT sent by the MCP server over WebSocket — it is SYNTHESIZED by the extension background script after processing `sync.full` (in handleSyncFull at message-router.ts:342-345)
+  - Both the config watcher path and POST /reload path go through the identical `performConfigReload → reloadCore → sendSyncFull` pipeline
+  - The side panel has TWO notification paths: (1) ws:message with sync.full (broadcast by offscreen to all extension contexts) and (2) sp:serverMessage with plugins.changed (forwarded by background after handleSyncFull completes)
+  - `loadPlugins()` in App.tsx has a 200ms debounce (`lastFetchRef.current`) to prevent rapid re-fetches
+  - When writing test configs in E2E tests, always preserve the `secret` field — loadConfig auto-generates a new secret if missing, invalidating Bearer tokens
+  - Chrome extension `chrome.runtime.sendMessage` from the offscreen document is NOT guaranteed to reach all extension pages reliably — there are timing-dependent delivery failures in the E2E environment
+  - E2E tests that combine config.json writes with POST /reload are inherently flaky due to the config watcher and POST /reload racing — both trigger performConfigReload and sendSyncFull, and concurrent handleSyncFull calls can interfere with each other
+---

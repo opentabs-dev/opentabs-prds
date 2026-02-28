@@ -1,0 +1,85 @@
+# Ralph Progress Log
+PRD: prd-2026-02-19-001018-platform-quality-fixes~running.json
+Started: Thu Feb 19 02:01:09 PST 2026
+---
+
+## Codebase Patterns
+- Platform packages are in `platform/`, plugins in `plugins/`
+- `getNextRequestId()` in `state.ts` generates JSON-RPC IDs via `crypto.randomUUID()` — used by extension-protocol.ts, http-routes.ts, and browser-tools/reload-extension.ts
+- The hot-reload patching loop in `index.ts` iterates `createState()` defaults and patches missing keys — only top-level keys, no structural changes
+- `STATE_SCHEMA_VERSION` only needs bumping when changing the **type** of an existing field, not when removing an optional field
+- `import-x/exports-last` ESLint rule requires that once exports start in a file, all remaining declarations must be exports — non-exported helpers must be placed BEFORE the first `export const`
+- `document.execCommand` triggers `@typescript-eslint/no-deprecated` — use Selection/Range API instead for contentEditable text insertion
+- `const` arrow functions in `methodHandlers` Map initializer must not reference functions defined later in the file (no hoisting) — either move them above the Map or keep inline lambdas
+- Browser extension code (`browser-commands.ts`) uses `chrome.scripting.executeScript` with `world: 'MAIN'` — DOM APIs inside the func callback run in the page context, but ESLint still checks them against TypeScript types
+- The `plugins/slack/opentabs-plugin.json` file had a pre-existing uncommitted diff (adapterHash change) — be careful not to accidentally stage it
+
+## 2026-02-19 - US-001
+- Removed unused `_state: ServerState` parameter from `getNextRequestId()` in state.ts
+- Removed deprecated `nextRequestId?: number` field from `ServerState` interface
+- Updated all 3 call sites: extension-protocol.ts, http-routes.ts, browser-tools/reload-extension.ts
+- Updated state.test.ts to call `getNextRequestId()` without arguments
+- Did NOT bump `STATE_SCHEMA_VERSION` — the removed field was optional and unused, no structural type change
+- **Learnings for future iterations:**
+  - `getNextRequestId` is imported in 4 files (3 production + 1 test); use grep to find all call sites before refactoring
+  - The hot-reload patching loop in index.ts only patches missing keys from `createState()` defaults — it doesn't reference individual fields by name, so removing a field from the interface doesn't require changes there
+---
+
+## 2026-02-19 - US-002
+- Added `npmPlugins: []` to `FALLBACK_CONFIG` in config.ts
+- One-line change: both fallback paths (invalid JSON object and catch block) now produce configs with `npmPlugins: []` via spread
+- Files changed: platform/mcp-server/src/config.ts
+- **Learnings for future iterations:**
+  - `FALLBACK_CONFIG` is spread into both fallback return paths (line 103 and 139), so adding a field to it automatically covers both
+  - The first-run default (line 90) is a separate code path and already had `npmPlugins: []`
+---
+
+## 2026-02-19 - US-003
+- Extended `cleanupStaleExecFiles` filter to also match `.js.tmp` files left behind by crashed `writeExecFile` operations
+- Changed filter from `f.endsWith('.js')` to `(f.endsWith('.js') || f.endsWith('.js.tmp'))`
+- Files changed: platform/mcp-server/src/extension-protocol.ts
+- **Learnings for future iterations:**
+  - `writeExecFile` uses a write-then-rename pattern (writes to `.tmp`, renames to `.js`), so cleanup must handle both suffixes
+  - The `cleanOldAdapters` filter at line 97 already excludes all `EXEC_FILE_PREFIX` files, so `.tmp` files won't interfere with adapter cleanup
+---
+
+## 2026-02-19 - US-004
+- Removed `notifyAllClients()` call from inside `reloadCore` (was at line 176)
+- Added notification loop in `performConfigReload` after `reloadCore` returns, so config reloads still notify clients
+- `performReload` already had its own notification loop after handler re-registration (lines 293-295), so hot reloads now send exactly one notification instead of two
+- Updated `reloadCore` JSDoc to document that callers are responsible for notification
+- Updated test: changed expected `notifyCalled` from 2 to 1 for the hot reload test case
+- Files changed: platform/mcp-server/src/reload.ts, platform/mcp-server/src/reload.test.ts
+- **Learnings for future iterations:**
+  - `notifyAllClients` is a closure inside `reloadCore` that captures `sessionServers` — it persists in file watcher callbacks but cannot be called from outside `reloadCore`
+  - When moving notifications out of a shared helper, each caller must add its own notification; use the imported `notifyToolListChanged` from `mcp-setup.js` directly
+  - The `performConfigReload` test uses `toBeGreaterThanOrEqual(1)` for notification count, which tolerates the change
+---
+
+## 2026-02-19 - US-005
+- Replaced hardcoded `BROWSER_TOOL_NAMES` array (5 entries) in `discovery.ts` with dynamic derivation from `browserTools.map(t => t.name)` (36 entries)
+- Added import of `browserTools` from `./browser-tools/index.js` — no circular dependency exists
+- The prompt injection check now covers all 36 browser/extension tools automatically
+- Files changed: platform/mcp-server/src/discovery.ts
+- **Learnings for future iterations:**
+  - `browser-tools/index.ts` does NOT import from `discovery.ts`, so there's no circular dependency risk when importing browserTools into discovery
+  - Browser tool names use both `browser_*` and `extension_*` prefixes — both formats are included in the dynamically derived list
+  - Prettier config requires no parens on single-param arrow functions: `t => t.name` not `(t) => t.name`
+---
+
+## 2026-02-19 - US-006 through US-013 (batch)
+- **US-006**: Updated error message in `handleBrowserSelectOption` from 'Either value or label must be provided' to 'At least one of value or label must be provided' to match acceptance criteria. Validation logic was already in place from a prior iteration.
+- **US-007**: Already implemented — `handleBrowserGetResourceContent` already uses `TextDecoder` for UTF-8 decoding.
+- **US-008**: Added tagName validation to `handleBrowserTypeText` — checks for `input`, `textarea`, or `contentEditable` before proceeding. Returns descriptive error for non-text elements. Also added proper contentEditable support via Selection/Range API.
+- **US-009**: Added character value mutation in `handleBrowserPressKey` for printable characters. For `input`/`textarea`, splices character at cursor position via `selectionStart`/`selectionEnd`. For `contentEditable`, uses Selection/Range API to insert at caret.
+- **US-010**: Already implemented — regex at line 248 already included underscore in character class.
+- **US-011**: Wrapped `response.json()` in `slackApi` with try-catch, throwing `ToolError('Failed to parse Slack API response', 'invalid_response')` on parse failure.
+- **US-012**: Extracted `withDebugger<T>` helper in `browser-commands.ts` that manages Chrome debugger attach/detach lifecycle. Placed in the non-export helpers section (before first export) to satisfy `import-x/exports-last`. Refactored `handleBrowserHandleDialog`, `handleBrowserListResources`, and `handleBrowserGetResourceContent` to use it.
+- **US-013**: Extracted `wrapAsync` and `wrapSync` helpers in `message-router.ts`. All browser/extension command dispatch table entries now use these wrappers (except `extension.reload`, `sync.full`, `plugin.update`, and `plugin.uninstall` which have unique patterns). Reduced dispatch table from ~400 lines to ~50 lines.
+- Files changed: `platform/browser-extension/src/browser-commands.ts`, `platform/browser-extension/src/message-router.ts`, `plugins/slack/src/slack-api.ts`
+- **Learnings for future iterations:**
+  - The `import-x/exports-last` rule means non-exported helpers MUST be placed before the first `export` in a file — inserting a helper between exports breaks ALL prior exports
+  - `document.execCommand` is deprecated per ESLint/TypeScript — use Selection/Range API for contentEditable text insertion instead
+  - `const` declarations are NOT hoisted — passing a `const` function to a Map initializer entry that appears before the function definition causes TS2448/TS2454. Use inline lambdas for late-defined functions or move them above the Map.
+  - Several PRD stories (US-007, US-010) were already implemented by prior iterations but not marked as `passes: true` — always check current code state before implementing
+---

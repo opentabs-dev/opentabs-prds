@@ -1,0 +1,82 @@
+{
+  "project": "Background / Side Panel Communication Hardening",
+  "description": "Fix three genuine defects in the background↔side panel communication layer: duplicate notification processing from dual message paths, redundant fetchConfigState calls on sync.full, and data loss on optimistic toggle rollback with mixed tool states.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Eliminate duplicate notification processing in side panel ws:message fallback",
+      "description": "As a developer, I want the side panel to process each server notification exactly once so that state updates are deterministic and not wasteful.",
+      "acceptanceCriteria": [
+        "The ws:message handler in App.tsx only processes sync.full (calling loadPlugins), NOT tab.stateChanged, tool.invocationStart, or tool.invocationEnd",
+        "Notification methods that the background forwards via sp:serverMessage (tab.stateChanged, tool.invocationStart, tool.invocationEnd, plugins.changed) are NOT handled in the ws:message branch",
+        "The sp:serverMessage handler continues to handle all notification types as before",
+        "handleNotification is only called from the sp:serverMessage branch, not the ws:message branch",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/App.tsx, lines 134-147.\n\nThe ws:message listener is a fallback for when the side panel doesn't receive sp:serverMessage (e.g., opened as extension page rather than via chrome.sidePanel.open). Currently it calls handleNotification(wsData) for all methods, but the background ALSO forwards tab.stateChanged, tool.invocationStart, tool.invocationEnd, and plugins.changed via sp:serverMessage (see SIDE_PANEL_METHODS in message-router.ts). This means those notifications are processed twice.\n\nThe fix: Change the ws:message handler (lines 134-147) to only handle sync.full. Remove the `else if (wsData)` branch that calls handleNotification. The ws:message path exists because sync.full is NOT forwarded to the side panel (it's not in SIDE_PANEL_METHODS), so the side panel needs the ws:message fallback only for that.\n\nCurrent code:\n```\nif (message.type === 'ws:message') {\n  const wsData = message.data as Record<string, unknown> | undefined;\n  if (wsData?.method === 'sync.full') {\n    loadPluginsRef.current();\n  } else if (wsData) {\n    handleNotification(wsData);\n  }\n  return false;\n}\n```\n\nFix:\n```\nif (message.type === 'ws:message') {\n  const wsData = message.data as Record<string, unknown> | undefined;\n  if (wsData?.method === 'sync.full') {\n    loadPluginsRef.current();\n  }\n  return false;\n}\n```\n\nThis is safe because all notification methods the side panel needs (tab.stateChanged, tool.invocationStart/End, plugins.changed) are in SIDE_PANEL_METHODS and get forwarded via sp:serverMessage."
+    },
+    {
+      "id": "US-002",
+      "title": "Deduplicate fetchConfigState calls on sync.full",
+      "description": "As a user, I want the side panel to make only one config.getState request after sync.full so that the MCP server is not hit with redundant requests.",
+      "acceptanceCriteria": [
+        "After a sync.full, exactly one config.getState request is sent (not two)",
+        "plugins.changed from handlePluginUpdate still triggers a config.getState fetch (this path must remain working)",
+        "plugins.changed from handleSyncFull does NOT trigger a redundant fetch if sync.full already triggered one within the debounce window",
+        "A simple debounce (100ms) or dedup guard prevents double-fetching without dropping legitimate plugins.changed notifications from plugin.update",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/App.tsx, lines 117-121 and 134-139.\n\nThe problem: When the MCP server sends sync.full, two independent paths trigger loadPlugins():\n1. ws:message handler (line 136) sees sync.full -> loadPlugins()\n2. background's handleSyncFull sends plugins.changed notification -> arrives as sp:serverMessage at line 118 -> loadPlugins()\n\nBoth call fetchConfigState() which sends config.getState to the server.\n\nThe fix after US-001 removes the handleNotification call from ws:message but the sync.full path AND plugins.changed path both still call loadPlugins. The simplest dedup: add a timestamp guard to loadPlugins.\n\nApproach: Wrap loadPlugins in a debounce. Use a ref to track the last call time. If called within 200ms of the previous call, skip. This is a common React pattern.\n\nCurrent loadPlugins is defined with useCallback([], []). Modify it to check a ref:\n```\nconst lastFetchRef = useRef(0);\nconst loadPlugins = useCallback(() => {\n  const now = Date.now();\n  if (now - lastFetchRef.current < 200) return;\n  lastFetchRef.current = now;\n  fetchConfigState()\n    .then(result => { ... })\n    .catch(() => {});\n}, []);\n```\n\nThis ensures plugins.changed from plugin.update (which doesn't overlap with sync.full timing) still triggers a fetch, while the rapid sync.full + plugins.changed double-fire is deduped.\n\nAlso remove the loadPluginsRef indirection (see US-003) since loadPlugins is already stable."
+    },
+    {
+      "id": "US-003",
+      "title": "Remove unnecessary loadPluginsRef indirection in App.tsx",
+      "description": "As a developer, I want the App component to use loadPlugins directly instead of through a ref, reducing indirection since loadPlugins already has a stable identity from useCallback with empty deps.",
+      "acceptanceCriteria": [
+        "loadPluginsRef is removed entirely",
+        "All call sites that used loadPluginsRef.current() now call loadPlugins() directly",
+        "loadPlugins is added to the useEffect dependency array (it has stable identity from useCallback([]))",
+        "The behavior is identical: loadPlugins is called on connect and on relevant notifications",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/App.tsx, lines 39-42.\n\nCurrent code:\n```\nconst loadPluginsRef = useRef(loadPlugins);\nuseEffect(() => {\n  loadPluginsRef.current = loadPlugins;\n}, [loadPlugins]);\n```\n\nThis ref indirection exists so 'the effect listener always calls the current version without needing loadPlugins in the dependency array'. But loadPlugins is wrapped in useCallback([], []) -- it has a stable identity that never changes. The ref adds complexity for zero benefit.\n\nRemove the ref and its sync effect. In the main useEffect (line 44), add loadPlugins to the dependency array. Since loadPlugins never changes (stable useCallback), the effect won't re-run. Replace all loadPluginsRef.current() calls with loadPlugins():\n- Line 48: loadPluginsRef.current() -> loadPlugins()\n- Line 97: loadPluginsRef.current() -> loadPlugins()\n- Line 119: loadPluginsRef.current() -> loadPlugins()\n- Line 139: loadPluginsRef.current() -> loadPlugins()\n\nThis makes the code simpler and more idiomatic React."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix PluginCard optimistic toggle-all rollback to preserve per-tool states",
+      "description": "As a user, I want the 'toggle all' switch rollback on server error to restore the exact per-tool enabled states that existed before I clicked, not a uniform opposite value.",
+      "acceptanceCriteria": [
+        "handleToggleAll captures the per-tool enabled states before applying the optimistic update",
+        "On server error, the rollback restores the exact captured per-tool states",
+        "If tools had mixed state (some enabled, some disabled) before toggle-all, the rollback restores that exact mixed state",
+        "The optimistic update behavior (immediate UI response) is preserved",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/side-panel/components/PluginCard.tsx, lines 68-82.\n\nCurrent rollback code (line 75-79):\n```\nvoid setAllToolsEnabled(plugin.name, newEnabled).catch(() => {\n  setPlugins(prev =>\n    prev.map(p =>\n      p.name === plugin.name ? { ...p, tools: p.tools.map(t => ({ ...t, enabled: !newEnabled })) } : p,\n    ),\n  );\n  showToggleError('Failed to toggle all tools');\n});\n```\n\nThe rollback sets ALL tools to `!newEnabled`, but if the pre-toggle state was mixed (some true, some false), this loses the original state.\n\nFix: Capture the original tools array before the optimistic update:\n```\nconst handleToggleAll = (e: React.MouseEvent) => {\n  e.stopPropagation();\n  const newEnabled = !allEnabled;\n  const originalTools = plugin.tools;\n  setPlugins(prev =>\n    prev.map(p => (p.name === plugin.name ? { ...p, tools: p.tools.map(t => ({ ...t, enabled: newEnabled })) } : p)),\n  );\n  void setAllToolsEnabled(plugin.name, newEnabled).catch(() => {\n    setPlugins(prev =>\n      prev.map(p =>\n        p.name === plugin.name ? { ...p, tools: originalTools } : p,\n      ),\n    );\n    showToggleError('Failed to toggle all tools');\n  });\n};\n```\n\nNote: `plugin.tools` is captured from the render-time props, which reflects the pre-toggle state because setPlugins hasn't committed yet at capture time. The captured `originalTools` array contains the exact per-tool states. On error, restore this exact snapshot.\n\nActually, since `plugin` comes from the current render props and `setPlugins` triggers a re-render, `plugin.tools` at the point of `handleToggleAll` invocation IS the pre-toggle state. Capturing it in a const before the optimistic setPlugins call is safe."
+    }
+  ]
+}

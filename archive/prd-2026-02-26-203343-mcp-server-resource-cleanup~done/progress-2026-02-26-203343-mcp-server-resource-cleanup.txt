@@ -1,0 +1,41 @@
+## Codebase Patterns
+- `bun run type-check` (tsc --build --noEmit) requires fresh build artifacts to pass; always run `bun run build` first after editing source files or the TS6310 composite project error appears
+- Root `package.json` devDependencies should only list packages used directly at the root workspace level; sub-packages in `platform/*/package.json` carry their own deps (e.g., `zod` belongs in `platform/mcp-server/package.json` not root)
+- `.ralph/worktrees/**` in `knip.ts` ignore is redundant — those paths are already covered by `.gitignore`, so knip skips them automatically
+- `git stash && git stash pop` can silently drop file changes; verify modified files are still modified after any stash operation
+
+# Ralph Progress Log
+PRD: prd-2026-02-26-203343-mcp-server-resource-cleanup~running.json
+Started: Fri Feb 27 11:55:54 UTC 2026
+---
+
+## 2026-02-27 - US-001
+- Implemented kill handle for npm child processes in `platform/mcp-server/src/plugin-management.ts`
+- Changed `spawnAsync` to return `{ promise, kill }` instead of a bare Promise, exposing the ChildProcess kill method
+- Updated `runNpmGlobal` to destructure `{ promise: resultPromise, kill }` and call `kill()` in the `finally` block so the npm subprocess is terminated regardless of whether the timeout or process completion wins the race
+- Also fixed two pre-existing `knip` failures: removed unused `zod` devDependency from root `package.json` (zod lives in `platform/mcp-server/package.json`), and removed redundant `.ralph/worktrees/**` from `knip.ts` ignore array
+- Files changed: `platform/mcp-server/src/plugin-management.ts`, `package.json`, `knip.ts`
+- **Learnings for future iterations:**
+  - `bun run type-check` requires fresh `bun run build` artifacts when source files have changed — stale tsbuildinfo causes TS6310 errors
+  - `git stash && git stash pop` can lose changes silently; always verify file state after stash operations
+  - `kill()` on a Node.js ChildProcess that has already exited is a safe no-op (returns false, doesn't throw)
+  - Putting `kill()` in the `finally` block (not in the timeout callback) is cleaner — it kills in all paths, which is fine since killing an already-exited process is harmless
+---
+
+## 2026-02-27 - US-002
+- Fixed dead code in `deleteExecFile` in `platform/mcp-server/src/adapter-files.ts`
+- Removed `.catch(() => {})` from the `unlink` call so rejections propagate to the outer try-catch, enabling the `log.warn` to actually execute on failure
+- Files changed: `platform/mcp-server/src/adapter-files.ts`
+- **Learnings for future iterations:**
+  - The `create-plugin` integration test (`scaffolded plugin can be installed and built`) can be flaky due to npm network/env issues; re-running passes. It is unrelated to mcp-server changes.
+  - Using `git stash` to verify pre-existing failures is effective, but remember to `git stash pop` to restore changes (verify file state after pop)
+---
+
+## 2026-02-27 - US-003
+- Changed `void deleteExecFile(filename)` to `await deleteExecFile(filename)` in the `finally` block of the `browser_execute_script` handler in `platform/mcp-server/src/browser-tools/execute-script.ts`
+- Since `deleteExecFile` wraps its `unlink` call in a try-catch (fixed in US-002), awaiting it never propagates an error to the caller; the handler still returns the dispatch result
+- Files changed: `platform/mcp-server/src/browser-tools/execute-script.ts`
+- **Learnings for future iterations:**
+  - A one-line `void` → `await` change in an `async` function `finally` block is valid and safe as long as the awaited function is itself error-safe (uses internal try-catch)
+  - All Phase 1 checks passed on first run with no issues
+---

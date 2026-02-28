@@ -1,0 +1,55 @@
+## Codebase Patterns
+- plugin-sdk/src/storage.ts: All storage functions wrap their access in try-catch and return null on any error. The inner try-catch for decodeURIComponent in getCookie is nested inside the outer try-catch.
+- plugin-sdk/src/fetch.ts: fetchJSONImpl is the shared implementation for fetchJSON, postJSON, putJSON, etc. When a schema is provided, 204/empty responses must still be validated against it. No-schema callers get undefined for 204 responses (backward compatible).
+- plugin-tools/src/commands/build-e2e.test.ts: Tests that run `tsc` (auto-tsc feature) need a 30_000ms timeout since tsc can take 10-20s in slow environments. Use the third argument to `test()` to set per-test timeouts.
+- plugin-sdk/src/dom.ts: Non-exported helper functions must appear BEFORE the first export statement to satisfy the `import-x/exports-last` ESLint rule. The `needsAttributeObservation` helper was placed before the exported interfaces for this reason.
+- plugin-tools/src/commands/build.ts: When spawnSync returns with `error` (ENOENT or other OS errors), stdout/stderr are null at runtime. Check `tscResult.error` first and throw a user-friendly message. The existing `status !== 0` branch only runs when `error` is falsy, at which point stdout/stderr are guaranteed non-null Buffers — no optional chaining needed there.
+
+# Ralph Progress Log
+PRD: prd-2026-02-25-190353-plugin-sdk-tools-bugs~running.json
+Started: Thu Feb 26 04:03:46 UTC 2026
+---
+
+## 2026-02-26 - US-001
+- Wrapped `document.cookie` access in getCookie with an outer try-catch that returns null on any error, matching the defensive pattern of all other storage functions in the file
+- Files changed: platform/plugin-sdk/src/storage.ts
+- **Learnings for future iterations:**
+  - All storage utility functions in plugin-sdk/src/storage.ts use try-catch to return null on errors (SecurityError, etc.)
+  - getCookie had an inner try-catch for decodeURIComponent but was missing the outer guard for document.cookie access itself
+  - The fix nests the existing inner try-catch inside the new outer try-catch
+---
+
+## 2026-02-26 - US-002
+- Fixed `fetchJSONImpl` in `platform/plugin-sdk/src/fetch.ts` to validate undefined against schema on 204/empty responses instead of silently returning undefined
+- When a schema is provided and response is 204/empty, `data = undefined` is set and schema validation runs; schemas that don't accept undefined throw `ToolError.validation`
+- When no schema is provided, 204/empty responses continue to return `undefined` (backward compatible)
+- Added `/no-content` endpoint (204 response) to the test server in `fetch.test.ts` and added two new test cases covering both behaviors
+- Also fixed pre-existing test timeout in `platform/plugin-tools/src/commands/build-e2e.test.ts`: the auto-tsc test that runs `tsc` was timing out after 5000ms; added a 30_000ms per-test timeout
+- Files changed: platform/plugin-sdk/src/fetch.ts, platform/plugin-sdk/src/fetch.test.ts, platform/plugin-tools/src/commands/build-e2e.test.ts
+- **Learnings for future iterations:**
+  - fetchJSONImpl is the shared implementation layer; fetchJSON, postJSON, putJSON, patchJSON, deleteJSON all delegate to it
+  - The 204 early-return was before schema validation — the fix gates the early return on `!schema` and falls through to shared validation logic
+  - bun:test allows per-test timeouts as a third argument: `test('name', fn, 30_000)`
+---
+
+## 2026-02-26 - US-003
+- Added `needsAttributeObservation(selector)` helper that returns true when the selector contains `[` (attribute selector) or `.` (class selector)
+- Updated `waitForSelector` and `waitForSelectorRemoval` to include `attributes: needsAttributeObservation(selector)` in their MutationObserver `observe()` options
+- Simple tag/ID-only selectors use childList-only observation (no attribute overhead); attribute/class selectors also observe attribute changes
+- Files changed: platform/plugin-sdk/src/dom.ts
+- **Learnings for future iterations:**
+  - The `import-x/exports-last` ESLint rule requires non-exported helpers to appear BEFORE the first export statement in the file
+  - prettier formats `const fn = (...): bool => a || b;` on one line if it fits within the printWidth (project uses ~120 chars)
+  - MutationObserver `observe()` accepts `attributes: false` explicitly — no need to omit the key; passing `false` is treated the same as omitting it
+---
+
+## 2026-02-26 - US-004
+- Fixed `spawnSync('tsc')` ENOENT crash in `platform/plugin-tools/src/commands/build.ts` by checking `tscResult.error` before accessing `stderr`/`stdout`
+- When `tscResult.error.code === 'ENOENT'`, throws `'tsc not found — run npm install to install TypeScript'`; re-throws other errors as-is
+- The existing `status !== 0` branch is unchanged — at that point we've already returned early on error, so stdout/stderr are guaranteed Buffers (no optional chaining needed)
+- Files changed: platform/plugin-tools/src/commands/build.ts
+- **Learnings for future iterations:**
+  - `spawnSync` with a non-existent command returns `{ error: Error { code: 'ENOENT' }, status: null, stdout: null, stderr: null }` — stdout/stderr are null at runtime even though TypeScript types them as `Buffer`
+  - Guarding with `?.` optional chaining on `stderr`/`stdout` after the error check is unnecessary — TypeScript considers them non-nullable in `SpawnSyncReturns<Buffer>` and flags the optional chain as an error
+  - The correct pattern: check `tscResult.error` first (throw before accessing null fields), then access `stderr`/`stdout` normally in the non-error branch
+---

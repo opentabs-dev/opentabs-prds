@@ -1,0 +1,118 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-000126-mcp-server-quality~running.json
+Started: Tue Feb 24 00:16:23 PST 2026
+---
+
+## Codebase Patterns
+- PermissionsConfig and ToolPermission are defined in platform/mcp-server/src/config.ts and exported via `export type { ... }` at the bottom of the file
+- state.ts imports PermissionsConfig from config.ts — this is the canonical import path for all consumers
+- permissions.ts imports both PermissionsConfig and ToolPermission from config.ts
+- The pattern for type exports in this codebase is: define locally, export via gathered `export type { ... }` at file bottom
+- loader.ts is the canonical home for tools.json manifest parsing utilities (extractToolsArray, validateTools, validateResources, validatePrompts)
+- file-watcher.ts imports shared helpers from loader.ts and adds its own lenient per-entry validation on top
+- Extension handler tests: use createState() for setup, populate state.pendingConfirmations/pendingDispatches directly, call handlers with explicit params — no module mocking needed
+- log-buffer.ts stores logs in globalThis ring buffers — use clearAllLogs() in afterEach to prevent cross-test contamination
+- http-routes.ts route handlers are module-level named functions (handleWsUpgrade, handleWsInfo, handleHealth, etc.) — createHandleFetch is a thin router that validates Host/CORS then delegates by pathname
+- File-watching state is grouped under state.fileWatching (FileWatchingState interface) — entries, timers, generation, configWatcher, configLastSeenMtime, mtimePollTimerId, mtimeLastPollAt, mtimePollDetections, mtimePollDetectionTimestamps
+- When grouping flat fields into sub-objects, use a local `const fw = state.fileWatching` alias inside functions to reduce verbosity, but reference `state.fileWatching.*` directly inside callbacks/closures that outlive the enclosing function's scope
+
+## 2026-02-24 00:18 - US-001
+- Verified PermissionsConfig is already correctly deduplicated: single definition in config.ts (line 29), exported at line 406
+- ToolPermission is also defined once in config.ts (line 26) and properly exported
+- state.ts already imports from the canonical location (line 12): `import type { PermissionsConfig } from './config.js'`
+- permissions.ts and permissions.test.ts also import from config.ts
+- No duplicate definitions found anywhere in the codebase
+- All acceptance criteria were already satisfied — no code changes needed
+- All Phase 1 checks pass: build, type-check, lint, knip, test (1845 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The codebase already follows the single-definition-and-export pattern for shared types
+  - config.ts is the canonical home for config-related types (PermissionsConfig, ToolPermission, OpentabsConfig)
+---
+
+## 2026-02-24 00:26 - US-002
+- Extracted `extractToolsArray(raw: unknown): unknown[] | null` shared helper in loader.ts
+- The helper handles both legacy array format and current `{ tools: [...] }` format
+- Updated `loadPlugin()` in loader.ts to use `extractToolsArray` instead of inline format detection
+- Updated `parseToolsJson()` in file-watcher.ts to use `extractToolsArray` instead of its own format detection
+- file-watcher.ts retains its lenient per-entry validation — only the format detection is shared
+- Added `extractToolsArray` to loader.ts exports
+- Files changed: platform/mcp-server/src/loader.ts, platform/mcp-server/src/file-watcher.ts
+- All Phase 1 checks pass: build, type-check, lint, knip, test (1845 tests, 0 failures)
+- **Learnings for future iterations:**
+  - `Array.isArray()` narrows to `any[]` in TypeScript when input is `unknown` — must cast `as unknown[]` to satisfy `@typescript-eslint/no-unsafe-return`
+  - file-watcher.ts already imports from loader.ts (`loadPlugin`), so adding shared helpers there is natural
+  - The file-watcher's lenient validation (skip invalid entries) vs loader's strict validation (error on any invalid) is intentional — file-watcher processes incremental updates
+---
+
+## 2026-02-24 00:32 - US-003
+- Created platform/mcp-server/src/extension-handlers.test.ts with 34 tests across 4 describe blocks
+- **handleConfirmationResponse tests (9):** allow_once resolves pending, deny resolves pending, unknown id ignored, allow_always with default scope (tool_domain) adds session rule, allow_always with tool_all sets domain null, allow_always with domain_all sets tool null, missing params ignored, invalid decision ignored, non-string id ignored, timer cleared
+- **handleToolProgress tests (10):** progress forwarded to onProgress callback, lastProgressTs updated, timeout timer reset on progress, MAX_DISPATCH_TIMEOUT_MS absolute ceiling rejects immediately, missing/invalid/unknown dispatchId ignored, missing params ignored, invalid progress/total types ignored, onProgress error doesn't break execution, progress without onProgress still updates state
+- **rejectAllPendingConfirmations tests (2):** all pending confirmations rejected and cleared, empty map handled gracefully
+- **handlePluginLog tests (10):** valid entry forwarded to callback, appended to log buffer, all valid levels accepted, missing params dropped, invalid/empty/non-string plugin dropped, non-string message dropped, non-string level dropped, invalid level dropped, missing ts auto-generated, data field forwarded
+- Files changed: platform/mcp-server/src/extension-handlers.test.ts (new file)
+- All Phase 1 checks pass: build, type-check, lint, knip, test (1879 tests, 0 failures)
+- **Learnings for future iterations:**
+  - When creating test helpers that track resolve/reject calls, use a mutable result object referenced by closures — do NOT spread a tracking object as static values at creation time
+  - All extension-handlers are exported individually and take (state, params, ...) making them easy to unit test without mocking
+  - handlePluginLog takes (params, callbacks) without state — unlike other handlers
+  - clearAllLogs() from log-buffer.ts is needed in afterEach to prevent cross-test contamination of the globalThis ring buffer
+- adapter-files.ts functions (writeExecFile, writeAdapterFile, cleanupStaleExecFiles, cleanupStaleAdapterFiles, ensureAdaptersDir) are all exported and testable
+- OPENTABS_CONFIG_DIR env var overrides getConfigDir() → getExtensionDir() → getAdaptersDir() for test isolation
+---
+
+## 2026-02-24 00:35 - US-004
+- Created platform/mcp-server/src/adapter-files.test.ts with 19 tests across 4 describe blocks
+- **writeExecFile tests (6):** wraps code in IIFE with Function constructor, JSON.stringify escapes special chars, handles async code (promise support in wrapper), malicious code with closing braces safely isolated, creates adapters dir via ensureAdaptersDir, error wrapper catches sync exceptions
+- **writeAdapterFile tests (3):** writes IIFE content to adapters dir, rewrites sourceMappingURL when sourceMap provided, does not rewrite sourceMappingURL when no sourceMap provided
+- **cleanupStaleExecFiles tests (4):** removes __exec-*.js files, removes __exec-*.js.tmp files, leaves non-exec files untouched, handles missing adapters directory gracefully
+- **cleanupStaleAdapterFiles tests (6):** removes .js files for plugins not in current set, removes .js.map files for stale plugins, keeps current plugins untouched, does not remove __exec-* files (managed by cleanupStaleExecFiles), does not remove .tmp files, handles missing adapters directory gracefully
+- Files changed: platform/mcp-server/src/adapter-files.test.ts (new file)
+- All Phase 1 checks pass: build, type-check, lint, knip, test (1898 tests, 0 failures)
+- **Learnings for future iterations:**
+  - OPENTABS_CONFIG_DIR env var redirects all path resolution: getConfigDir() → getExtensionDir() → getAdaptersDir()
+  - ensureAdaptersDir(state) caches directory creation on state.adaptersDirReady — reset via createState() for fresh test state
+  - atomicWrite from @opentabs-dev/shared is used for writes — writes to .tmp then renames atomically
+  - cleanupStaleAdapterFiles skips .tmp files and __exec-* files by design — these are managed by other functions
+---
+
+## 2026-02-24 00:43 - US-005
+- Extracted 7 named route handler functions from the monolithic createHandleFetch closure in http-routes.ts
+- handleWsUpgrade: WebSocket upgrade for extension connections (/ws)
+- handleWsInfo: WebSocket info endpoint for extension authentication (GET /ws-info)
+- handleHealth: Health endpoint (GET /health) — authenticated vs unauthenticated responses
+- handleAudit: Audit log endpoint (GET /audit) with filtering
+- handleReload: Config/plugin rediscovery endpoint (POST /reload)
+- handleExtensionReload: Extension reload endpoint (POST /extension/reload)
+- handleMcp: MCP Streamable HTTP transport (/mcp — POST/GET/DELETE sub-routing)
+- Introduced BunServer interface to deduplicate the inline bunServer type
+- createHandleFetch is now a thin router: host validation → CORS check → pathname dispatch
+- All extracted functions are module-level (not exported) — they receive only the deps they need
+- Existing http-routes.test.ts tests pass without modification (all 1898 tests, 0 failures)
+- computeAuditSummary was already a standalone function and remains unchanged
+- Files changed: platform/mcp-server/src/http-routes.ts
+- All Phase 1 checks pass: build, type-check, lint, knip, test (1898 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The HotHandlers interface's fetch type needed to use BunServer instead of the inline type to stay consistent
+  - Bun.serve()'s server parameter is structurally compatible with the BunServer interface (TypeScript structural typing)
+  - prettier enforces specific line-length constraints — functions with 3 short params should be on one line, long dispatch lines need wrapping
+  - The extracted route handlers don't need to be exported since tests exercise them through createHandlers → fetch
+---
+
+## 2026-02-24 00:57 - US-006
+- Grouped 9 flat file-watching fields on ServerState into a `fileWatching: FileWatchingState` sub-object
+- Defined `FileWatchingState` interface in state.ts with: entries, timers, generation, configWatcher, configLastSeenMtime, mtimePollTimerId, mtimeLastPollAt, mtimePollDetections, mtimePollDetectionTimestamps
+- Updated `createState()` to initialize `fileWatching` sub-object with all defaults
+- Bumped `STATE_SCHEMA_VERSION` from 3 to 4
+- Updated all consumers: file-watcher.ts (main consumer — all functions), http-routes.ts (/health endpoint)
+- Updated all test files: state.test.ts, file-watcher.test.ts, reload.test.ts
+- reload.ts and shutdown.ts did NOT need direct changes — they call `stopFileWatching(state)` which internally accesses `state.fileWatching.*`
+- index.ts hot-reload patching (top-level key patching) automatically handles the new `fileWatching` key
+- Files changed: platform/mcp-server/src/state.ts, platform/mcp-server/src/file-watcher.ts, platform/mcp-server/src/http-routes.ts, platform/mcp-server/src/state.test.ts, platform/mcp-server/src/file-watcher.test.ts, platform/mcp-server/src/reload.test.ts
+- All Phase 1 checks pass: build, type-check, lint, knip, test (1898 tests, 0 failures)
+- All Phase 2 checks pass: E2E (356 tests, 0 failures)
+- **Learnings for future iterations:**
+  - When grouping flat fields into a sub-object, use a `const fw = state.fileWatching` alias inside function bodies for conciseness, but inside closures/callbacks that run asynchronously (like setInterval/setTimeout), reference `state.fileWatching.*` to ensure the closure reads the current state
+  - The index.ts hot-reload auto-patching only checks top-level keys — structural changes within existing sub-objects require a schema version bump and process restart
+  - `replace_all` in the Edit tool is useful for bulk-renaming field accesses in test files (e.g., `state.fileWatcherGeneration` → `state.fileWatching.generation`)
+---

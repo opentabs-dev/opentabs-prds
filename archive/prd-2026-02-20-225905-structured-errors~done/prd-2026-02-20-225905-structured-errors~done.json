@@ -1,0 +1,129 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add structured error codes to ToolError so AI agents can distinguish retryable from permanent errors. Extends ToolError with category, retryable, and retryAfterMs fields. Propagates structured error metadata through the full dispatch chain (adapter → extension → MCP server → AI client). Adds static factory methods for common error categories. The MCP error response includes both human-readable and machine-readable error information.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Extend ToolError with retryable, retryAfterMs, category",
+      "description": "As a plugin developer, I want ToolError to carry structured metadata (retryable, retryAfterMs, category) so that AI agents can make intelligent retry decisions.",
+      "acceptanceCriteria": [
+        "ToolError constructor signature: (message: string, code: string, opts?: { retryable?: boolean; retryAfterMs?: number; category?: ErrorCategory })",
+        "ErrorCategory type: 'auth' | 'rate_limit' | 'not_found' | 'validation' | 'internal' | 'timeout'",
+        "retryable defaults to false when not provided",
+        "retryAfterMs is optional (undefined when not provided)",
+        "category is optional (undefined when not provided)",
+        "Existing ToolError(message, code) calls compile and work identically — no breaking change",
+        "ToolError fields are readonly",
+        "Update existing ToolError unit tests and add new tests for the opts parameter",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts. The ToolError class currently has: constructor(message: string, public readonly code: string). Add an optional third parameter: opts?: { retryable?: boolean; retryAfterMs?: number; category?: ErrorCategory }. Destructure opts in the constructor body and assign to readonly fields with defaults: this.retryable = opts?.retryable ?? false, this.retryAfterMs = opts?.retryAfterMs, this.category = opts?.category. Export the ErrorCategory type. The fields must be declared as readonly class properties. Update platform/plugin-sdk/src/index.test.ts: existing tests should still pass unchanged (backward compat), add new tests for constructing ToolError with opts, verify defaults, verify all category values are accepted."
+    },
+    {
+      "id": "US-002",
+      "title": "Propagate structured error fields through the dispatch chain",
+      "description": "As an AI agent, I want MCP error responses to include structured error metadata (code, category, retryable, retryAfterMs) so that I can programmatically decide whether to retry.",
+      "acceptanceCriteria": [
+        "Adapter runtime in tool-dispatch.ts catch block serializes ToolError fields: code, retryable, retryAfterMs, category into the error data object",
+        "Extension JSON-RPC error response data includes: { code: string, retryable?: boolean, retryAfterMs?: number, category?: string }",
+        "DispatchError.data type is updated to accommodate the new fields",
+        "MCP server formats error text as: [ERROR code=<CODE> category=<CATEGORY> retryable=<BOOL> retryAfterMs=<MS>] <message>\\n\\n```json\\n{\"code\":\"...\",\"category\":\"...\",\"retryable\":...,\"retryAfterMs\":...}\\n```",
+        "Fields with undefined/null values are omitted from both the text prefix and JSON block",
+        "Plain ToolError(message, code) without opts still produces: [<CODE>] <message> (backward compat for errors without structured fields)",
+        "Update existing unit tests in extension-protocol.test.ts and mcp-setup-dispatch.test.ts",
+        "Add new unit tests for structured error propagation with all field combinations",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Three files need changes in the dispatch chain:\n\n1. platform/browser-extension/src/tool-dispatch.ts (executeToolOnTab, lines 111-118): The catch block currently extracts e.message and e.code. Extend to also extract e.retryable (boolean), e.retryAfterMs (number), and e.category (string). The ToolError fields survive serialization across the chrome.scripting.executeScript boundary because the adapter IIFE runs in MAIN world and the error is caught and serialized to a plain object before returning. Update the ToolResult error type to include the optional fields: data?: { code: string; retryable?: boolean; retryAfterMs?: number; category?: string }. Pass all fields through in the data object.\n\n2. platform/browser-extension/src/tool-dispatch.ts (handleToolDispatch, line 262): The sendToServer call already passes result.data through. No change needed IF the data type is correctly extended. But verify the data flows through correctly at lines 229, 258, 287-289.\n\n3. platform/mcp-server/src/mcp-setup.ts (catch block, lines 295-313): Currently formats as [CODE] message. Change to detect structured fields in err.data. If err.data has category or retryable, format as the full structured error text with both human-readable prefix and machine-readable JSON block. If err.data only has code (legacy), keep the existing [CODE] format for backward compat.\n\n4. platform/mcp-server/src/extension-protocol.ts: The DispatchError data type (line 446) is Record<string, unknown>. This is already flexible enough, but update isDispatchError duck-typing if needed.\n\nImportant: The ToolError class is bundled into the adapter IIFE by Bun.build. When the adapter catch block (tool-dispatch.ts:111-118) catches the error, it runs inside chrome.scripting.executeScript in MAIN world. The caught error is a plain object at that point (it crossed the serialization boundary). So accessing e.retryable, e.retryAfterMs, e.category will work as long as ToolError assigns them as own properties (which it does as class fields)."
+    },
+    {
+      "id": "US-003",
+      "title": "Add standard error factory methods to ToolError",
+      "description": "As a plugin developer, I want convenient factory methods on ToolError for common error categories so that I don't have to remember the correct category/retryable combinations.",
+      "acceptanceCriteria": [
+        "ToolError.auth(message: string) returns new ToolError(message, 'AUTH_ERROR', { category: 'auth', retryable: false })",
+        "ToolError.notFound(message: string, code?: string) returns new ToolError(message, code ?? 'NOT_FOUND', { category: 'not_found', retryable: false })",
+        "ToolError.rateLimited(message: string, retryAfterMs?: number) returns new ToolError(message, 'RATE_LIMITED', { category: 'rate_limit', retryable: true, retryAfterMs })",
+        "ToolError.validation(message: string) returns new ToolError(message, 'VALIDATION_ERROR', { category: 'validation', retryable: false })",
+        "ToolError.timeout(message: string) returns new ToolError(message, 'TIMEOUT', { category: 'timeout', retryable: true })",
+        "ToolError.internal(message: string) returns new ToolError(message, 'INTERNAL_ERROR', { category: 'internal', retryable: false })",
+        "All factory methods are static",
+        "Unit tests for each factory method verify message, code, category, retryable, and retryAfterMs",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/plugin-sdk/src/index.ts. Add six static methods to the ToolError class. Each method is a one-liner that calls the constructor with the correct defaults. The notFound factory takes an optional code parameter because plugins often have domain-specific not-found codes (e.g., 'CHANNEL_NOT_FOUND', 'USER_NOT_FOUND'). The rateLimited factory takes optional retryAfterMs because some APIs provide it and some don't. Add comprehensive unit tests in platform/plugin-sdk/src/index.test.ts for each factory method."
+    },
+    {
+      "id": "US-004",
+      "title": "Add E2E tests for structured error propagation",
+      "description": "As a platform developer, I want E2E tests that verify structured error fields propagate from plugin tool handlers all the way to the MCP client response.",
+      "acceptanceCriteria": [
+        "e2e-test plugin has tools that throw structured ToolErrors: auth error, rate limited error, not found error, validation error, timeout error, internal error",
+        "The e2e-test plugin's existing failing tool is updated to use ToolError.internal() or similar",
+        "E2E tests call each error tool via MCP and verify the response text contains the structured error prefix",
+        "E2E tests verify retryable=true appears for rate_limit and timeout errors",
+        "E2E tests verify retryAfterMs appears when provided",
+        "E2E tests verify the machine-readable JSON block is present and parseable",
+        "The e2e-test plugin must be rebuilt: cd plugins/e2e-test && bun install && bun run build",
+        "bun run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Two parts:\n\n1. Update plugins/e2e-test: Add new tool files in plugins/e2e-test/src/tools/ for each error category. Each tool takes no input and throws a ToolError with the appropriate factory method. Example: throw ToolError.rateLimited('Too many requests', 5000). Update the plugin's index.ts to register the new tools. Rebuild: cd plugins/e2e-test && bun install && bun run build.\n\n2. Add E2E test cases in e2e/tool-dispatch.e2e.ts (or a new e2e/structured-errors.e2e.ts). Each test calls the error tool via MCP, asserts isError is true, and parses the response text to verify the structured fields. The response text format (from US-002) includes a JSON block that can be extracted with a regex like /```json\\n(.+?)\\n```/s and parsed.\n\nImportant: The e2e-test plugin is a standalone project in plugins/e2e-test/. It has its own package.json and depends on the published @opentabs-dev/plugin-sdk. If US-001 added new fields to ToolError, the plugin-sdk must be published first (US-005) for the e2e-test plugin to use them. However, the e2e-test plugin can use file: or link: references during development. Check if the e2e-test plugin already uses a local reference or a published version. If it uses a published version, this story must come after US-005 (publish). If the ordering must change, reorder accordingly.\n\nAlternative: If the e2e-test plugin uses a published SDK version, the E2E tests can be written to test the existing error format first, and then updated after publishing. Or, temporarily update the e2e-test plugin's package.json to use a file: reference to the local plugin-sdk during development, then switch back before the final publish."
+    },
+    {
+      "id": "US-005",
+      "title": "Publish updated packages and update plugins",
+      "description": "As a platform developer, I want to publish the updated plugin-sdk (with structured ToolError) so that plugins can depend on the new version.",
+      "acceptanceCriteria": [
+        "Determine new version number (patch bump if only additive changes)",
+        "Publish in dependency order: shared (if changed) → plugin-sdk → plugin-tools (if changed) → cli (if changed)",
+        "Wait for npm propagation (verify with npm info @opentabs-dev/plugin-sdk@<version>)",
+        "Update all plugins in plugins/ to depend on the new @opentabs-dev/plugin-sdk version",
+        "Rebuild all plugins: cd plugins/<name> && bun install && bun run build",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Use ./scripts/publish.sh <version> to publish. The publish script handles the correct order. After publishing, update each plugin's package.json to reference the new version of @opentabs-dev/plugin-sdk. Then bun install && bun run build in each plugin directory. The E2E test plugin (plugins/e2e-test) must also be updated and rebuilt so that US-004 tests work against the published SDK.\n\nNote: Only plugin-sdk definitely changed (US-001, US-003). Check if shared or plugin-tools need changes — if US-002 only changed browser-extension and mcp-server (which are not published packages), then only plugin-sdk needs publishing. The plugin-tools package only needs publishing if the build command itself changed (it shouldn't for this PRD)."
+    },
+    {
+      "id": "US-006",
+      "title": "Update CLAUDE.md with structured error documentation",
+      "description": "As a platform developer, I want CLAUDE.md to document the structured error pattern so that future development follows the established conventions.",
+      "acceptanceCriteria": [
+        "CLAUDE.md documents the ToolError structured fields: category, retryable, retryAfterMs",
+        "CLAUDE.md documents the factory methods: ToolError.auth(), .notFound(), .rateLimited(), .validation(), .timeout(), .internal()",
+        "CLAUDE.md documents the error propagation chain and the MCP error response format",
+        "CLAUDE.md guidance: plugin developers should use factory methods instead of bare ToolError(message, code) when the error fits a standard category",
+        "Documentation is plugin-agnostic (does not enumerate specific plugin error codes)",
+        "Documentation is concise and high-level (not a full API reference)"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Add a new subsection under 'Key Concepts' or 'Engineering Standards' in CLAUDE.md. Keep it concise — 10-15 lines max. Document the pattern, not every detail. Example:\n\n### Structured Errors\n\nToolError supports structured metadata for AI agents: `category` (auth, rate_limit, not_found, validation, internal, timeout), `retryable` (boolean), and `retryAfterMs` (number). Use factory methods: `ToolError.auth(msg)`, `ToolError.rateLimited(msg, ms)`, etc. The MCP server formats these into error responses that include both a human-readable prefix and a machine-readable JSON block, enabling AI agents to distinguish retryable from permanent errors.\n\nDo not list individual plugin error codes — keep it pattern-focused."
+    }
+  ]
+}

@@ -1,0 +1,130 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-190000-remove-simplify-security~running.json
+Started: Sun Feb 22 12:03:44 PST 2026
+---
+
+## Codebase Patterns
+- Platform source files in `platform/mcp-server/src/` are compiled via `tsc --build` with project references
+- When deleting `.ts` files, use `rm` from Bash (the Edit tool's delete is unreliable, and files may be restored by lint-staged or hooks if not properly staged)
+- The pre-commit hook runs prettier, eslint, and knip on staged files via lint-staged
+- TrustTier type from `@opentabs-dev/shared` is used by `npmTrustTier()` in discovery.ts — keep the import even when removing verification code
+- When removing import lines, avoid leaving blank lines between import groups — ESLint's `import-x/order` rule rejects them
+- `sanitizeOutput` in mcp-setup.ts (prototype pollution prevention) is distinct from the deleted `sanitizeToolOutput` (path/URL scrubbing) — keep it
+- E2E tests that replace the extension's WS slot use `fetchWsInfo` to get wsUrl + wsSecret, then connect with protocols `['opentabs', wsSecret]` — search `e2e/` broadly when removing WS-related features
+- `plugins/e2e-test` must be built before running `build-e2e.test.ts` — the test copies the plugin and needs `dist/index.js` to exist
+- Features threading through the full dispatch pipeline (shared types → plugin-tools → mcp-server → browser-extension → E2E) touch 20+ files — use `grep` to find ALL occurrences before editing
+
+## 2026-02-22 12:06 PST - US-001
+- **Implemented**: Removed npm registry verification and skip-verification flag
+- **Files deleted**: `platform/mcp-server/src/verify-plugin.ts`, `platform/mcp-server/src/skip-verification.ts`, `platform/mcp-server/src/verify-plugin.test.ts`
+- **Files modified**: `platform/mcp-server/src/discovery.ts` — removed imports of `isSkipPluginVerification` and `verifyOfficialPlugin`, removed Phase 3.5 verification block, removed `verifyOfficialPlugins` function
+- **Quality checks**: build, type-check, lint, knip, test — all pass (1548 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The Edit tool changes may be silently reverted by `bun run test` or lint-staged hooks — always use `Write` for full file rewrites and verify with `head` after writing
+  - Files deleted with `rm` can be silently restored if something runs `git checkout` — verify deletions stick after running quality checks
+  - The `TrustTier` import stays in discovery.ts because `npmTrustTier()` still returns it
+---
+
+## 2026-02-22 12:15 PST - US-002
+- **Implemented**: Removed tool output sanitization and skip-sanitization flag
+- **Files deleted**: `platform/mcp-server/src/sanitize-tool-output.ts`, `platform/mcp-server/src/skip-sanitization.ts`, `platform/mcp-server/src/sanitize-tool-output.test.ts`
+- **Files modified**:
+  - `platform/mcp-server/src/mcp-setup.ts` — removed `sanitizeToolOutput` import, replaced two ternaries (`state.skipSanitization ? cleaned : sanitizeToolOutput(cleaned)`) with just `cleaned`
+  - `platform/mcp-server/src/reload.ts` — removed `isCliSkipSanitization` import, removed `state.skipSanitization = ...` assignment
+  - `platform/mcp-server/src/state.ts` — removed `skipSanitization` field from `ServerState` interface and `createState()`
+  - `platform/mcp-server/src/config.ts` — removed `skipSanitization` from `OpentabsConfig`, `parseConfigRecord`, and `saveToolConfig` spread
+  - `platform/mcp-server/src/http-routes.ts` — removed `outputSanitizationEnabled` from `/health` response
+  - `platform/mcp-server/src/state.test.ts` — removed `skipSanitization` assertion
+  - `platform/mcp-server/src/http-routes.test.ts` — removed `outputSanitizationEnabled` from `HealthResponse` interface
+- **Quality checks**: build, type-check, lint, knip, test — all pass (1536 tests, 0 failures)
+- **Learnings for future iterations:**
+  - When removing an import line, replace with empty string but watch for blank lines between import groups — ESLint's `import-x/order` rule flags them
+  - Similarly watch for double blank lines left behind in function bodies — prettier flags them
+  - The `sanitizeOutput` function in mcp-setup.ts is separate from `sanitizeToolOutput` — it handles prototype pollution prevention and stays
+---
+
+## 2026-02-22 12:20 PST - US-003
+- **Implemented**: Removed connection token anti-takeover mechanism
+- **Files modified**:
+  - `platform/mcp-server/src/state.ts` — removed `connectionToken: string | null` from `ServerState` interface and `connectionToken: null` from `createState()`
+  - `platform/mcp-server/src/http-routes.ts` — removed `tokenMatched` variable, connection token comparison in WS upgrade handler, 409 Conflict rejection, `state.connectionToken = crypto.randomUUID()` on WS open, `state.connectionToken = null` on WS close, `connectionToken` from `/health` response
+  - `platform/mcp-server/src/extension-protocol.ts` — removed `connectionToken` from sync.full payload
+  - `platform/browser-extension/src/offscreen/index.ts` — removed `connectionToken` variable, removed from WS protocol array, removed extraction from sync.full handler
+  - `platform/mcp-server/src/http-routes.test.ts` — removed entire `WebSocket connection token` test describe block (7 tests)
+  - `e2e/fixtures.ts` — removed `fetchConnectionToken` helper function and export
+  - `e2e/lifecycle.e2e.ts` — removed `fetchConnectionToken` import, removed all `connToken`/`pingConnToken`/`zombieConnToken`/`rotateConnToken` usages from WS replacement patterns
+  - `e2e/dispatch-resilience.e2e.ts` — removed `fetchConnectionToken` import, removed all `stealConnToken`/`fakeConnToken`/`timeoutConnToken`/`rawConnToken` usages from WS replacement patterns
+- **Quality checks**: build, type-check, lint, knip, test — all pass (1527 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The connectionToken was used in WS replacement patterns across 4 E2E test files — when removing a feature used in E2E tests, search broadly with `grep` across the entire `e2e/` directory
+  - E2E tests that "steal" the extension's WS slot now only need `wsSecret` in the protocol array — no token fetch needed
+  - The test count dropped by 21 (1548→1527) reflecting the 7 removed unit tests plus earlier removals
+---
+
+## 2026-02-22 13:15 PST - US-004
+- **Implemented**: Removed adapter hash verification while keeping Object.freeze
+- **Files modified** (23 files, +31/-285 lines):
+  - `platform/shared/src/index.ts` — removed `adapterHash` from `PluginManifest` and `WirePluginPayload` interfaces
+  - `platform/plugin-tools/src/commands/build.ts` — removed SHA-256 hash computation (`Bun.CryptoHasher`), removed `__adapterHash` setter from freeze snippet, renamed `hashAndFreeze` to `freezeSnippet`, kept Object.freeze and Object.defineProperty calls
+  - `platform/mcp-server/src/state.ts` — removed `adapterHash` from `RegisteredPlugin` interface
+  - `platform/mcp-server/src/loader.ts` — removed `computeHash` function, removed `adapterHash` from `LoadedPlugin` interface and return object
+  - `platform/mcp-server/src/extension-protocol.ts` — removed `adapterHash` from both sync.full and plugin.update payloads
+  - `platform/mcp-server/src/file-watcher.ts` — removed `extractEmbeddedAdapterHash` function and both usages in `handleIifeChange` and tools.json handler
+  - `platform/browser-extension/src/types.ts` — removed `adapterHash` from `PluginMeta`
+  - `platform/browser-extension/src/message-router.ts` — removed `adapterHash` from `ValidatedPluginPayload`, `toPluginMeta`, `validatePluginPayload`, and injection calls
+  - `platform/browser-extension/src/iife-injection.ts` — removed `readAdapterHash` and `verifyAdapterHash` functions, removed `adapterHash` parameter from `injectAdapterFile`, `injectPluginIntoMatchingTabs`, `injectPluginsIntoTab`, and `reinjectStoredPlugins`
+  - `platform/browser-extension/src/browser-commands.ts` — removed hash fields from `handleExtensionCheckAdapter` response (removed `adapterHash`, `hashMatch`, `expectedHash`)
+  - `platform/browser-extension/src/tool-dispatch.ts` — updated comment from `hashAndFreeze` to `freeze snippet`
+  - `platform/mcp-server/src/browser-tools/extension-check-adapter.ts` — updated tool description to remove hash references
+  - Test files: removed hash-related tests/assertions from `build-e2e.test.ts`, `loader.test.ts`, `file-watcher.test.ts`, `registry.test.ts`, `version-check.test.ts`, `extension-protocol.test.ts`, `message-router.test.ts`
+  - E2E files: removed hash test from `tool-dispatch.e2e.ts`, updated comments in `iife-injection.e2e.ts`, updated assertions in `browser-tools.e2e.ts`
+  - Docs: removed "Adapter Integrity" section from `architecture.mdx`
+- **Quality checks**: build, type-check, lint, knip, test — all pass (1523 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The `plugins/e2e-test` directory must be built (`cd plugins/e2e-test && bun run build`) before running `build-e2e.test.ts` — these tests copy the plugin and need `dist/index.js` to exist
+  - The `hashAndFreeze` snippet was one self-contained IIFE doing both hash-setting and freezing — removing just the hash part while keeping freeze requires careful editing of the minified IIFE string
+  - `adapterHash` was threaded through 23 files across 5 packages (shared, plugin-tools, mcp-server, browser-extension, e2e) — a feature that touches the full dispatch pipeline requires systematic removal from every layer
+  - When removing parameters from functions like `injectAdapterFile(tabId, pluginName, version, adapterHash)`, remember to update ALL call sites (found 4 distinct callers)
+---
+
+## 2026-02-22 13:25 PST - US-005
+- **Implemented**: Simplified error sanitization to truncation only — removed all 5 regex replacements (Windows paths, Unix paths, URLs, localhost, IPv4)
+- **Files modified**:
+  - `platform/mcp-server/src/sanitize-error.ts` — removed regex replacements, simplified to truncation-only logic
+  - `platform/browser-extension/src/sanitize-error.ts` — identical simplification
+  - `platform/mcp-server/src/mcp-setup.test.ts` — replaced "[PATH] sanitization" test with two new tests: truncation of long errors (verifying 500-char limit) and preservation of file paths in short errors
+- **Files deleted**: `platform/browser-extension/src/sanitize-error.test.ts` (tested the removed regex behavior)
+- **Quality checks**: build, type-check, lint, knip, test — all pass (1510 tests, 0 failures)
+- **Learnings for future iterations:**
+  - `sanitizeErrorMessage` is called on the raw error message, then `mcp-setup.ts` wraps it in `"Tool dispatch error: ${msg}"` — so the final text length is prefix + sanitized message, not just sanitized message. Tests must account for the prefix.
+  - The browser-extension sanitize-error.test.ts only tested regex behavior; with regex removed, the test file was entirely obsolete. No mcp-server sanitize-error.test.ts existed — the sanitization was tested indirectly in mcp-setup.test.ts.
+---
+
+## 2026-02-22 13:30 PST - US-006
+- **Implemented**: Removed log relay nonce from content script injection
+- **Files modified**:
+  - `platform/browser-extension/src/iife-injection.ts` — removed nonce generation (`crypto.randomUUID()`), simplified ISOLATED world relay to remove nonce validation (kept `event.source === window` and `data.type === 'opentabs:plugin-logs'` checks), removed entire MAIN world script (postMessage monkey-patching + `_logNonce` setup), simplified idempotent guard (no nonce Set needed)
+  - `platform/plugin-tools/src/commands/build.ts` — removed `_logNonce` read and `nonce` field from `flushLogs` postMessage call in the generated adapter IIFE wrapper
+- **Quality checks**: build, type-check, lint, knip, test — all pass (1510 tests, 0 failures)
+- **Learnings for future iterations:**
+  - The nonce was threaded through two separate packages: `iife-injection.ts` (injection side) and `build.ts` (adapter IIFE template). Both must be cleaned up together.
+  - The `flushLogs` function in `build.ts` is a template string embedded in the IIFE wrapper — it reads `_logNonce` at runtime. Removing the nonce from the relay means also removing it from the adapter template.
+  - The MAIN world script (step 2 in injectLogRelay) existed solely for nonce injection — it monkey-patched `window.postMessage`. With the nonce removed, this entire script was deleted, eliminating the postMessage monkey-patching.
+---
+
+## 2026-02-22 13:35 PST - US-007
+- **Implemented**: Simplified permission system to tier defaults + skipConfirmation — removed 5-layer evaluation, domain matching, per-tool/per-domain policy overrides
+- **Files modified**:
+  - `platform/mcp-server/src/permissions.ts` — simplified `evaluatePermission` to: if skipConfirmation return allow, else return `TIER_DEFAULTS[getToolTier(toolName)]`. Removed `matchDomain`, `matchesDomainList` functions and their exports. Kept `TOOL_TIERS`, `TIER_DEFAULTS`, `getToolTier`, and `ToolTier` type.
+  - `platform/mcp-server/src/config.ts` — removed `PermissionsConfig` interface, `defaultPermissions()`, `parsePermissionsConfig()`, `VALID_TOOL_PERMISSIONS`, `isToolPermission`. Removed `permissions` field from `OpentabsConfig`, `parseConfigRecord`, `loadConfig` defaults, and `saveToolConfig` spread. Kept `ToolPermission` type.
+  - `platform/mcp-server/src/state.ts` — removed `permissions: PermissionsConfig` from `ServerState` interface and `createState()`. Removed `PermissionsConfig` import.
+  - `platform/mcp-server/src/reload.ts` — removed `state.permissions = config.permissions;` line.
+  - `platform/mcp-server/src/permissions.test.ts` — removed all `matchDomain`, `matchesDomainList`, trusted/sensitive/policy/evaluation-order test blocks. Kept `getToolTier` tests. Added 5 simple `evaluatePermission` tests (skipConfirmation, observe, interact, sensitive, null domain).
+  - `platform/mcp-server/src/state.test.ts` — removed `state.permissions.*` assertions (4 lines).
+  - `platform/mcp-server/src/config.test.ts` — removed `permissions` field from 3 `OpentabsConfig` literals in round-trip tests.
+- **Quality checks**: build, type-check, lint, knip, test — all pass (1482 tests, 0 failures)
+- **Learnings for future iterations:**
+  - `VALID_TOOL_PERMISSIONS` and `isToolPermission` were only used inside `parsePermissionsConfig` — removing that function made them unused too, so they had to be removed for knip compliance even though the PRD said to keep them.
+  - The `evaluatePermission` call site in `mcp-setup.ts` passes `domain` as the second arg — prefixing the parameter with `_domain` in the simplified function avoids changing the call site.
+  - Test count dropped by 28 (1510→1482) reflecting the removed permission evaluation test cases.
+---

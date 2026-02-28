@@ -1,0 +1,295 @@
+# Ralph Progress Log
+PRD: prd-2026-02-18-080340-security-hardening~running.json
+Started: Wed Feb 18 08:17:08 PST 2026
+---
+
+## Codebase Patterns
+- JSON-RPC types in `@opentabs-dev/shared` already use `string | number` for id fields — string UUIDs are protocol-compliant
+- `pendingDispatches` Map uses `string | number` keys — string UUIDs work without changing the Map type
+- The extension message parser at `extension-protocol.ts:346` already handles both string and number ids
+- `ServerState` fields on `globalThis` survive hot reloads — when removing a field, mark it optional instead of deleting to avoid hot-reload breakage
+- Unit tests in `platform/mcp-server/src/` run under Bun; E2E tests in `e2e/` run under Playwright/Node.js
+- `writeExecFile()` in `extension-protocol.ts` wraps user code in an IIFE — use `new Function(JSON.stringify(code))` to prevent breakout, not direct string interpolation
+- The browser extension reads back exec results via `globalThis.__openTabs.__lastExecResult` and `__lastExecAsync` — any wrapper changes must preserve these globals
+- The offscreen document derives `httpBase` from `mcpServerUrl` by replacing `ws` → `http` and stripping `/ws` path — use `new URL().host` for same-origin checks (includes port)
+- `handleBrowserExecuteScript` in `browser-commands.ts` uses `chrome.scripting.executeScript` with `files: ['adapters/${execFile}']` — execFile must be validated as a simple filename to prevent path traversal
+- Slack plugin in `plugins/slack/` is a standalone project — its `dist/` and `opentabs-plugin.json` are gitignored; only source files should be committed
+- `ToolError` from `@opentabs-dev/plugin-sdk` is already imported in the Slack tool files — no additional imports needed for throwing tool errors
+- WebSocket auth uses `Sec-WebSocket-Protocol` header (not URL query) — `/ws-info` returns `{ wsUrl, wsSecret }` and the client sends `['opentabs', secret]` as subprotocols
+- On macOS, `/var` → `/private/var` symlink means `tmpdir()` and `realpath(tmpdir())` return different paths — always compare against both raw and resolved paths when validating filesystem locations
+- Bun's `server.upgrade()` supports `{ data, headers }` — the `HotHandlers` interface and `createHandleFetch` parameter type must both include `headers?: HeadersInit`
+- E2E tests that open raw WebSocket connections use `fetchWsInfo()` (from fixtures.ts) to get URL + secret, then pass secret via subprotocol
+- Browser extension rate limiting is in `rate-limiter.ts` — `checkRateLimit(method)` returns boolean, integrated in `handleServerMessage()` before dispatch. Control methods are exempt via `EXEMPT_METHODS` set.
+
+## 2026-02-18 - US-001
+- Replaced `getNextRequestId()` in `state.ts` from sequential counter to `crypto.randomUUID()`
+- Marked `nextRequestId` field as optional/deprecated on `ServerState` for hot-reload compatibility
+- Updated tests in `state.test.ts`, `extension-protocol.test.ts`, and `reload-extension.test.ts` to expect UUID strings
+- Files changed: `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/state.test.ts`, `platform/mcp-server/src/extension-protocol.test.ts`, `platform/mcp-server/src/browser-tools/reload-extension.test.ts`
+- **Learnings for future iterations:**
+  - The shared package's JSON-RPC types already support string IDs — no shared package changes needed for string IDs
+  - When deprecating a ServerState field, keep it as optional to avoid breaking hot reload on stale globalThis
+  - Test fallback values for id lookups should use `''` (empty string) instead of `-1` when IDs are now strings
+---
+
+## 2026-02-18 - US-002
+- Fixed IIFE wrapper breakout vulnerability in `writeExecFile()` by passing user code through `JSON.stringify()` + `new Function()` instead of direct string interpolation
+- User code is now a JSON-escaped string literal passed to the Function constructor, preventing closing braces/parens from breaking out of the wrapper
+- All async detection, error handling, and result capture logic preserved
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`
+- **Learnings for future iterations:**
+  - `new Function(code)` creates a function whose body is `code` — `return` statements work as expected (same as wrapping in `(function() { ... })()`)
+  - `JSON.stringify()` handles all JavaScript string escaping (quotes, backslashes, newlines, Unicode) — no manual escaping needed
+  - The E2E tests (`browser-tools.e2e.ts`) cover execute_script extensively: string/number/boolean/null/object return values, DOM access, localStorage, error handling, and async Promises — all pass with the new Function() approach
+---
+
+## 2026-02-18 - US-003
+- Added `isValidWsOrigin()` helper in offscreen document that validates WebSocket URLs from /ws-info
+- Validates protocol is `ws:` or `wss:` and host matches the source HTTP base URL
+- Applied validation in both `refreshWsUrl()` and the `ws:setUrl` message handler
+- If validation fails, logs a warning and keeps the existing `mcpServerUrl` unchanged
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - The offscreen document derives `httpBase` from `mcpServerUrl` by replacing `ws` → `http` and stripping the `/ws` path — this is the source of truth for origin validation
+  - `new URL().host` includes port number, so `localhost:9515` !== `localhost:9516` — correct for same-origin checks
+  - The `ws:setUrl` handler has two validation points: (1) the resolved URL from /ws-info, and (2) the final `resolvedUrl` which may be the raw URL fallback
+---
+
+## 2026-02-18 - US-004
+- Added regex validation (`/^[a-z0-9_-]+\.js$/`) on `execFile` parameter in `handleBrowserExecuteScript`
+- Rejects filenames containing `/`, `..`, uppercase letters, or any character outside `[a-z0-9_-]` with a `.js` extension
+- Returns JSON-RPC error code `-32602` for invalid execFile format
+- Files changed: `platform/browser-extension/src/browser-commands.ts`
+- **Learnings for future iterations:**
+  - The execFile is used as `adapters/${execFile}` in `chrome.scripting.executeScript({ files: [...] })` — path traversal would escape the adapters directory
+  - The validation is placed right after the existing type/emptiness check, before the file is used
+  - All 199 E2E tests pass — the regex accepts the actual exec file naming pattern (e.g., `exec-abc123.js`)
+---
+
+## 2026-02-18 - US-005
+- Added SSRF protection to Slack file upload by validating upload URL domain before sending file data
+- Validates `upload_url` protocol is `https:` (throws `ToolError` with code `insecure_protocol` otherwise)
+- Validates hostname against trusted Slack domains (`slack.com`, `slack-edge.com`) including subdomains
+- Added `redirect: 'error'` to the fetch call to reject silent redirects to untrusted domains
+- Files changed: `plugins/slack/src/tools/upload-file.ts`
+- **Learnings for future iterations:**
+  - Slack's `files.getUploadURLExternal` API returns an `upload_url` that the client must POST file data to — this is an SSRF vector if not validated
+  - The Slack plugin's `dist/` and `opentabs-plugin.json` are gitignored — only commit source files under `src/`
+  - `ToolError` is already imported from `@opentabs-dev/plugin-sdk` in the tool files — no new imports needed
+  - `redirect: 'error'` on fetch rejects any HTTP redirect, preventing an attacker from using a valid Slack domain that 302s to a malicious endpoint
+---
+
+## 2026-02-18 - US-006
+- Enforced HTTPS for all Slack API calls to prevent token interception over unencrypted connections
+- `buildAuth()` now upgrades `http://` workspace URLs to `https://` via regex replacement
+- `slackApi()` validates `auth.workspaceUrl` starts with `https://` before making any fetch call — throws `ToolError` with code `insecure_connection` if not
+- Defense-in-depth: `buildAuth()` auto-upgrades (first line of defense), `slackApi()` rejects non-HTTPS (second line of defense)
+- Files changed: `plugins/slack/src/slack-api.ts`
+- **Learnings for future iterations:**
+  - `buildAuth()` is the central constructor for `SlackAuth` — all auth sources (localStorage, boot_data, page scripts, localStorage scan) funnel through it, so enforcing HTTPS there covers all paths
+  - The `slackApi()` HTTPS check is a defense-in-depth guard — even if `buildAuth()` is bypassed or the auth object is constructed manually, the API call will still be rejected
+  - `window.location.origin` (used as fallback workspace URL) is always HTTPS on Slack pages, but the upgrade logic handles edge cases like dev environments
+---
+
+## 2026-02-18 - US-007
+- Moved WebSocket auth token from URL query parameter to Sec-WebSocket-Protocol header
+- Server side (`http-routes.ts`): `/ws-info` now returns `{ wsUrl, wsSecret }` as separate fields (no token in URL). `/ws` upgrade handler reads token from `Sec-WebSocket-Protocol` header, validates, and echoes 'opentabs' as the accepted subprotocol.
+- Extension side (`offscreen/index.ts`): Added `wsSecret` state variable. `refreshWsUrl()` and `ws:setUrl` handler extract secret from `/ws-info` response. `connect()` passes `['opentabs', wsSecret]` as WebSocket protocols.
+- Updated `bunServer.upgrade()` type to include `headers?: HeadersInit` (Bun supports this but the local type was too narrow).
+- Updated E2E tests (`lifecycle.e2e.ts`, `dispatch-resilience.e2e.ts`, `fixtures.ts`) to use `fetchWsInfo()` and connect with subprotocol auth.
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/browser-extension/src/offscreen/index.ts`, `e2e/fixtures.ts`, `e2e/lifecycle.e2e.ts`, `e2e/dispatch-resilience.e2e.ts`
+- **Learnings for future iterations:**
+  - Bun's `server.upgrade()` supports `{ data, headers }` in the options object — `headers` can set `Sec-WebSocket-Protocol` for subprotocol negotiation. The local type annotation in `http-routes.ts` needed to be expanded to include this.
+  - The `HotHandlers` interface has a duplicate type for the `bunServer.upgrade` parameter — both the implementation type and the interface type need to be kept in sync.
+  - The `Sec-WebSocket-Protocol` header is comma-separated — parse with `.split(',').map(p => p.trim())` on the server side.
+  - Many E2E tests use `fetchWsUrl()` to open raw WebSocket connections (for stealing extension slots, sending malformed messages, etc.). All of these needed updating to pass the auth token via subprotocol.
+  - The `fetchWsInfo()` helper returns `{ wsUrl, wsSecret }` as separate values — useful for tests that need both pieces independently.
+---
+
+## 2026-02-18 - US-008
+- Added path traversal validation to `discoverFromLocalPaths()` in `discovery.ts`
+- Local plugin paths are validated against allowed root directories (user home directory and system temp directory)
+- Uses `realpath` to resolve symlinks before comparison, preventing symlink-based traversal attacks
+- Checks against both raw and resolved roots to handle macOS `/var` → `/private/var` symlink
+- Paths outside allowed directories are rejected with a warning log
+- Added `isAllowedPluginPath()` as an exported function with unit tests
+- Files changed: `platform/mcp-server/src/discovery.ts`, `platform/mcp-server/src/discovery.test.ts`
+- **Learnings for future iterations:**
+  - On macOS, `/var` is a symlink to `/private/var` — `realpath()` on a temp directory returns `/private/var/...` while `tmpdir()` returns `/var/...`. When comparing paths with `startsWith`, both sides must use the same resolution level.
+  - When `realpath()` fails for non-existent paths (like in unit tests), it falls back to the unresolved path. To handle this correctly, compare against both raw and resolved root directories.
+  - The allowed roots include `tmpdir()` because E2E tests (and some unit tests like `reload.test.ts`) create plugin directories in the system temp directory. Without this, those tests would fail.
+  - `discoverFromLocalPaths()` receives already-resolved absolute paths from `reload.ts` (which resolves them against the config directory). The validation operates on these resolved paths.
+---
+
+## 2026-02-18 - US-009
+- Added plugin existence validation in `handleTabStateChanged()` — rejects `tab.stateChanged` messages for unknown plugin names
+- Added tab state enum validation — rejects states that aren't `closed`, `unavailable`, or `ready`
+- Both validations send JSON-RPC error (code -32602) when an `id` is present, or log a warning for notifications
+- Updated existing tests to register plugins in `state.plugins` before sending state changes
+- Added 3 new tests: unknown plugin rejection (with id), invalid state rejection (with id), unknown plugin warning (notification)
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`, `platform/mcp-server/src/extension-protocol.test.ts`
+- **Learnings for future iterations:**
+  - `handleTabStateChanged` already had a `sendError` helper that sends a JSON-RPC error if `id` is present, or logs a warning for notifications — reuse it for new validations
+  - `parseTabMapping()` coerces invalid states to `'closed'` as a fallback — but `handleTabStateChanged` should reject invalid states outright rather than silently accepting them
+  - Existing tests didn't register plugins in `state.plugins` — they worked before because plugin existence wasn't validated. When adding validation, update all existing tests that exercise the happy path.
+---
+
+## 2026-02-18 - US-010
+- Added `VALID_PLUGIN_NAME` regex (`/^[a-z0-9]+(-[a-z0-9]+)*$/`) validation in side panel `App.tsx`
+- Applied to `tab.stateChanged`, `tool.invocationStart`, and `tool.invocationEnd` notification handlers
+- Messages with invalid plugin name format are silently dropped (consistent with existing validation pattern where invalid states are already silently dropped)
+- Uses same regex pattern as `NAME_REGEX` in `@opentabs-dev/shared` but defined locally since the side panel bundles separately
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - The side panel bundles separately from the main extension code — it uses Bun.build + Tailwind. Importing from `@opentabs-dev/shared` works (it's in node_modules) but for a simple constant, a local copy avoids an unnecessary bundle dependency
+  - The side panel notification handlers use a "silent drop" pattern: invalid messages are simply not processed (no warnings logged). This is consistent — the `validTabStates` check already silently drops unknown states
+  - The `tool.invocationStart`/`tool.invocationEnd` handlers also use `params.plugin` to build a `toolKey` string (`${plugin}:${tool}`) — applying the same validation there prevents injection through those paths too
+---
+
+## 2026-02-18 - US-011
+- Created `rate-limiter.ts` with a sliding window rate limiter for browser commands
+- Integrated rate limiting into `handleServerMessage()` in `message-router.ts` — checks rate limit before dispatching to handler
+- Per-method limits: `browser.screenshotTab`/`browser.enableNetworkCapture` at 2/sec, `browser.executeScript` at 10/sec, `tool.dispatch` at 5/sec, default 20/sec for other methods
+- Control/lifecycle methods (`extension.reload`, `sync.full`, `plugin.update`, `plugin.uninstall`) are exempt from rate limiting
+- Rate-limited requests with an `id` receive JSON-RPC error (code -32603), notifications are silently dropped with a console warning
+- Files changed: `platform/browser-extension/src/rate-limiter.ts` (new), `platform/browser-extension/src/message-router.ts`
+- **Learnings for future iterations:**
+  - The message router dispatches via a `methodHandlers` Map — rate limiting is best placed in `handleServerMessage()` before `handler(params, id)` to cover all methods uniformly
+  - Control methods like `sync.full` must be exempt — they arrive once on connect and blocking them breaks initialization
+  - The `sendToServer` function in `messaging.ts` accepts `unknown` (fire-and-forget via `chrome.runtime.sendMessage`) — error responses just need `jsonrpc`, `error`, and `id` fields
+  - ESLint enforces import ordering (`import-x/order`) — new imports must be placed alphabetically among existing local imports
+---
+
+## 2026-02-18 - US-012
+- Added sliding window rate limiter for `/reload` and `/extension/reload` endpoints in `http-routes.ts`
+- Module-level `endpointCallTimestamps` Map tracks request timestamps per endpoint path
+- `checkEndpointRateLimit()` filters timestamps within a 60-second window, rejects if >= maxPerMinute
+- Both endpoints limited to 10 requests per 60 seconds
+- Returns HTTP 429 "Too Many Requests" with `Retry-After: 60` header when limit exceeded
+- Rate limit check runs after auth check (no point rate-limiting unauthenticated requests)
+- Files changed: `platform/mcp-server/src/http-routes.ts`
+- **Learnings for future iterations:**
+  - The rate limiter is placed at module scope (not inside `createHandleFetch`) so it survives across requests but resets on hot reload (module re-evaluation). This is acceptable behavior — hot reload is infrequent and the rate limiter is a defense-in-depth measure.
+  - Rate limit check is ordered after `checkBearerAuth()` — this ensures unauthenticated requests get a 401 (cheaper check) rather than consuming rate limit slots
+  - The `endpointCallTimestamps` Map uses pathname as key, keeping `/reload` and `/extension/reload` limits independent
+---
+
+## 2026-02-18 - US-013
+- Added file upload type validation to Slack plugin's `upload-file.ts`
+- Reduced max content size from 50MB to 20MB in Zod schema
+- Block executable file extensions: `.exe`, `.sh`, `.bat`, `.cmd`, `.com`, `.app`, `.dmg`, `.msi`, `.bin`
+- Magic byte validation for binary uploads (`is_base64: true`): PNG (89 50 4E 47), JPEG (FF D8 FF), PDF (25 50 44 46), GIF (47 49 46)
+- Extension check runs before base64 decoding (fail fast), magic byte check runs after decoding
+- Files changed: `plugins/slack/src/tools/upload-file.ts`
+- **Learnings for future iterations:**
+  - The Slack plugin uses `ToolError` from `@opentabs-dev/plugin-sdk` for all error cases — consistent pattern across all tools
+  - Extension extraction uses `split('.').pop()` which handles multi-dot filenames like `archive.tar.gz` correctly (gets `gz`)
+  - Magic byte validation only applies when `is_base64: true` and the extension is in the MAGIC_BYTES map — text files and unknown binary types are not checked
+  - The `plugins/slack/` build is independent: `cd plugins/slack && bun run build` runs `tsc` then `opentabs build`
+---
+
+## 2026-02-18 - US-014
+- Set restrictive file permissions on config directory and file in `config.ts`
+- `mkdir` now passes `mode: 0o700` (owner-only access) in both `loadConfig()` and `saveConfig()`
+- `chmod(configPath, 0o600)` called after every `Bun.write()` of config.json (3 write sites total)
+- chmod wrapped in `.catch(() => {})` to silently handle systems that don't support it
+- Files changed: `platform/mcp-server/src/config.ts`
+- **Learnings for future iterations:**
+  - `Bun.write()` doesn't have a `mode` option — chmod must be called separately after writing
+  - `mkdir`'s `mode` option sets permissions on creation; if the directory already exists with broader permissions, it won't narrow them. A separate `chmod` on the directory would be needed for that case, but the `catch` pattern keeps it non-breaking.
+  - There are 3 write sites in config.ts: initial config creation, secret generation upgrade, and `saveConfig()`. All 3 need the chmod call.
+---
+
+## 2026-02-18 - US-015
+- Added `fs.chmodSync(configDir, 0o700)` after `mkdtempSync` in E2E test fixture `createTestConfigDir()`
+- Added `fs.chmodSync(configPath, 0o600)` after `writeFileSync` for config.json
+- E2E tests run under Playwright/Node.js, so synchronous Node.js `fs` APIs are correct here
+- Files changed: `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - E2E fixtures use synchronous Node.js `fs` APIs (not Bun) since Playwright runs under Node.js
+  - The `createTestConfigDir()` function creates a temp directory per test worker — restrictive permissions prevent cross-worker reads on shared CI systems
+---
+
+## 2026-02-18 - US-016
+- Changed `if (lookup.validate)` to `if (!lookup.validate)` with early return in `mcp-setup.ts` tools/call handler
+- When schema compilation failed (validate is null), tool calls now return `isError: true` with descriptive message including `validationErrors()` output
+- Unvalidated input no longer reaches plugin handlers — the call is rejected before dispatch
+- Files changed: `platform/mcp-server/src/mcp-setup.ts`
+- **Learnings for future iterations:**
+  - The `compileToolValidator()` function already returns `validate: null` and a descriptive `validationErrors()` function when compilation fails — the handler just needed to check for null and use the existing error message
+  - Flipping from `if (validate)` to `if (!validate)` with early return is cleaner than nesting — keeps the happy path at the top indentation level
+---
+
+## 2026-02-18 - US-017
+- Created `sanitizeErrorMessage()` utility in both `platform/mcp-server/src/sanitize-error.ts` and `platform/browser-extension/src/sanitize-error.ts`
+- Strips Windows paths, Unix paths (2+ segments), URLs, localhost:port, and IPv4 addresses from error messages
+- Truncates to 500 characters maximum
+- Applied to `http-routes.ts` `/reload` endpoint catch block (sanitizes error in HTTP JSON response, preserves raw message in server log)
+- Applied to all 22 catch blocks in `browser-commands.ts` via `replace_all` on the repeated error pattern
+- Applied to `tool-dispatch.ts` catch block for script execution failures
+- Files changed: `platform/mcp-server/src/sanitize-error.ts` (new), `platform/mcp-server/src/http-routes.ts`, `platform/browser-extension/src/sanitize-error.ts` (new), `platform/browser-extension/src/browser-commands.ts`, `platform/browser-extension/src/tool-dispatch.ts`
+- **Learnings for future iterations:**
+  - The function is duplicated between MCP server and browser extension because they're separate bundles — sharing via `@opentabs-dev/shared` would require publishing
+  - Unix path regex needs 2+ segments (`/a/b`) to avoid false positives on single slashes
+  - Log messages should retain raw error text for debugging; only client-facing responses get sanitized
+  - `browser-commands.ts` has 22 identical `err instanceof Error ? err.message : String(err)` patterns — `replace_all` handles them efficiently
+---
+
+## 2026-02-18 - US-018
+- Created `atomicWriteConfig()` helper that writes to `config.json.tmp`, sets 0o600 permissions, then atomically renames to `config.json`
+- On write failure, the temp file is cleaned up via `unlink().catch(() => {})`
+- Replaced all 3 config write sites (`Bun.write` + `chmod`) with single `atomicWriteConfig()` calls
+- Added `rename` and `unlink` imports from `node:fs/promises`
+- Files changed: `platform/mcp-server/src/config.ts`
+- **Learnings for future iterations:**
+  - `rename()` on the same filesystem is atomic on POSIX — readers never see a partially-written file
+  - `chmod` on the temp file before rename ensures the final file has correct permissions from the start
+  - The 3 write sites were: initial config creation in `loadConfig()`, secret generation upgrade in `loadConfig()`, and `saveConfig()`
+  - The `configWriteMutex` in `saveConfig()` serializes writes — atomic rename provides additional protection against partial reads during write
+---
+
+## 2026-02-18 - US-019
+- Added 10MB input size limit check in `handleToolDispatch()` after input validation
+- `JSON.stringify(input)` is used to measure serialized size; rejects with JSON-RPC error code -32602 if exceeds limit
+- Error message includes actual size and limit for debugging
+- Files changed: `platform/browser-extension/src/tool-dispatch.ts`
+- **Learnings for future iterations:**
+  - The size check is placed after object validation but before plugin lookup — fail fast on oversized inputs
+  - `JSON.stringify().length` measures string length in UTF-16 code units, which is close enough to byte length for size limit purposes
+---
+
+## 2026-02-18 - US-020
+- Added tab URL re-validation in tool dispatch loop before `executeToolOnTab()`
+- Uses `chrome.tabs.get()` to re-fetch the tab's current URL, then `urlMatchesPatterns()` to verify it still matches the plugin's URL patterns
+- If the tab navigated away, it's skipped and the next matching tab is tried (same fallback pattern as adapter-not-ready)
+- If `chrome.tabs.get()` throws (tab closed), the tab is skipped with a "Tab closed" error stored as fallback
+- Added `urlMatchesPatterns` import from `./tab-matching.js`
+- Files changed: `platform/browser-extension/src/tool-dispatch.ts`
+- **Learnings for future iterations:**
+  - `chrome.tabs.get()` is cheap and provides the current URL — much simpler than re-running `findAllMatchingTabs()`
+  - The existing `firstError` fallback pattern works perfectly for URL mismatch — set error, continue to next tab
+  - `urlMatchesPatterns()` was already exported from `tab-matching.ts` — no new code needed for pattern matching
+---
+
+## 2026-02-18 - US-021
+- Created `generateSecret()` helper using `crypto.getRandomValues(new Uint8Array(32))` to produce a 64-character hex string (256 bits)
+- Replaced all 4 `crypto.randomUUID()` calls in config.ts with `generateSecret()`
+- Existing UUID secrets in user configs remain valid — they're just shorter strings that still work for comparison
+- Files changed: `platform/mcp-server/src/config.ts`
+- **Learnings for future iterations:**
+  - `crypto.getRandomValues()` is available in Bun's global scope — no import needed
+  - `Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('')` is a clean one-liner for hex encoding
+  - The 4 secret generation sites: initial config, fallback config (invalid JSON), secret upgrade (missing secret), and error fallback
+---
+
+## 2026-02-18 - US-022
+- Added `sanitizeOutput()` function in `mcp-setup.ts` that recursively removes `__proto__`, `constructor`, and `prototype` keys from objects
+- Handles nested objects and arrays up to depth 50 to prevent stack overflow on deeply nested data
+- Applied to both browser tool results (line 258) and plugin tool results (line 367) before JSON serialization
+- Normal tool output without dangerous keys passes through unchanged
+- Files changed: `platform/mcp-server/src/mcp-setup.ts`
+- **Learnings for future iterations:**
+  - `Object.entries()` only enumerates own enumerable properties — `__proto__` as an actual key (not the prototype accessor) is enumerable
+  - The depth limit (50) prevents infinite recursion on circular references while being deep enough for real tool output
+  - Both browser tool results and plugin tool results go through `JSON.stringify()` in mcp-setup.ts — these are the only two serialization points for tool output to MCP clients
+---

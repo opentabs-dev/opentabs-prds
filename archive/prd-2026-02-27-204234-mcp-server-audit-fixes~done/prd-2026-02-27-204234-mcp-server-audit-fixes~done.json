@@ -1,0 +1,128 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix validated bugs found during backend code audit: permission tier misclassifications, sanitize-error regex gaps, analyze-site network capture race and error handling, detect-auth false positives, and logger duplicate message.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix permission tier misclassifications in permissions.ts",
+      "description": "As a platform operator, I want browser tools classified in the correct security tier so that destructive or disruptive tools require human confirmation instead of being auto-allowed.",
+      "acceptanceCriteria": [
+        "browser_clear_console_logs is classified as 'interact' (not 'observe') in TOOL_TIERS",
+        "extension_reload is classified as 'interact' (not 'observe') in TOOL_TIERS",
+        "extension_force_reconnect is classified as 'interact' (not 'observe') in TOOL_TIERS",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/permissions.ts\n\nThree tools are misclassified in the TOOL_TIERS map (line 29):\n\n1. `browser_clear_console_logs` (line 37): Currently 'observe'. This tool destroys diagnostic data — an agent can clear console logs without confirmation. Should be 'interact'.\n\n2. `extension_reload` (line 46): Currently 'observe'. This triggers chrome.runtime.reload() which disrupts all active tabs and connections. Should be 'interact'.\n\n3. `extension_force_reconnect` (line 45): Currently 'observe'. This tears down and re-establishes the WebSocket connection, disrupting in-flight dispatches. Should be 'interact'.\n\nThe fix is three single-line changes: change the tier string from 'observe' to 'interact' for each. Move the three entries from the 'Observe tier' comment section to the 'Interact tier' comment section to keep the file organized.\n\nIf any unit tests in platform/mcp-server/src/__tests__/ assert on these tiers, update them to expect 'interact'."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix sanitize-error regex gaps for single-segment paths and bare localhost",
+      "description": "As a platform operator, I want all system-internal references stripped from error messages so that MCP clients never see filesystem paths or localhost references.",
+      "acceptanceCriteria": [
+        "Unix paths with a single segment like /tmp, /etc, /var are redacted to [PATH]",
+        "Bare 'localhost' without a port number is redacted to [LOCALHOST]",
+        "Existing multi-segment path redaction still works (e.g., /home/user/file → [PATH])",
+        "Existing localhost:port redaction still works (e.g., localhost:3000 → [LOCALHOST])",
+        "The regex does not produce false positives on common words or single slashes",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/sanitize-error.ts\n\nTwo regex gaps (lines 9-20):\n\n1. Line 14: Unix path regex `/\\/[a-z0-9._-]+(?:\\/[a-z0-9._-]+)+/gi` requires 2+ segments. Single-segment paths like `/tmp`, `/etc`, `/var`, `/home` are NOT redacted. Fix: match paths with 1+ segments after the leading slash: `/\\/[a-z0-9._-]+(?:\\/[a-z0-9._-]+)*/gi`. Be careful not to match bare `/` (a single slash) — the regex should require at least one path component after the slash (e.g., `/tmp` matches, but `/` alone does not). Test that common words are not caught.\n\n2. Line 18: Only `localhost:\\d+` is matched. Bare `localhost` without a port (e.g., 'connection refused to localhost') is NOT redacted. Fix: change to `localhost(?::\\d+)?` to match both `localhost:3000` and bare `localhost`.\n\nThe regex replacement order matters — ensure the new patterns don't interfere with the URL and path patterns above them. URLs like `http://localhost:3000/path` should still be caught by the URL regex first (line 16)."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix analyze-site network capture race: enable capture before tab navigation",
+      "description": "As a user running analyze-site, I want network capture enabled before the page loads so that all network requests from the initial page load are captured.",
+      "acceptanceCriteria": [
+        "enableNetworkCapture is dispatched before the tab is opened or navigated in analyzeSite()",
+        "For new tabs: enableNetworkCapture is called, then browser.openTab is called",
+        "For existing tabs: enableNetworkCapture is called, then browser.navigateTab is called",
+        "The waitSeconds max is reduced to 25 (below the 30s dispatch timeout) to prevent guaranteed timeouts",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts\n\nBug 1 — Network capture race (lines 813-830): The current code opens/navigates the tab (lines 813-823) THEN enables network capture (lines 827-830). Fast-loading pages complete all network requests before capture starts, silently losing all network data.\n\nFix: Move the enableNetworkCapture dispatch (lines 827-830) BEFORE the tab open/navigate block (lines 813-823). The tab must already exist for enableNetworkCapture to target it. For new tabs: open the tab first (to get a tabId), then enable network capture, then navigate. For existing tabs: enable network capture on the existing tabId, then navigate.\n\nCheck the current flow carefully — if new tabs are opened via browser.openTab with a URL, the navigation happens as part of the open. In that case, open the tab to about:blank first, enable capture, then navigate. Or check if the extension supports enabling capture on a tab that hasn't navigated yet.\n\nBug 2 — waitSeconds max equals dispatch timeout (line ~810 or wherever the Zod schema is defined): The max(30) allows `waitSeconds: 30`, but the MCP dispatch timeout is also 30 seconds, causing a guaranteed timeout. Reduce the max to 25 to leave margin for the pre-wait and post-wait work."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix analyze-site error handling: protect network/cookie fetches and cleanup CDP",
+      "description": "As a user running analyze-site, I want errors in getNetworkRequests or getCookies to not orphan CDP debugger sessions, so that subsequent browser operations work correctly.",
+      "acceptanceCriteria": [
+        "getNetworkRequests dispatch is wrapped in try/catch that runs disableNetworkCapture in the catch block",
+        "getCookies dispatch is wrapped in try/catch",
+        "If getNetworkRequests throws, disableNetworkCapture is still called (via finally or catch)",
+        "If getCookies throws, the analysis continues with an empty cookie array rather than crashing",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts\n\nBug (lines 943-958): The `getNetworkRequests` (lines ~943-949) and `getCookies` (lines ~955-958) dispatches are NOT in a try/catch. If either fails, the function throws without calling `disableNetworkCapture` (line ~952), orphaning the CDP debugger attachment on the tab.\n\nFix: Wrap the getNetworkRequests + disableNetworkCapture + getCookies sequence in a try/catch/finally pattern:\n\n```\nlet networkRequests = [];\nlet cookies = [];\ntry {\n  networkRequests = await dispatchToExtension(state, 'browser.getNetworkRequests', { tabId });\n} catch (err) {\n  log.warn('Failed to get network requests:', err);\n} finally {\n  // Always disable network capture to clean up CDP\n  try {\n    await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId });\n  } catch (err) {\n    log.warn('Failed to disable network capture:', err);\n  }\n}\ntry {\n  cookies = await dispatchToExtension(state, 'browser.getCookies', { tabId });\n} catch (err) {\n  log.warn('Failed to get cookies:', err);\n}\n```\n\nThis ensures disableNetworkCapture runs even if getNetworkRequests fails, and the analysis degrades gracefully instead of crashing."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix detect-auth JWT regex false positives and Basic auth URL sampling",
+      "description": "As a user running analyze-site, I want accurate authentication detection so that reports don't contain false positive JWT detections or misattributed Basic auth URLs.",
+      "acceptanceCriteria": [
+        "BASE64URL_SEGMENT regex does not allow '=' padding characters (base64url uses no padding per RFC 7515)",
+        "detectBasicAuth samples the URL from the first request that has a Basic auth header specifically, not just any auth header",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts\n\nBug 1 — JWT regex (line 115): `BASE64URL_SEGMENT = /^[A-Za-z0-9_-]+=*$/` allows `=` padding via `=*`. Per RFC 7515, base64url encoding used in JWTs does NOT use padding. The `=*` causes false positives on non-JWT base64-encoded strings that happen to have three dot-separated segments. Fix: change to `/^[A-Za-z0-9_-]+$/` (remove `=*`).\n\nBug 2 — detectBasicAuth URL sampling (around lines 300-306): The function finds `requestsWithAuth` — requests with ANY Authorization header. Then it takes `firstReq = requestsWithAuth[0]` and uses `firstReq.url` as the sample URL. But `requestsWithAuth[0]` might have a Bearer token (not Basic). The sampleUrl should come from the first request that specifically has a `Basic ` prefix in its Authorization header.\n\nFix for bug 2: Instead of using `requestsWithAuth[0].url`, find the first request whose Authorization header starts with 'Basic ' and use that request's URL. Something like:\n```\nconst basicReq = requestsWithAuth.find(r => {\n  const auth = r.headers?.['authorization'] ?? r.headers?.['Authorization'] ?? '';\n  return auth.startsWith('Basic ');\n});\nconst sampleUrl = basicReq?.url ?? requestsWithAuth[0]?.url ?? url;\n```"
+    },
+    {
+      "id": "US-006",
+      "title": "Fix logger duplicate error message in debug stack output",
+      "description": "As a developer reading debug logs, I want error messages to appear once (not duplicated) when stack traces are included, so that debug output is clean and readable.",
+      "acceptanceCriteria": [
+        "When includeStack is true and err.stack exists, the output contains only the stack (which includes the message) — not message + stack",
+        "When includeStack is false, the output still shows err.message only",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/logger.ts\n\nBug (line 47): The `formatArgs` function's debug path concatenates `last.message + '\\n  ' + last.stack`. But `Error.stack` already includes the error message as its first line (e.g., 'Error: something\\n    at ...'). This produces duplicated output like:\n\n```\n[opentabs] ... something\nError: something\n    at ...\n```\n\nFix: When includeStack is true and last.stack exists, return just last.stack (not last.message + last.stack):\n\n```typescript\nif (includeStack && last.stack) {\n  return [...rest, '\\n  ' + last.stack];\n}\n```\n\nThis produces clean output:\n```\n[opentabs] ...\n  Error: something\n    at ...\n```"
+    }
+  ]
+}

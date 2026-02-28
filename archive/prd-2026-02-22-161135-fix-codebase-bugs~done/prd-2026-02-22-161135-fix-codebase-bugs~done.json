@@ -1,0 +1,288 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix 32 bugs found during codebase review, spanning analyze-site null safety, extension dispatch hangs, SDK utility edge cases, file watcher race conditions, and various correctness issues across the platform.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix analyze-site null safety for executeInTab results",
+      "description": "As a plugin developer using plugin_analyze_site, I want the tool to return partial results when individual script executions fail, so that a single failure doesn't crash the entire analysis.",
+      "acceptanceCriteria": [
+        "Every executeInTab call in platform/mcp-server/src/browser-tools/analyze-site/index.ts defaults to an empty array when the result is null",
+        "Each executeInTab call is individually wrapped in try-catch so one failure doesn't block subsequent probes",
+        "The openTab result (line ~813) is validated to be { id: number } before proceeding, with a clear error thrown on invalid shape",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts. Around lines 830-857, every `executeInTab` call casts its result (e.g., `as CsrfDomToken[]`) without null checks. `executeInTab` returns `inner?.value ?? null` (line 81), so null results get cast to typed nulls. Apply pattern: `const csrfTokens = ((await executeInTab(state, tabId, CSRF_SCRIPT)) ?? []) as CsrfDomToken[];`. Also line 813: `dispatchToExtension` returns `Promise<unknown>`, cast to `{ id: number }` — add a runtime guard: `if (typeof tabId !== 'number') throw new Error(...)`. Wrap each executeInTab in its own try-catch so partial analysis can still proceed."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix extension dispatch functions to always send JSON-RPC responses",
+      "description": "As an AI agent calling MCP tools, I want dispatch functions to always return a JSON-RPC response so that the MCP server never hangs waiting for a reply.",
+      "acceptanceCriteria": [
+        "In handleToolDispatch (platform/browser-extension/src/tool-dispatch.ts ~line 422-492), if all matching tabs have undefined IDs, a JSON-RPC error response is sent",
+        "In handleResourceRead (platform/browser-extension/src/resource-prompt-dispatch.ts ~line 294-354), if all matching tabs have undefined IDs, a JSON-RPC error response is sent",
+        "In handlePromptGet (platform/browser-extension/src/resource-prompt-dispatch.ts ~line 416-474), if all matching tabs have undefined IDs, a JSON-RPC error response is sent",
+        "JSON.stringify(input) in handleToolDispatch (~line 377) is wrapped in try-catch and sends a -32602 error on failure",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File 1: platform/browser-extension/src/tool-dispatch.ts. In handleToolDispatch, after the tab loop (lines 422-492), if no tab was tried (all had undefined IDs), `firstError` is never set and no response is sent. Add an else branch after `if (firstError)` that sends `{ jsonrpc: '2.0', error: { code: -32001, message: 'No usable tab found (all matching tabs have undefined IDs)' }, id }`. Also wrap `JSON.stringify(input)` at ~line 377 in try-catch.\n\nFile 2: platform/browser-extension/src/resource-prompt-dispatch.ts. Same pattern in handleResourceRead (~lines 294-354) and handlePromptGet (~lines 416-474). Add the same fallback error response after each tab loop."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix deleteJSON to handle 204 No Content responses",
+      "description": "As a plugin developer, I want deleteJSON to work with standard REST APIs that return 204 No Content, so that DELETE operations don't throw JSON parse errors.",
+      "acceptanceCriteria": [
+        "deleteJSON in platform/plugin-sdk/src/fetch.ts handles 204 status by returning undefined instead of attempting to parse JSON",
+        "The return type of deleteJSON reflects that it can return undefined for 204 responses",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/plugin-sdk/src/fetch.ts, lines 262-266. `deleteJSON` delegates to `fetchJSONImpl` which calls `response.json()`. Add an early return before JSON parsing: `if (response.status === 204) return undefined as T;`. Consider also handling other no-content statuses (201 with empty body, etc.) by checking `response.headers.get('content-length') === '0'` or catching empty-body JSON parse errors gracefully. Update the function signature/types accordingly."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix DOM utilities crash when document.body is null",
+      "description": "As a plugin developer, I want waitForSelector and waitForSelectorRemoval to work reliably even during early page lifecycle, so that tools triggered during navigation don't crash.",
+      "acceptanceCriteria": [
+        "waitForSelector in platform/plugin-sdk/src/dom.ts observes document.documentElement instead of document.body, or guards against null body",
+        "waitForSelectorRemoval in platform/plugin-sdk/src/dom.ts observes document.documentElement instead of document.body, or guards against null body",
+        "Timer cleanup occurs correctly even if the observer setup fails",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/plugin-sdk/src/dom.ts, lines 56 and 91. Both functions call `observer.observe(document.body, ...)`. Change to `observer.observe(document.documentElement, ...)` which is available earlier in page lifecycle (always non-null when scripts run). Ensure the timeout timer is cleaned up in all code paths, including if `observe()` itself somehow throws."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix file watcher mutating immutable plugin registry",
+      "description": "As a developer in dev mode, I want file watcher updates to be atomic, so that concurrent MCP requests don't see partially-updated plugin data.",
+      "acceptanceCriteria": [
+        "handleIifeChange in platform/mcp-server/src/file-watcher.ts creates a new plugin object instead of mutating the existing one",
+        "handleToolsJsonChange in platform/mcp-server/src/file-watcher.ts creates a new plugin object instead of mutating the existing one",
+        "Registry updates are atomic — the old plugin reference remains consistent for in-flight requests",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/file-watcher.ts, lines 179, 306-331. Currently mutates `plugin.iife`, `plugin.adapterHash`, `plugin.tools` directly. Object.freeze in buildRegistry is shallow. Fix: create a new RegisteredPlugin with spread + updated fields, then update the registry by calling `updatePluginInRegistry(newPlugin)` or similar. Check how the registry is structured — if it's a Map, swap the entry atomically. Look at platform/mcp-server/src/registry.ts for the PluginRegistry interface."
+    },
+    {
+      "id": "US-006",
+      "title": "Fix bg:getLogs broadcast causing duplicate log entries",
+      "description": "As a developer using extension_get_logs, I want to see accurate logs from both background and offscreen contexts without duplicates.",
+      "acceptanceCriteria": [
+        "The message type used to request offscreen logs is distinct from bg:getLogs (e.g., offscreen:getLogs) to prevent the background handler from responding to its own request",
+        "extension_get_logs returns separate, non-duplicated log entries from background and offscreen",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/browser-commands.ts, lines 1951-1955. `handleExtensionGetLogs` sends `chrome.runtime.sendMessage({ type: 'bg:getLogs' })` which broadcasts to all listeners including the background script itself. The background handler responds with its own logs, so the caller gets background logs labeled as offscreen logs. Fix: use a distinct message type like `offscreen:getLogs` for requesting offscreen logs. Update both the sender in browser-commands.ts and the receiver in the offscreen document. Search for all handlers of `bg:getLogs` to find the offscreen listener."
+    },
+    {
+      "id": "US-007",
+      "title": "Fix HTTP 5xx errors not marked as retryable in SDK fetch utilities",
+      "description": "As an AI agent, I want server errors (5xx) from plugin tools to be marked as retryable, so that I can automatically retry transient failures.",
+      "acceptanceCriteria": [
+        "httpStatusToToolError in platform/plugin-sdk/src/fetch.ts creates ToolErrors with retryable: true for status codes >= 500",
+        "503 Service Unavailable includes retryAfterMs if a Retry-After header is present",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "File: platform/plugin-sdk/src/fetch.ts, line 27. The default case falls through to `category: 'internal'` with no retryable flag. Add a check: `if (status >= 500) return new ToolError(message, 'http_error', { category: 'internal', retryable: true });` before the default case. For 503, also check the Retry-After response header and convert to retryAfterMs. Keep 4xx errors as non-retryable (they already have specific handling for 401/403/404/429)."
+    },
+    {
+      "id": "US-008",
+      "title": "Fix log buffers and global path cache lost on hot reload",
+      "description": "As a developer in dev mode, I want plugin log history and npm path caches to survive hot reloads, so that debugging and performance are not degraded.",
+      "acceptanceCriteria": [
+        "Plugin log buffers in platform/mcp-server/src/log-buffer.ts survive bun --hot reloads by storing on globalThis or ServerState",
+        "Cached global paths in platform/mcp-server/src/resolver.ts survive bun --hot reloads by storing on globalThis or ServerState",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "File 1: platform/mcp-server/src/log-buffer.ts, line 37. The `buffers` Map is module-level and resets on hot reload. Look at how platform/mcp-server/src/state.ts stores state on globalThis for the pattern to follow. Store the buffers map in ServerState or use `globalThis.__openTabs_logBuffers ??= new Map()`.\n\nFile 2: platform/mcp-server/src/resolver.ts, lines 128-136. `cachedGlobalPaths` is module-level. Same fix: store on globalThis. Follow existing patterns in the codebase for globalThis persistence."
+    },
+    {
+      "id": "US-009",
+      "title": "Fix waitUntil overlapping async predicate calls and retry abort handling",
+      "description": "As a plugin developer, I want timing utilities to handle async predicates and abort signals correctly, so that side-effectful operations don't overlap and cancellation is responsive.",
+      "acceptanceCriteria": [
+        "waitUntil in platform/plugin-sdk/src/timing.ts uses recursive setTimeout instead of setInterval to prevent overlapping async predicate calls",
+        "retry in platform/plugin-sdk/src/timing.ts checks the abort signal during sleep delays, not just between retries",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "File: platform/plugin-sdk/src/timing.ts.\n\nBug 1 (lines 87-100): `setInterval` fires `check()` on a fixed interval regardless of async predicate completion. Fix: replace setInterval with recursive setTimeout: `const scheduleNext = () => { if (!settled) timer = setTimeout(() => void check().then(scheduleNext), interval); }; scheduleNext();`\n\nBug 2 (lines 47-52): The abort signal is only checked between retries, not during sleep. Fix: race the sleep against the abort signal: `await Promise.race([sleep(delay), new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true }))]);` — but handle the case where the promise from addEventListener needs cleanup."
+    },
+    {
+      "id": "US-010",
+      "title": "Fix TOCTOU race in registerInConfig and path format inconsistency",
+      "description": "As a developer building plugins concurrently, I want plugin registration to be safe from race conditions and use consistent path formats.",
+      "acceptanceCriteria": [
+        "registerInConfig in platform/plugin-tools/src/commands/build.ts uses file locking or retry-with-CAS to prevent concurrent builds from overwriting each other's registrations",
+        "Path format in registerInConfig matches the format used by opentabs config set localPlugins.add in platform/cli/src/commands/config.ts (both use either absolute or relative paths consistently)",
+        "Duplicate detection works correctly regardless of which tool registered the plugin first",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "File 1: platform/plugin-tools/src/commands/build.ts, lines 62-93. Read-modify-write without locking. Use advisory file locking (e.g., a .lock file with retry) or a simple retry loop that re-reads the file before writing.\n\nFile 2: platform/cli/src/commands/config.ts, lines 253-270 stores absolute paths. platform/plugin-tools/src/commands/build.ts lines 86-89 stores relative paths. Normalize both to absolute paths (resolve relative paths against config dir before storing). Update duplicate detection to compare resolved absolute paths."
+    },
+    {
+      "id": "US-011",
+      "title": "Fix sanitizeOutput security bypass and _setLogTransport idempotency",
+      "description": "As a platform maintainer, I want security protections to work correctly and log transport to be robust during adapter re-injection.",
+      "acceptanceCriteria": [
+        "sanitizeOutput in platform/mcp-server/src/mcp-setup.ts returns a safe placeholder string instead of the unsanitized object when recursion depth exceeds the limit",
+        "_setLogTransport restore function in platform/plugin-sdk/src/log.ts only restores if the current transport matches the one being restored, preventing stale restores from corrupting newer transports",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "File 1: platform/mcp-server/src/mcp-setup.ts, line 62. When recursion depth > 50, the code returns the unsanitized object as-is. Change to return `'[Object too deep]'` or similar safe string.\n\nFile 2: platform/plugin-sdk/src/log.ts, lines 113-118. The restore function blindly sets `activeTransport = defaultTransport`. Fix: `return () => { if (activeTransport === transport) activeTransport = previous; };` — only restore if current transport matches what was installed."
+    },
+    {
+      "id": "US-012",
+      "title": "Fix CLI doctor hardcoded path and logs crash on file deletion",
+      "description": "As a user with a custom config directory, I want opentabs doctor to check the correct extension path, and opentabs logs to handle file deletion gracefully.",
+      "acceptanceCriteria": [
+        "checkExtensionInstalled in platform/cli/src/commands/doctor.ts uses getConfigDir() instead of hardcoded ~/.opentabs",
+        "followFile in platform/cli/src/commands/logs.ts handles ENOENT from statSync gracefully instead of crashing",
+        "tailFile output ends with a newline before followFile starts appending",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "File 1: platform/cli/src/commands/doctor.ts, line 112. Hardcodes `~/.opentabs` instead of using `getConfigDir()`. Import getConfigDir from the config module and use `join(getConfigDir(), 'extension')`.\n\nFile 2: platform/cli/src/commands/logs.ts. Line 76: `statSync(filePath)` in `readNewContent` has no try-catch. Wrap in try-catch and return gracefully (e.g., return empty string). Lines 37-55: tailFile output may not end with newline — add trailing newline if content is non-empty."
+    },
+    {
+      "id": "US-013",
+      "title": "Fix analyze-site detection module logic errors",
+      "description": "As a plugin developer using plugin_analyze_site, I want the detection modules to produce accurate results without logic errors in filtering and classification.",
+      "acceptanceCriteria": [
+        "Zone.js filter in GLOBALS_SCAN_SCRIPT (platform/mcp-server/src/browser-tools/analyze-site/index.ts ~line 421) uses || instead of && for the two startsWith conditions",
+        "GraphQL isMutation check (~line 678-679) uses match[0].startsWith('mutation') instead of query.trimStart().startsWith('mutation')",
+        "Cookie extractionHint in detect-auth.ts (~lines 146-148) escapes special regex characters in cookie names",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "File 1: platform/mcp-server/src/browser-tools/analyze-site/index.ts, line 421. `key.startsWith('_') && key.startsWith('__zone')` — the `&&` should be `||` to filter both `_`-prefixed and `__zone`-prefixed globals. Currently only __zone-prefixed globals are filtered (since `__zone` implies `_`).\n\nFile 2: Same file, lines 678-679. `query.trimStart().startsWith('mutation')` checks the raw query string beginning. Should use `match[0].startsWith('mutation')` where `match` is the regex result that extracted the operation keyword.\n\nFile 3: platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts, lines 146-148. Cookie names like `connect.sid` have unescaped `.` in regex hints. Use: `cookie.name.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&')` to escape."
+    },
+    {
+      "id": "US-014",
+      "title": "Fix Zod instanceof checks and remove dead code in plugin-tools",
+      "description": "As a plugin developer, I want prompt argument optionality to be detected correctly and build output to have no dead code.",
+      "acceptanceCriteria": [
+        "extractArgsFromSchema in platform/plugin-tools/src/commands/build.ts uses Zod's isOptional() method instead of instanceof checks for ZodOptional/ZodDefault",
+        "Dead code branch for 'legacy array format' in platform/plugin-tools/src/commands/inspect.ts is removed",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 14,
+      "passes": true,
+      "notes": "File 1: platform/plugin-tools/src/commands/build.ts, lines 418-427. Uses `fieldSchema instanceof z.ZodOptional || fieldSchema instanceof z.ZodDefault`. In Zod 4, instanceof checks may not be reliable. Use `fieldSchema.isOptional()` which covers both optional and default cases.\n\nFile 2: platform/plugin-tools/src/commands/inspect.ts, lines 63-68. `else if (Array.isArray(parsed))` is unreachable because line 57 already throws for arrays. Remove the dead branch entirely."
+    },
+    {
+      "id": "US-015",
+      "title": "Fix network capture data loss and select-option validation gap",
+      "description": "As a developer using network capture and browser tools, I want captured data to be complete and tool inputs to be validated correctly.",
+      "acceptanceCriteria": [
+        "Network capture in platform/browser-extension/src/network-capture.ts stores object references in requestIdToRequest map instead of array indices, preventing data loss when entries are shifted out",
+        "select-option tool in platform/mcp-server/src/browser-tools/select-option.ts validates that at least one of value or label is provided",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 15,
+      "passes": true,
+      "notes": "File 1: platform/browser-extension/src/network-capture.ts, lines 186-228. Currently stores array indices in `requestIdToRequest`. When entries are shifted from the array, indices become stale and response bodies are silently lost. Fix: store direct object references: `requestIdToRequest: Map<string, CapturedRequest>` pointing to the actual request object, not an index into the array.\n\nFile 2: platform/mcp-server/src/browser-tools/select-option.ts, lines 14-18. Both `value` and `label` are optional. Add a `.refine()` on the schema requiring at least one, or add a guard at the start of the handler."
+    },
+    {
+      "id": "US-016",
+      "title": "Fix extension protocol, prompt args, and isLocalhostHost edge cases",
+      "description": "As a platform maintainer, I want protocol handling and security checks to be robust against edge cases.",
+      "acceptanceCriteria": [
+        "Extension JSON-RPC error responses in platform/mcp-server/src/extension-protocol.ts (~line 549) are validated before constructing DispatchError",
+        "Prompt arguments in platform/browser-extension/src/resource-prompt-dispatch.ts (~line 392) are coerced to strings before passing to adapters",
+        "isLocalhostHost in platform/mcp-server/src/http-routes.ts handles ::ffff:127.0.0.1 (IPv4-mapped IPv6)",
+        "handleAuditFromFile in platform/cli/src/commands/audit.ts has a size guard to prevent OOM on large audit files",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 16,
+      "passes": true,
+      "notes": "File 1: platform/mcp-server/src/extension-protocol.ts, line 549. `parsed.error` is cast to `{ code: number; message: string }` without validation. Add shape validation: check typeof code === 'number' and typeof message === 'string', provide defaults if invalid.\n\nFile 2: platform/browser-extension/src/resource-prompt-dispatch.ts, line 392. `rawArgs` cast to `Record<string, string>` without coercion. Iterate and String() each value.\n\nFile 3: platform/mcp-server/src/http-routes.ts, lines 106-126. Add `::ffff:127.0.0.1` to ALLOWED_HOSTS set.\n\nFile 4: platform/cli/src/commands/audit.ts, lines 117-168. Reads entire file. Add a file size check (e.g., limit to 10MB) or read only the last N KB using file seek."
+    }
+  ]
+}

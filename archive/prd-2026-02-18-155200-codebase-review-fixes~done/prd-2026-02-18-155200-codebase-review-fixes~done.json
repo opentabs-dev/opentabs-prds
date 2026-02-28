@@ -1,0 +1,189 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix critical and high-priority issues found during thorough codebase review: WebSocket deadlock, unsafe type casts, silent error swallowing, missing try-catch guards, duplicated schemas, and flaky E2E tests.",
+  "userStories": [
+    {
+      "id": "US-101",
+      "title": "Fix WebSocket connecting flag deadlock in offscreen document",
+      "description": "As a developer, I want the offscreen WebSocket to recover from constructor failures so that the extension reconnects instead of permanently deadlocking.",
+      "acceptanceCriteria": [
+        "connecting flag is reset to false regardless of whether WebSocket constructor succeeds or throws",
+        "The fix uses a finally block or equivalent to guarantee the flag is always reset",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts, lines 197-212. The connect() function sets `connecting = true` on line 202, then tries `ws = new WebSocket(mcpServerUrl)` in a try-catch (lines 205-211). If the constructor throws, the catch block sets `connecting = false` and returns. But line 212 also sets `connecting = false` for the success path. The issue is subtle: if anything between line 206 and line 212 throws (including WebSocket constructor throwing a non-Error), `connecting` stays true. The fix is to restructure so `connecting = false` is in a finally block after the try-catch, or to set it immediately after the try-catch block (which is the current code — actually the current code IS correct for the WebSocket constructor case because the catch handles it). HOWEVER, look more carefully: the real issue is if `refreshWsUrl()` on line 203 throws AFTER `connecting = true` on line 202. There's no try-catch around the whole function. Wrap the entire function body in try-finally: `connecting = true; try { ... } finally { connecting = false; }`"
+    },
+    {
+      "id": "US-102",
+      "title": "Add try-catch around atob() in Slack upload-file tool",
+      "description": "As a plugin user, I want invalid base64 input to return an immediate error so that I get a clear error message instead of a silent 30-second timeout.",
+      "acceptanceCriteria": [
+        "atob() call in upload-file.ts handle function is wrapped in try-catch",
+        "Invalid base64 input throws ToolError with code 'invalid_base64' and a human-readable message",
+        "Valid base64 input still works correctly (no functional regression)",
+        "cd plugins/slack && bun run build succeeds"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: plugins/slack/src/tools/upload-file.ts, lines 37-40. Current code: `const contentBytes = params.is_base64 ? Uint8Array.from(atob(params.content), c => c.charCodeAt(0)) : new TextEncoder().encode(params.content);`. Wrap the atob branch in try-catch: `try { Uint8Array.from(atob(params.content), c => c.charCodeAt(0)) } catch { throw new ToolError('Invalid base64 content — ensure the content is properly base64-encoded', 'invalid_base64'); }`. ToolError is already imported on line 2. This is a standalone plugin (not in bun workspaces), so verify with `cd plugins/slack && bun run build`."
+    },
+    {
+      "id": "US-103",
+      "title": "Fix unsafe type casts on WebSocket message fields in extension-protocol",
+      "description": "As a developer, I want WebSocket message fields to be validated at runtime so that malformed messages with wrong types are handled gracefully.",
+      "acceptanceCriteria": [
+        "parsed.method uses runtime type guard: typeof check instead of 'as' cast",
+        "parsed.id uses runtime type guard: typeof check for string or number instead of 'as' cast",
+        "Existing unit tests still pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/extension-protocol.ts, lines 345-346. Current code:\n```\nconst method = parsed.method as string | undefined;\nconst id = parsed.id as string | number | undefined;\n```\nReplace with:\n```\nconst method = typeof parsed.method === 'string' ? parsed.method : undefined;\nconst id = typeof parsed.id === 'string' || typeof parsed.id === 'number' ? parsed.id : undefined;\n```\nThis is inside the handleExtensionMessage function. Check that no downstream code assumes method/id are always defined — they're already typed as `| undefined` so callers already handle the undefined case."
+    },
+    {
+      "id": "US-104",
+      "title": "Fix network capture state created before all debugger commands succeed",
+      "description": "As a developer, I want capture state to only exist when all debugger commands succeeded so that failed intermediate commands don't leave the debugger in an unknown state.",
+      "acceptanceCriteria": [
+        "captures.set() call is moved to AFTER both Network.enable and Runtime.enable succeed",
+        "If Network.enable or Runtime.enable fails after attach, chrome.debugger.detach is called before rethrowing",
+        "Existing unit tests still pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/network-capture.ts, lines 162-186. Current code attaches debugger (line 168), then runs Network.enable (176) and Runtime.enable (177), then sets captures (179). If sendCommand fails, the debugger is attached but capture state doesn't exist, so stopCapture can't clean it up. Fix: wrap lines 176-185 in try-catch. In the catch block, call `chrome.debugger.detach({ tabId }).catch(() => {})` to clean up the attachment, then rethrow. Move captures.set() to after both sendCommand calls succeed."
+    },
+    {
+      "id": "US-105",
+      "title": "Fix silent error swallowing in adapter teardown during injection",
+      "description": "As a developer, I want adapter teardown failures to be logged so that debugging injection issues is possible.",
+      "acceptanceCriteria": [
+        "The .catch(() => {}) on the teardown executeScript call is replaced with .catch that logs a warning",
+        "Warning includes the plugin name and the error",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/iife-injection.ts, line 221. Current code: `.catch(() => {});`. Replace with: `.catch((err: unknown) => { console.warn('[OpenTabs] adapter teardown script failed for', pluginName, ':', err); });`. The pluginName variable is in scope from the outer map callback. Keep the teardown as non-fatal (don't rethrow), just make the failure observable."
+    },
+    {
+      "id": "US-106",
+      "title": "Fix tab state lock swallowing rejections silently",
+      "description": "As a developer, I want tab state computation failures to be logged with context so that stale state is observable in logs.",
+      "acceptanceCriteria": [
+        "The .catch(() => {}) in the plugin lock chain logs the error with plugin name",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/tab-state.ts, line 283. Current code: `next.catch(() => {})`. Replace with: `next.catch((err: unknown) => { console.warn('[opentabs] tab state check failed for plugin', plugin.name, ':', err); })`. The plugin variable is available in the map callback scope. The catch handler must still prevent the rejection from propagating (don't rethrow), as the catch result is stored in pluginLocks to chain subsequent calls."
+    },
+    {
+      "id": "US-107",
+      "title": "Add try-catch with clear error message around z.toJSONSchema() in build command",
+      "description": "As a plugin author, I want clear error messages when my Zod schema fails to serialize so that I know exactly which tool and which restriction is violated.",
+      "acceptanceCriteria": [
+        "z.toJSONSchema(tool.input) call is wrapped in try-catch",
+        "z.toJSONSchema(tool.output) call is wrapped in try-catch",
+        "Caught errors are rethrown with message including the tool name and guidance about .transform()/.pipe()/.preprocess()",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "File: platform/cli/src/commands/build.ts, lines 71-78 (convertToolSchemas function). Current code calls z.toJSONSchema() directly. Wrap each call in try-catch. Example:\n```\nlet inputSchema: Record<string, unknown>;\ntry {\n  inputSchema = z.toJSONSchema(tool.input) as Record<string, unknown>;\n} catch (err) {\n  throw new Error(\n    `Tool \"${tool.name}\" input schema failed to serialize to JSON Schema. ` +\n    `Schemas cannot use .transform(), .pipe(), or .preprocess(). ` +\n    `${err instanceof Error ? err.message : String(err)}`\n  );\n}\n```\nDo the same for the output schema call."
+    },
+    {
+      "id": "US-108",
+      "title": "Use crypto.randomUUID() for temp file uniqueness in IIFE bundling",
+      "description": "As a developer, I want temp file names to be collision-resistant so that concurrent builds in the same directory don't interfere with each other.",
+      "acceptanceCriteria": [
+        "Date.now() in the temp file name is replaced with crypto.randomUUID()",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "File: platform/cli/src/commands/build.ts, line 106. Current code: `const wrapperPath = join(outDir, '_adapter_entry_${Date.now()}.ts');`. Replace with: `const wrapperPath = join(outDir, '_adapter_entry_${crypto.randomUUID()}.ts');`. crypto.randomUUID() is available globally in Bun without any import."
+    },
+    {
+      "id": "US-109",
+      "title": "Fix Slack API error code conflated with error message",
+      "description": "As a tool consumer, I want Slack API errors to have distinct human-readable messages and machine-readable error codes so that programmatic error handling works correctly.",
+      "acceptanceCriteria": [
+        "ToolError is constructed with a descriptive message as first arg and the Slack error code as second arg",
+        "Error code remains the raw Slack error string (e.g., 'channel_not_found')",
+        "Error message is human-readable (e.g., 'Slack API error: channel_not_found')",
+        "cd plugins/slack && bun run build succeeds"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "File: plugins/slack/src/slack-api.ts, line 414. Current code: `throw new ToolError(error, error);` where error is the raw Slack error code like 'channel_not_found'. Replace with: `throw new ToolError('Slack API error: ' + error, error);`. The ToolError constructor signature is ToolError(message: string, code: string). This is a standalone plugin — verify with `cd plugins/slack && bun run build`."
+    },
+    {
+      "id": "US-110",
+      "title": "Consolidate duplicated Slack message and pagination schemas",
+      "description": "As a developer, I want shared Zod schemas for Slack messages and pagination metadata to be defined in one place so that changes are made once instead of in multiple files.",
+      "acceptanceCriteria": [
+        "A messageSchema with fields type, user (optional), text, ts is exported from channel-schema.ts",
+        "A paginationMetadataSchema with next_cursor field is exported from channel-schema.ts",
+        "read-messages.ts imports messageSchema and paginationMetadataSchema from channel-schema.ts instead of defining locally",
+        "read-thread.ts imports a replySchema (extends messageSchema with thread_ts) or defines its own using messageSchema as base, and uses paginationMetadataSchema",
+        "list-channels.ts, list-members.ts, list-users.ts import paginationMetadataSchema from channel-schema.ts",
+        "No duplicated message or pagination schemas remain in individual tool files",
+        "cd plugins/slack && bun run build succeeds"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "Files to modify:\n- plugins/slack/src/tools/channel-schema.ts — add exports for messageSchema and paginationMetadataSchema\n- plugins/slack/src/tools/read-messages.ts — lines 5-10 define local messageSchema, lines 36-41 define pagination. Remove both and import.\n- plugins/slack/src/tools/read-thread.ts — lines 5-11 define replySchema (similar to messageSchema + thread_ts). Either extend messageSchema with .extend({ thread_ts: z.string().optional() }) or keep separate but import pagination.\n- plugins/slack/src/tools/list-channels.ts, list-members.ts, list-users.ts — each defines response_metadata output schema inline. Import paginationMetadataSchema.\n\nThe messageSchema should be: z.object({ type: z.string().describe('Message type'), user: z.string().optional().describe('User ID'), text: z.string().describe('Message text'), ts: z.string().describe('Message timestamp') }).\n\nThe paginationMetadataSchema should be: z.object({ next_cursor: z.string().describe('Cursor for the next page') }).optional().describe('Pagination metadata').\n\nThis is a standalone plugin — run `cd plugins/slack && bun run build` to verify."
+    },
+    {
+      "id": "US-111",
+      "title": "Replace fixed setTimeout waits with polling in E2E browser-tools tests",
+      "description": "As a developer, I want E2E browser-tools tests to poll for conditions instead of using fixed timeouts so that tests are reliable under parallel CI load.",
+      "acceptanceCriteria": [
+        "No occurrences of 'new Promise(resolve => setTimeout(resolve' in e2e/browser-tools.e2e.ts",
+        "All waits use the existing waitFor() helper or waitForToolResult() from helpers.ts",
+        "Each polling predicate checks the actual condition (cookie exists, console log captured, etc.)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "File: e2e/browser-tools.e2e.ts — approximately 12 occurrences of fixed setTimeout waits at lines 586, 610, 652, 699, 973, 1561, 1601, 1640, 1693, 1736. The waitFor() helper is exported from e2e/helpers.ts (polls a predicate with configurable timeout and interval). For each occurrence, identify what condition the test is waiting for, then replace the fixed wait with a polling predicate. For example, cookie tests should poll until `browser_get_cookies` returns the expected cookie. Console log tests should poll until `browser_get_console_logs` returns the expected entries. Network capture tests should poll until `browser_get_network_requests` returns captured requests. IMPORTANT: This is a large change — read each test carefully to understand what the setTimeout is waiting for before replacing it. The waitFor helper signature is: waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs?: number, intervalMs?: number, label?: string). E2E tests run under Playwright's Node.js runner."
+    }
+  ]
+}

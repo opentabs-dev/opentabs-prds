@@ -1,0 +1,122 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Improve opentabs doctor diagnostics (npm plugin checks, MCP client check, fix false alarm) and opentabs audit (ANSI alignment, --tool filter, --since filter).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix doctor false alarm for npm-only users",
+      "description": "As a user with only npm-installed plugins, I don't want to see a warning about having no local plugins configured.",
+      "acceptanceCriteria": [
+        "When localPlugins is empty, doctor shows an info-level message (dim, not yellow warning) saying 'No local plugins configured (npm plugins are auto-discovered at server startup)'",
+        "The message does not use the yellow '!' icon — it uses a dim '-' or is omitted entirely",
+        "When localPlugins has entries, the per-plugin checks remain unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/doctor.ts checkPlugins function (lines 153-211). Currently lines 161-169 return a warn() when pluginPaths.length === 0. Change this to return a pass() or an info-level result. Since CheckResult only has ok/fatal states, returning pass('Local plugins', 'none configured (npm plugins are auto-discovered at startup)') would be the simplest fix — it shows a green check instead of a yellow warning."
+    },
+    {
+      "id": "US-002",
+      "title": "Add npm plugin health check to doctor",
+      "description": "As a user, I want doctor to verify that my npm-installed plugins are healthy when the server is running.",
+      "acceptanceCriteria": [
+        "When the MCP server is reachable, doctor fetches /health and checks pluginDetails for npm-sourced plugins",
+        "Each npm plugin is listed with its name, version, and status (ready/unavailable/closed)",
+        "Failed plugins from /health are shown as warnings with their error message",
+        "When the server is not running, npm plugin checks are skipped with a dim note: 'npm plugin health requires a running server'",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/doctor.ts. After checkPlugins (local plugin checks), add a new check function that uses the health data already fetched in checkServerHealth (the healthData variable on line 225).\n\nAdd a new function checkNpmPlugins(data: Record<string, unknown> | null): CheckResult[]. If data is null (server not reachable), return [info('npm plugins', 'requires running server to check')]. If data has pluginDetails, filter for source === 'npm' and create pass/warn results based on tabState. Also check failedPlugins array for any failures.\n\nInsert the call after line 240 (after local plugin checks):\n```\nresults.push(...checkNpmPlugins(healthData));\n```"
+    },
+    {
+      "id": "US-003",
+      "title": "Add MCP client configuration check to doctor",
+      "description": "As a user, I want doctor to check if my MCP client is configured to connect to OpenTabs.",
+      "acceptanceCriteria": [
+        "Doctor checks for Claude Code config at ~/.claude/settings/mcp.json and reports if an 'opentabs' entry exists",
+        "Doctor checks for Cursor config at .cursor/mcp.json in the current directory",
+        "If at least one MCP client config is found with an opentabs entry, shows a green check",
+        "If no MCP client configs are found, shows a yellow warning with setup instructions",
+        "The check does not fail fatally (just warns) since the user might use an unsupported client",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/doctor.ts. Add a new checkMcpClientConfig function. Check these paths:\n1. ~/.claude/settings/mcp.json (Claude Code) — use join(homedir(), '.claude', 'settings', 'mcp.json')\n2. .cursor/mcp.json (Cursor) — use join(process.cwd(), '.cursor', 'mcp.json')\n\nFor each file that exists, try to parse JSON and check if it has mcpServers.opentabs. Return pass if found, warn if not found in any location.\n\nInsert the check after the extension checks and before plugin checks. The label should be 'MCP client config'."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix audit table ANSI column alignment",
+      "description": "As a user, I want the audit table columns to be properly aligned regardless of color codes.",
+      "acceptanceCriteria": [
+        "The status column (checkmark/cross) has consistent visual alignment across all rows",
+        "The padEnd operation accounts for ANSI escape code length so visual width is correct",
+        "Rows with green checkmarks and red crosses align to the same column position",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/audit.ts lines 122-128. The issue is on line 125:\n```\nconst status = (entry.success ? pc.green('\\u2713') : pc.red('\\u2717')).padEnd(statusCol);\n```\n\npadEnd counts ANSI escape codes as characters, so the visual padding is wrong. Fix by padding the raw string first, then colorizing:\n```\nconst statusChar = entry.success ? '\\u2713' : '\\u2717';\nconst statusPadded = statusChar.padEnd(statusCol);\nconst status = entry.success ? pc.green(statusPadded) : pc.red(statusPadded);\n```\n\nOr: apply color to the character only, then manually add spaces:\n```\nconst statusIcon = entry.success ? pc.green('\\u2713') : pc.red('\\u2717');\nconst status = statusIcon + ' '.repeat(Math.max(0, statusCol - 1));\n```\n\nThe second approach is more robust since checkmark/cross are single visual characters."
+    },
+    {
+      "id": "US-005",
+      "title": "Add --tool filter to opentabs audit",
+      "description": "As a user, I want to filter audit entries by tool name to debug specific tool invocations.",
+      "acceptanceCriteria": [
+        "Running 'opentabs audit --tool slack_send_message' filters to only entries for that tool",
+        "The --tool parameter is passed as a query parameter to the /audit endpoint",
+        "Can be combined with --plugin and --limit",
+        "Help text includes a --tool example",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/audit.ts.\n1. Add to AuditOptions interface (line 11): tool?: string\n2. In handleAudit (line 75): if (options.tool) url.searchParams.set('tool', options.tool)\n3. In registerAuditCommand: add .option('--tool <name>', 'Filter by tool name')\n4. Add to help text examples: '  $ opentabs audit --tool slack_send_message'\n\nThe server already supports the 'tool' query parameter (platform/mcp-server/src/http-routes.ts line 308)."
+    },
+    {
+      "id": "US-006",
+      "title": "Add --since and --before time filters to opentabs audit",
+      "description": "As a user, I want to filter audit entries by time range to see what happened during a specific period.",
+      "acceptanceCriteria": [
+        "Running 'opentabs audit --since 1h' shows entries from the last hour",
+        "Running 'opentabs audit --since 30m' shows entries from the last 30 minutes",
+        "Running 'opentabs audit --since 2d' shows entries from the last 2 days",
+        "Supported suffixes: s (seconds), m (minutes), h (hours), d (days)",
+        "Client-side filtering of entries based on their timestamp field",
+        "Invalid duration format produces a clear error message",
+        "Help text includes --since examples",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/audit.ts. Since the server /audit endpoint doesn't support time filtering, do it client-side after receiving entries.\n\n1. Add to AuditOptions: since?: string\n2. Add option: .option('--since <duration>', 'Show entries from the last duration (e.g., 1h, 30m, 2d)')\n3. Add a parseDuration function that parses '30m' -> 30*60*1000, '1h' -> 3600000, '2d' -> 172800000, etc.\n4. After fetching entries, filter: entries = entries.filter(e => new Date(e.timestamp).getTime() >= Date.now() - durationMs)\n5. When --since is used, request a higher limit from the server (e.g., 500, the max) to ensure we have enough entries to filter from.\n\nAdd examples to help text."
+    }
+  ]
+}

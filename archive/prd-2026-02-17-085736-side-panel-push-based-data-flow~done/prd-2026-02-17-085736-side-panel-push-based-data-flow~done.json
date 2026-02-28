@@ -1,0 +1,106 @@
+{
+  "project": "Side Panel Push-Based Data Flow",
+  "description": "Replace the side panel's indirect round-trip data flow with direct push-based updates. The background script will forward plugin state and tab state changes directly to the side panel, eliminating unnecessary fetchConfigState() round-trips and ensuring the side panel always reflects the latest MCP server state in real-time.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Forward tab.stateChanged to side panel from background",
+      "description": "As a user, I want the side panel tab state dots to update in real-time when I open, close, or navigate tabs so that I always see accurate plugin status without waiting for unrelated events to trigger a refresh.",
+      "acceptanceCriteria": [
+        "After checkTabStateChanges sends tab.stateChanged to the MCP server, it also calls forwardToSidePanel with the same tab.stateChanged data wrapped in sp:serverMessage",
+        "The forwardToSidePanel call happens immediately after the sendToServer call in the same code path",
+        "The side panel's existing tab.stateChanged handler in App.tsx (lines 83-93) receives these messages and updates the specific plugin's tabState in the plugins array",
+        "No new message types are introduced — uses existing sp:serverMessage with tab.stateChanged method",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "The change is in platform/browser-extension/src/tab-state.ts in the checkTabStateChanges function around line 220-229. After the sendToServer call that sends tab.stateChanged, add a forwardToSidePanel call:\n\nforwardToSidePanel({\n  type: 'sp:serverMessage',\n  data: {\n    jsonrpc: '2.0',\n    method: 'tab.stateChanged',\n    params: { plugin: plugin.name, state: newState.state, tabId: newState.tabId, url: newState.url },\n  },\n});\n\nImport forwardToSidePanel from './messaging.js'. The same pattern should be applied in handlePluginUpdate in message-router.ts (around line 309-319) where it computes new tab state and sends to server — also forward to side panel there.\n\nAlso need to forward tab state in sendTabSyncAll (tab-state.ts around line 107-113). After sending tab.syncAll to the server, forward individual tab.stateChanged messages to the side panel for each plugin so the side panel gets initial tab states on connect without waiting for fetchConfigState.\n\nThe side panel handler at App.tsx:83-93 already handles tab.stateChanged correctly — it pattern-matches the plugin name and updates tabState in the plugins array. No changes needed on the side panel side for this story."
+    },
+    {
+      "id": "US-002",
+      "title": "Push sync.full plugin state directly to side panel",
+      "description": "As a user, I want the side panel to update immediately when the MCP server sends a full sync instead of waiting for a round-trip config.getState request, so plugin changes appear instantly.",
+      "acceptanceCriteria": [
+        "handleSyncFull in message-router.ts forwards a new sp:serverMessage with method 'plugins.state' containing the full plugin list (name, displayName, version, trustTier, tabState, urlPatterns, tools with enabled status) directly to the side panel",
+        "The plugin data is built from the validated plugin payloads that handleSyncFull already processes, plus tab state from the lastKnownState cache in tab-state.ts",
+        "A new exported function in tab-state.ts returns the current lastKnownState for a given plugin name (or 'closed' as default)",
+        "App.tsx handles the 'plugins.state' notification by calling setPlugins() directly with the received plugin data, without triggering fetchConfigState()",
+        "The synthetic 'plugins.changed' notification in handleSyncFull (lines 289-292) is replaced with the new 'plugins.state' notification",
+        "Add 'plugins.state' to SIDE_PANEL_METHODS in message-router.ts",
+        "The PluginState type / ConfigStatePlugin type is compatible with the data shape forwarded",
+        "fetchConfigState() is still called on initial mount (getConnectionState → loadPlugins) as a fallback, but is no longer triggered by sync.full",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "This is the most impactful change. The key insight: handleSyncFull in message-router.ts already has validated plugin payloads (the `metas` array). It needs to build the ConfigStatePlugin[] shape from these and forward it.\n\nIn message-router.ts handleSyncFull (around line 289):\n1. Import a new getPluginTabState function from tab-state.ts that reads lastKnownState\n2. Build the plugins array in ConfigStatePlugin format:\n   metas.map(m => ({\n     name: m.name,\n     displayName: m.displayName ?? m.name,\n     version: m.version,\n     trustTier: m.trustTier,\n     tabState: getPluginTabState(m.name),\n     urlPatterns: m.urlPatterns,\n     tools: m.tools, // already has { name, description, enabled }\n   }))\n3. Forward via forwardToSidePanel({ type: 'sp:serverMessage', data: { jsonrpc: '2.0', method: 'plugins.state', params: { plugins } } })\n4. Replace the current synthetic 'plugins.changed' notification\n\nIn tab-state.ts, add and export:\nconst getPluginTabState = (pluginName: string): TabState => lastKnownState.get(pluginName) ?? 'closed';\n\nIn App.tsx, add a handler for 'plugins.state' before the existing 'plugins.changed' handler:\nif (data.method === 'plugins.state' && data.params) {\n  const params = data.params as { plugins?: PluginState[] };\n  if (Array.isArray(params.plugins)) {\n    setPlugins(params.plugins);\n  }\n  sendResponse({ ok: true });\n  return true;\n}\n\nKeep 'plugins.changed' handler as a fallback (it still triggers fetchConfigState), but the primary path is now 'plugins.state'.\n\nIMPORTANT: The tab state in the pushed data may be slightly stale (lastKnownState reflects the state BEFORE sendTabSyncAll runs after sync.full). This is acceptable because US-001 ensures real-time tab state updates flow separately. The side panel gets an approximate state immediately, then precise state updates moments later via tab.stateChanged."
+    },
+    {
+      "id": "US-003",
+      "title": "Push plugin.update state directly to side panel",
+      "description": "As a user, I want hot-reloaded plugin changes to appear in the side panel immediately without a round-trip, matching the pattern established for sync.full.",
+      "acceptanceCriteria": [
+        "handlePluginUpdate in message-router.ts forwards a sp:serverMessage with method 'plugin.updated' containing the single updated plugin in ConfigStatePlugin format",
+        "App.tsx handles the 'plugin.updated' notification by updating the specific plugin in the plugins array (replace by name), or adding it if not present",
+        "The synthetic 'plugins.changed' notification in handlePluginUpdate (lines 322-325) is replaced with the new 'plugin.updated' notification",
+        "Add 'plugin.updated' to SIDE_PANEL_METHODS in message-router.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Same pattern as US-002 but for a single plugin update.\n\nIn message-router.ts handlePluginUpdate (around line 322):\n1. Import getPluginTabState from tab-state.ts (already imported from US-002)\n2. Build the single plugin in ConfigStatePlugin format from the validated meta\n3. Forward: forwardToSidePanel({ type: 'sp:serverMessage', data: { jsonrpc: '2.0', method: 'plugin.updated', params: { plugin: { name, displayName, version, trustTier, tabState: getPluginTabState(meta.name), urlPatterns, tools } } } })\n4. Replace the current synthetic 'plugins.changed' notification\n\nIn App.tsx, add handler for 'plugin.updated':\nif (data.method === 'plugin.updated' && data.params) {\n  const params = data.params as { plugin?: PluginState };\n  if (params.plugin && typeof params.plugin.name === 'string') {\n    const updated = params.plugin;\n    setPlugins(prev => {\n      const idx = prev.findIndex(p => p.name === updated.name);\n      if (idx >= 0) {\n        const next = [...prev];\n        next[idx] = updated;\n        return next;\n      }\n      return [...prev, updated];\n    });\n  }\n  sendResponse({ ok: true });\n  return true;\n}\n\nAdd 'plugin.updated' to SIDE_PANEL_METHODS set in message-router.ts."
+    },
+    {
+      "id": "US-004",
+      "title": "Remove ws:message broadcast fallback in side panel",
+      "description": "As a developer, I want to remove the fragile ws:message broadcast fallback with the hardcoded 1.5s delay since the primary push-based data flow is now reliable.",
+      "acceptanceCriteria": [
+        "The ws:message handler in App.tsx (the block around lines 122-134 that listens for sync.full and calls setTimeout with 1500ms) is removed",
+        "The comment explaining the fallback is removed",
+        "No other code references or depends on this fallback behavior",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "In App.tsx, remove the entire block from 'Fallback: ws:message with sync.full...' comment through 'return false;' (approximately lines 118-134 after US-002/US-003 changes, but find the exact block by searching for 'ws:message' in the listener).\n\nThe block looks like:\nif (message.type === 'ws:message') {\n  const wsData = message.data as Record<string, unknown> | undefined;\n  if (wsData?.method === 'sync.full') {\n    setTimeout(() => loadPluginsRef.current(), 1_500);\n  }\n  return false;\n}\n\nRemove the entire if block including the comment above it. The primary push path (plugins.state from US-002 and plugin.updated from US-003) now handles all updates."
+    },
+    {
+      "id": "US-005",
+      "title": "Optimistic local toggle for tool enable/disable",
+      "description": "As a user, I want tool toggles to feel instant by updating the UI immediately when I click, instead of waiting for a server round-trip to refetch the entire plugin state.",
+      "acceptanceCriteria": [
+        "PluginCard's handleToggleAll and handleToggleTool update local plugins state optimistically before the server request completes",
+        "The .then(onRefresh) chain is removed from both toggle handlers — no fetchConfigState() round-trip on toggle",
+        "If the server request fails, the optimistic update is reverted (toggle flips back) and the error toast is shown",
+        "The onRefresh prop is removed from PluginCard and PluginList since it is no longer needed for toggle operations",
+        "The loadPlugins callback and its ref in App.tsx can remain for initial load and the plugins.changed fallback, but are no longer passed through PluginList/PluginCard for toggles",
+        "A setPlugins updater function is passed to PluginList/PluginCard instead of onRefresh, or the toggle logic is lifted to App.tsx, or an alternative clean approach is used",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "The cleanest approach: pass setPlugins down to PluginCard (or a wrapper that handles toggle logic) instead of onRefresh.\n\nIn App.tsx:\n- Keep loadPlugins for initial mount and plugins.changed fallback\n- Pass setPlugins to PluginList instead of onRefresh\n\nIn PluginList.tsx:\n- Replace onRefresh prop with setPlugins: React.Dispatch<React.SetStateAction<PluginState[]>>\n- Pass it through to PluginCard\n\nIn PluginCard.tsx:\n- Replace onRefresh prop with setPlugins\n- handleToggleAll becomes:\n  const handleToggleAll = (e: React.MouseEvent) => {\n    e.stopPropagation();\n    const newEnabled = !allEnabled;\n    // Optimistic update\n    setPlugins(prev => prev.map(p =>\n      p.name === plugin.name\n        ? { ...p, tools: p.tools.map(t => ({ ...t, enabled: newEnabled })) }\n        : p\n    ));\n    void setAllToolsEnabled(plugin.name, newEnabled).catch(() => {\n      // Revert on failure\n      setPlugins(prev => prev.map(p =>\n        p.name === plugin.name\n          ? { ...p, tools: p.tools.map(t => ({ ...t, enabled: !newEnabled })) }\n          : p\n      ));\n      showToggleError('Failed to toggle all tools');\n    });\n  };\n- handleToggleTool becomes similar: optimistic flip, revert on error\n- Remove .then(onRefresh) chains entirely\n\nNote: The plugin prop to PluginCard is derived from the plugins state array in App.tsx, so when setPlugins updates, PluginCard re-renders with the new plugin data automatically. The plugin prop is just a snapshot — the setPlugins call updates the source of truth."
+    }
+  ]
+}

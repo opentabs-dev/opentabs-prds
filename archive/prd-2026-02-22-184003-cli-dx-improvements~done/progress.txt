@@ -1,0 +1,93 @@
+# Ralph Progress Log
+PRD: prd-2026-02-22-184003-cli-dx-improvements~running.json
+Started: Sun Feb 22 21:06:35 PST 2026
+---
+
+## Codebase Patterns
+- The CLI commands in `platform/cli/src/commands/` follow a pattern: each file exports a `register*Command` function and individual check/helper functions for testability
+- The `readConfig` function returns `{ config, error }` — always check for null config before accessing fields
+- Status command reads config secret and sends auth header; doctor command should do the same
+- `Bun.serve({ port: 0 })` returns a server with an auto-assigned port; the `port` property type is `number | undefined` so use `as number` when you know it's assigned
+- E2E tests for plugin discovery expect non-existent local plugin paths to appear in `failedPlugins` — don't silently skip them in discovery.ts
+- The e2e-test plugin in `plugins/e2e-test/` must be built before running `platform/plugin-tools/src/commands/build-e2e.test.ts` tests
+- `Bun.spawnSync` is the correct way to run subprocesses synchronously in Bun (e.g., running `tsc` from the build pipeline)
+- The `build-e2e.test.ts` tests use `copyPlugin()` which copies the e2e-test plugin to a temp dir and symlinks node_modules — tests that modify dist/ or src/ should use this pattern
+
+## 2026-02-22 - US-001
+- Implemented: auth header in `checkServerHealth` matching the pattern from `status.ts`
+- Changed `checkNpmPlugins` to return `warn()` instead of `pass()` when health data is null
+- Exported `checkServerHealth` for testability and added 6 new unit tests covering auth header, no-auth, error responses, unreachable servers
+- Fixed pre-existing issue in `platform/mcp-server/src/discovery.ts` where "Path not found" errors for non-existent local plugin paths were silently skipped instead of being added to `failures`
+- Files changed:
+  - `platform/cli/src/commands/doctor.ts` — auth header + warn fix
+  - `platform/cli/src/commands/doctor.test.ts` — new checkServerHealth tests + updated checkNpmPlugins test
+  - `platform/mcp-server/src/discovery.ts` — removed silent skip of "Path not found" errors
+- **Learnings for future iterations:**
+  - The `server.stop(true)` in Bun returns a Promise — must be awaited in finally blocks to satisfy `@typescript-eslint/no-floating-promises`
+  - `expect(stringOrNull).toBe('specific string')` causes TypeScript overload resolution errors when the variable is `string | null`; use `toEqual` or change the variable type
+  - `bun test platform/` from inside the e2e-test plugin dir fails because it sets cwd to the plugin; always run from repo root
+---
+
+## 2026-02-22 - US-002
+- Changed `opentabs logs` default behavior from follow mode to print-and-exit
+- Replaced `--no-follow` option with `-f, --follow` opt-in flag
+- Updated command description from "Tail the MCP server log output" to "Show recent MCP server log output"
+- Updated help text examples to reflect new defaults
+- Updated file header comment to document the new behavior
+- Changed condition from `options.follow !== false` to `options.follow === true`
+- Files changed:
+  - `platform/cli/src/commands/logs.ts` — all changes in this single file
+- **Learnings for future iterations:**
+  - Commander's `--no-follow` pattern sets `follow: true` by default and `follow: false` when the flag is passed. Switching to `--follow` makes `follow: undefined` by default and `follow: true` when the flag is passed — so the condition must change from `!== false` to `=== true`
+  - The `LogsOptions` interface didn't need changes because `follow?: boolean` works for both patterns — the semantic difference is entirely in the Commander option definition and the condition check
+---
+
+## 2026-02-22 - US-003
+- Added auto-tsc when `dist/index.js` is missing but `src/index.ts` exists in `runBuild()`
+- When neither source nor compiled output exists, throws a clear "Is this a plugin directory?" error
+- If tsc fails (non-zero exit), build fails with tsc's stderr/stdout output
+- If tsc succeeds but `dist/index.js` still doesn't exist, hints about tsconfig.json outDir
+- Watch mode rebuilds naturally skip auto-tsc since `dist/index.js` will exist from tsc --watch
+- Added 3 tests in `build-e2e.test.ts`: auto-tsc success, neither-exists error, existing-dist skip
+- Files changed:
+  - `platform/plugin-tools/src/commands/build.ts` — auto-tsc logic in `runBuild()`
+  - `platform/plugin-tools/src/commands/build-e2e.test.ts` — 3 new tests
+- **Learnings for future iterations:**
+  - `Bun.spawnSync` returns `{ exitCode, stdout, stderr }` where stdout/stderr are `Buffer` — must call `.toString()` to get strings
+  - Async test functions without `await` trigger `@typescript-eslint/require-await` — remove `async` if the test is synchronous
+  - Prettier enforces single-line throw strings when they fit — don't break throw messages across multiple lines unnecessarily
+---
+
+## 2026-02-22 - US-004
+- Expanded existing CONTRIBUTING.md from 137 to 223 lines (within 150-250 target)
+- Added Node.js >= 20 prerequisite (required for Playwright E2E tests)
+- Added detailed "Git Hooks" section explaining pre-commit (lint-staged, knip, ralph file rejection) and pre-push (build, type-check, test) hooks
+- Added "E2E Test Infrastructure" section with fixture hierarchy, code example for writing a new test, and configuration details
+- Added comprehensive "Debugging" section covering all four process layers: MCP Server, Extension background, Side panel, Injected adapters, and E2E test failures (traces, reports, video)
+- Added "Creating a Pull Request" section with step-by-step instructions
+- Added `format:check` to the verification table
+- All links to CLAUDE.md preserved — no content duplication
+- Files changed:
+  - `CONTRIBUTING.md` — expanded with missing sections
+- **Learnings for future iterations:**
+  - CONTRIBUTING.md already existed with basic content — always check for existing files before creating new ones
+  - Playwright config uses `trace: 'retain-on-failure'` and `video: 'retain-on-failure'` — traces go to `test-results/` directory
+  - The `bun run check` script includes `format:check` which isn't in the 6-command CLAUDE.md list — the actual scripts in package.json are the source of truth
+---
+
+## 2026-02-22 - US-005
+- Added comprehensive JSDoc documentation to `e2e/fixtures.ts` and `e2e/helpers.ts`
+- Expanded file header in fixtures.ts with a "Fixture Hierarchy" section explaining how fixtures compose (mcpServer → extensionContext → backgroundPage, mcpServer → mcpClient, etc.)
+- Added JSDoc to all interfaces: `PluginDetail`, `HealthResponse`, `OpentabsConfig`, `McpServer`, `TestServer`, `McpClient`, `TestFixtures` (with per-field documentation)
+- Added JSDoc to all exported functions that lacked it: `fetchHealth`, `waitForHealth`, `readPluginToolNames`, `createTestConfigDir`, `cleanupTestConfigDir`, `startTestServer`, `startStrictCspServer`, `startAnalyzeSiteServer`, `launchExtensionContext`, `getBackgroundPage`, `createMcpClient`
+- Added JSDoc to helpers.ts: `parseToolResult`, expanded `BROWSER_TOOL_NAMES`
+- Fixed a dangling JSDoc comment on `createTestConfigDir` that was separated from its function by `readPluginToolNames`
+- No functional code changes — only documentation additions
+- Files changed:
+  - `e2e/fixtures.ts` — JSDoc additions
+  - `e2e/helpers.ts` — JSDoc additions
+- **Learnings for future iterations:**
+  - Most functions in fixtures.ts already had JSDoc; the main gap was interfaces and lower-level helpers
+  - helpers.ts was already well-documented; only `parseToolResult` and `BROWSER_TOOL_NAMES` needed additions
+  - The file header is a good place to document the fixture hierarchy since it's the first thing a contributor reads
+---

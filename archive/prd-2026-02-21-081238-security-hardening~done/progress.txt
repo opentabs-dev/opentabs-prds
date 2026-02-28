@@ -1,0 +1,71 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-081238-security-hardening~running.json
+Started: Sat Feb 21 10:25:31 PST 2026
+---
+
+## Codebase Patterns
+- Import order in platform packages: local (./), then external (@modelcontextprotocol, etc.), then node: builtins, then type imports. ESLint import-x/order enforces this.
+- `checkBearerAuth` is exported and tested directly in http-routes.test.ts — security-critical functions are unit-tested at the function level.
+- The WebSocket secret is sent via `Sec-WebSocket-Protocol` header as a comma-separated protocol list, not via URL query params. The server loops through parts to find the matching secret.
+- The CORS origin check in `createHandleFetch` runs before all route handlers (including /ws), so it covers WebSocket upgrades automatically — no separate origin check needed for the WS path.
+- Bun's WS upgrade convention: `bunServer.upgrade()` returns `true` on success and the handler returns `undefined` (not a Response).
+
+## 2026-02-21 - US-001
+- Implemented constant-time string comparison using `crypto.timingSafeEqual` from `node:crypto`
+- Added `constantTimeEqual(a, b)` helper that handles the length-mismatch requirement (early reject on length mismatch, since length is not secret)
+- Updated `checkBearerAuth` to use `constantTimeEqual` instead of `!==`
+- Replaced `parts.includes(state.wsSecret)` in /ws upgrade path with a loop that performs `constantTimeEqual` on every protocol part (no short-circuit on match)
+- Files changed: `platform/mcp-server/src/http-routes.ts`
+- **Learnings for future iterations:**
+  - ESLint import-x/order requires `node:` builtins to come AFTER external packages (e.g., `@modelcontextprotocol`), not before local imports
+  - `timingSafeEqual` throws on length mismatch, so a length guard is mandatory before calling it
+  - The WS protocol loop must NOT break on match to avoid timing leaks — iterate all parts unconditionally
+---
+
+## 2026-02-21 - US-002
+- All acceptance criteria were already satisfied by existing code:
+  - `sanitizeOutput` is already exported from `mcp-setup.ts` (line 671)
+  - Comprehensive tests already exist in `mcp-setup.test.ts` (lines 580-706) in a `describe('sanitizeOutput', ...)` block
+  - All 9 required test cases are covered: primitives, __proto__/constructor/prototype removal, recursive nested objects, arrays, depth > 50, empty objects/arrays, safe key preservation
+- No code changes needed — marked as passing after verifying all quality checks exit 0
+- Files changed: none
+- **Learnings for future iterations:**
+  - Before implementing a story, always check if the acceptance criteria are already satisfied by existing code — previous iterations may have already implemented the required tests
+  - `sanitizeOutput` uses `JSON.parse()` in tests to create objects with literal `__proto__` string keys, because JS object literal `{ __proto__: ... }` sets the prototype chain rather than creating an own property
+---
+
+## 2026-02-21 - US-003
+- Expanded the existing `handleExtensionMessage — oversized message` test block into a comprehensive `handleExtensionMessage — message size limit` describe block
+- Added boundary test: message at exactly 10MB (MAX_MESSAGE_SIZE) is processed normally — builds a valid JSON-RPC ping padded with spaces to exactly the limit, verifies pong reply is sent
+- Enhanced the oversized test: message at 10MB + 1 byte is dropped — verifies no messages sent, no state changes
+- Files changed: `platform/mcp-server/src/extension-protocol.test.ts`
+- **Learnings for future iterations:**
+  - `MAX_MESSAGE_SIZE` is module-private (not exported) — tests must use the literal `10 * 1024 * 1024` value since the constant cannot be imported
+  - JSON trailing whitespace (spaces) is valid — use it to pad messages to exact byte lengths for boundary testing
+  - The size check uses `>` (strictly greater than), so messages at exactly MAX_MESSAGE_SIZE pass through
+---
+
+## 2026-02-21 - US-004
+- Added a test in the `/health endpoint` describe block that sets `state.wsSecret` to a recognizable secret string and verifies the serialized response body does not contain it
+- The test reads the response as raw text (not parsed JSON) to catch both direct field leaks and accidental embedding in debug strings
+- Files changed: `platform/mcp-server/src/http-routes.test.ts`
+- **Learnings for future iterations:**
+  - Use `Response.text()` instead of `Response.json()` when checking for secret leakage — JSON parsing loses the raw string, making full-text search impossible
+  - The `createTestHandlers()` helper and `fetchJson()` pattern make /health tests straightforward — just set state fields and assert on the response
+  - The /health endpoint does not require authentication, so no Bearer header is needed in the test request
+---
+
+## 2026-02-21 - US-005
+- Verified that the existing CORS origin check (lines 179-182 of http-routes.ts) already covers WebSocket upgrades — it runs before the /ws handler and rejects non-extension Origins with 403
+- No production code changes needed — the origin check was already in place
+- Added a `describe('WebSocket upgrade origin check')` test block with 3 tests targeting the /ws path specifically:
+  - WS upgrade rejected with `Origin: http://evil.com` → 403
+  - WS upgrade allowed with no Origin header → successful upgrade (undefined response)
+  - WS upgrade allowed with `Origin: chrome-extension://abc` → successful upgrade (undefined response)
+- Created an `upgradingBunServer` mock that returns `true` from `upgrade()` to simulate successful WebSocket upgrades
+- Files changed: `platform/mcp-server/src/http-routes.test.ts`
+- **Learnings for future iterations:**
+  - The CORS origin check in `createHandleFetch` is positioned before all route handlers, so it covers all paths including /ws — no per-route origin checks needed
+  - Successful Bun WebSocket upgrades return `undefined` from the fetch handler (not a Response), so test with `expect(res).toBeUndefined()`
+  - To test WS upgrade paths, create a `upgradingBunServer` mock with `upgrade: () => true` (the default `mockBunServer` returns `false`)
+---

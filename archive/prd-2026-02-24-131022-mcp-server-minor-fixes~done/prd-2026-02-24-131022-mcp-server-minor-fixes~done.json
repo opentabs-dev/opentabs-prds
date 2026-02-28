@@ -1,0 +1,63 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three minor but genuine issues in the MCP server: a dangling JSDoc comment, a hot-reload-unsafe module-level flag, and an O(n*m) allocation in a filter loop.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix dangling JSDoc comment opener in loader.ts",
+      "description": "As a developer, I want loader.ts to have clean, well-formed comments so that JSDoc tooling and code review are not confused by a stray `/**` block opener.",
+      "acceptanceCriteria": [
+        "The duplicate `/**` on line 67 of platform/mcp-server/src/loader.ts is removed, leaving only the single JSDoc comment block for the `pluginNameFromPackage` function",
+        "No functional behavior changes",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/loader.ts, line 67 is `/**` followed immediately by line 68 which is another `/**`. The first `/**` is a stray comment opener — it should be removed entirely. The resulting file should have a single JSDoc block starting at what is currently line 68: `/** ... Extract the internal plugin name from an npm package name. ...`. This is a one-line deletion."
+    },
+    {
+      "id": "US-002",
+      "title": "Move audit-disk initialized flag to globalThis for hot-reload safety",
+      "description": "As a developer running the MCP server in dev mode, I want the audit-disk module's `initialized` flag to survive bun --hot reloads so that safeChmod is not called redundantly on every hot reload.",
+      "acceptanceCriteria": [
+        "The `let initialized = false;` module-level variable in platform/mcp-server/src/audit-disk.ts is replaced with a globalThis-based pattern matching the convention used in log-buffer.ts, resolver.ts, and reload.ts",
+        "safeChmod is called at most once per server process lifetime, not once per hot reload",
+        "The _resetInitialized test helper still works (resets the globalThis key)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/audit-disk.ts, line 22 has `let initialized = false;`. Under bun --hot, module-level variables reset on each re-evaluation, so this flag resets to false on every hot reload, causing a redundant safeChmod call on the next audit write. The fix is to store the flag on globalThis using a unique key (e.g., `__opentabs_audit_initialized__`), following the exact same pattern as `__opentabs_log_buffers__` in log-buffer.ts (line 37) and `__opentabs_global_paths__` in resolver.ts (line 137). The `_resetInitialized` export (used by tests) should reset the globalThis key to `false` instead of the module variable."
+    },
+    {
+      "id": "US-003",
+      "title": "Eliminate repeated Array.from() allocation in pruneStaleState",
+      "description": "As a developer, I want the outdatedPlugins pruning in reload.ts to use O(n+m) complexity instead of O(n*m) by pre-building a Set of npm package names.",
+      "acceptanceCriteria": [
+        "The `state.outdatedPlugins.filter(...)` call in pruneStaleState (platform/mcp-server/src/reload.ts, around line 96) no longer calls `Array.from(state.registry.plugins.values()).some(...)` inside the filter callback",
+        "A Set of npm package names is built once before the filter, and the filter uses Set.has() for O(1) lookup",
+        "Behavior is identical: only outdatedPlugins entries whose npmPackageName matches a current plugin are retained",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "In platform/mcp-server/src/reload.ts, lines 96-98 have:\n```\nstate.outdatedPlugins = state.outdatedPlugins.filter(o =>\n  Array.from(state.registry.plugins.values()).some(p => p.npmPackageName === o.name),\n);\n```\nThis creates a new Array from the plugins Map on every iteration of the filter callback. Fix: before the filter, build `const npmPkgNames = new Set(Array.from(state.registry.plugins.values()).map(p => p.npmPackageName).filter((n): n is string => n !== undefined));` then use `state.outdatedPlugins = state.outdatedPlugins.filter(o => npmPkgNames.has(o.name));`. This is the final story and must have e2eCheckpoint: true."
+    }
+  ]
+}

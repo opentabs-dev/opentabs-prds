@@ -1,0 +1,85 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-102704-file-watcher-reliability~running.json
+Started: Fri Feb 20 10:46:37 PST 2026
+---
+
+## Codebase Patterns
+- FileWatcherEntry is defined in state.ts and used in file-watcher.ts — all fields must be initialized in both watchPlugin and watchPendingPlugin return values
+- statSync with `{ throwIfNoEntry: false }` is the safe way to check file mtime without throwing on missing files
+- File watcher handlers (handleIifeChange, handleManifestChange, handlePendingPluginChange) receive pluginDir but need to look up their FileWatcherEntry from state.fileWatcherEntries by matching pluginDir
+- The config watcher's debounce callback captures variables from the enclosing scope (configDir, gen) — any new variables (like configPath) must also be declared in that outer scope to be accessible inside the callback
+- Pending plugins are identified by pluginName starting with `(pending:` — use this convention to distinguish loaded vs pending entries
+- All timer/interval IDs stored on ServerState must be cleaned up in stopFileWatching for hot-reload safety
+- Polling functions should capture fileWatcherGeneration at creation time and self-clear if it changes
+
+---
+
+## 2026-02-20T18:50 - US-001
+- Implemented mtime tracking for file watcher state
+- Added `lastSeenMtimes: Map<string, number>` to `FileWatcherEntry` interface
+- Added `configLastSeenMtime: number | null` to `ServerState` interface (default null)
+- Added helper functions `getFileMtimeMs`, `findEntry`, `recordMtime` to file-watcher.ts
+- Initial mtimes recorded in startFileWatching for both loaded and pending plugins
+- Mtimes updated after successful processing in handleIifeChange, handleManifestChange, handlePendingPluginChange
+- Config mtime recorded in startConfigWatching and updated on config change
+- Files changed: platform/mcp-server/src/state.ts, platform/mcp-server/src/file-watcher.ts
+- **Learnings for future iterations:**
+  - The return statements in watchPlugin and watchPendingPlugin must include all FileWatcherEntry fields — easy to miss when adding new fields
+  - getFileMtimeMs uses statSync with throwIfNoEntry: false for safe mtime reads
+  - Config watcher's debounce uses closures over outer scope variables — configPath must be declared outside the watch callback to be accessible in the setTimeout
+---
+
+## 2026-02-20T18:56 - US-002
+- Implemented periodic mtime polling as fs.watch() fallback
+- Added `MTIME_POLL_INTERVAL_MS = 30_000` constant to file-watcher.ts
+- Added `mtimePollTimerId: ReturnType<typeof setInterval> | null` to ServerState (default null)
+- Created `startMtimePolling(state, callbacks)` function that polls every 30s:
+  - Stats all watched files (manifest + IIFE per plugin entry) and config.json
+  - Compares mtime to `lastSeenMtimes`; if newer, calls the appropriate handler
+  - Updates mtime before calling handler to prevent re-triggering on next tick
+  - Files that don't exist (getFileMtimeMs returns null) are silently skipped
+  - Logs a message when polling detects a change, including file path and old/new mtime
+  - Captures fileWatcherGeneration and self-terminates if generation changes (hot reload)
+- Called `startMtimePolling` from `startFileWatching` after all fs.watch watchers are set up
+- `stopFileWatching` now clears the polling timer via clearInterval
+- Pending plugins are detected via `entry.pluginName.startsWith('(pending:')` convention
+- Files changed: platform/mcp-server/src/state.ts, platform/mcp-server/src/file-watcher.ts
+- **Learnings for future iterations:**
+  - The mtime is updated BEFORE calling the handler (set on entry.lastSeenMtimes.set) to prevent the handler's own mtime update from racing with the next poll tick
+  - Pending plugins use the naming convention `(pending:<dir>)` in pluginName — can check with startsWith to distinguish from loaded plugins
+  - The polling function captures `gen` at creation time and self-clears if generation has changed, providing defense in depth alongside stopFileWatching cleanup
+  - Handlers (handleManifestChange, handleIifeChange, handlePendingPluginChange) are safe to call from polling — they have their own debouncing and generation checks
+---
+
+## 2026-02-20T19:00 - US-003
+- Exposed file watcher health in /health endpoint
+- Added `mtimeLastPollAt: number | null` and `mtimePollDetections: number` to ServerState (state.ts)
+- Updated startMtimePolling to set `state.mtimeLastPollAt = Date.now()` at the start of each polling tick
+- Added `state.mtimePollDetections++` at each of the 3 detection points (manifest, IIFE, config) in the polling loop
+- Added `fileWatcher` object to /health response in http-routes.ts:
+  - `watchedPlugins`: count of non-pending FileWatcherEntry items
+  - `pendingPlugins`: count of entries with pluginName starting with `(pending:`
+  - `lastPollAt`: state.mtimeLastPollAt
+  - `pollDetections`: state.mtimePollDetections
+- Files changed: platform/mcp-server/src/state.ts, platform/mcp-server/src/file-watcher.ts, platform/mcp-server/src/http-routes.ts
+- **Learnings for future iterations:**
+  - The /health endpoint already has a rich response structure — new fields are added inline in the Response.json() call
+  - Pending vs loaded plugin distinction uses the `(pending:` prefix convention on pluginName — computed as a simple filter/count at response time rather than maintaining a separate counter
+  - The polling detection counter increments at the same 3 places (manifest, IIFE, config) where the log.info lines already exist — natural co-location
+---
+
+## 2026-02-20T19:05 - US-004
+- Added stale watcher warning when polling detects repeated changes
+- Added constants `STALE_WATCHER_THRESHOLD = 3`, `STALE_WATCHER_WINDOW_MS = 5 * 60 * 1000`, `MAX_DETECTION_TIMESTAMPS = 20` to file-watcher.ts
+- Added `mtimePollDetectionTimestamps: number[]` to ServerState (state.ts, default `[]`)
+- Created `recordPollDetection(state)` helper that:
+  - Increments `state.mtimePollDetections` and pushes `Date.now()` to timestamps array
+  - Trims timestamps array to `MAX_DETECTION_TIMESTAMPS` to prevent unbounded growth
+  - Filters to timestamps within the 5-minute window
+  - Emits `log.warn` exactly when count crosses threshold (`=== 3`), not on every subsequent detection
+- Replaced all 3 inline `state.mtimePollDetections++` calls in `startMtimePolling` with `recordPollDetection(state)`
+- Files changed: platform/mcp-server/src/state.ts, platform/mcp-server/src/file-watcher.ts
+- **Learnings for future iterations:**
+  - Using `=== threshold` instead of `>= threshold` for the warning check ensures it fires exactly once when crossing the threshold, then again only after old timestamps fall out of the window and new ones bring it back to the threshold — achieving "at most once per window" naturally
+  - The `replace_all` edit flag matches exact strings including whitespace — if the same logical line appears with different indentation (e.g., 6 vs 8 spaces), it won't match all occurrences. Check for remaining instances after bulk replacements.
+---

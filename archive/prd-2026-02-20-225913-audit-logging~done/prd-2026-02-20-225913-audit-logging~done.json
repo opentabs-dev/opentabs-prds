@@ -1,0 +1,139 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add persistent audit logging for all MCP tool invocations at the server level. The MCP server already sends ephemeral tool.invocationStart and tool.invocationEnd notifications to the extension (for side panel animation) and tracks timing (startTs, durationMs) in the tools/call handler in mcp-setup.ts, but once a tool call completes the data is gone. The server writes operational logs to ~/.opentabs/server.log but these are unstructured. This feature adds an in-memory circular buffer audit log, a /audit HTTP endpoint for querying it, audit summary stats in /health, a CLI command for viewing audit data, and E2E test coverage.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add in-memory audit log to ServerState",
+      "description": "As a platform developer, I want every tool invocation (success or failure) recorded in an in-memory circular buffer so that recent invocation history is available for diagnostics, monitoring, and the /audit endpoint.",
+      "acceptanceCriteria": [
+        "New AuditEntry type defined in state.ts: { timestamp: string (ISO 8601), tool: string (prefixed name e.g. 'slack_send_message'), plugin: string, success: boolean, durationMs: number, error?: { code: string, message: string, category?: string } }",
+        "New field on ServerState: auditLog of type AuditEntry[]",
+        "createState() initializes auditLog to an empty array",
+        "A new appendAuditEntry(state, entry) function in state.ts appends to state.auditLog and trims to 500 entries (circular buffer — oldest entries dropped)",
+        "Input/output of tool calls are NOT stored in the audit log (privacy and memory concerns)",
+        "After each plugin tool invocation in the tools/call handler (mcp-setup.ts), appendAuditEntry is called in the finally block with timestamp, tool, plugin, success, durationMs, and error details if applicable",
+        "Browser tool invocations are also logged to the audit log (same AuditEntry format, plugin field set to 'browser')",
+        "The error field is populated from DispatchError (code from err.code, message from err.message, category from err.data?.code) or from generic Error (code: 'UNKNOWN', message from err.message)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/state.ts: Add the AuditEntry interface and the auditLog field to ServerState. Add an appendAuditEntry helper function that pushes to state.auditLog and splices from the front if length exceeds 500 (the MAX_AUDIT_ENTRIES constant). Initialize auditLog: [] in createState(). Bump STATE_SCHEMA_VERSION to 3 since we're adding a new field.\n\nEdit platform/mcp-server/src/mcp-setup.ts: In the tools/call handler's finally block (around line 326-336), after sendInvocationEnd, call appendAuditEntry with the collected data. For error details: in the catch block, capture error info into a local variable (errorInfo) before returning. For DispatchError (checked via isDispatchError), extract code as string, message, and data?.code as category. For generic errors, use code 'UNKNOWN'.\n\nFor browser tool invocations (around lines 147-178), wrap the existing try/catch in a timing + audit block. Add startTs = Date.now() before the handler call, track success/failure, and call appendAuditEntry in a finally block with plugin set to 'browser'.\n\nThe auditLog array on ServerState survives hot reloads since it's on the globalThis-persisted state object. New hot-reload evaluations will see the existing entries."
+    },
+    {
+      "id": "US-002",
+      "title": "Add /audit endpoint to MCP server",
+      "description": "As a platform developer or monitoring system, I want to query the MCP server's recent tool invocation history via a REST endpoint so that I can inspect what tools have been called, their success rates, and timing.",
+      "acceptanceCriteria": [
+        "GET /audit returns a JSON array of AuditEntry objects, newest first",
+        "Query parameter: ?limit=N (default 50, max 500, clamped to valid range)",
+        "Query parameter: ?plugin=name filters entries where plugin matches the given name",
+        "Query parameter: ?tool=prefixed_name filters entries where tool matches the given prefixed tool name",
+        "Query parameter: ?success=true or ?success=false filters by success/failure",
+        "Multiple filters are AND-combined",
+        "Bearer auth required (same checkBearerAuth as other admin endpoints)",
+        "Returns 401 if auth fails",
+        "Returns empty array [] if no entries match",
+        "Response Content-Type is application/json",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/http-routes.ts: Add a new route block for GET /audit, placed after the /health block and before /reload. Pattern follows the existing route structure:\n\n```\nif (url.pathname === '/audit' && req.method === 'GET') {\n  const authError = checkBearerAuth(req, state.wsSecret);\n  if (authError) return authError;\n  // Parse query params\n  const limitParam = parseInt(url.searchParams.get('limit') ?? '50', 10);\n  const limit = Math.max(1, Math.min(500, Number.isNaN(limitParam) ? 50 : limitParam));\n  const pluginFilter = url.searchParams.get('plugin');\n  const toolFilter = url.searchParams.get('tool');\n  const successParam = url.searchParams.get('success');\n  const successFilter = successParam === 'true' ? true : successParam === 'false' ? false : undefined;\n  // Filter and slice\n  let entries = [...state.auditLog].reverse(); // newest first\n  if (pluginFilter) entries = entries.filter(e => e.plugin === pluginFilter);\n  if (toolFilter) entries = entries.filter(e => e.tool === toolFilter);\n  if (successFilter !== undefined) entries = entries.filter(e => e.success === successFilter);\n  entries = entries.slice(0, limit);\n  return Response.json(entries);\n}\n```\n\nImport AuditEntry type if needed for clarity, though the state.auditLog is already typed."
+    },
+    {
+      "id": "US-003",
+      "title": "Include audit summary in /health endpoint",
+      "description": "As a monitoring system or platform developer, I want the /health endpoint to include aggregate audit statistics so that I can get a quick overview of tool invocation health without querying the full audit log.",
+      "acceptanceCriteria": [
+        "The /health JSON response includes a new auditSummary object",
+        "auditSummary.totalInvocations: total entries in the audit log buffer",
+        "auditSummary.successCount: count of entries where success is true",
+        "auditSummary.failureCount: count of entries where success is false",
+        "auditSummary.last24h.total: count of entries with timestamp within the last 24 hours",
+        "auditSummary.last24h.success: success count within the last 24 hours",
+        "auditSummary.last24h.failure: failure count within the last 24 hours",
+        "auditSummary.avgDurationMs: average durationMs across all entries (0 if no entries)",
+        "All values computed from state.auditLog on each /health request (no separate counters)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/mcp-server/src/http-routes.ts: In the GET /health handler (around line 165-204), add an auditSummary computation before the Response.json call. Create a helper function computeAuditSummary(auditLog: AuditEntry[]) that iterates once through state.auditLog and accumulates: totalInvocations (length), successCount, failureCount, totalDurationMs, last24h counters. The 24-hour cutoff is Date.now() - 86_400_000 compared against new Date(entry.timestamp).getTime(). avgDurationMs is totalDurationMs / totalInvocations (or 0). Round avgDurationMs to 1 decimal place with Math.round(x * 10) / 10.\n\nAdd auditSummary to the Response.json object alongside the existing fields (status, version, mode, etc.). The function can be defined at module scope in http-routes.ts or extracted to a separate audit.ts module — prefer inline in http-routes.ts since it's a small computation and only used there.\n\nImport AuditEntry from state.ts."
+    },
+    {
+      "id": "US-004",
+      "title": "Add opentabs audit CLI command",
+      "description": "As a user or platform developer, I want to view recent tool invocation history from the terminal so that I can diagnose issues without using curl or a browser.",
+      "acceptanceCriteria": [
+        "New opentabs audit command registered in cli.ts",
+        "Options: --limit N (default 20), --plugin name (filter by plugin), --json (raw JSON output)",
+        "Default output: formatted table with columns: timestamp (local time, short format), tool, success (checkmark/cross), duration",
+        "Table output uses picocolors for coloring: green checkmark for success, red cross for failure",
+        "--json flag outputs raw JSON array from /audit endpoint",
+        "Fetches from http://localhost:<port>/audit with Bearer auth (reads secret from ~/.opentabs/config.json)",
+        "If server is not running (connection refused), displays a clear error message",
+        "If server returns 401, displays auth error message",
+        "Command is registered under the top-level program (opentabs audit), not as a subcommand",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Create platform/cli/src/commands/audit.ts with a registerAuditCommand(program) function following the pattern from status.ts. The command fetches GET http://localhost:<port>/audit?limit=<N>&plugin=<name> with Authorization: Bearer <secret>. Port is from --port option (inherited from parent program) or OPENTABS_PORT env or default 9515. Secret is read from ~/.opentabs/config.json (same loadConfigForCli pattern used in status.ts).\n\nFor table output, format each entry as a row: timestamp (format: 'HH:mm:ss' or 'MM-DD HH:mm' using Date methods — no external dependency), tool name, success indicator (pc.green('✓') or pc.red('✗')), duration (e.g., '142ms'). Use console.log with padEnd/padStart for column alignment.\n\nEdit platform/cli/src/commands/index.ts: Export registerAuditCommand.\n\nEdit platform/cli/src/cli.ts: Import and call registerAuditCommand(program).\n\nError handling: wrap fetch in try/catch. On TypeError (connection refused), show 'MCP server is not running. Start it with: opentabs start'. On 401 response, show 'Authentication failed. Is the server secret correct?'. On other errors, show the error message."
+    },
+    {
+      "id": "US-005",
+      "title": "Add E2E tests for audit logging",
+      "description": "As a platform developer, I want E2E tests verifying the audit logging pipeline so that regressions in audit data collection, querying, and health summary are caught automatically.",
+      "acceptanceCriteria": [
+        "New test file e2e/audit-logging.e2e.ts",
+        "Test: invoke 2-3 tools (at least one success, one failure), then GET /audit — verify entries have correct fields (timestamp is ISO 8601, tool/plugin/success/durationMs present), ordering is newest first",
+        "Test: GET /audit?plugin=e2e_test filters correctly (only entries for that plugin)",
+        "Test: GET /audit?success=false filters to only failed invocations",
+        "Test: GET /audit?limit=1 returns exactly 1 entry",
+        "Test: GET /health includes auditSummary with totalInvocations >= number of tools invoked, successCount and failureCount that sum to totalInvocations",
+        "Test: GET /audit without Bearer auth returns 401",
+        "bun run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Create e2e/audit-logging.e2e.ts following the pattern from tool-dispatch.e2e.ts. Import test fixtures from ./fixtures.js and helpers from ./helpers.js. Use the setupToolTest helper to set up the server + extension + test tab.\n\nTest structure:\n1. Call a tool that succeeds (e.g., echo tool via callToolExpectSuccess)\n2. Force a failure by calling a tool that will error (e.g., call when tab is not ready, or use a test server /control endpoint to trigger error mode)\n3. GET http://localhost:<port>/audit with Bearer auth, parse JSON response\n4. Assert: response is an array, length >= 2, entries have required fields, entries are ordered newest first (first entry timestamp >= second entry timestamp)\n5. GET /audit?success=false — assert all returned entries have success: false\n6. GET /audit?limit=1 — assert response array has length 1\n7. GET /health — parse auditSummary, assert totalInvocations >= 2, successCount + failureCount === totalInvocations\n8. GET /audit without Authorization header — assert 401 status\n\nFor the port and secret: the test fixtures provide mcpServer.port and the config secret. Look at how other E2E tests make HTTP requests to the server (e.g., lifecycle.e2e.ts calls /health)."
+    },
+    {
+      "id": "US-006",
+      "title": "Update CLAUDE.md to document audit logging",
+      "description": "As a platform developer, I want CLAUDE.md to document the audit logging feature so that the project instructions remain accurate.",
+      "acceptanceCriteria": [
+        "CLI commands section mentions opentabs audit command",
+        "MCP Server section mentions the /audit endpoint and auditSummary in /health",
+        "No plugin-specific details mentioned (keep documentation plugin-agnostic per existing guidelines)",
+        "No stale references introduced",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Edit CLAUDE.md. In the CLI section where commands are listed, add 'audit' to the opentabs command list (currently: start, status, doctor, setup, logs, plugin, config). Add a brief one-liner: opentabs audit shows recent tool invocation history. In the MCP Server description or Key Concepts section, add a brief mention that the server maintains an in-memory audit log of the last 500 tool invocations, queryable via GET /audit, with aggregate stats included in /health auditSummary. Keep it concise — no more than 2-3 sentences. Do not enumerate specific fields or query params in CLAUDE.md; the code and types are the source of truth for those details."
+    }
+  ]
+}

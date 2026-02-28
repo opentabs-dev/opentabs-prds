@@ -1,0 +1,172 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Improve CLI UX: multi-client MCP config, config reset/set, tool name discovery, env var warnings, extension reload notification, status clarity, and config error messages.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Show MCP config for multiple clients",
+      "description": "As a user, I want first-run setup instructions that cover popular MCP clients beyond just Claude Code.",
+      "acceptanceCriteria": [
+        "First-time instructions in start.ts show config for Claude Code (~/.claude/settings/mcp.json), Cursor (.cursor/mcp.json), and Windsurf",
+        "Each client config block is labeled with the client name",
+        "A note says 'For other MCP clients, consult their documentation for adding a Streamable HTTP server'",
+        "The subsequent-run dim hint also mentions multiple clients or uses a generic phrasing",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/start.ts. The printFirstTimeInstructions function (line 92-108) currently shows only Claude Code config. Expand it to show:\n\n1. Claude Code: ~/.claude/settings/mcp.json with the current JSON\n2. Cursor: .cursor/mcp.json with similar JSON format\n3. Windsurf: their config format\n4. Generic: 'For other MCP clients, add a Streamable HTTP server pointing to http://127.0.0.1:<port>/mcp'\n\nAlso update the subsequent-run hint (lines 151-157) to use generic phrasing like 'MCP client config (add to your client):' instead of specifically mentioning ~/.claude/settings/mcp.json.\n\nResearch the correct config format for Cursor (typically .cursor/mcp.json in the project root or global) and Windsurf. The key information is the URL: http://127.0.0.1:<port>/mcp with type streamable-http."
+    },
+    {
+      "id": "US-002",
+      "title": "Add opentabs config reset command",
+      "description": "As a user, I want to reset my configuration to defaults when it gets corrupted.",
+      "acceptanceCriteria": [
+        "Running 'opentabs config reset' deletes the existing config file and prints 'Config reset. Run opentabs start to regenerate.'",
+        "Running 'opentabs config reset --confirm' skips the confirmation prompt",
+        "If no config file exists, prints 'No config file found at <path>' and exits cleanly",
+        "Help text explains what reset does (deletes config, server will regenerate on next start)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Add a 'reset' subcommand in platform/cli/src/commands/config.ts. Implementation:\n1. Get config path via getConfigPath()\n2. Check if file exists via Bun.file(path).exists()\n3. If not exists, print message and return\n4. If --confirm not set, print a warning: 'This will delete your config at <path>. Your server secret will change.' and then proceed (no interactive prompt needed since we're a CLI tool -- just require --confirm flag for safety, or just do it since the server recreates it).\n\nActually, simpler approach: just delete the file and print a message. The server auto-creates a new one on next start. Use Bun.file(path).delete() for the deletion. Import from ../config.js."
+    },
+    {
+      "id": "US-003",
+      "title": "Expand config set to support more keys",
+      "description": "As a user, I want to use 'opentabs config set' to modify localPlugins and port settings, not just tool toggles.",
+      "acceptanceCriteria": [
+        "config set tool.<name> enabled/disabled continues to work as before",
+        "config set port <number> sets a default port in config (validated 1-65535)",
+        "config set localPlugins.add <path> appends a path to localPlugins array (no duplicates)",
+        "config set localPlugins.remove <path> removes a path from localPlugins array",
+        "Each operation prints a confirmation message showing the new value",
+        "Invalid keys produce a clear error listing supported key patterns",
+        "Help text is updated with examples for all supported keys",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/config.ts handleConfigSet function (line 79-119). Currently only handles 'tool.' prefix. Extend the routing:\n\n1. Keep existing tool.* handling\n2. Add 'port' key: validate as integer 1-65535, set config.port = value\n3. Add 'localPlugins.add' key: the value is a path, push to localPlugins array if not already present, resolve relative to cwd\n4. Add 'localPlugins.remove' key: filter localPlugins to remove matching path\n\nUpdate the error message on unknown key to list all supported patterns: 'Supported keys: tool.<plugin>_<tool>, port, localPlugins.add, localPlugins.remove'\n\nUpdate the help text in registerConfigCommand (line 132-138) to show examples."
+    },
+    {
+      "id": "US-004",
+      "title": "Add tool name discovery to config set",
+      "description": "As a user, I want to see available tool names when using config set, so I don't have to guess the exact prefixed name.",
+      "acceptanceCriteria": [
+        "Running 'opentabs config set tool.' (with trailing dot, no tool name) shows a list of all available tools from the running server",
+        "If the server is not running, prints a hint to start the server first or use 'opentabs status' to see tool names",
+        "The list shows tool names in the format <plugin>_<tool> that can be directly used with config set",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/config.ts handleConfigSet. When the key is exactly 'tool.' (ends with dot, no tool name after it), or when the toolName is empty after slicing:\n\n1. Try to fetch /health from the server (use resolvePort to get port)\n2. Extract all tool names from pluginDetails (each plugin has toolCount but not tool names... actually the /health endpoint doesn't return individual tool names).\n\nAlternative approach: when the user provides an invalid tool name (empty or missing underscore), AND the server is reachable, fetch tool names. The /health endpoint returns pluginDetails with name and toolCount but not individual tool names. We'd need to check if there's another endpoint that lists tools, or derive them from the MCP tools/list.\n\nSimplest approach: instead of fetching from server, just improve the error message to say 'Use opentabs status to see available tool names. Tool names use the format <plugin>_<tool>, e.g. slack_send_message'. This is simpler and doesn't require server communication."
+    },
+    {
+      "id": "US-005",
+      "title": "Warn on invalid OPENTABS_PORT env var",
+      "description": "As a user, I want to see a warning when my OPENTABS_PORT environment variable is invalid so I know it's being ignored.",
+      "acceptanceCriteria": [
+        "When OPENTABS_PORT is set but invalid (non-integer, out of range 1-65535, etc.), a yellow warning is printed: 'Warning: OPENTABS_PORT=\"<value>\" is invalid (must be 1-65535). Using default port 9515.'",
+        "The warning is printed to stderr so it doesn't interfere with JSON output",
+        "Valid OPENTABS_PORT values continue to work silently",
+        "Unset OPENTABS_PORT continues to use default silently",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Edit platform/cli/src/parse-port.ts resolvePort function (line 23-35). Currently, when envPort is defined but invalid, it silently falls through to DEFAULT_PORT. Add a console.error with picocolors yellow warning before returning the default.\n\nImport pc from picocolors. Add after line 30 (inside the if block where envPort is defined but parsed is invalid):\n```\nconsole.error(pc.yellow(`Warning: OPENTABS_PORT=\"${envPort}\" is invalid (must be 1-65535). Using default port ${DEFAULT_PORT}.`));\n```\n\nNote: picocolors is already a dependency of @opentabs-dev/cli."
+    },
+    {
+      "id": "US-006",
+      "title": "Document OPENTABS_CONFIG_DIR in CLI help",
+      "description": "As a user, I want to know about the OPENTABS_CONFIG_DIR environment variable from the CLI help text.",
+      "acceptanceCriteria": [
+        "The root 'opentabs' help text mentions OPENTABS_CONFIG_DIR in an 'Environment:' section",
+        "Both OPENTABS_PORT and OPENTABS_CONFIG_DIR are listed with descriptions",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Edit platform/cli/src/cli.ts. Add an addHelpText('after', ...) to the root program command (after line 26). Example:\n\n```\nprogram.addHelpText('after', `\nEnvironment:\n  OPENTABS_PORT         MCP server port (overridden by --port)\n  OPENTABS_CONFIG_DIR   Config directory (default: ~/.opentabs)\n`);\n```"
+    },
+    {
+      "id": "US-007",
+      "title": "Notify user to reload extension after update",
+      "description": "As a user, I want to be told when I need to reload the Chrome extension after an update.",
+      "acceptanceCriteria": [
+        "When the extension is updated (not first install), the message includes: 'Reload the extension from chrome://extensions/ for changes to take effect.'",
+        "On first install, the existing first-time instructions are shown (no change)",
+        "The reload hint is shown in dim/yellow to distinguish it from errors",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/start.ts. On line 79, after the 'Extension updated to v...' message, add a line:\n```\nconsole.log(pc.dim('  Reload the extension from chrome://extensions/ for changes to take effect.'));\n```"
+    },
+    {
+      "id": "US-008",
+      "title": "Add context to Reloads count in status output",
+      "description": "As a user, I want to understand what the 'Reloads' count means in opentabs status.",
+      "acceptanceCriteria": [
+        "The status output label changes from 'Reloads' to 'Reloads' with a parenthetical explanation or the label is 'Hot reloads' for clarity",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "Edit platform/cli/src/commands/status.ts line 87. Change the label from 'Reloads' to 'Reloads' and append context. Either change the pad label to 'Plugin reloads' or add a dim annotation after the count: `${String(data.reloadCount)} ${pc.dim('(plugin rediscoveries)')}`."
+    },
+    {
+      "id": "US-009",
+      "title": "Fix config read error double-messaging",
+      "description": "As a user, I want to see a single clear error message when my config file has invalid JSON, not two confusing messages.",
+      "acceptanceCriteria": [
+        "When config.json exists but contains invalid JSON, a single error message is shown: 'Invalid config at <path>: <parse error>' (not followed by 'No config found')",
+        "The caller (config show, config set, etc.) receives enough info to print an appropriate message",
+        "When config.json is truly missing, 'No config found at <path>' is shown (no change)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "The issue is in platform/cli/src/config.ts readConfig function (line 15-35). When JSON.parse fails, it logs to console.error AND returns null. The caller then checks for null and prints 'No config found' -- so the user sees both messages.\n\nFix: Change readConfig to throw a specific error for invalid JSON (or return a discriminated result), so callers can distinguish 'file missing' from 'file corrupt'. Simplest approach: return a result object like { config: null, error: 'missing' | 'invalid' } or just remove the console.error calls from readConfig and let callers handle messaging.\n\nBest approach: remove the console.error lines from readConfig (lines 24 and 29-31) so it returns null silently. Then in the callers (config.ts commands, doctor.ts, audit.ts), check if the file exists before calling readConfig to distinguish missing from corrupt. Or: have readConfig return { config, error } tuple."
+    }
+  ]
+}

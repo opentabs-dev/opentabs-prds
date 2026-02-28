@@ -1,0 +1,229 @@
+# Ralph Progress Log
+PRD: prd-2026-02-17-234500-add-browser-tools~running.json
+Started: Wed Feb 18 02:17:05 PST 2026
+---
+
+## Codebase Patterns
+- Browser tool MCP server files go in `platform/mcp-server/src/browser-tools/` using `defineBrowserTool` from `./definition.js`
+- Each tool dispatches to extension via `dispatchToExtension(state, 'browser.methodName', params)`
+- Extension handlers in `platform/browser-extension/src/browser-commands.ts` follow pattern: validate params, call chrome API, sendToServer with result/error
+- Message router dispatch table in `platform/browser-extension/src/message-router.ts` uses `methodHandlers` Map
+- Sync handlers (no `await`) must NOT be `async` — the dispatch table calls `.catch()` on async handlers but directly invokes sync ones
+- `chrome.debugger.onEvent` callback param type is `object | undefined` — cast to `Record<string, unknown>` inside the handler
+- `chrome.debugger.detach()` returns a Promise — use `void ...catch(() => {})` for fire-and-forget detach
+- BROWSER_TOOL_NAMES in e2e/helpers.ts must only list tools that exist on the MCP server, not future tools
+- All handlers wrapped with `if (id !== undefined) { handler(params, id).catch(console.error); }`
+- URL validation uses `safeUrl` from `./url-validation.js` (allowlist http/https only)
+- Extension-side URL validation uses `isBlockedUrlScheme` from `@opentabs-dev/shared`
+- Browser tools barrel: `platform/mcp-server/src/browser-tools/index.ts` — add new tools to the `browserTools` array
+- E2E test helpers in `e2e/helpers.ts`, browser tool names in `BROWSER_TOOL_NAMES` array
+- Test server in `e2e/test-server.ts` serves HTML pages and API endpoints for plugin testing
+- `chrome.tabs.update()` returns `Tab | undefined` — always guard against undefined before accessing properties
+- Bun `mock.module` has a bug: `mock<Type>()` (typed mock without implementation) causes named exports to resolve as `undefined` in consuming modules' static import bindings. Workaround: use `mock(asyncNoop as Type)` with an actual implementation function
+- When adding new browser command handlers, also update the mock.module factory in `message-router.test.ts`
+- For DOM interaction tools, use `chrome.scripting.executeScript({ target: { tabId }, world: 'MAIN', func, args })` — returns `results[0].result`
+- Return `{ error: string }` from the func for element-not-found cases; check before sending JSON-RPC response
+- Cookie tools use `safeUrl` from `url-validation.ts` for server-side URL validation + `isBlockedUrlScheme` for extension-side defense-in-depth
+- `chrome.cookies.set()` returns `Cookie | null` — always guard against null
+- **CRITICAL**: When adding new browser tool methods, also add them to `ALLOWED_METHODS` in `platform/browser-extension/src/offscreen/index.ts` — the offscreen document drops WebSocket messages with unrecognized methods, causing tool dispatch to silently hang until the 30s timeout
+
+---
+
+## 2026-02-18 - US-001
+- Added `cookies` and `debugger` permissions to manifest.json
+- Added `/interactive` route to e2e/test-server.ts with interactive HTML page (button, input, textarea, select, delayed content div, status span)
+- Updated BROWSER_TOOL_NAMES in e2e/helpers.ts with all 23 browser tool names (6 existing + 17 new)
+- Files changed: platform/browser-extension/manifest.json, e2e/test-server.ts, e2e/helpers.ts
+- **Learnings for future iterations:**
+  - The test server uses `Bun.serve()` fetch handler pattern — add new pages by defining HTML const and adding route in the fetch handler
+  - Manifest permissions are a simple JSON array — just append new permission strings
+  - BROWSER_TOOL_NAMES is used by E2E tests to verify tool registration — must be updated before implementing tools
+---
+
+## 2026-02-18 - US-002
+- Added `browser_focus_tab` tool: MCP server definition + extension handler + message router entry
+- Added `browser_get_tab_info` tool: MCP server definition + extension handler + message router entry
+- Updated message-router.test.ts: added mock functions and dispatch routing tests for both new methods
+- Fixed Bun mock.module bug: changed mock declarations from `mock<Type>()` to `mock(asyncNoop as Type)` to work around Bun bug where typed mocks without implementations resolve as `undefined` in static import bindings
+- Files changed: platform/mcp-server/src/browser-tools/focus-tab.ts (new), platform/mcp-server/src/browser-tools/get-tab-info.ts (new), platform/mcp-server/src/browser-tools/index.ts, platform/browser-extension/src/browser-commands.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts
+- **Learnings for future iterations:**
+  - `chrome.tabs.update()` returns `Tab | undefined` — guard against undefined before accessing `.windowId`, `.id`, etc.
+  - Bun `mock<Type>()` (without implementation) causes named exports to resolve as `undefined` in consuming modules. Use `mock(asyncNoop as Type)` instead.
+  - When adding new browser command handlers, must update: (1) browser-commands.ts, (2) message-router.ts dispatch table + imports, (3) message-router.test.ts mock declarations + mock.module factory + routing tests
+---
+
+## 2026-02-18 - US-003
+- Added `browser_screenshot_tab` tool: MCP server definition + extension handler + message router entry
+- MCP server tool at `platform/mcp-server/src/browser-tools/screenshot-tab.ts` dispatches `browser.screenshotTab`
+- Extension handler focuses the tab first (`chrome.tabs.update` + `chrome.windows.update`), waits 100ms for render, then captures via `chrome.tabs.captureVisibleTab`, strips the data URI prefix, returns base64 PNG
+- Updated message-router.test.ts with mock function, mock.module factory entry, and routing test
+- Files changed: platform/mcp-server/src/browser-tools/screenshot-tab.ts (new), platform/mcp-server/src/browser-tools/index.ts, platform/browser-extension/src/browser-commands.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts
+- **Learnings for future iterations:**
+  - `chrome.tabs.captureVisibleTab(windowId, { format: 'png' })` captures the ACTIVE tab in the given window — must focus the tab first
+  - A small delay (~100ms) after focusing is needed for the tab content to render before capture
+  - The data URL returned by `captureVisibleTab` starts with `data:image/png;base64,` — strip this prefix before returning
+---
+
+## 2026-02-18 - US-004
+- Added `browser_get_tab_content` tool: MCP server definition + extension handler + message router entry
+- MCP server tool at `platform/mcp-server/src/browser-tools/get-tab-content.ts` dispatches `browser.getTabContent`
+- Extension handler uses `chrome.scripting.executeScript` with `{ func }` to extract text content from the page
+- Supports optional `selector` (defaults to `body`) and `maxLength` (defaults to 50000) parameters
+- Returns `{ title, url, content }` on success; returns error for non-existent selectors
+- Updated message-router.test.ts with mock function, mock.module factory entry, and routing test
+- Files changed: platform/mcp-server/src/browser-tools/get-tab-content.ts (new), platform/mcp-server/src/browser-tools/index.ts, platform/browser-extension/src/browser-commands.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts
+- **Learnings for future iterations:**
+  - `chrome.scripting.executeScript` with `{ func, args }` allows passing typed arguments to the injected function — use this pattern for static content extraction
+  - The `world: 'MAIN'` option runs in the page's JS context, giving access to `document.title`, `document.URL`, and `innerText`
+  - `executeScript` returns `results[0].result` — type the result with an explicit interface to avoid `as any` casts
+  - For element-not-found errors, return an `{ error }` property from the func and check it before sending the JSON-RPC response
+---
+
+## 2026-02-18 - US-005
+- Added `browser_click_element` tool: MCP server definition + extension handler + message router entry
+- Added `browser_type_text` tool: MCP server definition + extension handler + message router entry
+- Added `browser_select_option` tool: MCP server definition + extension handler + message router entry
+- All three use `chrome.scripting.executeScript` with `{ func, args }` for DOM interaction in the MAIN world
+- `click_element` dispatches `el.click()` on the first matching element
+- `type_text` focuses the element, optionally clears, sets value, dispatches input + change events
+- `select_option` iterates options by value or label, sets selectedIndex, dispatches change event
+- Updated message-router.test.ts with mock functions, mock.module factory entries, and routing tests for all three
+- Files changed: platform/mcp-server/src/browser-tools/click-element.ts (new), platform/mcp-server/src/browser-tools/type-text.ts (new), platform/mcp-server/src/browser-tools/select-option.ts (new), platform/mcp-server/src/browser-tools/index.ts, platform/browser-extension/src/browser-commands.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts
+- **Learnings for future iterations:**
+  - For `select_option`, avoid non-null assertions on `HTMLOptionsCollection` items — use `Array.from()` and guard with `if (!opt) continue` to satisfy ESLint
+  - Template literal expressions must not have `string | undefined` type — use `String()` wrapper for potentially undefined values
+  - When a tool requires at least one of two optional params (value/label), validate this in the extension handler before calling executeScript
+---
+
+## 2026-02-18 - US-006
+- Added `browser_wait_for_element` tool: MCP server definition + extension handler + message router entry
+- Added `browser_query_elements` tool: MCP server definition + extension handler + message router entry
+- `wait_for_element` uses `chrome.scripting.executeScript` with a Promise-based polling loop (`setInterval` + `resolve`) to wait for elements to appear in the DOM
+- Supports `visible` parameter to require the element to be visible (not `display:none`)
+- `query_elements` uses `querySelectorAll`, slices to `limit`, maps to `{ tagName, text, attributes }` with configurable attribute extraction
+- Updated message-router.test.ts with mock functions, mock.module factory entries, and routing tests for both
+- Files changed: platform/mcp-server/src/browser-tools/wait-for-element.ts (new), platform/mcp-server/src/browser-tools/query-elements.ts (new), platform/mcp-server/src/browser-tools/index.ts, platform/browser-extension/src/browser-commands.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts
+- **Learnings for future iterations:**
+  - `chrome.scripting.executeScript` automatically awaits Promise return values from the injected func — just return a `new Promise()` and Chrome handles the async
+  - For visibility checking, `htmlEl.offsetParent !== null` catches `display:none` on ancestors, while `getComputedStyle(el).display !== 'none'` catches direct `display:none`
+  - Prettier removes extra parens around `||` chains when they don't affect precedence — `!vis || (A || B)` becomes `!vis || A || B`
+  - `Object.fromEntries` with `el.hasAttribute(a)` filter cleanly extracts only present attributes without undefined values
+---
+
+## 2026-02-18 - US-007
+- Added `browser_get_cookies` tool: MCP server definition + extension handler + message router entry
+- Added `browser_set_cookie` tool: MCP server definition + extension handler + message router entry
+- Added `browser_delete_cookies` tool: MCP server definition + extension handler + message router entry
+- All three tools use `safeUrl` from `url-validation.ts` for URL parameter validation
+- Extension handlers use `chrome.cookies.getAll`, `chrome.cookies.set`, `chrome.cookies.remove`
+- Extension handlers also validate URLs with `isBlockedUrlScheme` from `@opentabs-dev/shared` for defense-in-depth
+- `getCookies` maps cookie objects to a clean subset of fields (name, value, domain, path, secure, httpOnly, sameSite, expirationDate)
+- `setCookie` conditionally includes optional fields (domain, path, secure, httpOnly, expirationDate) only when provided
+- `deleteCookies` returns `{ deleted: true, name, url }` on success
+- Updated message-router.test.ts with mock functions, mock.module factory entries, and routing tests for all three
+- Files changed: platform/mcp-server/src/browser-tools/get-cookies.ts (new), platform/mcp-server/src/browser-tools/set-cookie.ts (new), platform/mcp-server/src/browser-tools/delete-cookies.ts (new), platform/mcp-server/src/browser-tools/index.ts, platform/browser-extension/src/browser-commands.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts
+- **Learnings for future iterations:**
+  - `chrome.cookies.getAll({ url })` returns all cookies that match the URL — use `filter.name` to narrow by cookie name
+  - `chrome.cookies.set()` returns `Cookie | null` — guard against null before accessing properties
+  - `chrome.cookies.remove({ url, name })` is the minimum required params — returns a details object on success
+  - Cookie tools use both server-side URL validation (`safeUrl` Zod schema) and extension-side URL validation (`isBlockedUrlScheme`) for defense-in-depth
+  - When building `chrome.cookies.SetDetails`, only include optional fields when the param is actually provided — don't pass `undefined` values
+---
+
+## [2026-02-18 02:45] - US-008
+- Implemented network capture state management in extension
+- Created `platform/browser-extension/src/network-capture.ts` with per-tab CDP debugger-based capture
+- Added 5 browser command handlers in `browser-commands.ts`: enableNetworkCapture (async), getNetworkRequests (sync), disableNetworkCapture (sync), getConsoleLogs (sync), clearConsoleLogs (sync)
+- Added 5 dispatch entries in `message-router.ts` and corresponding routing tests in `message-router.test.ts`
+- Fixed premature BROWSER_TOOL_NAMES entries in `e2e/helpers.ts` — removed 5 tool names for not-yet-implemented MCP server tools that were causing E2E failures
+- Files changed: network-capture.ts (new), browser-commands.ts, message-router.ts, message-router.test.ts, e2e/helpers.ts
+- **Learnings for future iterations:**
+  - Chrome `debugger.onEvent` callback types `params` as `object | undefined`, not `Record<string, unknown>` — must cast inside the handler body
+  - `chrome.debugger.detach()` is a Promise — cannot use try/catch for fire-and-forget; use `void ...catch(() => {})`
+  - Handlers that are purely synchronous must NOT use `async` keyword — ESLint `@typescript-eslint/require-await` enforces this, and the dispatch table pattern differs (sync handlers called directly, async handlers get `.catch(console.error)`)
+  - E2E test helper arrays like `BROWSER_TOOL_NAMES` must only list tools that are actually registered on the MCP server — adding future tool names breaks tests
+  - CDP `Network.requestWillBeSent` fires first with request data, then `Network.responseReceived` merges status/headers — use a `pendingRequests` Map keyed by requestId to correlate them
+---
+
+## [2026-02-18] - US-009
+- Added `browser_enable_network_capture` MCP server tool at `platform/mcp-server/src/browser-tools/enable-network-capture.ts`
+- Added `browser_get_network_requests` MCP server tool at `platform/mcp-server/src/browser-tools/get-network-requests.ts`
+- Added `browser_disable_network_capture` MCP server tool at `platform/mcp-server/src/browser-tools/disable-network-capture.ts`
+- All three tools dispatch to extension handlers already implemented in US-008
+- Added all three to the browser-tools barrel (`index.ts`)
+- Updated `BROWSER_TOOL_NAMES` in `e2e/helpers.ts` with the three new tool names
+- Files changed: enable-network-capture.ts (new), get-network-requests.ts (new), disable-network-capture.ts (new), platform/mcp-server/src/browser-tools/index.ts, e2e/helpers.ts
+- **Learnings for future iterations:**
+  - When extension-side handlers are already implemented (US-008), the MCP server tool files are minimal: just `defineBrowserTool` with Zod schema + `dispatchToExtension` call
+  - The barrel file imports must be kept alphabetically sorted
+  - `BROWSER_TOOL_NAMES` must be updated each time new MCP server tools are registered (not when extension handlers are added)
+  - Prettier enforces single-line arrow function returns when they fit — avoid unnecessary line breaks before `dispatchToExtension`
+---
+
+## [2026-02-18] - US-010
+- Added `browser_get_console_logs` MCP server tool at `platform/mcp-server/src/browser-tools/get-console-logs.ts`
+- Added `browser_clear_console_logs` MCP server tool at `platform/mcp-server/src/browser-tools/clear-console-logs.ts`
+- Both tools dispatch to extension handlers already implemented in US-008
+- Added both to the browser-tools barrel (`index.ts`)
+- Updated `BROWSER_TOOL_NAMES` in `e2e/helpers.ts` with the two new tool names
+- Files changed: get-console-logs.ts (new), clear-console-logs.ts (new), platform/mcp-server/src/browser-tools/index.ts, e2e/helpers.ts
+- **Learnings for future iterations:**
+  - Console log tools follow the same pattern as network capture tools — extension handlers use `getConsoleLogs`/`clearConsoleLogs` from `network-capture.ts`
+  - `z.enum()` for the level parameter serializes cleanly to JSON Schema — use it when there's a fixed set of allowed values
+  - Long `.describe()` strings on chained Zod methods need Prettier line-break formatting — wrap in `.describe(\n  'long string',\n)`
+---
+
+## 2026-02-18 04:15 - US-011
+- Implemented E2E tests for browser_focus_tab, browser_get_tab_info, browser_screenshot_tab, and browser_get_tab_content
+- Updated tool listing test to use BROWSER_TOOL_NAMES array instead of hard-coded names
+- Fixed critical bug: offscreen document's ALLOWED_METHODS whitelist was missing all 17 new browser tool methods added in US-002 through US-010, causing WebSocket messages for these tools to be silently dropped
+- Files changed: e2e/browser-tools.e2e.ts (added 8 test cases across 4 new describe blocks), platform/browser-extension/src/offscreen/index.ts (added 17 methods to ALLOWED_METHODS)
+- **Learnings for future iterations:**
+  - The offscreen document (`platform/browser-extension/src/offscreen/index.ts`) has an ALLOWED_METHODS whitelist that MUST be updated when adding new browser tool methods — missing entries cause dispatch timeouts with no error message
+  - Stale `.tsbuildinfo` files can cause `tsc --build` to skip recompiling changed modules, resulting in a stale bundled `dist/background.js` — delete all `.tsbuildinfo` files when debugging mysterious bundle issues
+  - For E2E tests that don't need a fully loaded page (e.g., testing tab focus or tab info), use `browser_open_tab` directly instead of `openTestServerTab` (which polls `readyState`) to keep tests fast
+  - The base64 encoding of a PNG file always starts with `iVBOR` — useful for verifying screenshot captures
+---
+
+## 2026-02-18 05:00 - US-012
+- Implemented E2E tests for browser_click_element, browser_type_text, browser_select_option, browser_wait_for_element, and browser_query_elements
+- Added `openInteractivePage` helper that opens /interactive and waits for readyState === complete
+- Fixed bug in `handleBrowserSelectOption`: `chrome.scripting.executeScript` args array cannot contain `undefined` values — changed to `value ?? null, label ?? null` and updated func parameter types/comparisons to use `null`
+- Files changed: e2e/browser-tools.e2e.ts (added 9 test cases across 5 new describe blocks + openInteractivePage helper), platform/browser-extension/src/browser-commands.ts (fixed select_option undefined→null)
+- **Learnings for future iterations:**
+  - `chrome.scripting.executeScript` args array cannot contain `undefined` values — Chrome throws "Value is unserializable" at the offending index. Always use `?? null` for optional args passed to executeScript.
+  - When testing DOM interaction tools, use a dedicated helper (`openInteractivePage`) that waits for full page load to avoid flaky tests from racing with page rendering
+  - The /interactive test page has specific element IDs (test-btn, test-input, test-textarea, test-select, delayed-content, status) — reference these directly in E2E tests
+---
+
+## 2026-02-18 05:30 - US-013
+- Implemented E2E tests for browser_get_cookies, browser_set_cookie, and browser_delete_cookies
+- Cookie lifecycle test: set → get → verify value → delete → verify gone
+- Name filter test: set two cookies, get with name filter, verify only matching cookie returned
+- URL validation tests: all three cookie tools reject javascript:, data:, and file: URLs (9 tests)
+- Files changed: e2e/browser-tools.e2e.ts (added 11 test cases across 2 new describe blocks)
+- **Learnings for future iterations:**
+  - Cookie tools use the test server URL (`testServer.url`) which is http://localhost — cookies work fine with localhost
+  - Use unique cookie names with `__opentabs_e2e` prefix to avoid conflicts with any pre-existing cookies
+  - Clean up cookies at the end of each test to avoid cross-test interference
+  - Non-null assertion operator (`!`) is forbidden by ESLint — use a guard with `if (!x) throw new Error(...)` instead
+---
+
+## 2026-02-18 06:00 - US-014
+- Implemented E2E tests for network capture and console log tools
+- Network capture lifecycle: enable → navigate → get requests → verify captured → disable
+- Buffer clear test: get with clear=true empties the buffer, subsequent get returns empty
+- URL filter test: enable with urlFilter, verify all captured requests match the filter
+- Error test: enable on non-existent tab returns error
+- Console log capture: enable network capture → execute console.log/console.error → verify captured with correct levels
+- Console log clear: clear_console_logs empties buffer, subsequent get returns empty
+- Files changed: e2e/browser-tools.e2e.ts (added 7 test cases across 2 new describe blocks)
+- **Learnings for future iterations:**
+  - Network capture uses the Chrome DevTools Protocol (CDP) debugger — it takes ~1000ms for navigation + request capture to complete, so use 1000ms delay before checking requests
+  - Console log capture piggybacks on network capture (both use the CDP debugger) — must call `browser_enable_network_capture` before console logs are captured
+  - CDP console entries arrive asynchronously — use 500ms delay after `browser_execute_script` before checking console logs
+  - The urlFilter is a substring match on the request URL, not a regex — simple string containment check
+---
+
+## Completion
+All 14 user stories (US-001 through US-014) are now passing. The PRD is complete.

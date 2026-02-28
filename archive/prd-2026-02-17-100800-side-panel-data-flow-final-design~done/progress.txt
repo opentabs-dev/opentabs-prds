@@ -1,0 +1,85 @@
+## Codebase Patterns
+- `forwardToSidePanel` from `messaging.ts` wraps messages in `sp:serverMessage` type for the side panel
+- Side panel filters incoming messages by `SIDE_PANEL_METHODS` set in `message-router.ts` — only `tab.stateChanged`, `tool.invocationStart`, `tool.invocationEnd`, `plugins.changed` are forwarded
+- Tab state is cached in `lastKnownState` map in `tab-state.ts` — redundant notifications are suppressed
+- `sendToServer` and `forwardToSidePanel` are both fire-and-forget (catch errors silently)
+- Three places emit tab.stateChanged: `checkTabStateChanges`, `sendTabSyncAll` (initial sync), `handlePluginUpdate`
+- Side panel data flow uses three patterns: (1) server-originated state uses invalidate + re-fetch via `loadPlugins`/`fetchConfigState`, (2) extension-originated tab state is pushed directly via `forwardToSidePanel`, (3) tool toggles use optimistic local `setPlugins` updates
+- ESLint import-x/order: type imports from local modules must come before type imports from external packages
+- Playwright: use `getByText('X', { exact: true })` for text matching — `locator('text=X')` does substring matching and causes strict mode violations (e.g., "Connected" matches "Disconnected")
+- E2E side panel tests use `getExtensionId`, `openSidePanel`, `setupAdapterSymlink` helpers (currently duplicated in each test file)
+- `startMcpServer(configDir, hot, explicitPort)` supports explicit port for server restart tests
+- `forwardToSidePanel` (chrome.runtime.sendMessage) is unreliable in Playwright for side panels opened as regular pages. Use /health endpoint + side panel reload as workaround.
+- /health endpoint: `pluginDetails` is the array, `plugins` is just a count number
+- background.ts: `injectPluginsIntoTab` must complete BEFORE `checkTabStateChanges` on `status:complete` events (injection → state check sequence)
+- App.tsx `handleNotification` handles `tab.stateChanged`, `tool.invocationStart`, `tool.invocationEnd` — shared between `sp:serverMessage` and `ws:message` paths
+- `testServer.setSlow(ms)` adds configurable delay to all tool responses — useful for animation/timing E2E tests
+- `createMcpClient(port)` from fixtures.ts creates a direct MCP client for calling tools in E2E tests
+
+## 2026-02-17 - US-001
+- Implemented direct forwarding of tab.stateChanged to side panel from background
+- Files changed:
+  - `platform/browser-extension/src/tab-state.ts` — added `forwardToSidePanel` import, added forwarding in `sendTabSyncAll` (loop through entries) and `checkTabStateChanges` (after sendToServer)
+  - `platform/browser-extension/src/message-router.ts` — added `forwardToSidePanel` call in `handlePluginUpdate` after tab.stateChanged sendToServer
+- **Learnings for future iterations:**
+  - The side panel App.tsx already had the tab.stateChanged handler at lines 82-94 — it validates params and updates the specific plugin's tabState via setPlugins
+  - `forwardToSidePanel` was already imported in `message-router.ts` (used for plugins.changed), but had to be newly imported in `tab-state.ts`
+  - No new InternalMessage variants needed — the existing `sp:serverMessage` type with `SpRelayMessage` covers all forwarded server messages
+---
+
+## 2026-02-17 - US-002
+- Implemented optimistic local toggle for tool enable/disable
+- Files changed:
+  - `platform/browser-extension/src/side-panel/App.tsx` — replaced `onRefresh={loadPlugins}` with `setPlugins={setPlugins}` in PluginList props
+  - `platform/browser-extension/src/side-panel/components/PluginList.tsx` — replaced `onRefresh` prop with `setPlugins: Dispatch<SetStateAction<PluginState[]>>` and passed it through to PluginCard
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — replaced `onRefresh` prop with `setPlugins`, rewrote `handleToggleAll` and `handleToggleTool` to use optimistic updates with revert-on-error
+- **Learnings for future iterations:**
+  - `loadPlugins` is still used in App.tsx for invalidation-based re-fetches (plugins.changed, connection state changes, ws:message fallback) — only the toggle path switched to optimistic
+  - `onRefresh` was only used for toggle operations, so it was fully removed from PluginList and PluginCard
+  - The `plugin` prop to PluginCard is derived from the `plugins` state array in App.tsx, so `setPlugins` updates automatically trigger re-renders with fresh data — no extra plumbing needed
+  - Import ordering: ESLint import-x/order requires type imports from local modules (e.g., `../bridge.js`) before type imports from external packages (e.g., `react`)
+---
+
+## 2026-02-17 - US-003
+- Created E2E test for side panel connection status transitions (connected → disconnected → reconnected)
+- Files changed:
+  - `e2e/side-panel-data-flow.e2e.ts` — new file with connection status test
+- **Learnings for future iterations:**
+  - Use `getByText('Connected', { exact: true })` instead of `locator('text=Connected')` — the latter does substring matching and will match "Disconnected" and "MCP server not connected" too, causing strict mode violations
+  - The offscreen document's reconnect logic works reliably with restarted MCP servers: the secret is persisted in config.json, and `refreshWsUrl()` fetches `/ws-info` before each reconnect attempt
+  - `startMcpServer(configDir, hot, explicitPort)` accepts an explicit port for restart tests — the restarted server binds to the same port the extension was patched with
+  - Side panel Header shows exact text "Connected" / "Disconnected" and DisconnectedState shows "MCP server not connected"
+  - E2E test file `e2e/side-panel-data-flow.e2e.ts` is covered by `e2e/tsconfig.json` (includes `*.ts`)
+  - The `getExtensionId`, `openSidePanel`, and `setupAdapterSymlink` helpers are duplicated across side-panel test files — could be extracted to helpers.ts in the future
+---
+
+## 2026-02-17 - US-004
+- Created E2E test for tab state dot transitions: closed (red) → ready (green) → closed (red)
+- Fixed race condition in background.ts where `injectPluginsIntoTab` and `checkTabStateChanges` ran in parallel on `tabs.onUpdated(status:complete)` — state check could finish before adapter injection, reporting 'unavailable' when adapter would return ready
+- Files changed:
+  - `e2e/side-panel-data-flow.e2e.ts` — added tab state change test
+  - `platform/browser-extension/src/background.ts` — sequenced injection before state check
+- **Learnings for future iterations:**
+  - `forwardToSidePanel` (chrome.runtime.sendMessage from background) does NOT reliably deliver to the side panel when opened as a regular extension page in Playwright. The `ws:message` broadcast from offscreen DOES work. For tab state tests, use server-side polling via /health endpoint's `pluginDetails[].tabState` + side panel reload as a workaround.
+  - The /health endpoint returns `pluginDetails` (array of objects with `name`, `displayName`, `toolCount`, `tabState`) — NOT `plugins` (which is just a count number).
+  - Adapter injection and state checking were racing in background.ts — the fix is to await `injectPluginsIntoTab` before `checkTabStateChanges` when both are triggered by `status: 'complete'`. For URL-only changes, only state check runs (no injection needed).
+---
+
+## 2026-02-17 - US-005
+- Verification story: confirmed existing side-panel-live-update E2E tests still pass after US-001/US-002/US-003/US-004 changes
+- Both tests passed in full E2E suite run (137 passed, 2 flaky pre-existing file watcher timeouts)
+- No code changes needed
+---
+
+## 2026-02-17 - US-006
+- Created E2E test for tool invocation animation (spinner appears during tool call, disappears after)
+- Extracted `handleNotification` function in App.tsx to deduplicate notification handling between `sp:serverMessage` and `ws:message` broadcast paths
+- Files changed:
+  - `e2e/side-panel-data-flow.e2e.ts` — added tool invocation animation test, imported `createMcpClient`
+  - `platform/browser-extension/src/side-panel/App.tsx` — extracted `handleNotification`, extended `ws:message` handler to process tool invocation and tab state notifications
+- **Learnings for future iterations:**
+  - `testServer.setSlow(ms)` adds a configurable delay to all tool responses — use this to create observable time windows for UI animation tests
+  - The `ws:message` broadcast from the offscreen document is the reliable delivery path in Playwright E2E tests; `sp:serverMessage` from the background is unreliable for side panels opened as regular extension pages
+  - Extracting `handleNotification` eliminated duplication between the `sp:serverMessage` and `ws:message` handlers — both paths now process `tab.stateChanged`, `tool.invocationStart`, and `tool.invocationEnd` through the same function
+  - Full E2E suite: 140 tests passed (0 failures) after all 6 user stories
+---

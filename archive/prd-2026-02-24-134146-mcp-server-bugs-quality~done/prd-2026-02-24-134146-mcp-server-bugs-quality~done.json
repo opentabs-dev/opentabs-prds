@@ -1,0 +1,107 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix five genuine bugs and code quality issues in the MCP server: a subprocess that can hang forever, an unhandled promise rejection, an unbounded array, unvalidated input, and redundant I/O.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add SIGKILL fallback and timeout guard to runNpmGlobal subprocess handling",
+      "description": "As a server operator, I want npm subprocess operations to never hang indefinitely so that the MCP server remains responsive even when an npm process becomes unresponsive.",
+      "acceptanceCriteria": [
+        "After proc.kill() fires (60s timeout), a secondary 5-second timer sends SIGKILL if the process has not exited",
+        "The entire runNpmGlobal function rejects with a timeout error rather than hanging indefinitely if the subprocess does not exit within the secondary timeout",
+        "All timers are properly cleaned up on normal (non-timeout) exit paths",
+        "The error thrown on timeout includes a clear message indicating the npm command timed out",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/plugin-management.ts, lines 83-110, the `runNpmGlobal` function spawns an npm subprocess with a 60s timeout that calls `proc.kill()` (SIGTERM). However, after SIGTERM, the function continues to `await proc.exited` with no secondary guard. If the process ignores SIGTERM, the function hangs forever.\n\nThe fix should:\n1. After `proc.kill()` (SIGTERM), set a secondary 5s timer that calls `proc.kill('SIGKILL')`\n2. Use `Promise.race` to race `proc.exited` against a timeout rejection, so the function never hangs\n3. Clean up all timers on both normal and timeout paths\n\nExample approach:\n```typescript\nconst timeoutId = setTimeout(() => {\n  proc.kill();\n  // SIGKILL fallback after 5s\n  setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5_000);\n}, NPM_SUBPROCESS_TIMEOUT_MS);\n```\n\nAnd for the await, wrap `proc.exited` in a `Promise.race` with a rejection timeout:\n```typescript\nconst exitCode = await Promise.race([\n  proc.exited,\n  new Promise<never>((_, reject) =>\n    setTimeout(() => reject(new Error(`npm ${command} for ${packageName} timed out after ${NPM_SUBPROCESS_TIMEOUT_MS}ms`)), NPM_SUBPROCESS_TIMEOUT_MS + 10_000)\n  ),\n]);\n```\n\nMake sure to clear ALL timeout IDs on the normal exit path. The secondary SIGKILL timer also needs to be cleared if the process exits normally after SIGTERM."
+    },
+    {
+      "id": "US-002",
+      "title": "Add .catch() to void sendSyncFull in WebSocket open handler",
+      "description": "As a server operator, I want all fire-and-forget promises to have error handlers so that unhandled promise rejections do not crash the server process.",
+      "acceptanceCriteria": [
+        "The `void sendSyncFull(state).then(...)` call in the WebSocket open handler (http-routes.ts) has a `.catch()` that logs the error via the logger",
+        "The catch handler does not re-throw (fire-and-forget pattern)",
+        "The pattern matches the existing pattern in reload.ts line 152 which already uses `.catch()` correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/http-routes.ts, line 558, the WebSocket open handler has:\n```typescript\nvoid sendSyncFull(state).then(() => {\n  if (state.pendingExtensionReload) {\n    state.pendingExtensionReload = false;\n    log.info('Sending deferred extension reload ...');\n    setTimeout(() => sendExtensionReload(state), 500);\n  }\n});\n```\n\nThis promise chain has no `.catch()`. If `sendSyncFull` rejects, this becomes an unhandled promise rejection. Compare with platform/mcp-server/src/reload.ts line 152 which correctly uses:\n```typescript\nvoid sendSyncFull(state).catch((err: unknown) => {\n  log.warn('Failed to send sync.full to extension:', err);\n});\n```\n\nThe fix is to add a `.catch()` at the end of the promise chain in http-routes.ts:\n```typescript\nvoid sendSyncFull(state).then(() => {\n  if (state.pendingExtensionReload) {\n    state.pendingExtensionReload = false;\n    log.info('Sending deferred extension reload ...');\n    setTimeout(() => sendExtensionReload(state), 500);\n  }\n}).catch((err: unknown) => {\n  log.warn('Failed to send sync.full to extension after WebSocket connect:', err);\n});\n```"
+    },
+    {
+      "id": "US-003",
+      "title": "Validate ConfirmationScope before casting in handleConfirmationResponse",
+      "description": "As a user, I want the 'Allow Always' confirmation action to work reliably so that clicking it actually persists the permission for the session instead of silently failing when the extension sends an unexpected scope value.",
+      "acceptanceCriteria": [
+        "The scope value received from the extension is validated against the set of valid ConfirmationScope values ('tool_domain', 'tool_all', 'domain_all') before being used",
+        "Invalid scope values fall back to the default 'tool_domain' (same as current default)",
+        "A log.warn is emitted when an invalid scope value is received, to aid debugging",
+        "The type assertion `as ConfirmationScope` is no longer applied to unvalidated string input",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/extension-handlers.ts, line 445:\n```typescript\nconst scope = typeof params.scope === 'string' ? (params.scope as ConfirmationScope) : 'tool_domain';\n```\n\nThis casts any string to `ConfirmationScope` without validation. If the extension sends an invalid scope value (e.g., a typo or protocol version mismatch), the resulting `SessionPermissionRule` will have an invalid `scope` field. When `isSessionAllowed` in platform/mcp-server/src/permissions.ts evaluates this rule, the `switch` statement's `default: return false` means the rule never matches — so the user's 'Allow Always' click silently has no effect.\n\nThe fix:\n```typescript\nconst VALID_SCOPES = new Set<string>(['tool_domain', 'tool_all', 'domain_all']);\n// ...\nconst rawScope = typeof params.scope === 'string' ? params.scope : '';\nif (rawScope && !VALID_SCOPES.has(rawScope)) {\n  log.warn(`Invalid confirmation scope '${rawScope}', falling back to 'tool_domain'`);\n}\nconst scope: ConfirmationScope = VALID_SCOPES.has(rawScope) ? (rawScope as ConfirmationScope) : 'tool_domain';\n```\n\nThe `VALID_SCOPES` set could be defined as a module-level constant near the top of the file or next to the ConfirmationScope type usage. The `ConfirmationScope` type is defined in platform/mcp-server/src/state.ts line 205 as `'tool_domain' | 'tool_all' | 'domain_all'`."
+    },
+    {
+      "id": "US-004",
+      "title": "Deduplicate sessionPermissions array to prevent unbounded growth",
+      "description": "As a server operator, I want session permission rules to be deduplicated so that the sessionPermissions array does not grow without bound during long-running sessions with many 'Allow Always' actions.",
+      "acceptanceCriteria": [
+        "Before pushing a new SessionPermissionRule, the code checks if an equivalent rule already exists (same tool, domain, and scope)",
+        "Duplicate rules are not added to the array",
+        "The deduplication check uses the correct semantics: null values in tool/domain fields are handled correctly (e.g., a rule with tool=null matches another rule with tool=null)",
+        "The isSessionAllowed function behavior is unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "In platform/mcp-server/src/extension-handlers.ts, line 455:\n```typescript\nstate.sessionPermissions.push(rule);\n```\n\nEvery 'Allow Always' confirmation unconditionally appends a new rule. Over a long session, this grows without bound. The `isSessionAllowed` function in platform/mcp-server/src/permissions.ts iterates the entire array with `.some()` on every browser tool call.\n\nThe fix: before pushing, check if an equivalent rule already exists:\n```typescript\nconst isDuplicate = state.sessionPermissions.some(\n  r => r.tool === rule.tool && r.domain === rule.domain && r.scope === rule.scope,\n);\nif (!isDuplicate) {\n  state.sessionPermissions.push(rule);\n}\n```\n\nNote that `rule.tool` and `rule.domain` can be `null` (for 'tool_all' scope, domain is null; for 'domain_all' scope, tool is null). The `===` comparison handles null correctly (null === null is true).\n\nThis is in the `handleConfirmationResponse` function around line 444-456. The `SessionPermissionRule` type is defined in platform/mcp-server/src/state.ts around line 207."
+    },
+    {
+      "id": "US-005",
+      "title": "Remove redundant loadSecret() call in index.ts",
+      "description": "As a developer, I want the startup code to not perform redundant I/O so that the initialization path is clean and each operation happens in exactly one place.",
+      "acceptanceCriteria": [
+        "The `state.wsSecret = await loadSecret()` call on line 148 of index.ts is removed",
+        "The `loadSecret` import in index.ts is removed (no longer used)",
+        "The `loadSecret()` call in reloadCore (reload.ts line 201) remains as the single source of truth for loading the WebSocket secret",
+        "The comment on lines 146-147 of index.ts is removed since it is no longer relevant",
+        "knip does not report loadSecret as unused in index.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes",
+        "bun run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "In platform/mcp-server/src/index.ts, lines 146-148:\n```typescript\n// Load the WebSocket secret from auth.json (single source of truth).\n// Also re-read on every reload (reloadCore) so secret rotation takes effect.\nstate.wsSecret = await loadSecret();\n```\n\nThis is redundant because `performReload` (called on line 144) already calls `reloadCore` which calls `loadSecret()` and assigns `state.wsSecret` at platform/mcp-server/src/reload.ts line 201:\n```typescript\nstate.wsSecret = await loadSecret();\n```\n\nThe fix: remove lines 146-148 from index.ts, and remove the `loadSecret` import from line 45:\n```typescript\nimport { loadSecret } from './config.js';\n```\n\nSince this is the final story, verify that no other code in index.ts depends on the `loadSecret` import. After removal, `loadSecret` should only be imported in reload.ts and config.ts.\n\nThis is the final story — it must have e2eCheckpoint: true to ensure full verification before merge."
+    }
+  ]
+}

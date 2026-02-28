@@ -1,0 +1,167 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Remove 6 unnecessary security features and simplify 4 others to reduce E2E test complexity and developer friction. The platform is a localhost-only developer tool — the removed features protect against threats that imply full machine compromise or are unreliable (network-dependent npm verification). Simplifications reduce a 5-layer permission system to tier defaults + skipConfirmation, remove hash verification while keeping Object.freeze, strip regex from error sanitization keeping only truncation, and remove log relay nonce.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Remove npm registry verification and skip-verification flag",
+      "description": "As a platform developer, I want to remove the npm registry integrity verification (verify-plugin.ts) and its skip flag (skip-verification.ts) because the verification silently passes on network failure, giving a false sense of security.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/verify-plugin.ts is deleted",
+        "platform/mcp-server/src/skip-verification.ts is deleted",
+        "platform/mcp-server/src/verify-plugin.test.ts is deleted",
+        "All imports of verify-plugin.js and skip-verification.js are removed from discovery.ts",
+        "The verifyOfficialPlugins function and isSkipPluginVerification() call are removed from discovery.ts",
+        "npmTrustTier function and all other discovery logic remain intact",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "Files to delete: platform/mcp-server/src/verify-plugin.ts (152 lines), platform/mcp-server/src/skip-verification.ts (14 lines), platform/mcp-server/src/verify-plugin.test.ts.\n\nIn platform/mcp-server/src/discovery.ts: remove the two imports (lines 7-8), remove the if(!isSkipPluginVerification()) block and the verifyOfficialPlugins async function (~lines 100-165). Keep npmTrustTier, discoverPlugins, and all other code. The TrustTier import from shared can also be removed since it was only used by verifyOfficialPlugins' type cast.\n\nUse 'git rm' or 'rm' for file deletion — the edit tool's delete operation is unreliable."
+    },
+    {
+      "id": "US-002",
+      "title": "Remove tool output sanitization and skip-sanitization flag",
+      "description": "As a platform developer, I want to remove tool output sanitization (sanitize-tool-output.ts) and the --dangerously-skip-sanitization flag (skip-sanitization.ts) because it destroys actionable data (file paths, URLs) that AI agents need.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/sanitize-tool-output.ts is deleted",
+        "platform/mcp-server/src/skip-sanitization.ts is deleted",
+        "platform/mcp-server/src/sanitize-tool-output.test.ts is deleted",
+        "All imports of sanitize-tool-output.js removed from mcp-setup.ts",
+        "All imports of skip-sanitization.js removed from reload.ts",
+        "In mcp-setup.ts: the ternary 'state.skipSanitization ? cleaned : sanitizeToolOutput(cleaned)' is replaced with just 'cleaned' (two occurrences around lines 496 and 648)",
+        "In reload.ts: the line setting state.skipSanitization is removed",
+        "skipSanitization field removed from ServerState interface and createState() in state.ts",
+        "skipSanitization removed from OpentabsConfig in config.ts and from parseConfigRecord",
+        "outputSanitizationEnabled removed from /health response in http-routes.ts",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Files to delete: platform/mcp-server/src/sanitize-tool-output.ts (56 lines), platform/mcp-server/src/skip-sanitization.ts (20 lines), platform/mcp-server/src/sanitize-tool-output.test.ts.\n\nFiles to modify:\n- platform/mcp-server/src/mcp-setup.ts: remove import of sanitizeToolOutput, replace two ternaries with just 'cleaned'\n- platform/mcp-server/src/reload.ts: remove import of isCliSkipSanitization, remove line 'state.skipSanitization = isCliSkipSanitization() || config.skipSanitization === true;'\n- platform/mcp-server/src/state.ts: remove 'skipSanitization: boolean' from ServerState, remove 'skipSanitization: false' from createState()\n- platform/mcp-server/src/config.ts: remove 'skipSanitization?: boolean' from OpentabsConfig, remove parsing in parseConfigRecord, remove from saveToolConfig spread\n- platform/mcp-server/src/http-routes.ts: remove 'outputSanitizationEnabled: !state.skipSanitization' from health response\n- Test files: update state.test.ts to remove skipSanitization assertions, update http-routes.test.ts to remove outputSanitizationEnabled assertion\n\nKeep sanitize-error.ts (error sanitization stays, simplified in US-005)."
+    },
+    {
+      "id": "US-003",
+      "title": "Remove connection token anti-takeover mechanism",
+      "description": "As a platform developer, I want to remove the connectionToken anti-takeover mechanism because it protects against a threat (rogue local process displacing the extension) that implies the machine is already fully compromised, and it's the biggest driver of E2E test complexity.",
+      "acceptanceCriteria": [
+        "connectionToken field removed from ServerState interface and createState() in state.ts",
+        "Connection token validation removed from WebSocket upgrade handler in http-routes.ts (keep secret validation and 401 rejection)",
+        "state.connectionToken assignment on WS connect and null-clear on disconnect removed from http-routes.ts",
+        "connectionToken removed from /health response in http-routes.ts",
+        "connectionToken removed from sync.full payload in extension-protocol.ts",
+        "connectionToken removed from WebSocket protocol array in offscreen/index.ts",
+        "connectionToken extraction from sync.full and /ws-info removed from offscreen/index.ts",
+        "All connectionToken test cases removed from http-routes.test.ts",
+        "fetchConnectionToken helper removed from e2e/fixtures.ts if it exists",
+        "E2E tests in lifecycle.e2e.ts and dispatch-resilience.e2e.ts updated to use simple secret-only WS connections",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "This is the HIGHEST IMPACT removal for E2E simplification.\n\nFiles to modify:\n- platform/mcp-server/src/state.ts: remove 'connectionToken: string | null' from ServerState, remove 'connectionToken: null' from createState()\n- platform/mcp-server/src/http-routes.ts: In WS upgrade handler (~line 239), remove tokenMatched variable, connection token comparison in the for loop, and the 409 Conflict rejection. Keep secretMatched and the 401 rejection. Remove state.connectionToken = crypto.randomUUID() on WS connect (~line 544). Remove state.connectionToken = null on WS disconnect (~line 582). Remove connectionToken from health response (~line 334).\n- platform/mcp-server/src/extension-protocol.ts: Remove connectionToken from sync.full payload (~line 239), remove adapterHash references too while here (~line 220, 483)\n- platform/browser-extension/src/offscreen/index.ts: Remove connectionToken variable, remove from WS protocol array (keep just ['opentabs', secret]), remove from sync.full handler and /ws-info handler\n- platform/mcp-server/src/http-routes.test.ts: Remove entire connectionToken test blocks (multiple describe/test blocks)\n- e2e/fixtures.ts: Remove fetchConnectionToken helper if present\n- e2e/lifecycle.e2e.ts: Simplify WS replacement tests to just use wsSecret (no token sequence)"
+    },
+    {
+      "id": "US-004",
+      "title": "Remove adapter hash verification, keep Object.freeze",
+      "description": "As a platform developer, I want to remove the SHA-256 hash verification of adapter IIFEs while keeping Object.freeze(), because hash verification adds build-time and runtime complexity without meaningful protection beyond what freeze provides.",
+      "acceptanceCriteria": [
+        "Hash computation removed from opentabs-plugin build in platform/plugin-tools/src/commands/build.ts (keep Object.freeze snippet)",
+        "adapterHash field removed from RegisteredPlugin in state.ts",
+        "computeHash function removed from loader.ts, adapterHash removed from LoadedPlugin",
+        "Hash verification functions removed from iife-injection.ts (readAdapterHash, verifyAdapterHash), adapterHash parameter removed from injection functions",
+        "adapterHash removed from PluginMeta in message-router.ts and from sync.full parsing",
+        "adapterHash removed from plugin type in types.ts",
+        "adapterHash removed from extension_check_adapter browser tool response in browser-commands.ts (keep isFrozen check)",
+        "adapterHash removed from extension-protocol.ts plugin state",
+        "All adapterHash test assertions removed from relevant test files (file-watcher.test.ts, registry.test.ts, loader.test.ts, extension-protocol.test.ts, message-router.test.ts, version-check.test.ts, build-e2e.test.ts)",
+        "Object.freeze() on adapter registration is preserved",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Key files:\n- platform/plugin-tools/src/commands/build.ts: Find the hashAndFreeze snippet that appends both Object.freeze and __adapterHash. Remove the hash computation (SHA-256) and __adapterHash assignment. Keep the Object.freeze() call and Object.defineProperty calls.\n- platform/mcp-server/src/state.ts: Remove 'adapterHash?: string' from RegisteredPlugin interface\n- platform/mcp-server/src/loader.ts: Remove computeHash function, remove adapterHash from loaded plugin object and LoadedPlugin type\n- platform/browser-extension/src/iife-injection.ts: Remove readAdapterHash and verifyAdapterHash functions. Remove adapterHash parameter from injectAdapterFile and injectPluginIntoMatchingTabs. Remove hash verification block from injection flow.\n- platform/browser-extension/src/message-router.ts: Remove adapterHash from PluginMeta, from mapping code, from sync.full parsing\n- platform/browser-extension/src/types.ts: Remove adapterHash from plugin type\n- platform/browser-extension/src/browser-commands.ts: In extension_check_adapter handler, remove __adapterHash reading, hashMatch computation, expectedHash/adapterHash from response. Keep Object.isFrozen check.\n- platform/mcp-server/src/extension-protocol.ts: Remove adapterHash from plugin state in sync.full\n- Test files: Remove adapterHash from makePlugin helpers, remove EMBEDDED_HASH constant, remove hash-specific test blocks"
+    },
+    {
+      "id": "US-005",
+      "title": "Simplify error sanitization to truncation only",
+      "description": "As a platform developer, I want to remove the regex-based path/URL/IP replacement from error sanitization, keeping only the 500-character truncation, because error messages should show real paths for debugging.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/sanitize-error.ts simplified to only truncation (remove all 5 regex replacements for Windows paths, Unix paths, URLs, localhost, IPv4)",
+        "platform/browser-extension/src/sanitize-error.ts simplified identically (it's a separate copy)",
+        "platform/browser-extension/src/sanitize-error.test.ts deleted (tests the removed regex behavior)",
+        "The sanitizeErrorMessage function signature and MAX_LENGTH (500) are preserved",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Two copies of the same file:\n- platform/mcp-server/src/sanitize-error.ts\n- platform/browser-extension/src/sanitize-error.ts\n\nBoth should become:\n```typescript\nconst MAX_LENGTH = 500;\nexport const sanitizeErrorMessage = (msg: string): string => {\n  if (msg.length <= MAX_LENGTH) return msg;\n  return msg.slice(0, MAX_LENGTH) + '...';\n};\n```\n\nDelete: platform/browser-extension/src/sanitize-error.test.ts (tests the regex replacements that are being removed). The mcp-server copy's tests (if any) should also be updated to only test truncation.\n\nCheck if platform/mcp-server/src/sanitize-error.test.ts exists and update it to only test truncation behavior."
+    },
+    {
+      "id": "US-006",
+      "title": "Remove log relay nonce from content script injection",
+      "description": "As a platform developer, I want to remove the per-tab nonce validation from the log relay because the attack it prevents (page script spoofing log entries) has minimal impact and the nonce adds disproportionate complexity.",
+      "acceptanceCriteria": [
+        "Nonce generation removed from iife-injection.ts injectLogRelay function",
+        "Nonce validation check removed from ISOLATED world relay script (keep the relay itself — still forward opentabs:plugin-logs messages)",
+        "MAIN world postMessage monkey-patching script removed entirely (it only exists to inject the nonce)",
+        "_logNonce setup removed from MAIN world",
+        "The ISOLATED world relay still checks event.source === window and data.type === 'opentabs:plugin-logs' before forwarding",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "File: platform/browser-extension/src/iife-injection.ts\n\nThe injectLogRelay function has 3 parts:\n1. Nonce generation (const nonce = crypto.randomUUID()) — REMOVE\n2. ISOLATED world script that validates nonce on postMessages and forwards to background — KEEP the relay, REMOVE the nonce check. Still check event.source === window and data.type === 'opentabs:plugin-logs'.\n3. MAIN world script that monkey-patches window.postMessage to inject the nonce — REMOVE ENTIRELY (this whole script only exists for nonce injection)\n\nAlso remove _logNonce setup in MAIN world (the ot._logNonce = n assignment)."
+    },
+    {
+      "id": "US-007",
+      "title": "Simplify permission system to tier defaults plus skipConfirmation",
+      "description": "As a platform developer, I want to simplify the 5-layer permission evaluation to just tier defaults (observe=allow, interact=ask, sensitive=ask) plus the skipConfirmation bypass, removing all domain matching and per-tool overrides.",
+      "acceptanceCriteria": [
+        "evaluatePermission in permissions.ts simplified to: if skipConfirmation return allow, else return TIER_DEFAULTS[getToolTier(toolName)]",
+        "matchDomain and matchesDomainList functions removed from permissions.ts",
+        "PermissionsConfig interface removed from config.ts",
+        "defaultPermissions() and parsePermissionsConfig() functions removed from config.ts",
+        "permissions field removed from OpentabsConfig in config.ts",
+        "permissions field removed from ServerState interface and createState() in state.ts",
+        "state.permissions assignment removed from reload.ts",
+        "All permission test cases using state.permissions, matchDomain, matchesDomainList removed from permissions.test.ts",
+        "New simple tests added for the simplified evaluatePermission (skipConfirmation=true returns allow, observe tool returns allow, interact tool returns ask)",
+        "TOOL_TIERS, TIER_DEFAULTS, getToolTier, evaluatePermission exports preserved",
+        "ToolPermission type and VALID_TOOL_PERMISSIONS kept in config.ts (still used by evaluatePermission return type)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Files to modify:\n- platform/mcp-server/src/permissions.ts: Simplify evaluatePermission. Keep domain parameter (prefix with _domain) to avoid changing call sites. Remove matchDomain, matchesDomainList, and all domain matching logic. Keep TOOL_TIERS map, TIER_DEFAULTS map, getToolTier function.\n- platform/mcp-server/src/config.ts: Remove PermissionsConfig interface, defaultPermissions(), parsePermissionsConfig(). Remove 'permissions' from OpentabsConfig. Remove permissions parsing from parseConfigRecord. Remove permissions from saveToolConfig spread. KEEP ToolPermission type, VALID_TOOL_PERMISSIONS, isToolPermission.\n- platform/mcp-server/src/state.ts: Remove 'permissions: PermissionsConfig' from ServerState, remove from createState(). Remove PermissionsConfig import.\n- platform/mcp-server/src/reload.ts: Remove 'state.permissions = config.permissions;' line\n- platform/mcp-server/src/permissions.test.ts: Delete all tests referencing state.permissions, matchDomain, matchesDomainList. Keep getToolTier tests. Add 3 new evaluatePermission tests: (1) skipConfirmation=true returns allow, (2) observe tool returns allow, (3) interact tool returns ask.\n- platform/mcp-server/src/config.test.ts: Remove permissions assertions if any exist"
+    }
+  ]
+}

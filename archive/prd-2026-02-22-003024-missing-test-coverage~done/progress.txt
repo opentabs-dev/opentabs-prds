@@ -1,0 +1,149 @@
+# Ralph Progress Log
+PRD: prd-2026-02-22-003024-missing-test-coverage~running.json
+Started: Sun Feb 22 13:41:14 PST 2026
+---
+
+## Codebase Patterns
+- Unit tests use `bun:test` (describe, test, expect) — import from `'bun:test'`
+- Test files live alongside source files as `*.test.ts` in the same `src/` directory
+- Tests are type-checked via `tsconfig.test.json` in each package (includes `src/**/*.test.ts`)
+- Prettier enforces no-parens on single-param arrow functions without type annotations
+- `noUncheckedIndexedAccess` is enabled globally — array `[index]` returns `T | undefined`. Avoid `!` (ESLint forbids it). Use `.at()` + type guard, destructuring, or `.map()` to extract fields for assertion (e.g., `messages(logs)` helper that maps entries to strings)
+- The `plugins/e2e-test/` directory is gitignored for `dist/` — the build-e2e tests in `platform/plugin-tools/` require the plugin to be pre-built (`cd plugins/e2e-test && bun install && bun run build`)
+- Follow existing test patterns: `platform/plugin-sdk/src/errors.test.ts` for factory method testing, `platform/shared/src/validation.test.ts` for validation logic testing
+- ESLint import order: value imports from local modules first, then `bun:test`, then `type` imports last — no blank lines between import groups
+- When testing Result<T, E> error paths, use a helper like `expectErr()` that calls `isErr()` as a type guard before accessing `.error` — direct `.error` access on the union type causes TS2339
+- Mock `Bun.resolveSync` and `Bun.spawnSync` by saving originals in `beforeEach` and restoring in `afterEach`; call `resetGlobalPathsCache()` to clear cached paths between tests
+- To test CLI commands that call `process.exit()`: save originals with `.bind()` (avoids unbound-method lint), replace with mock that throws, catch in try/catch, restore in finally
+- When a source function uses `process.cwd()`, refactor to accept an optional `projectDir` parameter (defaulting to `process.cwd()`) rather than mocking `process.cwd()` globally
+- E2E tests follow the standalone pattern from `e2e/config-watcher.e2e.ts`: mkdtempSync → writeTestConfig → startMcpServer → try/finally with server.kill() + cleanupTestConfigDir
+- Use `createMinimalPlugin()` from `e2e/fixtures.ts` to create fully discoverable test plugins; for broken plugins, manually create directory structure omitting specific files
+- Loader error messages contain identifiable substrings: "tools.json" for manifest issues, "Adapter IIFE" for missing adapter — use these in test assertions
+
+## 2026-02-22 - US-001
+- Implemented: Unit tests for `platform/shared/src/result.ts` covering all 7 exported functions (ok, err, isOk, isErr, unwrap, unwrapOr, mapResult)
+- Files changed: `platform/shared/src/result.test.ts` (new, 174 lines, 33 tests)
+- Also fixed: Pre-existing build-e2e test failures by building the e2e-test plugin (`plugins/e2e-test/dist/` was missing in the worktree)
+- **Learnings for future iterations:**
+  - The `plugins/e2e-test/dist/` directory must be pre-built for `platform/plugin-tools/src/commands/build-e2e.test.ts` to pass — it's not tracked in git
+  - When working in a worktree, plugin build artifacts need to be regenerated: `cd plugins/e2e-test && bun install && bun run build`
+  - Test edge cases with falsy values (0, '', false, null, undefined) for Result utilities to ensure type guards work correctly
+---
+
+## 2026-02-22 - US-002
+- Implemented: Unit tests for `platform/shared/src/manifest.ts` covering `parsePluginPackageJson()` with all validation paths
+- Files changed: `platform/shared/src/manifest.test.ts` (new, 302 lines, 32 tests across 10 describe blocks)
+- Test coverage: valid inputs (all fields, scoped names, multiple URL patterns, extra fields ignored), top-level validation (null, string, array, number), name validation (missing, empty, non-string, invalid naming convention), version/main validation, opentabs field validation (missing, null, array, string), nested field validation (displayName, description, urlPatterns), and error message source path inclusion
+- **Learnings for future iterations:**
+  - ESLint import-x/order requires: local value imports → `bun:test` → type imports (no blank lines between groups)
+  - When accessing `.error` on a `Result<T, E>` union, TypeScript requires narrowing via `isErr()` first — use a helper function `expectErr()` that asserts + narrows for cleaner test code
+  - The `as unknown as Record<string, unknown>` double-cast is needed to check for absence of extra fields on readonly interfaces
+---
+
+## 2026-02-22 - US-003
+- Implemented: Unit tests for `platform/mcp-server/src/resolver.ts` covering all 4 exported functions (resolvePluginPath, isAllowedPluginPath, discoverGlobalNpmPlugins, resetGlobalPathsCache)
+- Files changed: `platform/mcp-server/src/resolver.test.ts` (new, ~310 lines, 28 tests across 7 describe blocks)
+- Test coverage: resolvePluginPath with absolute paths (valid, non-existent, file-not-directory, outside allowed dirs), relative paths (./ and ../ against configDir), ~/ home paths, npm package specifiers (mock Bun.resolveSync), specifier format detection (local vs npm), isAllowedPluginPath (home, tmp, outside, root, prefix attack), discoverGlobalNpmPlugins (unscoped, scoped, no-opentabs-field, empty, nonexistent dir, dedup, caching)
+- **Learnings for future iterations:**
+  - `resolver.ts` exports `resolvePluginPath` (not `resolveLocalPlugin` or `resolvePluginSpecifier` as the PRD AC names suggest) — always read the source to get the actual exported API names
+  - `discovery.test.ts` already tests `isAllowedPluginPath` and `discoverGlobalNpmPlugins` — `resolver.test.ts` adds coverage for `resolvePluginPath` which was the main untested function
+  - Mock `Bun.resolveSync` and `Bun.spawnSync` by saving originals in `beforeEach` and restoring in `afterEach` — the pattern is well-established in `discovery.test.ts`
+  - ESLint `@typescript-eslint/restrict-plus-operands` catches `string | undefined` concatenation — use nullish coalescing (`?? ''`) or template literals with explicit handling
+---
+
+## 2026-02-22 - US-004
+- Implemented: Unit tests for `platform/mcp-server/src/log-buffer.ts` covering all 5 exported functions (appendLog, getLogs, getLogCount, getBufferedPlugins, clearAllLogs) plus circular buffer behavior
+- Files changed: `platform/mcp-server/src/log-buffer.test.ts` (new, ~240 lines, 22 tests across 6 describe blocks)
+- Test coverage: appendLog (new buffer, multiple entries, per-plugin isolation), getLogs (unknown plugin, empty, chronological order, limit, limit exceeds size, field preservation), circular buffer (eviction at 1000, chronological order after wrap, limit after wrap), getLogCount (unknown, tracking, cap at 1000, per-plugin), getBufferedPlugins (empty, populated, after wrap), clearAllLogs (full clear, re-use after clear)
+- **Learnings for future iterations:**
+  - `noUncheckedIndexedAccess` + ESLint `no-non-null-assertion` means array `[index]` access requires careful handling: use `.at()` with type guards, destructuring (`const [first] = arr`), or `.map()` helpers to extract fields
+  - For testing array contents by a single field, a `messages()` helper (mapping entries to `.message`) is cleaner than per-index assertions
+  - `expect.objectContaining()` returns `any` type, triggering `@typescript-eslint/no-unsafe-argument` — prefer destructuring and direct field assertions instead
+  - Prettier auto-collapses short imports/params to single lines — let `bun run format` handle it rather than manually formatting
+---
+
+## 2026-02-22 - US-005
+- Implemented: Unit tests for `platform/mcp-server/src/sanitize-error.ts` (sanitizeErrorMessage) and `platform/mcp-server/src/sdk-version.ts` (sdkVersion constant)
+- Files changed: `platform/mcp-server/src/sanitize-error.test.ts` (new, ~110 lines, 14 tests across 8 describe blocks), `platform/mcp-server/src/sdk-version.test.ts` (new, ~25 lines, 4 tests)
+- sanitize-error.test.ts coverage: passthrough (simple message, empty string), unix path sanitization (absolute paths, nested paths, single slash not replaced), windows path sanitization (backslash and forward-slash), URL sanitization (URL content stripped by path regex first), localhost sanitization (port variants), IPv4 sanitization (private IPs, loopback), multiple replacements in one message, truncation (>500, exactly 500, <500), string error passthrough
+- sdk-version.test.ts coverage: type check (string), semver format validation, matches plugin-sdk package.json version, not the fallback value
+- **Learnings for future iterations:**
+  - `sanitize-error.ts` applies regex replacements in order: Windows paths → Unix paths → URLs → localhost → IPv4. The unix path regex matches inside URLs (e.g., `://api.example.com/v1/users` has the `/api.example.com/v1/users` portion matched as a unix path), so URLs end up partially path-replaced rather than cleanly [URL]-replaced. Test expectations must account for this ordering.
+  - `sdk-version.ts` exports a module-level constant read at import time — it cannot be mocked without module-level tricks. Test it by verifying the value matches the actual plugin-sdk package.json version.
+  - The SDK version *comparison* logic (`checkSdkCompatibility`, `parseMajorMinor`) lives in `loader.ts` (not `sdk-version.ts`) and is already thoroughly tested in `loader.test.ts`. The PRD AC mentions "SDK version comparison" but the actual comparison tests already exist — `sdk-version.test.ts` focuses on the version constant itself.
+---
+
+## 2026-02-22 - US-006
+- Implemented: Unit tests for `platform/browser-extension/src/log-collector.ts` covering `LogCollector` class and `installLogCollector` function
+- Files changed: `platform/browser-extension/src/log-collector.test.ts` (new, ~316 lines, 30+ tests across 7 describe blocks)
+- Test coverage: capture and getEntries (single entry, multiple levels, multi-arg formatting, Error formatting, JSON formatting, circular refs, message truncation at 2000 chars, timestamps), getEntries ordering (newest-first), getEntries filtering (by level, by source, by since timestamp, limit, limit exceeding buffer, combined filters), circular buffer capacity (eviction, multiple evictions, default capacity of 500), clear (removes entries, allows new entries after), getStats (empty, totalCaptured including evicted, timestamps, persistence across clear), installLogCollector (wraps console methods, calls originals, uses specified source, respects custom maxEntries)
+- **Learnings for future iterations:**
+  - `log-collector.ts` does NOT use Chrome APIs — it purely wraps console methods. The PRD notes mentioning "mock chrome.runtime.sendMessage" don't apply; the relay behavior happens elsewhere in the extension pipeline.
+  - `installLogCollector` mutates global `console` methods — tests must save/restore originals in `beforeEach`/`afterEach` to avoid polluting other tests.
+  - The `LogCollector` class is self-contained and testable without any mocks — just instantiate and call methods.
+  - `getEntries()` returns newest-first order (reversed from internal buffer).
+  - `totalCaptured` is not reset by `clear()` — it's an all-time count, while `bufferSize` tracks current buffer occupancy.
+---
+
+## 2026-02-22 - US-007
+- Implemented: Unit tests for `platform/plugin-tools/src/commands/inspect.ts` covering `extractFields`, `truncate`, and `handleInspect` (the full inspect command handler)
+- Files changed: `platform/plugin-tools/src/commands/inspect.ts` (refactored to export testable functions and accept `projectDir` parameter), `platform/plugin-tools/src/commands/inspect.test.ts` (new, ~440 lines, 28 tests across 9 describe blocks)
+- Test coverage: extractFields (simple types, empty schema, anyOf unions, unknown type, non-array required), truncate (shorter, exact, longer, minimum, empty), handleInspect missing manifest (exits 1 with error), invalid manifest (invalid JSON, non-object, no tools array), JSON output mode (raw JSON, with resources/prompts), formatted output (tool fields, plugin metadata, SDK version, missing package.json, summary counts, pluralization), resources display (full metadata, omitted optional fields), prompts display (full metadata with args, omitted optional fields), tool description truncation
+- **Learnings for future iterations:**
+  - `handleInspect` was not exported and used `process.cwd()` directly — refactored to accept an optional `projectDir` parameter (defaulting to `process.cwd()`) to enable testing without mocking `process.cwd()`
+  - To test functions that call `process.exit()`, save originals with `.bind()` (avoids `@typescript-eslint/unbound-method`), mock with `throw new Error('process.exit(...)')`, and catch in try/catch
+  - `as const` objects satisfy `ManifestTool` when spread into arrays — use a named constant (`sampleTool`) instead of indexed access (`manifest.tools[0]!`) to avoid non-null assertions
+  - Prettier collapses short object arrays to single lines — don't manually format multi-line when content fits on one line
+---
+
+## 2026-02-22 - US-008
+- Verified: All 5 browser tool E2E tests already exist in `e2e/browser-tools.e2e.ts` — they were present in the codebase before this PRD was created
+- Tests verified passing: `browser_clear_console_logs` (line 1779), `browser_get_resource_content` (lines 1891, 1927, 1945), `extension_get_state` (line 2630), `extension_get_logs` (line 2666), `extension_get_side_panel` (line 2699)
+- Files changed: none (no code changes needed)
+- All 7 matching E2E tests pass (ran via `--grep` filter, 6.6s total)
+- All quality checks pass: build, type-check, lint, knip, test (1742 unit tests, 0 failures)
+- **Learnings for future iterations:**
+  - PRD stories may list acceptance criteria that are already satisfied by existing code — always verify the current state before writing new code
+  - Use `bun run test:e2e -- --grep "pattern"` to run a subset of E2E tests matching specific tool names
+  - The E2E browser tools tests cover both success and error paths (non-existent tabs, non-existent URLs, etc.)
+---
+
+## 2026-02-22 - US-009
+- Implemented: E2E tests for plugin discovery edge cases in `e2e/discovery-edge-cases.e2e.ts` (6 tests in 1 describe block)
+- Files changed: `e2e/discovery-edge-cases.e2e.ts` (new, ~430 lines, 6 tests)
+- Test coverage:
+  - Non-existent local plugin path appears in failedPlugins with clear error
+  - Local plugin with missing dist/tools.json appears in failedPlugins (error mentions "tools.json")
+  - Local plugin with invalid JSON in dist/tools.json appears in failedPlugins (error mentions "tools.json")
+  - Local plugin with missing dist/adapter.iife.js appears in failedPlugins (error mentions "Adapter IIFE")
+  - Valid plugins (e2e-test + minimal valid-partial) still load when one broken plugin is present, verified via both /health pluginDetails and tools/list
+  - Fixing a broken plugin (writing valid tools.json + adapter IIFE) and calling POST /reload transitions plugin from failedPlugins to healthy pluginDetails, verified tool appears in tools/list
+- All quality checks pass: build, type-check, lint, knip, test (1742 unit tests, 0 failures)
+- Note: E2E tests not run in this automated context per CLAUDE.md instructions — manual `bun run test:e2e` verification needed
+- **Learnings for future iterations:**
+  - Standalone E2E tests (not using Playwright fixtures) follow the config-watcher pattern: mkdtempSync → writeTestConfig → startMcpServer → try/finally with server.kill() + cleanupTestConfigDir
+  - The loader produces specific error messages: "tools.json" for missing/invalid manifest, "Adapter IIFE" for missing adapter — test assertions should match these substrings
+  - POST /reload returns `{ ok: true, plugins: N, durationMs: N }` on success — useful for verifying rediscovery completed
+  - `createMinimalPlugin()` from fixtures.ts creates a fully discoverable plugin with package.json, dist/tools.json, and dist/adapter.iife.js — ideal for creating valid plugins alongside broken ones
+  - For broken plugins, manually create the directory structure with `fs.mkdirSync` + `fs.writeFileSync` — only omit the specific file being tested
+  - `configWithPlugins()` helper pattern (wrapping readPluginToolNames + e2e-test path) reduces boilerplate across tests that need the base e2e-test plugin plus additional local plugins
+  - The MCP server does NOT validate individual prompt arguments — it passes them through to the adapter. Missing required args result in `undefined` values in the rendered output, not validation errors.
+  - Standalone E2E tests for resources/prompts can use `createMinimalPlugin` (which defines no resources/prompts by default) with a dedicated server to test empty list behavior
+---
+
+## 2026-02-22 - US-010
+- Implemented: E2E tests for resource and prompt error scenarios in `e2e/resources-prompts.e2e.ts` (3 new tests across 2 describe blocks)
+- Files changed: `e2e/resources-prompts.e2e.ts` (modified, +96 lines)
+- Test coverage:
+  - Typed prompt with missing required argument (`name` omitted) renders with undefined value in output
+  - Resource list returns empty array when server has only plugins with no resources (standalone server with `createMinimalPlugin`)
+  - Prompt list returns empty array when server has only plugins with no prompts (standalone server with `createMinimalPlugin`)
+- Pre-existing tests already covered: reading resource with URI matching no plugin (returns "not found" error), getting prompt with unknown name (returns "not found" error)
+- All quality checks pass: build, type-check, lint, knip, test (1742 unit tests, 0 failures)
+- Note: E2E tests not run in this automated context per CLAUDE.md instructions — manual `bun run test:e2e` verification needed
+- **Learnings for future iterations:**
+  - The MCP server's prompts/get handler does not validate individual arguments — `request.params.arguments` defaults to `{}` and passes through without checking which args are required. Validation is a client-side/adapter-side responsibility.
+  - The `createMinimalPlugin()` helper produces plugins with `resources: []` and `prompts: []` in tools.json — perfect for testing empty list scenarios.
+  - For standalone E2E tests (not using Playwright fixtures), follow the `mkdtempSync → writeTestConfig → startMcpServer → createMcpClient → try/finally cleanup` pattern established in discovery-edge-cases.e2e.ts.
+  - Prettier collapses single-item arrays like `[{ name: 'ping', description: 'A ping tool' }]` onto one line — don't manually break them across lines.
+---

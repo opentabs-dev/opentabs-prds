@@ -1,0 +1,103 @@
+# Ralph Progress Log
+PRD: prd-2026-02-21-120520-doctor-audit-improvements~running.json
+Started: Sat Feb 21 12:49:09 PST 2026
+---
+
+## Codebase Patterns
+- Doctor checks use `pass()`, `warn()`, and `fail()` factory functions that return `CheckResult` objects
+- `CheckResult` has `ok` (boolean), `fatal` (boolean), `label`, `detail`, and optional `hint` fields
+- `pass()` creates `ok: true, fatal: false`; `warn()` creates `ok: false, fatal: false`; `fail()` creates `ok: false, fatal: true`
+- Doctor tests are in `platform/cli/src/commands/doctor.test.ts` — uses `OPENTABS_CONFIG_DIR` env var for test isolation
+- The `checkPlugins` function is exported and tested directly (unit tests, not integration)
+- The /health endpoint returns `pluginDetails[]` with `source: 'npm' | 'local'` and `failedPlugins[]` with `{ path, error }`
+- `handleDoctor` already fetches health data via `checkServerHealth` — reuse `healthData` for any server-dependent checks
+- Doctor check functions that read filesystem paths should accept optional params for testability (avoids mocking homedir/cwd)
+- Never use `.padEnd()`/`.padStart()` on ANSI-colorized strings — pad raw strings first, then colorize (or colorize first and append spaces manually)
+
+---
+
+## 2026-02-21 12:50 - US-001
+- Changed `checkPlugins` to return `pass('Local plugins', 'none configured (npm plugins are auto-discovered at startup)')` instead of `warn()` when `pluginPaths.length === 0`
+- Updated test in `doctor.test.ts` to expect `ok: true` and label `'Local plugins'` instead of `ok: false`
+- Files changed:
+  - `platform/cli/src/commands/doctor.ts` (line 171-172)
+  - `platform/cli/src/commands/doctor.test.ts` (lines 122-129)
+- **Learnings for future iterations:**
+  - The `CheckResult` type only supports ok/fatal states — there's no info-only level. `pass()` with a descriptive detail string is the closest to an "info" message
+  - The label in `pass('Local plugins', ...)` was changed from `'Plugins'` to `'Local plugins'` to be more specific, since future stories will add npm plugin checks with their own labels
+---
+
+## 2026-02-21 12:55 - US-002
+- Added `checkNpmPlugins(data: Record<string, unknown> | null): CheckResult[]` function to doctor.ts
+- When `data` is null (server not reachable), returns `pass('npm plugins', 'requires running server to check')`
+- When server is reachable, filters `pluginDetails` for `source === 'npm'` and reports each with displayName, tool count, and tab state
+- Reports `failedPlugins` from /health as warnings
+- Integrated the call into `handleDoctor` after local plugin checks (step 8)
+- Added `checkNpmPlugins` to exports
+- Added 7 unit tests covering: null data, no npm plugins, local-only plugins excluded, npm plugin listing, failed plugins, mixed results, and missing fields
+- Files changed:
+  - `platform/cli/src/commands/doctor.ts` (added ~40 lines: interfaces + checkNpmPlugins function + integration)
+  - `platform/cli/src/commands/doctor.test.ts` (added ~80 lines: 7 new tests)
+- **Learnings for future iterations:**
+  - The /health endpoint returns `pluginDetails` (array of `{ name, displayName, toolCount, tools, tabState, source, sdkVersion, logBufferSize }`) and `failedPlugins` (array of `{ path, error }`)
+  - `source` field is `'npm' | 'local'` — filter on this to distinguish npm from local plugins
+  - `displayName` is always present on `HealthPluginDetail` so `??` fallback triggers an eslint `@typescript-eslint/no-unnecessary-condition` error — just use `p.displayName` directly
+  - New doctor check functions should be exported and tested in isolation (same pattern as `checkPlugins`)
+---
+
+## 2026-02-21 13:02 - US-003
+- Added `checkMcpClientConfig(clients?)` function to doctor.ts that checks for MCP client configurations
+- Checks Claude Code (`~/.claude/settings/mcp.json`) and Cursor (`.cursor/mcp.json`) config files
+- Returns `pass` if any config has `mcpServers.opentabs` entry, `warn` otherwise
+- Function accepts optional `McpClientLocation[]` parameter for testability (defaults to standard locations)
+- Integrated into `handleDoctor` as step 7 (between extension checks and plugin checks)
+- Added 7 unit tests: Claude Code found, Cursor found, no configs exist, config without opentabs, config without mcpServers, invalid JSON skipped, first match returned
+- Files changed:
+  - `platform/cli/src/commands/doctor.ts` (added ~40 lines: McpClientLocation interface + checkMcpClientConfig function + integration)
+  - `platform/cli/src/commands/doctor.test.ts` (added ~100 lines: 7 new tests)
+- **Learnings for future iterations:**
+  - Doctor check functions that depend on filesystem paths should accept an optional parameter for testability (avoid needing to mock `homedir()` or `process.cwd()`)
+  - The `McpClientLocation` interface pattern (`{ name, path }`) is reusable if more MCP clients are added in the future
+  - MCP client config structure: `{ mcpServers: { opentabs: { ... } } }` — the opentabs key is what we check for
+  - Use narrowing chain (`typeof parsed === 'object' && 'mcpServers' in parsed && ...`) for safe unknown-typed JSON parsing
+---
+
+## 2026-02-21 13:05 - US-004
+- Fixed ANSI column alignment in `audit.ts` table output
+- The issue: `padEnd(statusCol)` was applied to an ANSI-colorized string, so escape codes inflated the character count and produced incorrect visual padding
+- Fix: apply color to the icon character first, then append whitespace separately with `' '.repeat(Math.max(0, statusCol - 1))`
+- Files changed:
+  - `platform/cli/src/commands/audit.ts` (line 125: split into 2 lines)
+- **Learnings for future iterations:**
+  - Never call `.padEnd()` / `.padStart()` on ANSI-colorized strings — ANSI escape codes are invisible but count as characters. Always pad the raw string first, then colorize, or colorize first and add spaces manually
+  - The `statusCol` value (4) accounts for the icon (1 char) plus padding (3 spaces). Since `✓`/`✗` are single visual characters, `statusCol - 1` gives the correct trailing space count
+---
+
+## 2026-02-21 13:10 - US-005
+- Added `--tool <name>` CLI option to `opentabs audit` for filtering by tool name
+- Added `tool?: string` to `AuditOptions` interface
+- Passes `tool` as a query parameter to the `/audit` endpoint (server already supports it)
+- Added `--tool` example to help text
+- Files changed:
+  - `platform/cli/src/commands/audit.ts` (4 lines added: interface field, query param, CLI option, help example)
+- **Learnings for future iterations:**
+  - The MCP server `/audit` endpoint already supports `tool`, `plugin`, `success`, and `limit` query parameters (see `platform/mcp-server/src/http-routes.ts`)
+  - Adding a new CLI filter that maps to an existing server query param is straightforward: add to interface, pass as searchParam, add CLI option
+  - The `--tool` and `--plugin` filters can be combined since the server applies both independently
+---
+
+## 2026-02-21 13:15 - US-006
+- Added `--since <duration>` CLI option to `opentabs audit` for client-side time filtering
+- Added `parseDuration` function that parses duration strings (e.g., `30m`, `1h`, `2d`) into milliseconds
+- Uses a `DURATION_UNITS` Map for `s`/`m`/`h`/`d` suffixes
+- When `--since` is set, requests 500 entries from the server (the max) to ensure enough data for client-side filtering
+- Filters entries where `timestamp >= Date.now() - durationMs` before display or JSON output
+- Added help text examples for `--since` standalone and combined with `--plugin`
+- Files changed:
+  - `platform/cli/src/commands/audit.ts` (added ~30 lines: DURATION_UNITS map, parseDuration function, sinceMs handling, client-side filter, CLI option, help examples)
+- **Learnings for future iterations:**
+  - When the server doesn't support a filter param, client-side filtering is simple: request max entries, filter after fetch
+  - `Record<string, number>` with regex match group indexing causes TS2538/TS2532 because match groups are `string | undefined` — using `Map.get()` provides cleaner narrowing
+  - Prettier in this project wants single-line `throw new InvalidArgumentError(...)` when the string fits — don't break it across lines
+  - Arrow function params with single argument don't need parentheses per prettier config (`.filter(e =>` not `.filter((e) =>`)
+---

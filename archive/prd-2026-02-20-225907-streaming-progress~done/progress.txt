@@ -1,0 +1,129 @@
+# Ralph Progress Log
+PRD: prd-2026-02-20-225907-streaming-progress~running.json
+Started: Sat Feb 21 02:28:34 PST 2026
+---
+
+## Codebase Patterns
+- ToolDefinition interface is in platform/plugin-sdk/src/index.ts — the single source of truth for tool types
+- The IIFE wrapper in platform/plugin-tools/src/commands/build.ts wraps tool.handle() with lifecycle hooks (onToolInvocationStart/End) — any changes to handle()'s signature must also be reflected in the wrapper's origHandle.call() forwarding
+- Tool execution happens in tool-dispatch.ts via chrome.scripting.executeScript in MAIN world — the injected function calls tool.handle(tInput, context) with a ToolHandlerContext
+- Tests in plugin-sdk use Promise.resolve() instead of async/await for simple handlers to avoid the @typescript-eslint/require-await lint rule
+- Prettier enforces no parens around single arrow function parameters
+- CustomEvents fired in MAIN world ARE visible to ISOLATED world content scripts — they share the same DOM. This is the correct cross-world communication pattern for Chrome extensions.
+- The dispatchId is the JSON-RPC request ID (UUID string) — it correlates progress notifications from adapter → extension → server back to the pending dispatch
+- InternalMessage is a discriminated union in types.ts — adding a new message type requires updating exhaustiveness checks in background.ts AND offscreen/index.ts switch statements
+- McpServerInstance.setRequestHandler passes (request, extra) where extra has signal, _meta (with progressToken), sessionId, and sendNotification — test mocks must match this signature
+- dispatchToExtension injects dispatchId into the params sent to the extension so the extension can use it for progress correlation
+- The extension-side timeout in tool-dispatch.ts uses a progressCallbacks Map keyed by dispatchId — background.ts calls notifyDispatchProgress() to reset the timeout when progress arrives
+- ESLint rule import-x/exports-last requires all exports at the end of file — use `export { a, b }` instead of inline `export const`
+- MAX_SCRIPT_TIMEOUT_MS (extension) is 295s = MAX_DISPATCH_TIMEOUT_MS (server 300s) minus 5s safety margin, ensuring the extension always responds before the server gives up
+- **CRITICAL**: Bun's bundler strips unused function parameters during compilation. The lifecycle hook wrapper in build.ts must use `...args` rest params with `origHandle.apply(this, args)` instead of named params like `(params, context)` + `origHandle.call(this, params, context)`. Bun compiles the latter to just `(params)` + `origHandle.call(this, params)`, silently dropping the context parameter.
+- The MCP SDK's SSE transport sends progress notifications as inline events in the same SSE stream as the tool response. The client receives `event: message\ndata: {method: "notifications/progress", ...}` events before the final `data: {result: ..., id: N}` event. To capture progress, parse ALL SSE data lines and filter by `method === 'notifications/progress'`.
+- The `_meta.progressToken` field must be sent in the tools/call request's `params` object for the MCP server to emit progress notifications. Without it, `onProgress` is undefined and progress is silently dropped.
+
+## 2026-02-21 - US-001
+- **What was implemented**: Added ToolHandlerContext and ProgressOptions interfaces to plugin-sdk. Updated ToolDefinition.handle signature to accept an optional second `context?: ToolHandlerContext` parameter. Updated the lifecycle hook wrapper in build.ts to forward the context argument through to origHandle.
+- **Files changed**:
+  - platform/plugin-sdk/src/index.ts — added ProgressOptions interface, ToolHandlerContext interface, updated handle() signature
+  - platform/plugin-sdk/src/index.test.ts — added 7 new tests for ToolHandlerContext: both handle signatures accepted by defineTool, backward-compatible calling without context, calling with context and verifying progress calls, fire-and-forget resilience, ProgressOptions shape tests
+  - platform/plugin-tools/src/commands/build.ts — updated lifecycle hook wrapper to forward context arg through to origHandle.call()
+- **Learnings for future iterations:**
+  - The lifecycle hook wrapper in build.ts is a string template (wrapperCode) that generates JavaScript — changes to handle() signature must be manually propagated there since it's not type-checked
+  - The context parameter is optional (context?: ToolHandlerContext) to maintain backward compatibility — existing plugins with handle(params) still compile
+  - tool-dispatch.ts currently calls tool.handle(tInput) without context — US-002 will need to construct the context and pass it as the second arg in the executeToolOnTab injected function
+---
+
+## 2026-02-21 - US-002
+- **What was implemented**: Full progress notification pipeline from adapter through extension to MCP server. Four components were modified:
+  1. **Extension tool-dispatch.ts**: Modified `executeToolOnTab` to accept a `dispatchId` parameter and create a `ToolHandlerContext` with `reportProgress` that fires `CustomEvent(`opentabs:progress:${dispatchId}`)` on the document. Added `injectProgressListener` (ISOLATED world content script that listens for these CustomEvents and relays via `chrome.runtime.sendMessage`) and `removeProgressListener` for cleanup after tool execution.
+  2. **Extension background.ts**: Added handler for the new `tool:progress` internal message type, forwarding progress to the MCP server over WebSocket as `{ method: 'tool.progress', params: { dispatchId, progress, total, message? } }`.
+  3. **Extension types.ts**: Added `ToolProgressMessage` interface and included it in the `InternalMessage` discriminated union. Updated offscreen/index.ts exhaustiveness check.
+  4. **MCP server state.ts**: Added `progressToken` and `onProgress` fields to `PendingDispatch`.
+  5. **MCP server extension-protocol.ts**: Added `handleToolProgress` handler for `tool.progress` method. Updated `dispatchToExtension` to accept `DispatchOptions` (with `progressToken` and `onProgress` callback) and inject `dispatchId` into params sent to extension.
+  6. **MCP server mcp-setup.ts**: Updated `McpServerInstance` interface to include `RequestHandlerExtra` with `_meta` and `sendNotification`. The tools/call handler extracts `progressToken` from `extra._meta`, creates an `onProgress` callback that calls `extra.sendNotification({ method: 'notifications/progress', ... })`, and passes both to `dispatchToExtension`.
+  7. **Test updates**: Updated mock server types and handler invocations in `mcp-setup.test.ts` and `mcp-setup-dispatch.test.ts` to match the new `(request, extra)` signature.
+- **Files changed**:
+  - platform/browser-extension/src/tool-dispatch.ts — added progress listener injection, CustomEvent-based reporting, dispatchId plumbing
+  - platform/browser-extension/src/background.ts — added `tool:progress` message handler
+  - platform/browser-extension/src/types.ts — added `ToolProgressMessage` to `InternalMessage` union
+  - platform/browser-extension/src/offscreen/index.ts — added `tool:progress` to exhaustiveness check
+  - platform/mcp-server/src/state.ts — added `progressToken` and `onProgress` to `PendingDispatch`
+  - platform/mcp-server/src/extension-protocol.ts — added `handleToolProgress`, `DispatchOptions`, dispatchId injection
+  - platform/mcp-server/src/mcp-setup.ts — added `RequestHandlerExtra`, progressToken extraction, onProgress callback creation
+  - platform/mcp-server/src/mcp-setup.test.ts — updated mock types and handler calls for new signature
+  - platform/mcp-server/src/mcp-setup-dispatch.test.ts — updated mock types and handler calls for new signature
+- **Learnings for future iterations:**
+  - CustomEvents with per-dispatch unique event names (`opentabs:progress:${dispatchId}`) prevent cross-dispatch interference when multiple tools run concurrently
+  - The ISOLATED world content script stores a cleanup function on the document object for the ISOLATED world script to call later — `doc[cleanupKey]` pattern avoids dynamic delete (ESLint `no-dynamic-delete`) by setting to undefined instead
+  - `chrome.runtime.sendMessage` from ISOLATED world content scripts returns a promise that must be `void`-ed to satisfy `no-floating-promises` lint rule
+  - `dispatchToExtension` now injects `dispatchId` (the JSON-RPC request ID) into the params sent to the extension, so the extension can correlate progress back to the right dispatch
+  - The `onProgress` callback on `PendingDispatch` uses `extra.sendNotification` from the MCP SDK's `RequestHandlerExtra`, which correctly scopes the notification to the session that made the request
+  - US-003 will need to reset the dispatch timeout when `handleToolProgress` fires — the `pending.timerId` is accessible in the handler
+---
+
+## 2026-02-21 - US-003
+- **What was implemented**: Dispatch timeout reset on progress with absolute max bound. Both the MCP server and Chrome extension now reset their timeout timers when a tool reports progress, with a MAX_DISPATCH_TIMEOUT_MS (300s/5min) absolute ceiling.
+- **Files changed**:
+  - platform/mcp-server/src/state.ts — added `MAX_DISPATCH_TIMEOUT_MS = 300_000`, added `lastProgressTs?: number` to `PendingDispatch`
+  - platform/mcp-server/src/extension-protocol.ts — updated `handleToolProgress` to reset `pending.timerId` on each progress event, bounded by `MAX_DISPATCH_TIMEOUT_MS`. If absolute max exceeded, rejects immediately. Updated import to include `MAX_DISPATCH_TIMEOUT_MS`.
+  - platform/browser-extension/src/constants.ts — added `MAX_SCRIPT_TIMEOUT_MS = 295_000` (5min minus 5s safety margin)
+  - platform/browser-extension/src/tool-dispatch.ts — added `progressCallbacks` Map and `notifyDispatchProgress` export for background.ts to call. Restructured `executeToolOnTab` timeout to be resettable via progress callbacks, bounded by `MAX_SCRIPT_TIMEOUT_MS`.
+  - platform/browser-extension/src/background.ts — imported and called `notifyDispatchProgress(message.dispatchId)` in the `tool:progress` message handler
+  - platform/mcp-server/src/extension-protocol.test.ts — added 5 new tests: (a) dispatch without progress times out at 30s, (b) progress resets timeout and dispatch survives past 30s, (c) progress updates lastProgressTs, (d) absolute max fires even with continuous progress, (e) progress after max elapsed rejects immediately
+- **Learnings for future iterations:**
+  - The extension-side timeout reset uses a progressCallbacks Map keyed by dispatchId — a lightweight pub/sub within the service worker, avoiding complex cross-context communication
+  - ESLint rule `import-x/exports-last` requires all exports at the bottom of the file — use `export { a, b }` barrel export instead of inline `export const` when a file has multiple exports
+  - MAX_SCRIPT_TIMEOUT_MS is intentionally 5s less than MAX_DISPATCH_TIMEOUT_MS so the extension always returns a timeout error before the server does, preventing orphaned script executions
+  - Test patterns: use `as PendingDispatch` type assertion after `expect(pending).toBeDefined()` instead of non-null assertions (`!`) to satisfy `@typescript-eslint/no-non-null-assertion`
+---
+
+## 2026-02-21 - US-004
+- **What was implemented**: Full E2E tests for the progress notification pipeline, plus a critical fix for the lifecycle hook wrapper dropping the `context` parameter during Bun bundling.
+  1. **New E2E test tool**: `slow_with_progress` in `plugins/e2e-test/src/tools/slow-with-progress.ts` — sleeps for a configurable duration and reports progress at regular intervals using `context.reportProgress()`.
+  2. **MCP client enhancement**: Added `callToolWithProgress` method to the E2E test fixture's MCP client (`e2e/fixtures.ts`). Sends `_meta.progressToken` in tools/call requests and captures `notifications/progress` SSE events alongside the tool result.
+  3. **E2E test file**: `e2e/progress.e2e.ts` with 4 tests covering the full pipeline, varying step counts, 35s progress-extending timeout, and default timeout for non-progress tools.
+  4. **Lifecycle wrapper fix**: Changed `build.ts` from `async function(params: any, context: any) { origHandle.call(this, params, context) }` to `async function() { const handleArgs = arguments; origHandle.apply(this, handleArgs) }`. Bun's bundler was stripping the named `context` parameter, compiling it to just `(params)` and `origHandle.call(this, params)`.
+- **Files changed**:
+  - plugins/e2e-test/src/tools/slow-with-progress.ts — new tool for progress E2E testing
+  - plugins/e2e-test/src/index.ts — registered slowWithProgress tool
+  - e2e/fixtures.ts — added `ProgressNotification` interface, `callToolWithProgress` method to McpClient
+  - e2e/progress.e2e.ts — 4 new E2E tests for progress reporting
+  - platform/plugin-tools/src/commands/build.ts — fixed lifecycle wrapper to use `arguments`/rest args for correct parameter forwarding
+- **Learnings for future iterations:**
+  - Bun's bundler aggressively strips function parameters it considers unused during TS→JS compilation, even with `minify: false`. Named params that are only passed through to another function may be dropped. Use `...args` rest params or `arguments` to ensure all parameters are forwarded.
+  - The MCP SDK's `WebStandardStreamableHTTPServerTransport` always responds with SSE for POST requests when `enableJsonResponse` is false (the default). Progress notifications are written to the SSE stream via `writeSSEEvent` when `relatedRequestId` matches the tools/call request ID.
+  - The `res.text()` call on a `fetch()` response with an SSE stream blocks until the stream is closed (after the final response is sent). All progress notifications and the final result are captured in a single `text()` call.
+  - The e2e-test plugin uses the npm-published `@opentabs-dev/plugin-tools` — workspace changes to `build.ts` don't take effect until the package is published or the built file is manually copied to the plugin's node_modules.
+---
+
+## 2026-02-21 - US-005
+- **What was implemented**: Published all four @opentabs-dev platform packages at v0.0.15 (shared, plugin-sdk, plugin-tools, cli) using `scripts/publish.sh 0.0.15`. Updated both the e2e-test and slack plugin dependencies from ^0.0.14 to ^0.0.15. Rebuilt both plugins with the new packages to verify the published artifacts work correctly.
+- **Files changed**:
+  - platform/shared/package.json — version bump to 0.0.15
+  - platform/plugin-sdk/package.json — version bump to 0.0.15, shared dep to ^0.0.15
+  - platform/plugin-tools/package.json — version bump to 0.0.15, deps to ^0.0.15
+  - platform/cli/package.json — version bump to 0.0.15, deps to ^0.0.15
+  - plugins/e2e-test/package.json — deps to ^0.0.15
+  - plugins/e2e-test/bun.lock — resolved new package versions
+  - plugins/slack/package.json — deps to ^0.0.15
+- **Learnings for future iterations:**
+  - The `scripts/publish.sh` script handles the full publish workflow: build, version bump, cross-reference update, rebuild, and publish in dependency order (shared → plugin-sdk → plugin-tools → cli)
+  - npm propagation is fast enough that `bun install` in plugins can run immediately after publish without a wait
+  - Both plugins (e2e-test, slack) must be updated together when platform packages are published to keep dependency versions consistent
+  - The publish script bumps ALL four packages to the same version even if not all changed — this simplifies version management and cross-references
+---
+
+## 2026-02-21 - US-006
+- **What was implemented**: Updated CLAUDE.md to document the streaming progress support feature across all relevant existing sections.
+  1. **Architecture section**: Updated MCP Server, Chrome Extension, and Plugin SDK component descriptions to mention progress forwarding and `ToolHandlerContext`.
+  2. **Key Concepts section**: Added "Progress reporting" paragraph documenting the full notification chain (adapter → extension → server → MCP client), wire format (`tool.progress` JSON-RPC), `dispatchId` correlation, and fire-and-forget semantics. Added "Dispatch timeout and progress" paragraph documenting timeout reset on progress, `MAX_DISPATCH_TIMEOUT_MS` (5min) absolute ceiling, and `MAX_SCRIPT_TIMEOUT_MS` (295s) extension-side bound.
+  3. **Directory structure**: Added `progress.e2e.ts` to the E2E test listing.
+  4. **Adding a New Plugin section**: Updated step 3 to mention `handle(params, context?)` with optional `ToolHandlerContext` for progress reporting.
+  5. **SDK utilities usage example**: Replaced the simple example with a progress-aware tool handler showing `context?.reportProgress()` in a loop.
+- **Files changed**:
+  - CLAUDE.md — all documentation changes integrated into existing sections (no new sections added)
+- **Learnings for future iterations:**
+  - CLAUDE.md has a "Keeping CLAUDE.md Up to Date" section at the bottom that reminds maintainers to keep it plugin-agnostic and high-level
+  - Documentation changes are pure text — they pass through lint-staged's prettier formatting on commit
+  - The directory structure listing in CLAUDE.md should be kept in sync when new E2E test files are added
+---

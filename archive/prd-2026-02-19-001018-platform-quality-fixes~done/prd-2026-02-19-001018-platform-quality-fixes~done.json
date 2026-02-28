@@ -1,0 +1,247 @@
+{
+  "project": "OpenTabs Platform Quality Fixes",
+  "description": "Fix 13 genuine defects found during a comprehensive platform audit: 2 security gaps, 3 behavior bugs, 3 dead code items, 2 missing validations, 2 code quality duplications, and 1 inconsistency across mcp-server, browser-extension, and slack plugin.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Remove dead code: getNextRequestId unused _state parameter and deprecated nextRequestId field",
+      "description": "As a developer, I want dead code removed from state.ts so that the codebase is clean and unconfusing.",
+      "acceptanceCriteria": [
+        "getNextRequestId in state.ts takes zero parameters and returns string",
+        "All call sites updated from getNextRequestId(state) to getNextRequestId()",
+        "nextRequestId field removed from ServerState interface",
+        "If STATE_SCHEMA_VERSION needs bumping, it is bumped",
+        "Any hot-reload patching loop in index.ts that references nextRequestId is updated",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "state.ts:177 — getNextRequestId takes _state: ServerState but only calls crypto.randomUUID(). Remove the parameter. Grep for getNextRequestId(state) to find all call sites — currently in extension-protocol.ts and browser-tools/reload-extension.ts. Also remove the deprecated nextRequestId field from the ServerState interface at lines 111-115. Check index.ts for the hot-reload patching loop that iterates over createState() defaults — it may reference nextRequestId. Bump STATE_SCHEMA_VERSION at line 149 if removing the field changes schema compat (though since it's optional and unused, bumping may not be needed — use your judgment)."
+    },
+    {
+      "id": "US-002",
+      "title": "Add npmPlugins to FALLBACK_CONFIG for consistency",
+      "description": "As a developer, I want all config creation paths to produce the same shape so that callers don't need null coalescing for npmPlugins.",
+      "acceptanceCriteria": [
+        "FALLBACK_CONFIG at config.ts:70-74 includes npmPlugins: []",
+        "Both fallback paths (line 103 and line 139) now produce configs with npmPlugins: []",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "config.ts:70-74 — FALLBACK_CONFIG is { plugins: [], tools: {}, secret: undefined }. The first-run default at line 90 includes npmPlugins: []. Add npmPlugins: [] to FALLBACK_CONFIG. This is a one-line change. The fallback path at line 103 spreads FALLBACK_CONFIG, so it will automatically pick up the new field."
+    },
+    {
+      "id": "US-003",
+      "title": "Clean up stale .tmp files in cleanupStaleExecFiles",
+      "description": "As a platform operator, I want stale .tmp exec files cleaned up on server startup so that crashed sessions don't leave orphan files.",
+      "acceptanceCriteria": [
+        "cleanupStaleExecFiles at extension-protocol.ts:744-758 also deletes files matching EXEC_FILE_PREFIX + *.js.tmp",
+        "Filter logic matches both .js and .js.tmp suffixed files with the exec prefix",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "extension-protocol.ts:753 — current filter is entries.filter(f => f.startsWith(EXEC_FILE_PREFIX) && f.endsWith('.js')). The writeExecFile function at line 726 creates .tmp files as intermediates (tmpPath = finalPath + '.tmp'). Change the filter to: entries.filter(f => f.startsWith(EXEC_FILE_PREFIX) && (f.endsWith('.js') || f.endsWith('.js.tmp'))). This handles crash leftovers where the rename never completed."
+    },
+    {
+      "id": "US-004",
+      "title": "Eliminate redundant double notifyToolListChanged on hot reload",
+      "description": "As an MCP client, I want to receive only one tools/list_changed notification per reload so that I don't double-fetch the tool list.",
+      "acceptanceCriteria": [
+        "During hot reload (performReload), each MCP client receives exactly one tools/list_changed notification, not two",
+        "During config reload (performConfigReload), MCP clients still receive a notification",
+        "The notification happens after handler re-registration in performReload (lines 295-297), not inside reloadCore",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "reload.ts:176 calls notifyAllClients() inside reloadCore, and then performReload calls notifyToolListChanged again at lines 295-297. Remove the notifyAllClients() call from inside reloadCore (line 176). However, performConfigReload also calls reloadCore and relies on that notification since it does NOT call notifyToolListChanged separately. Solution: remove the call at line 176, and add a notifyAllClients call in performConfigReload after the reloadCore call (around line 348). The notifyAllClients helper is a local function inside reloadCore — you may need to extract it or inline the loop in performConfigReload."
+    },
+    {
+      "id": "US-005",
+      "title": "Derive BROWSER_TOOL_NAMES dynamically from browserTools array",
+      "description": "As a security-conscious platform, I want the prompt injection detection to cover ALL browser tools so that malicious plugins cannot reference unchecked sensitive tools.",
+      "acceptanceCriteria": [
+        "BROWSER_TOOL_NAMES in discovery.ts is derived from the browserTools array, not hardcoded",
+        "All 35+ browser tool names are included in the prompt injection check",
+        "The derivation is at module scope (computed once), not inside the check function",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "discovery.ts:481-487 — BROWSER_TOOL_NAMES is a hardcoded array of 5 names. Import { browserTools } from './browser-tools/index.js' and derive: const BROWSER_TOOL_NAMES = browserTools.map(t => t.name). This ensures the list stays in sync automatically. The browserTools array is defined in browser-tools/index.ts and has 35 entries. Note: the names in browserTools use the format 'browser_*' (underscored), which matches the format used in the prompt injection check at line 499 (descLower comparison). Verify the import doesn't create a circular dependency — discovery.ts currently imports from shared and nothing from browser-tools."
+    },
+    {
+      "id": "US-006",
+      "title": "Add at-least-one validation for select-option tool",
+      "description": "As an AI agent, I want a clear error when I invoke browser_select_option without providing value or label so that I don't get a confusing late error.",
+      "acceptanceCriteria": [
+        "When neither value nor label is provided, the tool returns a clear error message before dispatching to the extension",
+        "The error message says 'At least one of value or label must be provided'",
+        "When value is provided alone, the tool works correctly",
+        "When label is provided alone, the tool works correctly",
+        "When both are provided, the tool works correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "platform/mcp-server/src/browser-tools/select-option.ts:14-19 — both value and label are z.string().optional(). Add validation in the browser command handler (browser-commands.ts handleBrowserSelectOption function) to check that at least one of params.value or params.label is defined. If neither is provided, send an error response: { code: -32602, message: 'At least one of value or label must be provided' }. Do NOT use .refine() on the Zod schema — per CLAUDE.md, transforms/refines on input schemas can break JSON Schema serialization. The handler-level check is the correct pattern for this codebase."
+    },
+    {
+      "id": "US-007",
+      "title": "Fix atob UTF-8 corruption in getResourceContent",
+      "description": "As a user, I want base64-encoded text resources to be decoded correctly so that non-ASCII characters (Chinese, emoji) are not garbled.",
+      "acceptanceCriteria": [
+        "handleBrowserGetResourceContent uses TextDecoder for base64 text decoding instead of bare atob",
+        "The pattern matches network-capture.ts line 204-205: new TextDecoder().decode(Uint8Array.from(atob(content), c => c.charCodeAt(0)))",
+        "Non-ASCII characters in base64-encoded text resources are preserved correctly",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "browser-commands.ts:1760 — current code is content = atob(content) which returns Latin-1. Replace with content = new TextDecoder().decode(Uint8Array.from(atob(content), c => c.charCodeAt(0))). This matches the existing correct pattern at network-capture.ts:204-205. The try-catch on line 1762 already handles decode failures, so keep the structure: try { content = new TextDecoder().decode(Uint8Array.from(atob(content), c => c.charCodeAt(0))); base64Encoded = false; } catch { /* return as-is */ }"
+    },
+    {
+      "id": "US-008",
+      "title": "Fix typeText to validate element is a text input before casting",
+      "description": "As an AI agent, I want typeText to return a clear error when targeting non-input elements so that I don't get silent false success.",
+      "acceptanceCriteria": [
+        "handleBrowserTypeText checks the element tagName before casting to HTMLInputElement",
+        "If the element is not input, textarea, or contenteditable, returns error: 'Element is not a text input (found <tagname>)'",
+        "Existing behavior for input/textarea elements is unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "browser-commands.ts:524-526 — after const el = document.querySelector(sel), add a tag check before the cast. The correct pattern: const tag = el.tagName.toLowerCase(); const isEditable = tag === 'input' || tag === 'textarea' || (el as HTMLElement).isContentEditable; if (!isEditable) return { error: 'Element ' + sel + ' is not a text input (found <' + tag + '>)' }; Then proceed with the existing cast and logic. This matches the same tag-check pattern used in handleBrowserPressKey at line 1257-1258."
+    },
+    {
+      "id": "US-009",
+      "title": "Fix pressKey to mutate element value for printable characters",
+      "description": "As an AI agent, I want pressKey with a printable character to actually insert text into input elements so that the behavior matches what InputEvent implies.",
+      "acceptanceCriteria": [
+        "For printable characters on input/textarea elements, pressKey inserts the character into element.value before dispatching InputEvent",
+        "For contentEditable elements, uses document.execCommand('insertText', false, key) or equivalent",
+        "The keyboard event sequence (keydown, keypress, keyup) is preserved",
+        "The InputEvent dispatch is preserved (after value mutation)",
+        "Non-printable keys (Enter, Tab, Escape, arrows) are NOT affected",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "browser-commands.ts:1256-1269 — after the 'if (isPrintable)' check and before dispatching InputEvent, insert the character into the element value. For input/textarea: get current selectionStart/selectionEnd, splice the character in, set the new value, and update selection. For contentEditable: use document.execCommand('insertText', false, k). The typeText handler at lines 526-528 shows the simple case (replaces entire value), but pressKey should insert at cursor position. Pattern: const input = target as HTMLInputElement; const start = input.selectionStart ?? input.value.length; const end = input.selectionEnd ?? start; input.value = input.value.slice(0, start) + k + input.value.slice(end); input.selectionStart = input.selectionEnd = start + 1; Then dispatch the InputEvent."
+    },
+    {
+      "id": "US-010",
+      "title": "Fix Slack token regex missing underscore in localStorage scan",
+      "description": "As a Slack plugin user, I want token extraction from localStorage to correctly handle tokens with underscores so that authentication works reliably.",
+      "acceptanceCriteria": [
+        "Regex at slack-api.ts:248 uses [a-zA-Z0-9_-]+ (with underscore) instead of [a-zA-Z0-9-]+",
+        "Matches the character class used at line 157",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "plugins/slack/src/slack-api.ts:248 — change /(xoxc-[a-zA-Z0-9-]+)/ to /(xoxc-[a-zA-Z0-9_-]+)/. This is a one-character fix. The regex at line 157 already includes the underscore: /[\"']?api_token[\"']?\\s*:\\s*[\"'](xoxc-[a-zA-Z0-9_-]+)[\"']/. IMPORTANT: this is a plugin file, not a platform file. Build with: cd plugins/slack && bun run build. The root bun run build does NOT build plugins."
+    },
+    {
+      "id": "US-011",
+      "title": "Wrap slackApi response.json() in try-catch for ToolError consistency",
+      "description": "As a plugin developer, I want all errors from slackApi to be ToolError instances so that error handling is consistent and predictable.",
+      "acceptanceCriteria": [
+        "response.json() call at slack-api.ts:410 is wrapped in try-catch",
+        "JSON parse failures throw ToolError('Failed to parse Slack API response', 'invalid_response')",
+        "Existing behavior for valid JSON responses is unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 11,
+      "passes": true,
+      "notes": "plugins/slack/src/slack-api.ts:410 — change from const data: unknown = await response.json(); to: let data: unknown; try { data = await response.json(); } catch { throw new ToolError('Failed to parse Slack API response', 'invalid_response'); }. ToolError is already imported (line 1). IMPORTANT: this is a plugin file. Build with: cd plugins/slack && bun run build."
+    },
+    {
+      "id": "US-012",
+      "title": "Extract withDebugger helper from duplicated debugger attach/detach pattern",
+      "description": "As a developer, I want debugger attach/detach logic in browser-commands.ts to be a shared helper so that new debugger-using commands get the pattern for free and bugs are fixed in one place.",
+      "acceptanceCriteria": [
+        "A withDebugger helper function exists in browser-commands.ts that handles: checking isCapturing, attaching debugger with error message for 'Another debugger', and detaching in finally block",
+        "handleBrowserHandleDialog uses withDebugger instead of inline attach/detach",
+        "handleBrowserListResources uses withDebugger instead of inline attach/detach",
+        "handleBrowserGetResourceContent uses withDebugger instead of inline attach/detach",
+        "Behavior is identical to the current inline pattern",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 12,
+      "passes": true,
+      "notes": "browser-commands.ts has three functions with near-identical debugger boilerplate at lines 1552-1601, 1623-1679, 1706-1783. Extract: async function withDebugger<T>(tabId: number, fn: () => Promise<T>): Promise<T> { const alreadyAttached = isCapturing(tabId); if (!alreadyAttached) { try { await chrome.debugger.attach({ tabId }, '1.3'); } catch (err) { const msg = err instanceof Error ? err.message : String(err); throw new Error(msg.includes('Another debugger') ? 'Failed to attach debugger — another debugger...' : 'Failed to attach debugger: ' + sanitizeErrorMessage(msg)); } } try { return await fn(); } finally { if (!alreadyAttached) { await chrome.debugger.detach({ tabId }).catch(() => {}); } } }. The caller catches the thrown Error and sends the jsonrpc error response."
+    },
+    {
+      "id": "US-013",
+      "title": "Extract wrapAsyncHandler helper to eliminate message-router dispatch boilerplate",
+      "description": "As a developer, I want the message-router dispatch table to use a helper function so that adding new handlers is a one-liner and the id/catch pattern cannot be forgotten.",
+      "acceptanceCriteria": [
+        "A wrapAsyncHandler helper function exists that wraps async handlers with the id !== undefined check and .catch(err => console.warn(...))",
+        "A wrapSyncHandler helper exists for sync handlers (no .catch needed)",
+        "All browser command entries in methodHandlers use the wrapper instead of inline lambdas",
+        "Behavior is identical to the current dispatch table",
+        "The known-methods.test.ts test continues to pass (it checks methodHandlerNames)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 13,
+      "passes": true,
+      "notes": "message-router.ts:154-553 — every browser command handler follows this pattern: (params, id) => { if (id !== undefined) { handleFoo(params, id).catch((err: unknown) => console.warn('[opentabs] browser.foo handler failed:', err)); } }. Some handlers are sync (getNetworkRequests, disableNetworkCapture, getConsoleLogs, clearConsoleLogs) and don't have .catch(). Extract two helpers:\n\nconst wrapAsync = (method: string, fn: (params: Record<string, unknown>, id: string | number) => Promise<void>): MessageHandler => (params, id) => { if (id !== undefined) fn(params, id).catch((err: unknown) => console.warn(`[opentabs] ${method} handler failed:`, err)); };\n\nconst wrapSync = (fn: (params: Record<string, unknown>, id: string | number) => void): MessageHandler => (params, id) => { if (id !== undefined) fn(params, id); };\n\nThen each entry becomes: ['browser.listTabs', wrapAsync('browser.listTabs', handleBrowserListTabs)]. Some handlers take only id (no params) — the wrapper still passes params, the handler ignores them. This is fine because the type is already (params, id) => void. Note: some handlers like sync.full and plugin.update don't check id !== undefined (they are notifications). Keep those as-is (or create a wrapNotification helper). The test in known-methods.test.ts checks methodHandlerNames which is derived from methodHandlers.keys() — this won't be affected."
+    }
+  ]
+}

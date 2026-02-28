@@ -1,0 +1,200 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix extension auto-reload from server side, remove version mismatch from extension, add outdated plugins badge in side panel, fix search filter inconsistency, improve failed plugin UX, fix tab state hint, add format:check to check command, auto-build e2e plugin, optimize CI, add changelog automation.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Server-triggered extension auto-reload on update",
+      "description": "As a user, I want the Chrome extension to automatically reload when the MCP server detects an updated extension version, so I never need to manually reload from chrome://extensions/.",
+      "acceptanceCriteria": [
+        "When the MCP server starts and extension-install.ts detects a version change (copies new extension files), it sends an extension.reload command to the connected extension via WebSocket",
+        "The extension's message-router.ts already handles extension.reload by calling chrome.runtime.reload() — this existing mechanism is reused",
+        "If the extension is not connected when the server starts, the reload happens on next WebSocket connection (the server marks a pending reload flag)",
+        "The CLI start.ts no longer prints 'Reload the extension from chrome://extensions/ for changes to take effect.' since it's automatic",
+        "The existing /extension/reload HTTP endpoint continues to work for manual triggers",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "The extension already supports `extension.reload` via message-router.ts (lines 182-205) — it calls `chrome.runtime.reload()`. The server just needs to trigger this.\n\nChanges needed:\n\n1. **platform/mcp-server/src/extension-install.ts**: `ensureExtensionInstalled()` currently returns `{ installed: boolean; version: string }`. Add a `versionChanged: boolean` flag to the return value. Set it to `true` when files are copied (version mismatch).\n\n2. **platform/mcp-server/src/state.ts**: Add `pendingExtensionReload: boolean` to `ServerState`, initialized to `false`.\n\n3. **platform/mcp-server/src/index.ts** (or wherever server startup orchestration happens): After `ensureExtensionInstalled()`, if `versionChanged` is true, set `state.pendingExtensionReload = true`. If the extension WebSocket is already connected, send the reload command immediately and reset the flag.\n\n4. **platform/mcp-server/src/http-routes.ts** (or extension-protocol.ts): In the WebSocket `open` handler (createHandleWsOpen), after the extension connects, check `state.pendingExtensionReload`. If true, send the `extension.reload` JSON-RPC message and reset the flag. Use a short delay (500ms) to let the extension fully initialize before reloading.\n\n5. **platform/cli/src/commands/start.ts**: Remove the 'Reload the extension...' message from lines 79-80 in autoInitialize. Replace with a message like 'Extension will auto-reload.' (dim).\n\nThe extension.reload flow: server sends `{ jsonrpc: '2.0', method: 'extension.reload', id }` via WebSocket -> message-router handles it -> clears wsConnected from storage -> calls chrome.runtime.reload() after 100ms flush delay."
+    },
+    {
+      "id": "US-002",
+      "title": "Remove version mismatch banner from side panel",
+      "description": "As a user, I no longer need the version mismatch banner since the server auto-reloads the extension when versions differ.",
+      "acceptanceCriteria": [
+        "VersionMismatchBanner.tsx component is deleted",
+        "All references to versionMismatch state in App.tsx are removed",
+        "The protocolVersion check in loadPlugins is removed",
+        "The SIDE_PANEL_PROTOCOL_VERSION constant is removed from constants.ts if it exists there",
+        "The side panel renders without any version mismatch UI",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "Files to modify:\n\n1. **Delete** platform/browser-extension/src/side-panel/components/VersionMismatchBanner.tsx\n2. **platform/browser-extension/src/side-panel/App.tsx**:\n   - Remove `versionMismatch` from useState (line 28)\n   - Remove the protocolVersion check in loadPlugins (lines 66-70)\n   - Remove the VersionMismatchBanner import and rendering (around line 219)\n   - Remove `versionMismatch: false` from disconnect handler\n3. **platform/browser-extension/src/constants.ts**: Remove `SIDE_PANEL_PROTOCOL_VERSION` if defined there\n4. Check if any E2E tests reference version mismatch and update them\n\nAlso check bridge.ts ConfigStateResult — the protocolVersion field can remain in the server response (backwards compatible), the side panel just no longer reads it."
+    },
+    {
+      "id": "US-003",
+      "title": "Show outdated plugins badge in side panel",
+      "description": "As a user, I want to see a notification badge when plugin updates are available, like an iOS-style red badge count.",
+      "acceptanceCriteria": [
+        "A new state variable 'outdatedPlugins' is tracked in App.tsx from the fetchConfigState response",
+        "When outdatedPlugins.length > 0, a red circular badge with the count is shown in the top-right corner of the side panel header",
+        "The badge looks like an iOS notification badge: small red circle with white number, positioned at top-right",
+        "Clicking the badge shows a dropdown or expandable section listing each outdated plugin with: name, current version -> latest version, and the npm update command",
+        "The update command is rendered in a code block that can be copied",
+        "The badge is hidden when outdatedPlugins is empty",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "The data is already available. In bridge.ts, `fetchConfigState()` returns `ConfigStateResult` which includes `outdatedPlugins`. The App.tsx loadPlugins function receives this data but currently ignores it.\n\n1. **platform/browser-extension/src/side-panel/App.tsx**: Add `outdatedPlugins` state (type from shared: `OutdatedPlugin[]`). Set it from `fetchConfigState()` result. Clear it on disconnect.\n\n2. Create **platform/browser-extension/src/side-panel/components/OutdatedPluginsBadge.tsx**: A new component that:\n   - Shows a small red circle with count (absolute positioned top-right)\n   - On click, opens a popover/dropdown listing outdated plugins\n   - Each entry: plugin name, currentVersion -> latestVersion, code block with updateCommand\n   - Use the retro design system (Alert variant, or a custom popover)\n\n3. In App.tsx render, place the badge near the top of the layout (in the header area, near the search bar).\n\nThe OutdatedPlugin type from server state has: `{ name: string, currentVersion: string, latestVersion: string, updateCommand: string }`. The updateCommand is already formatted as `npm update -g <pkg>` (from version-check.ts).\n\nFor the badge style: a `position: absolute` or `relative` container with a red circle. Use Tailwind: `absolute -top-1 -right-1 bg-destructive text-destructive-foreground rounded-full w-5 h-5 text-xs flex items-center justify-center font-bold`."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix search filter inconsistency between PluginList and PluginCard",
+      "description": "As a user, I want the tool search filter to check the same fields at both the plugin level and the tool level so tools aren't unexpectedly hidden.",
+      "acceptanceCriteria": [
+        "PluginList.tsx and PluginCard.tsx both filter tools by the same fields: displayName, name, and description",
+        "PluginList uses displayName, name, and description to determine if a plugin has matching tools (currently only checks name and description)",
+        "A tool matching only on displayName is correctly shown in its plugin card and the plugin card is correctly shown in the list",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Edit platform/browser-extension/src/side-panel/components/PluginList.tsx lines 20-28. Currently:\n```typescript\nconst filtered = plugins.filter(p =>\n  p.tools.some(t => t.name.toLowerCase().includes(filterLower) || t.description.toLowerCase().includes(filterLower)),\n);\n```\n\nChange to also check displayName:\n```typescript\nconst filtered = plugins.filter(p =>\n  p.tools.some(t =>\n    t.displayName.toLowerCase().includes(filterLower) ||\n    t.name.toLowerCase().includes(filterLower) ||\n    t.description.toLowerCase().includes(filterLower),\n  ),\n);\n```\n\nThis matches what PluginCard.tsx already does in its tool filtering (line ~96-104)."
+    },
+    {
+      "id": "US-005",
+      "title": "Improve failed plugin card UX",
+      "description": "As a user, I want to see failed plugin errors clearly and be able to copy the error text for troubleshooting.",
+      "acceptanceCriteria": [
+        "Failed plugin cards show the error message at a readable font size (at least 12px/text-xs instead of 11px)",
+        "The error message is selectable/copyable (user-select: text)",
+        "Long error messages are truncated with an expand/collapse toggle",
+        "The full error is shown when expanded",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "notes": "Edit platform/browser-extension/src/side-panel/components/FailedPluginCard.tsx (15 lines currently).\n\n1. Change error text from 11px to `text-xs` (12px) for readability\n2. Add `select-text` class to the error paragraph for copy support\n3. Add a truncation pattern: show first 2 lines by default, with a 'Show more' / 'Show less' toggle. Use React state for expanded/collapsed. Truncate with `line-clamp-2` when collapsed.\n\nExample:\n```tsx\nconst [expanded, setExpanded] = useState(false);\n// ...\n<p className={`text-xs text-destructive/70 select-text ${expanded ? '' : 'line-clamp-2'}`}>{error}</p>\n{error.length > 100 && (\n  <button onClick={() => setExpanded(!expanded)} className=\"text-xs text-muted-foreground underline\">\n    {expanded ? 'Show less' : 'Show more'}\n  </button>\n)}\n```"
+    },
+    {
+      "id": "US-006",
+      "title": "Fix tab state hint for unavailable state",
+      "description": "As a user, I want the 'unavailable' tab state hint to be accurate when the readiness check is not about authentication.",
+      "acceptanceCriteria": [
+        "The unavailable hint changes from 'Log in to {displayName}' to 'Waiting for {displayName} to be ready' or similar generic phrasing",
+        "The hint does not assume authentication is the only reason for unavailability",
+        "The ready and closed hints remain unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "notes": "Edit platform/browser-extension/src/side-panel/components/PluginCard.tsx TabStateHint component (lines 24-38). Change the unavailable case from:\n```\n'Log in to {displayName}'\n```\nTo something more generic:\n```\n'{displayName} is not ready — ensure you are logged in and the page is fully loaded'\n```\nOr shorter: `'Waiting for {displayName} to be ready'`\n\nThe 'closed' hint ('Open {domain} in your browser') is fine as-is. The 'ready' hint (no hint) is fine."
+    },
+    {
+      "id": "US-007",
+      "title": "Add format:check to bun run check command",
+      "description": "As a platform developer, I want format:check included in the unified check command so formatting issues are caught locally.",
+      "acceptanceCriteria": [
+        "The 'check' script in root package.json includes format:check",
+        "The 'check:all' script also includes format:check",
+        "format:check runs after lint (since lint:fix may change formatting)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "notes": "Edit root package.json. Current scripts:\n```\n\"check\": \"bun run build && bun run type-check && bun run lint && bun run knip && bun run test\"\n\"check:all\": \"bun run build && bun run type-check && bun run lint && bun run knip && bun run test && bun run test:e2e\"\n```\n\nAdd format:check after lint:\n```\n\"check\": \"bun run build && bun run type-check && bun run lint && bun run format:check && bun run knip && bun run test\"\n\"check:all\": \"bun run build && bun run type-check && bun run lint && bun run format:check && bun run knip && bun run test && bun run test:e2e\"\n```"
+    },
+    {
+      "id": "US-008",
+      "title": "Auto-build e2e-test plugin in test:e2e",
+      "description": "As a contributor, I want the e2e-test plugin to be automatically built before E2E tests run so I don't get cryptic failures on first run.",
+      "acceptanceCriteria": [
+        "The test:e2e script in root package.json builds the e2e-test plugin before running Playwright",
+        "The build is conditional — only runs if dist/tools.json is missing or older than src/ files (to avoid unnecessary rebuilds)",
+        "If the plugin build fails, the error is clear and the E2E tests do not start",
+        "The global-setup.ts prerequisite check still exists as a safety net",
+        "CI E2E job also benefits from this change",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 8,
+      "passes": true,
+      "notes": "Simplest approach: modify the test:e2e script in root package.json to include the plugin build:\n\nFrom:\n```\n\"test:e2e\": \"bunx playwright test\"\n```\n\nTo:\n```\n\"test:e2e\": \"bun run build:e2e-plugin && bunx playwright test\"\n```\n\nAnd add:\n```\n\"build:e2e-plugin\": \"cd plugins/e2e-test && bun install --frozen-lockfile && bun run build\"\n```\n\nFor the conditional build: checking file timestamps adds complexity. Simpler to just always build — the plugin build is fast (tsc + opentabs-plugin build is <3s). The `bun install --frozen-lockfile` is also fast if deps are already installed.\n\nAlternatively, wrap in a script that checks if dist/tools.json exists and skip if so. But the simpler always-build approach is more reliable."
+    },
+    {
+      "id": "US-009",
+      "title": "Optimize CI with shared build artifacts",
+      "description": "As a platform developer, I want CI to build once and share artifacts across jobs to reduce redundant work.",
+      "acceptanceCriteria": [
+        "A single 'build' job runs first and uploads the built artifacts",
+        "All other jobs (type-check, lint, knip, unit-tests, e2e-tests) download the artifacts instead of building from scratch",
+        "The format job remains independent (does not need build artifacts)",
+        "Total CI wall time is reduced by eliminating 5 redundant builds",
+        "All CI jobs still pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 9,
+      "passes": true,
+      "notes": "Edit .github/workflows/ci.yml. Restructure from 7 independent jobs to a dependency graph:\n\n1. **build** job: runs `bun install --frozen-lockfile && bun run build`, then uses `actions/upload-artifact@v4` to upload the workspace (or at least the `platform/*/dist/` directories and `node_modules/.cache`).\n\n2. **type-check**, **lint**, **knip**, **unit-tests**, **e2e-tests** jobs: add `needs: [build]`, use `actions/download-artifact@v4` to restore build artifacts, skip `bun run build`.\n\n3. **format** job: remains independent (no build dependency).\n\nFor the artifact, upload:\n- All `platform/*/dist/` directories\n- `node_modules/` (or use the bun cache)\n- `~/.opentabs/extension/` (for E2E tests)\n\nActually, the simplest approach: upload the entire workspace as an artifact. With `actions/upload-artifact@v4` compression, this is typically fast.\n\nAlternative simpler approach: just add `needs: [build]` and use bun's build cache. Since tsc --build uses .tsbuildinfo files and bun caches node_modules, the second `bun run build` in dependent jobs would be nearly instant (incremental). But this still runs the build command — just faster.\n\nThe cleanest approach: upload `platform/*/dist/` + `platform/browser-extension/dist/` + `.opentabs/extension/` + `bun.lock` as artifacts. Dependent jobs download and skip the build step entirely."
+    },
+    {
+      "id": "US-010",
+      "title": "Add automated changelog generation to publish script",
+      "description": "As a contributor, I want the publish script to auto-generate a changelog from commits since the last release.",
+      "acceptanceCriteria": [
+        "The publish script generates a CHANGELOG section from git commits since the last tag",
+        "The changelog is appended to a CHANGELOG.md file (created if not exists)",
+        "Each entry shows the commit subject line, grouped by conventional commit type if available",
+        "If no conventional commit format is used, commits are listed ungrouped",
+        "The changelog section is included in the release commit",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 10,
+      "passes": true,
+      "notes": "Edit scripts/publish.sh. Add a changelog generation step before the git commit.\n\n```bash\necho \"\"\necho \"==> Generating changelog...\"\n\nPREV_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo \"\")\nif [ -n \"$PREV_TAG\" ]; then\n  COMMITS=$(git log --oneline \"$PREV_TAG..HEAD\" --no-merges)\nelse\n  COMMITS=$(git log --oneline --no-merges)\nfi\n\n# Prepend to CHANGELOG.md\nCHANGELOG_ENTRY=\"## v$VERSION\\n\\n$(echo \"$COMMITS\" | sed 's/^[a-f0-9]* /- /')\\n\"\n\nif [ -f CHANGELOG.md ]; then\n  echo -e \"$CHANGELOG_ENTRY\\n$(cat CHANGELOG.md)\" > CHANGELOG.md\nelse\n  echo -e \"# Changelog\\n\\n$CHANGELOG_ENTRY\" > CHANGELOG.md\nfi\n\necho \"  Generated changelog for v$VERSION\"\n```\n\nThen add CHANGELOG.md to the git add step:\n```bash\ngit add platform/*/package.json CHANGELOG.md\n```"
+    }
+  ]
+}

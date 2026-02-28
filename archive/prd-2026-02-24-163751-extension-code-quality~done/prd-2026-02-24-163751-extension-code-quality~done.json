@@ -1,0 +1,144 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix code quality issues, bugs, and inconsistencies in the browser extension codebase: unsanitized error messages at trust boundaries, misleading response codes, missing switch case documentation, duplicate constants, network capture memory leaks, and CLAUDE.md documentation discrepancy.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Sanitize adapter error messages at the dispatch-helpers trust boundary",
+      "description": "As a platform maintainer, I want all error messages from MAIN-world adapter execution to be sanitized before being sent to the MCP server, so that internal file paths, IP addresses, and URLs are never leaked to external clients.",
+      "acceptanceCriteria": [
+        "In dispatch-helpers.ts, the error path at line 157 (result.message from adapter DispatchResult) is passed through sanitizeErrorMessage before being sent via sendToServer",
+        "The firstError.message stored at line 151 is also sanitized when sent at line 186",
+        "All error messages originating from MAIN-world adapter execution that flow through dispatchWithTabFallback to sendToServer pass through sanitizeErrorMessage",
+        "The existing sanitization at line 174 (catch block) remains unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/dispatch-helpers.ts. There are two paths where unsanitized adapter error messages reach the MCP server:\n\n1. Line 155-159: `sendToServer({ error: { code: result.code, message: result.message, data: result.data } })` — the `result.message` comes from MAIN-world adapter execution (DispatchResult type) and is not sanitized. Wrap it: `message: sanitizeErrorMessage(result.message)`.\n\n2. Line 151: `firstError ??= { code: result.code, message: result.message }` — this is later sent at line 184-188. The message should be sanitized either at storage (line 151) or at send (line 186). Sanitizing at storage is cleaner: `message: sanitizeErrorMessage(result.message)`.\n\nThe catch block at line 174 already calls `sanitizeErrorMessage(msg)` — this is the correct pattern to follow.\n\nThe sanitizeErrorMessage function is already imported at line 4. No new imports needed."
+    },
+    {
+      "id": "US-002",
+      "title": "Sanitize error messages in extractScriptResult for browser commands",
+      "description": "As a platform maintainer, I want the extractScriptResult helper to sanitize error strings from MAIN-world script results before forwarding them to the MCP server, so that browser command errors don't leak internal details.",
+      "acceptanceCriteria": [
+        "In helpers.ts, the extractScriptResult function at line 105 passes result.error through sanitizeErrorMessage before sending it to the MCP server",
+        "The sanitizeErrorMessage import is already present in helpers.ts (line 3) — no new import needed",
+        "The existing sendErrorResult function at line 112 continues to sanitize as it does now",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/browser-commands/helpers.ts, line 104-106.\n\nCurrent code:\n```typescript\nif (result.error) {\n  sendToServer({ jsonrpc: '2.0', error: { code: JSONRPC_INVALID_PARAMS, message: result.error }, id });\n  return null;\n}\n```\n\n`result.error` is a string from a MAIN-world script execution (chrome.scripting.executeScript). It could contain file paths or internal details from the page context. The fix is simple — wrap it: `message: sanitizeErrorMessage(result.error)`. The import already exists at line 3.\n\nNote: the `sendErrorResult` function at line 112 already sanitizes via `sanitizeErrorMessage(toErrorMessage(err))`. The `extractScriptResult` function is the only unsanitized path in this file.\n\nAlso update the test in helpers.test.ts if it asserts on the exact unsanitized error string — it should still pass since test mocks sanitizeErrorMessage as identity function."
+    },
+    {
+      "id": "US-003",
+      "title": "Add missing sp:confirmationTimeout to offscreen no-op case list",
+      "description": "As a platform maintainer, I want the offscreen document's message handler switch statement to explicitly list all known InternalMessage types, so that the no-op documentation is exhaustive and future changes don't accidentally miss a message type.",
+      "acceptanceCriteria": [
+        "In offscreen/index.ts, the no-op case list (around line 510-523) includes 'sp:confirmationTimeout' alongside the existing 'sp:confirmationResponse' entry",
+        "The switch statement lists every InternalMessage type that the offscreen document does not handle, for documentation completeness",
+        "No runtime behavior changes — the default fall-through to return undefined is equivalent",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts, lines 510-523.\n\nCurrent no-op list:\n```typescript\ncase 'offscreen:getUrl':\ncase 'ws:state':\ncase 'ws:message':\ncase 'bg:send':\ncase 'bg:getConnectionState':\ncase 'plugin:logs':\ncase 'tool:progress':\ncase 'sp:getState':\ncase 'sp:connectionState':\ncase 'sp:serverMessage':\ncase 'sp:confirmationRequest':\ncase 'sp:confirmationResponse':\n  break;\n```\n\nAdd `case 'sp:confirmationTimeout':` after the `sp:confirmationResponse` line. Check extension-messages.ts for the full InternalMessage union to ensure no other types are missing — the `offscreen:getLogs` type is handled actively earlier in the switch, and `port-changed` is also handled earlier, so verify only `sp:confirmationTimeout` is missing."
+    },
+    {
+      "id": "US-004",
+      "title": "Eliminate duplicate port constants between background and side panel",
+      "description": "As a platform maintainer, I want the side panel to import port-related constants from the shared constants module instead of redefining them locally, so that a value change in one place automatically propagates to both contexts.",
+      "acceptanceCriteria": [
+        "side-panel/constants.ts no longer defines DEFAULT_PORT or PORT_STORAGE_KEY",
+        "All side panel files that previously imported DEFAULT_PORT from side-panel/constants now import DEFAULT_SERVER_PORT from the root constants module (../../constants.js)",
+        "All side panel files that previously imported PORT_STORAGE_KEY from side-panel/constants now import SERVER_PORT_KEY from the root constants module (../../constants.js)",
+        "The side panel's esbuild bundle still builds correctly (esbuild resolves cross-directory imports fine since they're bundled together)",
+        "No runtime behavior change — the values are identical (9515 and 'serverPort')",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "Files to change:\n\n1. platform/browser-extension/src/side-panel/constants.ts — remove DEFAULT_PORT and PORT_STORAGE_KEY. Keep ERROR_DISPLAY_DURATION_MS and COUNTDOWN_POLL_INTERVAL_MS (these are side-panel-specific).\n\n2. Find all importers of DEFAULT_PORT and PORT_STORAGE_KEY from side-panel/constants:\n   - Use grep for `from.*side-panel/constants` or `from.*./constants` within the side-panel directory\n   - Update imports to use DEFAULT_SERVER_PORT and SERVER_PORT_KEY from '../../constants.js'\n\nThe shared constants file is at platform/browser-extension/src/constants.ts and exports:\n- DEFAULT_SERVER_PORT = 9515\n- SERVER_PORT_KEY = 'serverPort'\n\nThe side panel is built by build-side-panel.ts using esbuild with bundling enabled, so importing from ../../constants.js works fine — esbuild will include the referenced exports in the side panel bundle.\n\nImportant: update ALL references in side-panel components (likely Footer.tsx and EmptyStates.tsx based on the constants' usage)."
+    },
+    {
+      "id": "US-005",
+      "title": "Clean up stale requestIdToRequest entries when network capture ring buffer shifts",
+      "description": "As a platform maintainer, I want the network capture module to remove stale requestIdToRequest entries when requests are evicted from the ring buffer, so that long-running capture sessions don't leak memory.",
+      "acceptanceCriteria": [
+        "When a request is shifted from the requests array (at the ring buffer capacity boundary), its corresponding requestIdToRequest entry is also deleted",
+        "The cleanup applies in both the responseReceived path (line 189-191) and the loadingFailed path (line 215-217) where requests.shift() is called",
+        "The requestIdToRequest Map does not retain references to CapturedRequest objects that have been evicted from the requests array",
+        "Existing tests in network-capture.test.ts continue to pass",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/network-capture.ts, lines 188-192 and 215-218.\n\nThe issue: when the ring buffer is at capacity, `state.requests.shift()` evicts the oldest CapturedRequest. However, the `state.requestIdToRequest` Map still holds a reference to that evicted object, keyed by its CDP requestId. Over long capture sessions, this Map accumulates stale entries.\n\nThe fix is to track the requestId on the CapturedRequest object (or look it up) so we can delete the Map entry when shifting. Two approaches:\n\nApproach A (recommended): The shifted request was previously added via `state.requestIdToRequest.set(requestId, completed)` — but we don't know its requestId at shift time. We need to find which key maps to the shifted object. Since the Map is keyed by requestId and the request was just shifted, iterate the map to find and delete entries pointing to the shifted object. However, this is O(n) per shift.\n\nApproach B (better): Store the requestId on the CapturedRequest object itself. Add an optional `_requestId` field (or similar) to CapturedRequest. When creating a CapturedRequest in the responseReceived handler, store the requestId. When shifting, delete `requestIdToRequest` using the shifted object's stored requestId. For the loadingFailed path, the request is NOT added to requestIdToRequest (it's already deleted at line 201), so the shift in that path doesn't need requestIdToRequest cleanup.\n\nActually, the simplest approach: when shifting in the responseReceived handler (line 189-191), the shifted request is the oldest one. We can check if the shifted request has a matching entry in requestIdToRequest and delete it. Since we can't easily map from request object back to requestId, the cleanest solution is:\n\n1. Add a `requestId` property to the CapturedRequest interface (internal only, stripped before returning to callers if needed)\n2. Set it when creating the completed request in responseReceived (line 184 area)\n3. When shifting (line 190-191), get the shifted request and delete `requestIdToRequest.get(shifted.requestId)`\n\nCheck the CapturedRequest type definition and the getRequests/getNetworkRequests functions to ensure the requestId field doesn't leak to external callers (or just accept it as an internal detail)."
+    },
+    {
+      "id": "US-006",
+      "title": "Fix ws:setUrl to return ok:false for rejected URLs",
+      "description": "As a platform maintainer, I want the offscreen document's ws:setUrl handler to return { ok: false, reason: '...' } when a URL is rejected, so that callers get accurate feedback about whether the URL was accepted.",
+      "acceptanceCriteria": [
+        "When ws:setUrl receives a URL with an invalid protocol, the response is { ok: false, reason: 'Invalid protocol: <protocol>' }",
+        "When ws:setUrl receives a malformed URL, the response is { ok: false, reason: 'Invalid URL format' }",
+        "When ws:setUrl receives a URL that fails the isValidWsOrigin check, the response is { ok: false, reason: 'URL origin mismatch' } or similar descriptive message",
+        "The success path continues to return { ok: true }",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/browser-extension/src/offscreen/index.ts, lines 436-483.\n\nThe ws:setUrl handler validates the incoming URL in several places, but all rejection paths return `sendResponse({ ok: true })` — misleading the caller into thinking the URL was set successfully.\n\nFix each rejection path:\n1. Line 445: Invalid protocol → `sendResponse({ ok: false, reason: 'Invalid WebSocket protocol' })`\n2. Line 450: Invalid URL format → `sendResponse({ ok: false, reason: 'Invalid URL format' })`\n3. Line 463: Origin mismatch from ws-info → `sendResponse({ ok: false, reason: 'WebSocket URL origin mismatch' })`\n4. Line 471: Final origin validation fail → `sendResponse({ ok: false, reason: 'WebSocket URL origin mismatch' })`\n\nThe current caller (background.ts line 143) uses fire-and-forget `.catch(() => {})`, so no caller updates are needed. But future callers will benefit from the accurate response."
+    },
+    {
+      "id": "US-007",
+      "title": "Fix CLAUDE.md --radius documentation to match actual CSS value",
+      "description": "As a platform maintainer, I want the CLAUDE.md theme documentation to match the actual CSS variable values in styles.css, so that developers following the documentation apply correct styles.",
+      "acceptanceCriteria": [
+        "The --radius row in the browser-extension CLAUDE.md theme table matches the actual value in styles.css (currently --radius: 0 in CSS vs 0.5rem in docs)",
+        "The documentation accurately reflects the current theme design choices",
+        "No other theme token discrepancies exist between CLAUDE.md and styles.css",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 7,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "notes": "File: platform/browser-extension/CLAUDE.md, around line 42 in the theme table.\n\nThe CLAUDE.md documents `--radius` as `0.5rem`, but the actual CSS in platform/browser-extension/src/side-panel/styles.css line 42 defines `--radius: 0`.\n\nUpdate the CLAUDE.md table to reflect the actual CSS value. Change the `--radius` row from `0.5rem` to `0`.\n\nAlso verify no other tokens in the table are stale — compare each row against the actual `:root` block in styles.css."
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix resource leaks and dead code in the MCP server: orphaned npm child processes on timeout, unreachable error logging in deleteExecFile, and invisible exec file cleanup failures.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Kill child process on runNpmGlobal timeout",
+      "description": "As a server operator, I want timed-out npm subprocesses to be killed so that orphaned processes don't accumulate and consume system resources.",
+      "acceptanceCriteria": [
+        "When the 60s timeout fires in runNpmGlobal, the spawned npm child process is killed before the timeout error is thrown",
+        "spawnAsync returns or exposes a kill handle so the caller can terminate the child",
+        "The existing behavior for non-timeout cases (successful completion and non-zero exit) is unchanged",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/mcp-server/src/plugin-management.ts, lines 63-118.\n\nspawnAsync (line 64) creates a child via spawn() but only returns a Promise<{exitCode, stdout, stderr}> \u2014 the ChildProcess handle is encapsulated and inaccessible. When the timeout wins Promise.race at line 101, the child process keeps running as an orphan.\n\nFix approach: make spawnAsync return an object with both a result promise and a kill function (or return the ChildProcess alongside the promise). In runNpmGlobal, call kill() in the timeout path before re-throwing. The finally block already clears the timer \u2014 add the kill there or in the timeout callback.\n\nBe careful: spawnAsync is also used by other callers in the same file (searchNpmRegistry at ~line 153, installPlugin, uninstallPlugin). Ensure the interface change doesn't break those call sites."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix deleteExecFile dead code and error logging",
+      "description": "As a developer, I want deleteExecFile to actually log failures so that exec file cleanup issues are diagnosable rather than silently swallowed.",
+      "acceptanceCriteria": [
+        "deleteExecFile logs a warning via log.warn when unlink fails",
+        "The .catch(() => {}) that swallows the unlink error is removed",
+        "The outer try-catch correctly handles the unlink rejection",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/mcp-server/src/adapter-files.ts, lines 192-199.\n\nCurrent code:\n```\nconst deleteExecFile = async (filename: string): Promise<void> => {\n  try {\n    await unlink(join(getAdaptersDir(), filename)).catch(() => {});\n  } catch {\n    log.warn(`Failed to delete exec file: ${filename}`);\n  }\n};\n```\n\nThe .catch(() => {}) on the unlink promise swallows all rejections, converting them to resolved promises. The outer try-catch never fires, making the log.warn on line 197 dead code.\n\nFix: remove the .catch(() => {}) so unlink rejections propagate to the outer catch block, which already has the correct log.warn. The function's JSDoc says 'Fire-and-forget \u2014 logs on failure' but the logging never executes."
+    },
+    {
+      "id": "US-003",
+      "title": "Await exec file deletion in execute-script handler",
+      "description": "As a server operator, I want exec file deletion errors to be logged so that stale temporary files from execute-script don't accumulate silently on long-running servers.",
+      "acceptanceCriteria": [
+        "execute-script handler awaits deleteExecFile in its finally block instead of using void fire-and-forget",
+        "deleteExecFile errors do not propagate to the caller (the finally block catches or the function itself is fire-and-forget safe)",
+        "The handler still returns the dispatch result, not the deletion result",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "notes": "File: platform/mcp-server/src/browser-tools/execute-script.ts, line 50.\n\nCurrent code uses `void deleteExecFile(filename)` in the finally block, making deletion fire-and-forget. Combined with US-002's fix (deleteExecFile will now actually log errors), this story ensures the await happens so the log.warn in deleteExecFile has a chance to execute before the function context is garbage collected.\n\nSince deleteExecFile already wraps unlink in try-catch (after US-002's fix), awaiting it won't throw. The finally block should use `await deleteExecFile(filename)` instead of `void deleteExecFile(filename)`.\n\nThis story depends on US-002 being completed first (same PRD, sequential execution)."
+    }
+  ]
+}

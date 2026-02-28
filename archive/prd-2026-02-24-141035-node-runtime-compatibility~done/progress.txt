@@ -1,0 +1,231 @@
+# Ralph Progress Log
+PRD: prd-2026-02-24-141035-node-runtime-compatibility~running.json
+Started: Tue Feb 24 14:11:46 PST 2026
+---
+
+## Codebase Patterns
+- Runtime detection: `const isBun = typeof Bun !== 'undefined'` — use this pattern everywhere
+- The tsconfig for platform/shared includes all `src/` files, so new files there are automatically type-checked
+- ESLint requires imports to be in alphabetical order (local before node:*), and type imports alphabetical within their group
+- nodeSpawnSync with `stdio: ['ignore', 'pipe', 'pipe']` guarantees non-null stdout/stderr — no optional chaining needed
+- Bun.CryptoHasher.digest('hex') returns string directly, no `as string` cast needed
+- cross-platform.ts `platformExec` now includes 'node' for Windows resolution alongside npm/npx/bun/bunx
+- Bun.resolveSync → require.resolve with createRequire(import.meta.url) — works in both Node.js and Bun
+- Tests that mock Bun.resolveSync should be replaced with real node_modules structures + process.cwd mock
+- macOS /var → /private/var symlink: use realpathSync when comparing paths in tests
+- BunServer interface is now ServerAdapter — exported from http-routes.ts for use by server-node.ts and index.ts
+- Node.js server adapter (server-node.ts) uses ws library 'headers' event for custom upgrade response headers
+- Avoid async callbacks in Node.js event handlers — wrap in void-returning function to satisfy @typescript-eslint/no-misused-promises
+- bun-types' RequestInit lacks `duplex` — cast init as Record<string, unknown> to set it for Node.js
+- Readable.toWeb() returns ReadableStream<any>, not ReadableStream<Uint8Array> — use double cast `as unknown as ReadableStream<Uint8Array>`
+- spawnStreaming for long-running processes (streaming stdout/stderr), spawnInherit for pass-through stdio (npm install)
+- getFileSize and readFileSlice for file metadata and partial reads (log tailing, audit size checks)
+- esbuild IIFE bundling for browser: use external: ['node:*'] to handle node builtins from transitive deps behind runtime detection
+- esbuild sourcemap: 'linked' is equivalent to Bun.build's sourcemap: 'external'
+- esbuild outfile + allowOverwrite: true overwrites input files in-place (useful for post-tsc bundling)
+- esbuild needs .mjs in resolveExtensions for packages with bare .mjs subpath files (e.g., lucide-react/dynamic)
+- When migrating a package from Bun to runtime layer, grep for `Bun\.` in non-test files to find ALL call sites — don't rely on the PRD line numbers alone
+- resolver.ts bun global path discovery only runs when isBun is true — Node.js users only scan npm global paths
+
+## 2026-02-24 14:16 - US-001
+- Created platform/shared/src/runtime.ts — dual-runtime compatibility layer with: isBun, readFile, readJsonFile, writeFile, fileExists, deleteFile, spawnProcess, spawnProcessSync, getEnv, getArgv, sha256
+- Updated platform/shared/src/cross-platform.ts — atomicWrite uses runtime.writeFile instead of Bun.write; platformExec comment updated for multi-runtime; added 'node' Windows resolution
+- Updated platform/shared/src/constants.ts — getConfigDir uses runtime.getEnv instead of Bun.env
+- Updated platform/shared/src/index.ts — exports all runtime symbols (isBun, readFile, readJsonFile, writeFile, fileExists, deleteFile, spawnProcess, spawnProcessSync, getEnv, getArgv, sha256, SpawnResult, SpawnOptions)
+- Fixed pre-existing duplicate property in e2e/fixtures.ts (OPENTABS_SKIP_NPM_DISCOVERY was duplicated)
+- Files changed: platform/shared/src/runtime.ts (NEW), platform/shared/src/cross-platform.ts, platform/shared/src/constants.ts, platform/shared/src/index.ts, e2e/fixtures.ts
+- **Learnings for future iterations:**
+  - ESLint import-x/order: local imports (./runtime.js) must come before node: imports
+  - The tsconfig.json `include: ["src"]` covers all .ts files in src/ — no manual addition needed
+  - `Bun.CryptoHasher.digest('hex')` return type is already `string` in bun-types — no cast needed
+  - `nodeSpawnSync` with stdio 'pipe' returns non-null Buffer for stdout/stderr
+---
+
+## 2026-02-24 14:30 - US-002
+- Migrated all Bun-specific API calls in platform/mcp-server production code to use @opentabs-dev/shared runtime layer
+- Bun.file().text()/json()/exists()/delete() → readFile/readJsonFile/fileExists/deleteFile (loader.ts, config.ts, file-watcher.ts, resolver.ts, plugin-management.ts, adapter-files.ts)
+- Bun.env → getEnv() (index.ts, dev-mode.ts, skip-npm-discovery.ts, logger.ts, resolver.ts)
+- Bun.argv → getArgv() (dev-mode.ts)
+- Bun.resolveSync → require.resolve via createRequire(import.meta.url) (resolver.ts)
+- Bun.spawnSync → spawnProcessSync (resolver.ts)
+- Bun.spawn → spawnProcess (plugin-management.ts)
+- Updated resolver.test.ts to use real node_modules structures instead of Bun.resolveSync mocks
+- Updated error messages: 'bun install && bun run build' → 'npm install && npm run build', 'PORT=<number> bun dev' → 'PORT=<number> opentabs start'
+- Updated comments: 'bun --hot' references generalized where appropriate
+- Files changed: loader.ts, config.ts, file-watcher.ts, resolver.ts, plugin-management.ts, adapter-files.ts, index.ts, dev-mode.ts, skip-npm-discovery.ts, logger.ts, resolver.test.ts
+- **Learnings for future iterations:**
+  - require.resolve with `{ paths: [process.cwd()] }` is the cross-runtime replacement for Bun.resolveSync
+  - On macOS, require.resolve may or may not resolve /var → /private/var symlinks depending on package scope — always use realpathSync for path comparisons in tests
+  - file-watcher.ts has its own local `fileExists` wrapper — renamed import to `runtimeFileExists` to avoid naming collision
+  - ESLint import-x/order: node:fs/promises must come before node:module alphabetically
+  - process.cwd must be bound when stored in a variable: `process.cwd.bind(process)` to satisfy @typescript-eslint/unbound-method
+---
+
+## 2026-02-24 14:50 - US-003
+- Created platform/mcp-server/src/server-node.ts — Node.js HTTP+WebSocket server adapter using node:http + ws
+- Refactored platform/mcp-server/src/index.ts — dual-runtime server creation: createBunServer() under Bun, createNodeServer() under Node.js
+- Renamed BunServer → ServerAdapter in platform/mcp-server/src/http-routes.ts and exported the type
+- Updated platform/mcp-server/src/http-routes.test.ts — renamed mockBunServer → mockServer, upgradingBunServer → upgradingServer
+- Added ws (^8.19.0) and @types/ws (^8.18.1) to platform/mcp-server/package.json
+- HotState.server type updated to accept either NodeServer or ReturnType<typeof Bun.serve>
+- Files changed: server-node.ts (NEW), index.ts, http-routes.ts, http-routes.test.ts, package.json, bun.lock
+- **Learnings for future iterations:**
+  - ws library 'headers' event on WebSocketServer allows injecting custom headers (e.g., Sec-WebSocket-Protocol) into the 101 upgrade response
+  - Node.js WebSocket upgrades happen via a separate 'upgrade' event on the HTTP server — use a mutable context pattern to bridge with the fetch handler's server.upgrade() call
+  - bun-types' RequestInit does not include `duplex` property — use `(init as Record<string, unknown>)['duplex'] = 'half'` for Node.js body-carrying requests
+  - Readable.fromWeb() requires `body as unknown as NodeReadableStream` double-cast because bun-types' ReadableStream and node:stream/web ReadableStream have incompatible generics
+  - ESLint @typescript-eslint/no-misused-promises: avoid async callbacks in createServer/event handlers — extract to a void-returning wrapper that calls `void run()` internally
+  - ESLint @typescript-eslint/consistent-type-imports forbids `import()` type annotations inline — use top-level `import type` instead
+  - ws RawData type is `Buffer | ArrayBuffer | Buffer[]` — handle each variant explicitly to satisfy @typescript-eslint/no-base-to-string
+---
+
+## 2026-02-24 15:00 - US-004
+- Migrated all Bun-specific API calls in platform/cli to use @opentabs-dev/shared runtime layer
+- cli.ts: shebang #!/usr/bin/env bun → #!/usr/bin/env node, Bun.file → readFile
+- commands/start.ts: Bun.file().exists() → runtimeFileExists, Bun.spawn → spawnStreaming, platformExec('bun') → platformExec('node'), error message 'bun run build' → 'npm run build'
+- commands/plugin.ts: Bun.file → readFile, Bun.spawn → spawnInherit/spawnProcess (npm subcommands)
+- commands/update.ts: Bun.file → readFile, Bun.spawnSync → spawnProcessSync, 'bun install -g' → 'npm install -g'
+- commands/config.ts: Bun.file → runtimeFileExists/runtimeDeleteFile
+- commands/doctor.ts: Bun.version → isBun check (shows Bun or Node.js version), Bun.file → runtimeFileExists/readFile/readJsonFile
+- commands/audit.ts: Bun.file → runtimeFileExists/getFileSize/readFile
+- commands/logs.ts: Bun.file().size/slice → getFileSize/readFileSlice
+- commands/setup.ts: Bun.file → runtimeFileExists/readFile, Bun.write → runtimeWriteFile
+- config.ts: Bun.file → runtimeFileExists/readFile
+- parse-port.ts: Bun.env → getEnv
+- scaffold.ts: Bun.file → readJsonFile, Bun.write → runtimeWriteFile, README/console output bun→npm, .gitignore adds package-lock.json
+- doctor.test.ts: updated test to expect 'Runtime' label instead of 'Bun runtime'
+- Added to runtime layer: spawnStreaming, spawnInherit, getFileSize, readFileSlice
+- Files changed: 15 files (all platform/cli/src/ + platform/shared/src/runtime.ts + platform/shared/src/index.ts)
+- **Learnings for future iterations:**
+  - Readable.toWeb() returns ReadableStream<any> which doesn't directly cast to ReadableStream<Uint8Array> — use `as unknown as ReadableStream<Uint8Array>` double cast
+  - When adding runtime imports to existing files, long import lines trigger prettier/prettier formatting errors — run lint:fix after edits
+  - spawnInherit is a cleaner pattern for pass-through stdio (npm install/uninstall) — returns Promise<number> directly instead of wrapping a proc object
+  - The doctor check renamed from 'Bun runtime' to 'Runtime' shows both Bun and Node.js versions — update test expectations when changing labels
+---
+
+## 2026-02-24 15:06 - US-005
+- Migrated platform/plugin-tools to use esbuild instead of Bun.build for IIFE bundling
+- Added esbuild (^0.24.0) as a dependency to platform/plugin-tools/package.json
+- cli.ts: shebang #!/usr/bin/env bun → #!/usr/bin/env node, Bun.file → readFile from @opentabs-dev/shared
+- commands/build.ts: Replaced all Bun.file/Bun.write/Bun.env/Bun.spawnSync/Bun.CryptoHasher with runtime equivalents from @opentabs-dev/shared (readFile, writeFile, fileExists, deleteFile, getEnv, sha256, spawnProcessSync, getFileSize)
+- commands/build.ts: Replaced Bun.build() IIFE bundling with esbuild's build() — using outfile (not outdir) for precise output naming, sourcemap: 'linked' (equivalent to Bun.build's 'external'), external: ['node:*'] to handle Node.js builtins from @opentabs-dev/shared
+- commands/inspect.ts: Replaced Bun.file with fileExists/readFile from @opentabs-dev/shared
+- commands/build-e2e.test.ts: Updated IIFE format assertion — esbuild prefixes output with "use strict"; so the check changed from startsWith('(') to contains('(() => {')
+- Files changed: package.json, bun.lock, cli.ts, commands/build.ts, commands/inspect.ts, commands/build-e2e.test.ts
+- **Learnings for future iterations:**
+  - esbuild with platform: 'browser' errors on node:* imports from bundled dependencies — use external: ['node:*'] to skip resolution of Node.js builtins that are behind runtime detection
+  - esbuild IIFE format prefixes output with "use strict"; unlike Bun.build which starts directly with '(' — tests checking IIFE format should use contains('(() => {') instead of startsWith('(')
+  - esbuild's outfile option gives precise control over output filename (vs outdir which derives names from entry points)
+  - esbuild sourcemap: 'linked' is equivalent to Bun.build's sourcemap: 'external' (both generate .map file + add sourceMappingURL comment)
+  - Import aliasing: use `writeFile as runtimeWriteFile` when there are local variables with the same name to avoid collisions
+---
+
+## 2026-02-24 15:13 - US-006
+- Migrated platform/create-plugin to use runtime layer — small story, only one file
+- platform/create-plugin/src/index.ts: shebang #!/usr/bin/env bun → #!/usr/bin/env node, Bun.file().text() → readFile from @opentabs-dev/shared
+- platform/create-plugin/package.json: added @opentabs-dev/shared as dependency
+- platform/create-plugin/tsconfig.json: added project reference to ../shared
+- bun.lock: updated with new dependency
+- Files changed: platform/create-plugin/src/index.ts, platform/create-plugin/package.json, platform/create-plugin/tsconfig.json, bun.lock
+- **Learnings for future iterations:**
+  - When adding a new @opentabs-dev/* import to a package, remember to add both the dependency in package.json AND the project reference in tsconfig.json
+  - ESLint import-x/order: @opentabs-dev/cli comes before @opentabs-dev/shared alphabetically — always order scoped packages alphabetically
+  - tsc --build --noEmit can produce TS6310 errors when incremental build cache is stale — clean and rebuild fixes it
+---
+
+## 2026-02-24 15:20 - US-007
+- Updated root package.json: added `"node": ">= 20.0.0"` to engines alongside existing `"bun": ">= 1.3.9"`
+- Updated root package.json postinstall: `bun scripts/check-bun-version.ts` → `if command -v bun >/dev/null 2>&1; then bun scripts/check-bun-version.ts; fi` (skips when Bun not installed)
+- Updated scripts/check-bun-version.ts: added `typeof Bun === 'undefined'` guard at top — exits cleanly if accidentally invoked under Node.js
+- Updated platform/mcp-server/package.json: start script `bun dist/index.js` → `node dist/index.js`; dev script kept as `bun --hot dist/index.js --dev` (platform contributor only)
+- Verified bun-types kept in all devDependencies (needed for type-checking Bun API branches)
+- Files changed: package.json, platform/mcp-server/package.json, scripts/check-bun-version.ts
+- **Learnings for future iterations:**
+  - Postinstall hooks with `bun` commands fail for Node.js users — use shell conditional `if command -v bun` to guard
+  - The `if cmd; then action; fi` pattern in npm scripts exits 0 when cmd fails, unlike `cmd && action` which propagates exit codes
+  - mcp-server start script must use `node` for production (Node.js users), but dev script stays `bun --hot` (contributor-only)
+---
+
+## 2026-02-24 15:25 - US-008
+- Migrated platform/browser-extension build scripts from Bun.build to esbuild
+- build-extension.ts: Replaced Bun.build() with esbuild build(), using outfile + allowOverwrite to write directly to tsc output paths. Removed Bun.write (esbuild handles output directly).
+- build-side-panel.ts: Replaced Bun.file().delete() with node:fs/promises unlink(), replaced Bun.build() with esbuild build(). Added resolveExtensions to handle .mjs subpath imports (lucide-react/dynamic).
+- Updated build-side-panel.ts doc comment: "Uses esbuild" instead of "Uses Bun.build"
+- Updated package.json: added esbuild ^0.24.0 as devDependency, changed build:tailwind from bunx to npx
+- Updated CLAUDE.md: build script descriptions now say "esbuild" instead of "Bun.build"
+- Files changed: build-extension.ts, build-side-panel.ts, package.json, CLAUDE.md, bun.lock
+- **Learnings for future iterations:**
+  - esbuild with outfile + allowOverwrite: true can overwrite input files in-place (useful for post-tsc bundling where you overwrite tsc output)
+  - esbuild doesn't resolve .mjs subpath imports by default (e.g., lucide-react/dynamic → dynamic.mjs) — add .mjs to resolveExtensions
+  - esbuild errors are thrown as exceptions (unlike Bun.build which returns { success, logs }) — use try/catch for error handling
+  - Build scripts stay invoked via `bun run` since they're .ts files in the contributor workflow — esbuild migration makes the bundler portable, not the script runner
+---
+
+## 2026-02-24 15:30 - US-009
+- Updated all CLAUDE.md files to reflect dual-runtime (Node.js + Bun) support
+- Root CLAUDE.md: Runtime line changed to 'Node.js 20+ (production); Bun (development, testing)'; 'Bun-First Convention' section rewritten to 'Runtime Compatibility' describing three tiers (production code, build scripts, tests); added note after Commands section clarifying bun run is for contributors; Plugin Changes workflow updated to npm
+- platform/mcp-server/CLAUDE.md: Dev vs Production Mode section updated — production runs on Node.js with node:http + ws, dev mode runs under Bun with Bun.serve(); Hot Reload section scoped to dev-only
+- platform/cli/CLAUDE.md: Added note that CLI runs on Node.js 20+, installed via npm, Bun not required
+- platform/plugin-tools/CLAUDE.md: Added note about Node.js compatibility and esbuild usage
+- platform/browser-extension/CLAUDE.md: Already updated in US-008 (esbuild references) — verified, no changes needed
+- plugins/CLAUDE.md: Changed 'bun run build/check' to 'npm run build/check', 'bun install' to 'npm install'
+- e2e/CLAUDE.md: Added clarifying note that MCP server test fixture uses Bun for hot-reload testing
+- .ralph/CLAUDE.md: Kept as-is — ralph workers run in monorepo context where Bun is available
+- Files changed: CLAUDE.md, e2e/CLAUDE.md, platform/cli/CLAUDE.md, platform/mcp-server/CLAUDE.md, platform/plugin-tools/CLAUDE.md, plugins/CLAUDE.md
+- **Learnings for future iterations:**
+  - CLAUDE.md-only stories pass all quality checks trivially since no source code changes — fast turnaround
+  - The browser-extension CLAUDE.md was already updated in US-008 — always check recent commits before making redundant changes
+  - .ralph/CLAUDE.md stays Bun-centric since ralph is contributor-only infrastructure
+---
+
+## 2026-02-24 15:31 - US-010
+- Updated root README.md: "Building a Plugin" section changed Bun requirement to Node.js 20+, bun install/build → npm install/build; "Contributing" section added Node.js requirement alongside Bun; contributor commands kept as bun
+- Updated plugins/README.md: Plugin dev commands changed bun → npm (install, build, type-check, lint, format:check, check); bunx → npx for create-opentabs-plugin; root-level monorepo commands kept as bun
+- Files changed: README.md, plugins/README.md
+- **Learnings for future iterations:**
+  - README-only stories pass all quality checks trivially since no source code changes
+  - Contributor-facing commands in README (clone, build monorepo) stay as bun; user/plugin-dev-facing commands use npm/npx
+  - The command table in root README is in the Contributing section so it correctly stays as bun commands
+---
+
+## 2026-02-24 15:45 - US-011
+- Updated user-facing documentation (docs/) to reflect Node.js-first approach
+- docs/content/docs/install/index.mdx: Removed Bun requirement for plugin devs, changed bun→npm commands, updated Node.js version to 20+, contributors section now lists both Bun and Node.js
+- docs/content/docs/first-plugin.mdx: Node.js prereq replaces Bun, npm install/build commands
+- docs/content/docs/guides/plugin-development.mdx: npx create-opentabs-plugin, npm install/build/dev commands
+- docs/content/docs/reference/cli.mdx: Doctor check says "Runtime" (not "Bun runtime"), npx for create-plugin
+- docs/content/docs/reference/troubleshooting.mdx: "checks runtime" not "checks Bun", npm commands for plugin deps
+- docs/content/docs/reference/configuration.mdx: Dev mode section labeled "contributors only" with explanatory note
+- docs/content/docs/guides/logging-debugging.mdx: Doctor output shows Node.js runtime, npm run build hint
+- docs/content/docs/contributing/architecture.mdx: Dual-runtime server description (Bun.serve in dev, node:http+ws in production)
+- docs/content/docs/contributing/dev-setup.mdx: Node.js 20+ requirement (up from 18+)
+- docs/components/ComponentInstall.tsx: Reordered tabs so npm is the default (first tab), followed by pnpm, yarn, bun
+- docs/components/illustrations.tsx: Plugin dev install path shows "Node.js 20+" instead of "Bun runtime"; FirstPluginFlow shows "npm run build"
+- Contributor-only docs (dev-setup, publishing) kept Bun references as-is — correct for contributor context
+- Files changed: 11 files across docs/
+- **Learnings for future iterations:**
+  - docs/ is a standalone Next.js project — needs its own `bun install` before checks work (not part of root bun workspaces)
+  - ComponentInstall.tsx tab order determines default selection — first Tab in TabList is the default
+  - illustrations.tsx SVG text labels are plain text inside <text> elements — simple string replacement
+  - Contributor-only docs should keep Bun references; only user/plugin-dev-facing docs switch to npm/Node.js
+---
+
+## 2026-02-24 15:50 - US-012
+- Final cleanup sweep: replaced remaining Bun API calls with runtime-compatible equivalents
+- extension-install.ts: Bun.file/Bun.write → fileExists/readFile/writeFile from @opentabs-dev/shared
+- version.ts: Bun.file().json() → readJsonFile
+- sdk-version.ts: Bun.file().json() → readJsonFile
+- skip-confirmation.ts: Bun.argv/Bun.env → getArgv/getEnv
+- resolver.ts: bun global path discovery now wrapped in `if (isBun)` guard — Node.js users only scan npm global paths
+- doctor.ts: renamed checkBunVersion → checkRuntime (function and comment)
+- doctor.test.ts: updated import and test describe block to use checkRuntime
+- file-watcher.ts: updated comments from 'bun run build' → 'npm run build' (plugin developer context)
+- reload.ts: updated comment from 'Bun.write' → 'writeFile'
+- All Phase 1 checks pass (build, type-check, lint, knip, test: 2055 pass 0 fail)
+- Phase 2 E2E tests pass (356 passed, 1 flaky — passed on retry)
+- Files changed: 9 files (extension-install.ts, version.ts, sdk-version.ts, skip-confirmation.ts, resolver.ts, reload.ts, file-watcher.ts, doctor.ts, doctor.test.ts)
+- **Learnings for future iterations:**
+  - Several files in mcp-server (extension-install.ts, version.ts, sdk-version.ts, skip-confirmation.ts) were missed by the US-002 migration — always do a comprehensive `Bun.` API grep when migrating a package
+  - The bun global path discovery in resolver.ts should only run when Bun is available — Node.js users install plugins via npm, so spawning `bun pm -g bin` is unnecessary and may fail
+  - Function renames (checkBunVersion → checkRuntime) require updating both the source and test files' imports and describe blocks
+---

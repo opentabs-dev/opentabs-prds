@@ -1,0 +1,61 @@
+# Ralph Progress Log
+PRD: prd-2026-02-27-204234-cli-audit-fixes~running.json
+Started: Sat Feb 28 04:43:00 UTC 2026
+---
+## Codebase Patterns
+- CLI source is in platform/cli/src/commands/; tests are co-located as *.test.ts
+- node:path's isAbsolute() is platform-native (Windows paths only recognized on Windows)
+- Pre-commit hook runs prettier + eslint --fix on staged files automatically
+- `import-x/exports-last` rule: do NOT use `export const foo`; use `const foo` and add to the `export { ... }` at end of file
+- `import-x/order` with `newlines-between: 'never'`: no blank lines between any import groups; `import type` declarations come after value imports (type group is last in groups array)
+- `import-x/first` rule: ALL imports must precede any non-import statements (including vi.mock calls); use Vitest's automatic hoisting of vi.mock
+
+## 2026-02-28 - US-001
+- Fixed resolveStoredPluginPath in platform/cli/src/commands/config.ts
+- Changed `startsWith('/')` to `isAbsolute()` from node:path for cross-platform absolute path detection
+- Reordered: check `~/` prefix before `isAbsolute()` since tilde paths are not recognized as absolute
+- Added `isAbsolute` to the node:path import
+- Added platform-conditional test (test.runIf(process.platform === 'win32')) for Windows drive-letter paths in config.test.ts
+- **Learnings for future iterations:**
+  - node:path's `isAbsolute` is platform-specific — `isAbsolute('C:\\foo')` returns false on Linux
+  - The Windows test is correctly skipped on Linux (shows as 1 skipped in test output)
+  - Pre-commit hook auto-formats and lints staged files; no need to run manually before commit
+---
+
+## 2026-02-28 - US-002
+- Fixed isPortInUse in platform/cli/src/commands/start.ts
+- Replaced fetch-based HTTP check with net.createServer() TCP check
+- Added `import net from 'node:net'` (placed after node:fs/promises to satisfy import-x/order lint rule)
+- The handleStart error message logic was already port-number-based (port === 9515), not /health-response-based, so no other changes needed
+- **Learnings for future iterations:**
+  - ESLint import-x/order rule requires node: imports in alphabetical order; `node:net` sorts after `node:fs/promises` but before `node:path`
+  - start.ts has no test file; isPortInUse is unexported so unit testing requires exporting or integration testing
+---
+
+## 2026-02-28 - US-003
+- Fixed scaffoldPlugin in platform/cli/src/scaffold.ts to clean up partial directory on file write failure
+- Added `rmSync` to the `node:fs` import
+- Wrapped the mkdirSync + writeFile block in a try-catch; catch calls `rmSync(projectDir, { recursive: true, force: true })` then re-throws
+- Added unit test in platform/cli/src/scaffold.test.ts using `vi.mock('node:fs/promises')` to control writeFile failures
+- Used `import type * as FsPromises from 'node:fs/promises'` for the generic type parameter in vi.mock factory (avoids `@typescript-eslint/consistent-type-imports` error from inline `typeof import()`)
+- **Learnings for future iterations:**
+  - To mock a Node built-in in Vitest: `vi.mock('node:fs/promises', async importOriginal => { const actual = await importOriginal<typeof FsPromises>(); return { ...actual, method: vi.fn(actual.method) }; })` where `FsPromises` is `import type * as FsPromises`
+  - `vi.fn(actual.writeFile)` creates a spy that passes through to the real impl by default; `mockRejectedValueOnce` overrides just one call
+  - `vi.clearAllMocks()` in afterEach resets call history but preserves default implementations (use `vi.resetAllMocks()` to clear implementations too)
+  - The `import-x/order` rule places `import type` declarations AFTER value imports from the same module group when auto-fixed
+---
+
+## 2026-02-28 - US-004
+- Fixed followFile in platform/cli/src/commands/logs.ts with two bug fixes
+- Bug 1 (content gap): Added `readNewContent()` call immediately after `watch()` setup to catch content written between tailFile and watcher registration
+- Bug 2 (error recovery): In `stream.on('error')` handler, added retry logic: `if (readRequested) { readRequested = false; setTimeout(readNewContent, 100); }`
+- Changed `export const followFile` to `const followFile` + added to `export { followFile, registerLogsCommand }` at end (import-x/exports-last rule)
+- Created platform/cli/src/commands/logs.test.ts with two unit tests verifying the fixes
+- Mocked `node:fs` (statSync, createReadStream, watch) in Vitest using the `importOriginal` pattern
+- Used `(firstStream as EventEmitter).emit(...)` instead of non-null assertion `firstStream!.emit(...)` to satisfy `@typescript-eslint/no-non-null-assertion` after an `expect(firstStream).toBeDefined()` check
+- **Learnings for future iterations:**
+  - `import-x/exports-last` means inline `export const foo` in the middle of a file is an error; always use end-of-file `export { ... }`
+  - When mocking `node:fs`, use `import { statSync, ... } from 'node:fs'` BEFORE `vi.mock(...)` (Vitest hoists vi.mock automatically; ESLint import-x/first requires all imports before any non-import code)
+  - For `no-non-null-assertion`: combine `expect(value).toBeDefined()` + `(value as Type).method()` instead of `value!.method()`
+  - Prettier `printWidth: 120` — single-line expressions up to 120 chars are preferred over multi-line wrapping
+---

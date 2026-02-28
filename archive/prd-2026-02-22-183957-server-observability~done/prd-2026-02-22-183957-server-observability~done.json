@@ -1,0 +1,89 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add logging to silent failure paths in plugin discovery, version checking, and resource/prompt validation so that users and plugin developers can diagnose issues instead of encountering silent no-ops.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add logging to silent catch blocks in resolver.ts npm discovery",
+      "description": "As a user who installed a plugin globally, I want to see a warning when npm path resolution fails so that I can understand why my plugin is not being discovered.",
+      "acceptanceCriteria": [
+        "The catch block at platform/mcp-server/src/resolver.ts line 148 (npm root -g failure) logs a log.debug message including the error",
+        "The catch block at platform/mcp-server/src/resolver.ts line 163 (bun pm -g bin failure) logs a log.debug message including the error",
+        "The catch block at platform/mcp-server/src/resolver.ts line 195 (unreadable global directory) logs a log.debug message with the directory path",
+        "The catch block at platform/mcp-server/src/resolver.ts line 230 (unreadable scope directory) logs a log.debug message with the directory path",
+        "When BOTH npm and bun path resolution fail, the existing log.info at line 256 is upgraded to log.warn so it appears more prominently",
+        "The hasOpentabsField catch block at line 179 logs a log.debug message with the package path and error",
+        "All new log messages include enough context (paths, error messages) to diagnose the issue",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/resolver.ts. There are 5 silent catch blocks that swallow errors with no logging. The fix is to add log.debug() calls in each catch block. Use debug level (not warn) for individual directory read failures since they can be noisy in environments with many global modules. But upgrade the summary message at line 256 from log.info to log.warn when BOTH npm and bun discovery fail — this is the most actionable signal for users.\n\nLine 148: `} catch { }` → `} catch (e) { log.debug('npm root -g failed:', e instanceof Error ? e.message : String(e)); }`\nLine 163: `} catch { }` → `} catch (e) { log.debug('bun pm -g bin failed:', e instanceof Error ? e.message : String(e)); }`\nLine 179: `} catch { return false; }` → `} catch (e) { log.debug('Failed to read package.json at', pkgPath, e instanceof Error ? e.message : String(e)); return false; }`\nLine 195: `} catch { return found; }` → `} catch (e) { log.debug('Could not read global node_modules directory:', dir, e instanceof Error ? e.message : String(e)); return found; }`\nLine 230: `} catch (() => {})` → `.catch((e) => { log.debug('Could not read scoped directory:', scopeDir, e instanceof Error ? e.message : String(e)); })`\n\nImport log from the server's logging module (check existing imports in the file for the pattern — it likely uses a local log variable or imports from a shared logger)."
+    },
+    {
+      "id": "US-002",
+      "title": "Log warnings when version check fails to reach npm registry",
+      "description": "As a user, I want to know when update checking failed so that I can distinguish 'all plugins are up to date' from 'could not check for updates'.",
+      "acceptanceCriteria": [
+        "fetchLatestVersion in platform/mcp-server/src/version-check.ts logs a log.debug message when an HTTP error (non-200) is returned from the npm registry, including the status code and package name",
+        "fetchLatestVersion logs a log.debug message when a network error or timeout occurs, including the error message and package name",
+        "checkForUpdates counts how many plugins had unreachable registries vs how many were successfully checked",
+        "When some plugins could not be checked, the summary log says something like 'Checked N of M npm plugins for updates (K unreachable)' instead of the misleading 'All npm plugins are up to date'",
+        "When ALL plugins are unreachable, the log is a log.warn: 'Could not check for plugin updates — npm registry unreachable'",
+        "The outdatedPlugins state on the /health endpoint is unchanged (only actually-outdated plugins are listed)",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "File: platform/mcp-server/src/version-check.ts.\n\nfetchLatestVersion (lines 26-46): Change the silent `return null` on HTTP errors and exceptions to log.debug with context. Add a second return value or use a discriminated union to distinguish 'checked and up to date' from 'could not check'. The simplest approach: have fetchLatestVersion return `{ latest: string } | { error: string } | null` instead of `string | null`. Or alternatively, keep the function returning `string | null` but add a separate counter.\n\ncheckForUpdates (lines 87-133): Track two counters: `checkedCount` (where fetchLatestVersion returned non-null) and `unreachableCount` (where it returned null). Adjust the summary log at lines 126-132:\n- If unreachableCount > 0 && outdated.length === 0: `log.info('Checked ${checkedCount} of ${total} npm plugins for updates (${unreachableCount} unreachable)')`\n- If unreachableCount === total: `log.warn('Could not check for plugin updates — npm registry unreachable')`\n- If unreachableCount === 0 && outdated.length === 0: keep existing 'All npm plugins are up to date'\n\nAlso handle Promise.allSettled rejected results at line 119 — currently silently ignored. Add unreachableCount++ for rejected results."
+    },
+    {
+      "id": "US-003",
+      "title": "Surface resource and prompt validation warnings during plugin build",
+      "description": "As a plugin developer, I want to see build-time warnings when my resource or prompt definitions are malformed so that I don't deploy a plugin with silently missing capabilities.",
+      "acceptanceCriteria": [
+        "The opentabs-plugin build command in platform/plugin-tools/src/commands/build.ts validates resources and prompts from the plugin instance BEFORE writing tools.json",
+        "For each resource definition, the build validates: uri is a non-empty string, name is a non-empty string, description is a string (if present), mimeType is a string (if present)",
+        "For each prompt definition, the build validates: name is a non-empty snake_case string (matching tool name pattern), description is a string (if present), render is a function",
+        "If any resource or prompt has validation issues, the build prints a yellow warning message listing the issues (NOT a fatal error — the build still succeeds)",
+        "The warning message format is consistent with the existing tool validation messages (e.g., 'Warning: Resource \"foo\" has invalid uri: must be a non-empty string')",
+        "The server-side soft-failure in loader.ts validateResources/validatePrompts is unchanged — it remains a safety net, not the primary validation point",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, around lines 810-830 where tools.json is generated.\n\nThe key insight is that the server-side validation in loader.ts (lines 172-280) should remain as a safety net, but the PRIMARY validation point should be at build time. Currently, the build validates tools extensively (validatePlugin, lines 153-260) but resources and prompts are passed through without any build-time checks — they're just serialized directly into tools.json from the plugin instance.\n\nAdd a new function `validateResourcesAndPrompts(plugin: OpenTabsPlugin, projectDir: string)` that runs after `validatePlugin` (around line 754). For resources, check each entry has a non-empty string `uri` and `name`. For prompts, check each entry has a non-empty `name` matching the snake_case pattern (reuse the existing tool name regex from line 194), a `render` function, and optional string `description`. Print warnings (not errors) using the existing picocolors import for yellow text.\n\nDo NOT make this a hard failure — that would break existing plugins that happen to have slightly non-conforming resource/prompt definitions. Just warn."
+    },
+    {
+      "id": "US-004",
+      "title": "Add build-time count summary for resources and prompts",
+      "description": "As a plugin developer, I want the build output to show how many resources and prompts were included so that I can verify my definitions were picked up.",
+      "acceptanceCriteria": [
+        "The build success message in platform/plugin-tools/src/commands/build.ts includes resource and prompt counts alongside the existing tool count",
+        "The format is something like: 'Built slack v1.0.0 — 5 tools, 2 resources, 1 prompt' (only showing non-zero counts)",
+        "When resources and prompts are 0, only tools are shown: 'Built slack v1.0.0 — 5 tools' (existing behavior preserved)",
+        "The opentabs-plugin inspect command in platform/plugin-tools/src/commands/inspect.ts also shows counts in its summary output",
+        "bun run build passes",
+        "bun run type-check passes",
+        "bun run lint passes",
+        "bun run knip passes",
+        "bun run test passes"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "File 1: platform/plugin-tools/src/commands/build.ts — find the success message (search for the log.success or console.log line that prints after a successful build). It currently shows tool count. Add resource and prompt counts from the manifest data.\n\nFile 2: platform/plugin-tools/src/commands/inspect.ts — find the summary output section. Add counts for resources and prompts.\n\nThe manifest data is already available since tools.json includes resources and prompts arrays. Read them from the same manifest object used for tool counting. Only show the count labels for non-zero values to keep the output clean."
+    }
+  ]
+}
