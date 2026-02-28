@@ -1,0 +1,30 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix `opentabs status --json` to output valid JSON when the server is not running. Currently it outputs plain text error messages, breaking any script or automation that parses the JSON output. `opentabs plugin list --json` already handles offline mode correctly (returns JSON with `serverRunning: false`), so `status --json` is inconsistent.\n\nLOW issues (not worth separate stories):\n- `audit --file` with no audit.log says \"No audit log file found\" but doesn't mention this is expected on fresh installs\n- `browser-tool.` with no value says \"Missing value\" instead of listing available browser tool names (like `tool.` does for plugin tools)",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Return JSON from `opentabs status --json` when server is unreachable",
+      "description": "As a user scripting against the CLI, I want `opentabs status --json` to always return valid JSON so that my scripts can reliably parse the output regardless of server state.",
+      "acceptanceCriteria": [
+        "`opentabs status --json` with server not running outputs a JSON object to stdout with at least `{\"status\":\"not_running\"}` and exits with code 1",
+        "`opentabs status --json` with server returning 401 outputs a JSON object to stdout with error details and exits with code 1",
+        "`opentabs status --json` with server timeout outputs a JSON object to stdout with error details and exits with code 1",
+        "`opentabs status --json` with non-OpenTabs service on the port outputs a JSON object to stdout with error details and exits with code 1",
+        "All error JSON objects include a `status` field (e.g., `not_running`, `auth_failed`, `timeout`, `error`) and an `error` field with a human-readable message",
+        "Non-JSON mode (`opentabs status` without `--json`) continues to output the existing human-readable error messages to stderr unchanged",
+        "Existing unit tests for status command continue to pass, and new tests cover the JSON error paths",
+        "`npm run build` passes",
+        "`npm run type-check` passes",
+        "`npm run lint` passes",
+        "`npm run knip` passes",
+        "`npm run test` passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in `platform/cli/src/commands/status.ts`, in the `handleStatus` function.\n\nThe catch block (lines 200-218) and the early-exit error paths (lines 82-109) need to check `options.json` before outputting. When `options.json` is true, output JSON to stdout instead of plain text to stderr.\n\nThe `options` parameter of type `StatusOptions` already has the `json?: boolean` field — it just needs to be threaded through to the error paths.\n\nPattern to follow: output error JSON to `console.log` (stdout) so it can be piped/parsed, then `process.exit(1)`. Example:\n```typescript\nif (options.json) {\n  console.log(JSON.stringify({ status: 'not_running', error: 'Server not running' }));\n  process.exit(1);\n}\n```\n\nError conditions to handle:\n1. Connection refused (isConnectionRefused) → `not_running`\n2. Timeout (isTimeout) → `timeout`\n3. 401 Unauthorized → `auth_failed`\n4. Non-OpenTabs HTTP error (isNonOpenTabsHttpError) → `not_found`\n5. Non-2xx HTTP response → `error`\n6. Invalid JSON response → `invalid_response`\n7. Missing `status` field in response → `not_found`\n8. Generic errors → `error`\n\nTest file: `platform/cli/src/commands/status.test.ts` — add tests for each JSON error path."
+    }
+  ]
+}
