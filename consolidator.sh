@@ -162,6 +162,30 @@ trap cleanup EXIT
 
 # --- Helper Functions ---
 
+# Short model label for log tags: "claude-opus" → "opus", "claude-sonnet" → "sonnet"
+_model_label() {
+  local m="$1"
+  # Strip common prefixes to get a short label
+  m="${m##*-}"    # claude-opus-4-20250514 → 20250514? No — take last meaningful segment
+  case "$1" in
+    *opus*)   echo "opus" ;;
+    *sonnet*) echo "sonnet" ;;
+    *haiku*)  echo "haiku" ;;
+    *)        echo "$1" ;;
+  esac
+}
+
+MODEL_LABEL=$(_model_label "$CONSOLIDATOR_MODEL")
+
+# Extract short objective from branch name.
+# ralph-2026-02-17-143000-improve-sdk → improve-sdk
+_branch_objective() {
+  local name="${1#origin/}"
+  name="${name#ralph-}"
+  # Strip timestamp prefix (YYYY-MM-DD-HHMMSS-)
+  echo "${name:18}"
+}
+
 # Find all remote ralph-* branches, sorted by committer date (oldest first).
 # This ensures branches are merged in the order they were completed.
 find_ralph_branches() {
@@ -178,23 +202,26 @@ find_ralph_branches() {
 merge_branch() {
   local remote_branch="$1"
   local branch_name="${remote_branch#origin/}"
+  local objective
+  objective=$(_branch_objective "$branch_name")
+  local tag="M:${objective:0:20}:${MODEL_LABEL}"
 
   # Count commits to merge
   local commit_count
   commit_count=$(git -C "$CODE_DIR" rev-list --count "HEAD..$remote_branch" 2>/dev/null || echo "0")
 
   if [ "$commit_count" -eq 0 ]; then
-    echo -e "$(ts) ${DIM}  $branch_name: no commits to merge. Deleting remote branch.${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}No commits to merge. Deleting remote branch.${RESET}"
     if [ "$DRY_RUN" = false ]; then
       git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
     fi
     return 0
   fi
 
-  echo -e "$(ts) ${CYAN}  $branch_name${RESET}: $commit_count commit(s)"
+  echo -e "$(ts) ${CYAN}[${tag}]${RESET} Merging $branch_name ($commit_count commits)"
 
   if [ "$DRY_RUN" = true ]; then
-    echo -e "$(ts) ${DIM}  [dry-run] Would merge $branch_name${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}[dry-run] Would merge $branch_name${RESET}"
     return 0
   fi
 
@@ -203,27 +230,27 @@ merge_branch() {
   # commit (e.g., after a repo re-init). Safe because content is the same codebase.
   local merge_output
   if merge_output=$(git -C "$CODE_DIR" merge --no-edit --allow-unrelated-histories "$remote_branch" 2>&1); then
-    echo -e "$(ts) ${GREEN}  Merged successfully.${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Merged successfully.${RESET}"
 
     # Push main to remote — retry before giving up (preserves merge work)
     local push_ok=false
     for push_attempt in 1 2 3; do
       if git -C "$CODE_DIR" push origin main --quiet 2>/dev/null; then
-        echo -e "$(ts) ${GREEN}  Pushed main.${RESET}"
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main.${RESET}"
         push_ok=true
         break
       fi
-      echo -e "$(ts) ${YELLOW}  Push attempt $push_attempt failed. Retrying...${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push attempt $push_attempt failed. Retrying...${RESET}"
       sleep 1
     done
 
     if [ "$push_ok" = true ]; then
       # Delete the remote branch (it's merged)
       git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
-      echo -e "$(ts) ${DIM}  Deleted remote branch: $branch_name${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
       return 0
     else
-      echo -e "$(ts) ${YELLOW}  Push failed after 3 attempts. Resetting to remote.${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed after 3 attempts. Resetting to remote.${RESET}"
       git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
       git -C "$CODE_DIR" reset --hard origin/main --quiet
       return 1
@@ -243,17 +270,17 @@ merge_branch() {
       conflict_count=$(echo "$conflicted_files" | wc -l | tr -d ' ')
     fi
 
-    echo -e "$(ts) ${YELLOW}  MERGE CONFLICT: $branch_name ($conflict_count file(s))${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}MERGE CONFLICT ($conflict_count file(s))${RESET}"
     if [ -n "$conflicted_files" ]; then
-      echo -e "$(ts) ${YELLOW}  Conflicted: $(echo "$conflicted_files" | tr '\n' ' ')${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Conflicted: $(echo "$conflicted_files" | tr '\n' ' ')${RESET}"
     fi
-    echo -e "$(ts) ${DIM}  Merge output: $(echo "$merge_output" | head -5)${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Merge output: $(echo "$merge_output" | head -5)${RESET}"
 
     # If no conflicted files detected, the merge failed for a non-content reason
     # (e.g., tree conflict, permission issue). Abort and write breadcrumb.
     if [ "$conflict_count" -eq 0 ]; then
-      echo -e "$(ts) ${RED}  No conflicted files detected — merge failed for a non-content reason.${RESET}"
-      echo -e "$(ts) ${RED}  Aborting merge. Branch preserved for manual resolution.${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}No conflicted files — merge failed for a non-content reason.${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Aborting merge. Branch preserved for manual resolution.${RESET}"
       git -C "$CODE_DIR" merge --abort 2>/dev/null || git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
 
       local breadcrumb="$CONFLICTS_DIR/${branch_name}.merge-conflict.txt"
@@ -276,11 +303,11 @@ merge_branch() {
         echo "  # Fix issues, then: git add . && git commit && git push origin main"
         echo "  git push origin --delete $branch_name"
       } > "$breadcrumb"
-      echo -e "$(ts) ${YELLOW}  Wrote: $breadcrumb${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Wrote: $breadcrumb${RESET}"
       return 1
     fi
 
-    echo -e "$(ts) ${CYAN}  Invoking AI to resolve...${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} Invoking AI to resolve..."
 
     # Build context for AI: branch commits, conflicted file contents, PRD description
     local branch_log
@@ -334,7 +361,7 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
 
     # Check that claude CLI is available before attempting AI resolution
     if [ -z "$CLAUDE_BIN" ]; then
-      echo -e "$(ts) ${RED}  Skipping AI resolution: 'claude' CLI not found in PATH.${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Skipping AI resolution: 'claude' CLI not found.${RESET}"
       ai_exit=127
     else
       # Run with timeout to prevent indefinite hangs.
@@ -353,15 +380,49 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
         ) 2>"$5" | tee "$4"
       ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" \
         2>&1 | while IFS= read -r line; do
-          echo -e "$(ts) ${DIM}  [AI] $line${RESET}"
+          # Parse stream-json: extract text content and tool use, skip raw JSON noise
+          local msg=""
+          if echo "$line" | grep -q '"type":"tool_use"' 2>/dev/null; then
+            msg=$(echo "$line" | python3 -c "
+import sys,json
+try:
+  d=json.load(sys.stdin)
+  for c in d.get('message',{}).get('content',[]):
+    if c.get('type')=='tool_use':
+      name=c.get('name','')
+      inp=c.get('input',{})
+      if name in ('Edit','Write'):
+        print(f'Tool: {name} → {inp.get(\"filePath\",inp.get(\"file_path\",\"\"))[:80]}')
+      elif name=='Bash':
+        print(f'Tool: {name} → {inp.get(\"command\",\"\")[:80]}')
+      elif name=='Read':
+        print(f'Tool: {name} → {inp.get(\"filePath\",inp.get(\"file_path\",\"\"))[:80]}')
+      else:
+        print(f'Tool: {name}')
+except: pass" 2>/dev/null)
+          elif echo "$line" | grep -q '"type":"result"' 2>/dev/null; then
+            msg=$(echo "$line" | python3 -c "
+import sys,json
+try:
+  d=json.load(sys.stdin)
+  cost=d.get('total_cost_usd',0)
+  dur=d.get('duration_ms',0)
+  turns=d.get('num_turns',0)
+  status=d.get('subtype','')
+  print(f'Result: {status} ({turns} turns, {dur/1000:.1f}s, \${cost:.2f})')
+except: pass" 2>/dev/null)
+          fi
+          if [ -n "$msg" ]; then
+            echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}${msg}${RESET}"
+          fi
         done
       ai_exit=${PIPESTATUS[0]}
     fi
 
     if [ "$ai_exit" -eq 124 ]; then
-      echo -e "$(ts) ${RED}  AI timed out after 10 minutes.${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI timed out after 10 minutes.${RESET}"
     elif [ "$ai_exit" -ne 0 ]; then
-      echo -e "$(ts) ${RED}  AI invocation failed (exit $ai_exit).${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI invocation failed (exit $ai_exit).${RESET}"
     else
       # Check if there are still unresolved conflicts (files with conflict markers)
       local remaining_conflicts
@@ -380,21 +441,21 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
         if [ "$merge_in_progress" = "yes" ]; then
           # Merge still in progress — we need to commit
           if git -C "$CODE_DIR" commit --no-edit 2>/dev/null; then
-            echo -e "$(ts) ${GREEN}  AI resolved conflict successfully.${RESET}"
+            echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}AI resolved conflict successfully.${RESET}"
             ai_ok=true
           else
-            echo -e "$(ts) ${RED}  AI staged files but commit failed.${RESET}"
+            echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI staged files but commit failed.${RESET}"
           fi
         else
           # Claude already committed — check if HEAD advanced past the merge base
-          echo -e "$(ts) ${GREEN}  AI resolved conflict and committed.${RESET}"
+          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}AI resolved conflict and committed.${RESET}"
           ai_ok=true
         fi
       else
         if [ -n "$marker_files" ]; then
-          echo -e "$(ts) ${RED}  AI left conflict markers in: $(echo "$marker_files" | tr '\n' ' ')${RESET}"
+          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI left conflict markers in: $(echo "$marker_files" | tr '\n' ' ')${RESET}"
         else
-          echo -e "$(ts) ${RED}  AI left $remaining_conflicts unresolved conflicts.${RESET}"
+          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI left $remaining_conflicts unresolved conflicts.${RESET}"
         fi
       fi
     fi
@@ -406,20 +467,19 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
       local push_ok=false
       for push_attempt in 1 2 3; do
         if git -C "$CODE_DIR" push origin main --quiet 2>/dev/null; then
-          echo -e "$(ts) ${GREEN}  Pushed main (AI-resolved merge).${RESET}"
+          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI-resolved merge).${RESET}"
           push_ok=true
           break
         fi
-        echo -e "$(ts) ${YELLOW}  Push attempt $push_attempt failed. Retrying...${RESET}"
-        sleep 1
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push attempt $push_attempt failed. Retrying...${RESET}"
       done
 
       if [ "$push_ok" = true ]; then
         git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
-        echo -e "$(ts) ${DIM}  Deleted remote branch: $branch_name${RESET}"
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
         return 0
       else
-        echo -e "$(ts) ${YELLOW}  Push failed. Resetting to remote.${RESET}"
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed. Resetting to remote.${RESET}"
         git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
         git -C "$CODE_DIR" reset --hard origin/main --quiet
         return 1
@@ -427,7 +487,7 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
     fi
 
     # AI failed to resolve — clean up and fall back to breadcrumb file
-    echo -e "$(ts) ${YELLOW}  AI resolution failed. Writing breadcrumb for manual resolution.${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}AI resolution failed. Writing breadcrumb.${RESET}"
     git -C "$CODE_DIR" merge --abort 2>/dev/null || git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
 
     local breadcrumb="$CONFLICTS_DIR/${branch_name}.merge-conflict.txt"
@@ -461,8 +521,8 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
       echo "$merge_output"
     } > "$breadcrumb"
 
-    echo -e "$(ts) ${YELLOW}  Wrote conflict details to: $breadcrumb${RESET}"
-    echo -e "$(ts) ${YELLOW}  Branch preserved: origin/$branch_name${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Wrote: $breadcrumb${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Branch preserved: origin/$branch_name${RESET}"
     return 1
   fi
 }

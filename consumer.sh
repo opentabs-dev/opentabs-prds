@@ -1110,6 +1110,26 @@ dispatch_prd() {
 
   echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Claimed: $running_basename${RESET}"
 
+  # Extract primary model from PRD (first story's model field)
+  local prd_model=""
+  if [ -f "$QUEUE_DIR/$running_basename" ]; then
+    prd_model=$(python3 -c "
+import json,sys
+try:
+  d=json.load(open(sys.argv[1]))
+  stories=d.get('userStories',[])
+  if stories: print(stories[0].get('model',''))
+except: pass" "$QUEUE_DIR/$running_basename" 2>/dev/null)
+  fi
+  # Short label: opus, sonnet, etc.
+  case "$prd_model" in
+    *opus*)   prd_model="opus" ;;
+    *sonnet*) prd_model="sonnet" ;;
+    *haiku*)  prd_model="haiku" ;;
+    "")       prd_model="?" ;;
+  esac
+  tag="W${slot}:${objective:0:20}:${prd_model}"
+
   local branch_name="ralph-$slug"
   local worktree_dir="$WORKTREE_BASE/$slug"
 
