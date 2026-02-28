@@ -1,0 +1,61 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-104339-auth-resilience~running.json
+Started: Sat Feb 28 18:46:46 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Swapped `ensureAuthSecret()` and `autoInitialize()` call order in `handleStart()` so auth.json is written before extension files are copied
+- Files changed: `platform/cli/src/commands/start.ts` (lines 251-253)
+- **Learnings for future iterations:**
+  - `ensureAuthSecret()` is in `platform/cli/src/config.ts` — creates `~/.opentabs/extension/` and writes auth.json; safe to call before `autoInitialize()`
+  - `autoInitialize()` is defined locally in `start.ts` — copies extension files via cpSync; won't overwrite auth.json since it's not in the source package
+  - `secret` variable was already used downstream in `printFirstTimeInstructions()` — no signature changes needed
+  - The fix is a 2-line swap with no API changes required
+---
+
+## 2026-02-28 - US-003
+- Added `console.warn` logging in `bootstrapFromAuthFile()` for three failure cases: non-ok HTTP response, missing/invalid secret field, and fetch error
+- Added `authJsonWarned` flag to suppress repeated warnings on reconnect attempts; resets to false on successful read
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - The `authJsonWarned` flag is a module-level boolean that suppresses repeat warnings during exponential backoff reconnects — resets only on successful auth.json read
+  - All three failure paths use the `[opentabs:offscreen]` prefix matching the existing log convention in this file
+  - The catch block was changed from `catch {` (no binding) to `catch (e) {` to log the error — TypeScript and eslint accept this without issues
+
+---
+
+## 2026-02-28 - US-002
+- Added `await bootstrapFromAuthFile()` at the start of `connect()`, right after the guard check and before `refreshWsUrl()`
+- Files changed: `platform/browser-extension/src/offscreen/index.ts` (line ~266)
+- **Learnings for future iterations:**
+  - `bootstrapFromAuthFile()` is defined at line ~509 in the same file — it fetches `auth.json` via `chrome.runtime.getURL`, sets `wsSecret` if valid, silently ignores missing/unreadable files
+  - The function is idempotent and cheap (reads a small local file with a 1s timeout), safe to call on every reconnect attempt
+  - `connect()` guard at line ~260 prevents concurrent connects — `bootstrapFromAuthFile()` only runs when a new connection attempt actually starts
+  - `wsSecret` is a module-level variable used in the `protocols` array when creating the WebSocket (line ~276)
+---
+
+## 2026-02-28 - US-004
+- Created `e2e/auth-bootstrap.e2e.ts` with test: "extension connects after auth.json is written post-load"
+- Test uses custom setup (not standard extensionContext fixture) to control when auth.json exists
+- Launches extension without auth.json → verifies disconnected state → writes auth.json → verifies reconnection and tool dispatch
+- Files changed: `e2e/auth-bootstrap.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - `launchExtensionContext(port)` without a secret parameter creates an extension copy without auth.json — exactly what's needed for testing late auth bootstrap
+  - `createExtensionCopy(port)` (no secret) skips writing auth.json to the extension dir (line 850 of fixtures.ts)
+  - `setupAdapterSymlink()` from helpers.ts encapsulates the adapter dir symlink logic — cleaner than inline fs operations
+  - The standard `extensionContext` fixture always symlinks auth.json (line 1537-1540 of fixtures.ts), so custom setup is required for tests that need auth.json absent at boot
+  - Extension reconnect backoff starts at 1s, doubling to max 30s — a 3s wait is enough for the extension to attempt and fail initial connection
+---
+
+## 2026-02-28 - US-005
+- Added E2E test "extension recovers from stale secret after server restart with new secret" to `e2e/auth-bootstrap.e2e.ts`
+- Test uses custom setup with auth.json symlink between server config dir and extension dir
+- Flow: start connected → rotate secret in auth.json → trigger hot reload → verify extension reconnects with new secret → verify tool dispatch
+- Files changed: `e2e/auth-bootstrap.e2e.ts` (added second test + `symlinkCrossPlatform` and `crypto` imports)
+- **Learnings for future iterations:**
+  - `symlinkCrossPlatform()` from fixtures.ts handles symlink creation cross-platform — use it instead of `fs.symlinkSync()` directly
+  - Writing to the server's auth.json via the symlink automatically updates the extension's copy — no need to write to both locations separately
+  - `server.triggerHotReload()` sends SIGUSR1 to the dev proxy process — wait for "Hot reload complete" log before asserting reconnection
+  - `server.secret` is a mutable property — update it after rotation so `waitForHealth` uses the correct auth for polling
+  - All 387 E2E tests passed including the new test (e2eCheckpoint: true)
+---
