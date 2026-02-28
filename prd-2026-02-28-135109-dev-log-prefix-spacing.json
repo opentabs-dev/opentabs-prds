@@ -1,0 +1,29 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix extra leading space in dev mode log output for tsc and any other child processes that emit lines with leading whitespace or ANSI escape sequences.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Strip leading whitespace and ANSI clear-screen escapes from piped child process output",
+      "description": "As a developer running npm run dev, I want all prefixed log lines to be consistently aligned without extra leading spaces, so that the terminal output looks clean and uniform.",
+      "acceptanceCriteria": [
+        "The pipeWithPrefix function in scripts/dev.ts trims leading whitespace from each line before writing it (using line.trimStart() or equivalent)",
+        "The pipeTscStdout function in scripts/dev.ts trims leading whitespace from each line before writing it",
+        "ANSI clear-screen escape sequences (\\x1Bc, \\x1B[2J, \\x1B[H) emitted by tsc --watch are stripped from line content before prefixing",
+        "The sentinel detection (line.includes('Watching for file changes')) still works correctly after trimming — the check should be performed on the trimmed content",
+        "Output from [tsc], [ext], and [mcp] prefixes all have exactly one space between the prefix and the content with no extra leading whitespace",
+        "The trailing partial line handling (after the for loop) also trims leading whitespace",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in scripts/dev.ts. Two functions need updating: pipeWithPrefix (lines 43-70) and pipeTscStdout (lines 78-109).\n\nFor both functions, add a line sanitization step that:\n1. Strips ANSI escape sequences commonly emitted by tsc --watch (clear screen: \\x1Bc, \\x1B[2J, \\x1B[H, and cursor positioning sequences)\n2. Trims leading whitespace\n\nA clean approach is to define a small helper at the top of the pipe logic, e.g.:\n\n  /** Strip ANSI clear-screen escapes and leading whitespace from a line. */\n  const sanitize = (s: string): string =>\n    s.replace(/\\x1B(?:\\[(?:[0-9;]*[A-Za-z])|c)/g, '').trimStart();\n\nThen in both pipeWithPrefix and pipeTscStdout, apply sanitize to each line before the length check and before writing:\n\n  for (const rawLine of lines) {\n    const line = sanitize(rawLine);\n    if (line.length > 0) {\n      output.write(`${coloredPrefix} ${line}\\n`);\n    }\n    // For pipeTscStdout, the sentinel check should use 'line' (sanitized)\n  }\n\nAlso apply sanitize to the trailing partial line write at the end of each function.\n\nThe root cause: tsc --build --watch emits output lines with a leading space character (and sometimes ANSI clear-screen sequences). When piped through the prefix formatter, this leading space adds to the single space in the format string, producing 'prefix  content' (double space). Other processes (extension build via console.log, MCP server) don't emit leading whitespace, so they show the correct single space.\n\nIMPORTANT: The regex for stripping ANSI sequences only needs to handle common tsc-emitted sequences. A comprehensive ANSI stripper is overkill — just handle \\x1Bc (reset), \\x1B[2J (clear), \\x1B[H (cursor home), and general CSI sequences \\x1B[...letter. Leave color sequences alone — tsc in watch mode with piped output typically doesn't emit colors, and our prefix already adds/resets colors.\n\nActually, on reflection, it's simpler and safer to strip ALL ANSI escape sequences from child process output, since we're adding our own color prefixes. Use a broader regex:\n\n  const ANSI_RE = /[\\x1B\\x9B](?:\\[[0-9;]*[A-Za-z]|\\].*?(?:\\x07|\\x1B\\\\)|[()#][AB012]|c)/g;\n  const sanitize = (s: string): string => s.replace(ANSI_RE, '').trimStart();\n\nThis prevents any ANSI garbage from child processes from corrupting the prefixed output."
+    }
+  ]
+}
