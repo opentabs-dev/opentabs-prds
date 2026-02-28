@@ -1,0 +1,47 @@
+## Codebase Patterns
+- confirmation-badge.ts: The `clearedConfirmationIds` set guards against double-decrements. The pattern is: add to the set when clearing, then prune from the set when the entry is no longer needed for idempotency (i.e., when no background timeout can race). The bg timeout callback always prunes after firing; the fix also prunes in `clearConfirmationBadge` when `confirmationTimeouts` doesn't have the id.
+- Production call order in background-message-handlers.ts: `clearConfirmationBackgroundTimeout(id)` is always called BEFORE `clearConfirmationBadge(id)` in both `handleSpConfirmationResponse` and `handleSpConfirmationTimeout`. Tests should test this same order.
+- Browser extension tests use `vi.useFakeTimers()` and reset state via `clearAllConfirmationBadges()` in beforeEach.
+- network-capture.ts: Use `vi.useFakeTimers()` + `vi.advanceTimersByTime(n)` to test that periodic prune intervals fire and clean up entries. Use `vi.setSystemTime(Date.now() + n)` to advance only the clock (not fire timers) when testing inline prune logic triggered by a specific event.
+- network-capture.ts: WS_TTL_MS (5 min) is separate from PENDING_REQUEST_TTL_MS (60 s) because WebSocket connections are long-lived; pruning them too aggressively would drop active connections.
+- When adding a new map to CaptureState, ensure it is: (1) initialized in startCapture, (2) populated and deleted in the appropriate event handlers, (3) pruned in the periodic interval, (4) pruned in any inline prune site, (5) cleared in stopCapture, and (6) cleared in any clear=true read operation (e.g., getWsFrames).
+- network-capture.ts: The `pendingCaptures` Map<number, Promise<void>> serializes concurrent startCapture calls. The pattern is: check pendingCaptures first (return existing promise if present), then check captures (throw if already active), wrap async work in an IIFE, store in pendingCaptures, await with a finally block that deletes from pendingCaptures. The IIFE variable shadowing the outer loop variable `pending` was renamed to `pendingReq` to avoid lint confusion.
+- For concurrent async tests: firing both calls synchronously before any await resolves ensures the second call sees the pendingCaptures entry. Use `Promise.allSettled` (not `Promise.all`) to test failure cases — both promises share the same underlying rejection, and `Promise.all` would cause unhandled rejection noise.
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-130506-extension-resource-leak-fixes~running.json
+Started: Sat Feb 28 21:05:32 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- What was implemented: Added pruning of `clearedConfirmationIds` entries in `clearConfirmationBadge` when no background timeout is pending for the id. After the badge is cleared and there's no pending bg timeout that could race, the entry is immediately removed from the set, preventing unbounded growth.
+- Files changed:
+  - `platform/browser-extension/src/confirmation-badge.ts`: Added pruning logic at end of `clearConfirmationBadge` — if `!confirmationTimeouts.has(id)`, delete from `clearedConfirmationIds`
+  - `platform/browser-extension/src/confirmation-badge.test.ts`: Added two new tests — one for production call order (clearConfirmationBackgroundTimeout then clearConfirmationBadge) and one verifying idempotency is preserved when bg timeout is still pending
+- **Learnings for future iterations:**
+  - The bug only manifests when `clearConfirmationBackgroundTimeout` is called BEFORE `clearConfirmationBadge` (the production order). When `clearConfirmationBadge` runs first, `clearConfirmationBackgroundTimeout` already prunes the id at line 129 of the original file. The existing tests for this used the reversed order so the bug wasn't caught by tests.
+  - The idempotency guard should only be preserved while a background timeout can still race. Once the timeout is cancelled or fired, the entry is safe to prune immediately.
+  - When writing tests for this module, use different timeout values for different confirmations to avoid bg timeouts firing simultaneously.
+---
+
+## 2026-02-28 - US-002
+- What was implemented: Added `wsCreatedAt: Map<string, number>` to `CaptureState` to track WebSocket creation timestamps. Both the periodic prune interval and the inline prune in `Network.requestWillBeSent` now delete entries from `wsFramesByRequestId` and `wsCreatedAt` when their age exceeds `WS_TTL_MS` (5 minutes). Added a new `WS_TTL_MS` constant separate from `PENDING_REQUEST_TTL_MS` since WebSocket connections are expected to be long-lived. Also ensured `wsCreatedAt` is cleared in `stopCapture` and `getWsFrames(clear=true)`, and cleaned up in `Network.webSocketClosed`.
+- Files changed:
+  - `platform/browser-extension/src/network-capture.ts`: Added `WS_TTL_MS` constant, `wsCreatedAt` field to `CaptureState`, population in `webSocketCreated`, cleanup in `webSocketClosed`, pruning in both prune sites, initialization in `startCapture`, and clearing in `stopCapture` and `getWsFrames`
+  - `platform/browser-extension/src/network-capture.test.ts`: Added 3 new tests in `wsFramesByRequestId pruning` describe block covering periodic interval pruning, inline prune via requestWillBeSent, and active connections surviving TTL
+- **Learnings for future iterations:**
+  - `vi.setSystemTime(Date.now() + N)` advances the clock without firing any timers — use this when you want to test inline prune logic in isolation from the periodic interval
+  - `vi.advanceTimersByTime(N)` both advances the clock AND fires all timers in that window — use this for testing the periodic prune interval
+  - The acceptance criteria required pruning in BOTH the periodic interval and the inline prune site; both must be updated or the fix is incomplete
+---
+
+## 2026-02-28 - US-003
+- What was implemented: Added a `pendingCaptures: Map<number, Promise<void>>` at module level to serialize concurrent startCapture calls for the same tabId. The first call creates an IIFE promise, stores it in pendingCaptures, and awaits it with a finally block that deletes the entry. A second concurrent call that arrives before the first resolves finds the pendingCaptures entry and returns it directly, waiting for the first to complete without re-attaching the debugger. Also renamed the loop variable `pending` in the prune interval to `pendingReq` to avoid shadowing the outer-scope `inFlightCapture` variable name pattern.
+- Files changed:
+  - `platform/browser-extension/src/network-capture.ts`: Added `pendingCaptures` map, refactored `startCapture` to check it first, wrapped async capture logic in an IIFE promise, added finally-block cleanup
+  - `platform/browser-extension/src/network-capture.test.ts`: Added `concurrent startCapture guard` describe block with 3 tests: (1) second concurrent call awaits first and attach is called only once, (2) non-racing call still throws "already active", (3) if first fails both calls reject and tab is not reported as capturing
+- **Learnings for future iterations:**
+  - The key invariant: `pendingCaptures.set(tabId, promise)` runs before the first `await capturePromise`, so a synchronous second call always sees the entry
+  - For failure cases, use `Promise.allSettled` to avoid unhandled rejection noise — both calls share the same underlying promise, and `Promise.all` would throw on first rejection before the second settles
+  - The `isCapturing` function only checks `captures` (not `pendingCaptures`) — this is correct: capture is "active" only after the attach and sendCommand sequence fully completes
+---

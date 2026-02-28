@@ -18,7 +18,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/confirmation-badge.ts\n\nThe `clearedConfirmationIds` Set (line 18) tracks confirmation IDs that have already been cleared to prevent double-decrementing the badge count. The problem: when the side panel resolves a confirmation first (sp:confirmationResponse), the flow is:\n1. `clearConfirmationBackgroundTimeout(id)` — deletes from confirmationTimeouts AND clearedConfirmationIds (line 129)\n2. `clearConfirmationBadge(id)` — id is NOT in clearedConfirmationIds (just deleted), so it adds it back (line 109), decrements count\n3. The background timeout was cancelled, so it never fires to delete the entry\n4. The ID stays in clearedConfirmationIds permanently until the next disconnect\n\nFix approach: Add a cleanup step that removes the ID from clearedConfirmationIds after both paths have definitively settled. One clean approach: in `clearConfirmationBadge`, after adding to clearedConfirmationIds, schedule a microtask or short setTimeout to remove the ID once the concurrent timeout race window has passed. Alternatively, remove from clearedConfirmationIds when the corresponding confirmationTimeouts entry is absent (meaning no background timeout can race).\n\nThe simplest correct fix: in `clearConfirmationBadge`, after the idempotency check succeeds and the count is decremented, also delete the entry from `confirmationTimeouts` if present (it's already cleared), and then use a `queueMicrotask` or just inline the deletion of the clearedConfirmationIds entry when there's no corresponding confirmationTimeouts entry. Since the race window is only between the bg timeout callback and the side panel message, and both run on the same event loop, by the time the next macrotask runs, the race is settled.\n\nActually the simplest approach: in `clearConfirmationBadge`, after adding the id to `clearedConfirmationIds` and decrementing the count, check if `confirmationTimeouts.has(id)` is false — if so, the bg timeout either already fired or was cancelled, so the id is safe to prune immediately from clearedConfirmationIds. If it's true, leave it for the bg timeout callback to prune (which it already does at line 79)."
@@ -38,7 +38,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/network-capture.ts\n\nThe `wsFramesByRequestId` map (line 96 in CaptureState) maps WebSocket requestIds to their URLs. Entries are added on `Network.webSocketCreated` (line 309-311) and removed on `Network.webSocketClosed` (line 347-350). However, if a WebSocket connection is never cleanly closed (tab navigates away mid-connection, connection drops without close frame), the entry persists indefinitely.\n\nThe existing prune interval (lines 449-461) and inline prune in requestWillBeSent (lines 189-199) already prune `pendingRequests` and `requestIdToRequest` but NOT `wsFramesByRequestId`.\n\nFix: Add `wsFramesByRequestId` pruning to both the prune interval and the inline prune. Since wsFramesByRequestId entries don't have a timestamp, the simplest approach is to track creation time. Add a `wsCreatedAt` Map<string, number> to CaptureState that records when each WebSocket requestId was first seen. Then prune entries from both maps when the creation timestamp exceeds PENDING_REQUEST_TTL_MS. Alternatively, use a longer TTL (e.g., 5 minutes) since WebSocket connections are expected to be long-lived.\n\nNote: The `getWsFrames` function (line 534-544) clears `wsFramesByRequestId` when `clear=true`, and `stopCapture` (line 470-478) clears it. The leak only affects long-running captures where WebSocket connections open and silently die."
@@ -58,7 +58,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/network-capture.ts\n\nThe `startCapture` function (line 408) checks `captures.has(tabId)` synchronously, then does async work (chrome.debugger.attach, sendCommand). The capture state is only stored in the `captures` map at line 463, AFTER all async operations complete. If two startCapture calls arrive for the same tabId before the first completes:\n1. Both pass the `captures.has(tabId)` check (returns false)\n2. First call: chrome.debugger.attach succeeds\n3. Second call: chrome.debugger.attach throws 'Another debugger is already attached'\n4. Second call throws to the caller with a confusing error\n\nFix: Add a `pendingCaptures` Set<number> that tracks tab IDs with in-flight startCapture calls. Check this set alongside `captures.has(tabId)`. Add to the set before the async work, remove in finally block. If the tab is in pendingCaptures, either throw a clear error ('Capture already starting for tab X') or return silently.\n\nAlternative simpler approach: use a per-tab promise lock similar to the `withPluginLock` pattern in tab-state.ts, so concurrent calls are serialized and the second one sees the capture as already active."
