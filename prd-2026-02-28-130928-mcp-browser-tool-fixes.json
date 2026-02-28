@@ -1,0 +1,86 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix resource leaks and missing defensive guards in MCP server browser tools identified during backend code audit. Covers: fire-and-forget exec file deletion in analyze-site, stale activeNetworkCaptures tracking in both analyze-site and disable-network-capture, and unsafe dispatch result casting in export-har.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Await deleteExecFile in analyze-site executeInTab helper",
+      "description": "As a platform operator, I want temporary exec files created during site analysis to be reliably cleaned up so that orphaned files don't accumulate in the extension adapters directory.",
+      "acceptanceCriteria": [
+        "In the executeInTab helper in analyze-site/index.ts, deleteExecFile is awaited (not fire-and-forget with void)",
+        "The await is in the finally block so deletion happens even on dispatch error",
+        "If deleteExecFile throws, the error is caught and logged (does not crash the analysis)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts line 83.\n\nCurrent code in the executeInTab finally block:\n```\n  } finally {\n    void deleteExecFile(filename);\n  }\n```\n\nCompare with the correct pattern in platform/mcp-server/src/browser-tools/execute-script.ts which awaits the deletion:\n```\n    } finally {\n      await deleteExecFile(filename);\n    }\n```\n\nFix: Change `void deleteExecFile(filename)` to:\n```\n    try {\n      await deleteExecFile(filename);\n    } catch {\n      // Best-effort cleanup\n    }\n```\n\nThe try-catch is needed because executeInTab runs 12+ times per analysis, and we don't want a single file deletion failure to abort the entire analysis. The execute-script.ts handler doesn't need the try-catch because it's a single execution where a failed delete should propagate."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix stale activeNetworkCaptures entry when disable-network-capture dispatch fails",
+      "description": "As a user, I want the server's network capture tracking state to be accurate even when the disable dispatch fails so that browser_export_har doesn't incorrectly think capture is still active.",
+      "acceptanceCriteria": [
+        "In disable-network-capture.ts, state.activeNetworkCaptures.delete(tabId) is called regardless of whether dispatchToExtension succeeds or throws",
+        "The delete is in a finally block so it runs on both success and error paths",
+        "The dispatch result is still returned on success",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/disable-network-capture.ts (24 lines).\n\nCurrent handler:\n```\n  handler: async (args, state) => {\n    const result = await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId: args.tabId });\n    state.activeNetworkCaptures.delete(args.tabId);\n    return result;\n  },\n```\n\nIf dispatchToExtension throws (extension disconnected, timeout), the delete never runs. The server then thinks capture is still active for that tab.\n\nFix: Move the delete into a finally block:\n```\n  handler: async (args, state) => {\n    try {\n      return await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId: args.tabId });\n    } finally {\n      state.activeNetworkCaptures.delete(args.tabId);\n    }\n  },\n```\n\nThis ensures the tracking state is cleaned up regardless of dispatch outcome. If the dispatch failed, the capture may or may not still be running in the extension, but the server-side tracking should reflect 'not active' since we can't know the true state."
+    },
+    {
+      "id": "US-003",
+      "title": "Update activeNetworkCaptures in analyze-site network capture lifecycle",
+      "description": "As a platform operator, I want the analyze-site orchestrator to maintain accurate network capture tracking state so that concurrent browser_export_har calls don't get confused by analyzer-initiated captures.",
+      "acceptanceCriteria": [
+        "After the analyzer calls browser.enableNetworkCapture via dispatchToExtension, state.activeNetworkCaptures.add(tabId) is called",
+        "In the finally cleanup block, state.activeNetworkCaptures.delete(tabId) is called after disabling capture",
+        "Also in the error catch block (line ~960), state.activeNetworkCaptures.delete(tabId) is called after the best-effort disable",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts.\n\nThe analyzeSite function signature already receives `state: ServerState` as a parameter.\n\nThree locations need changes:\n\n1. After enabling capture (~line 829-832):\n```\n    await dispatchToExtension(state, 'browser.enableNetworkCapture', {\n      tabId,\n      maxRequests: 200,\n    });\n```\nAdd: `state.activeNetworkCaptures.add(tabId);`\n\n2. In the error catch block (~line 957-963) where capture is disabled as best-effort:\n```\n    } catch {\n      try {\n        await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId });\n      } catch {\n        // Best-effort cleanup\n      }\n    }\n```\nAdd: `state.activeNetworkCaptures.delete(tabId);` after the inner try-catch.\n\n3. In the finally block (~line 1034-1040):\n```\n    try {\n      await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId });\n    } catch {\n      // Best-effort cleanup\n    }\n```\nAdd: `state.activeNetworkCaptures.delete(tabId);` after the try-catch."
+    },
+    {
+      "id": "US-004",
+      "title": "Add defensive dispatch result handling in export-har",
+      "description": "As a user, I want browser_export_har to handle unexpected dispatch result shapes gracefully instead of crashing with 'Cannot read property map of undefined'.",
+      "acceptanceCriteria": [
+        "requestsResult is defensively checked: if the dispatch result is an array, use it directly; if it's an object with a requests property, use that; otherwise default to an empty array",
+        "framesResult is defensively checked the same way: array, .frames property, or empty array fallback",
+        "The defensive handling matches the pattern already used in analyze-site/index.ts lines 950-956",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/export-har.ts lines 199-212.\n\nCurrent code (unsafe cast):\n```\n    const requestsResult = (await dispatchToExtension(state, 'browser.getNetworkRequests', {\n      tabId: args.tabId,\n      ...(args.clear !== undefined ? { clear: args.clear } : {}),\n    })) as { requests: CapturedRequest[] };\n\n    const entries = requestsResult.requests.map(requestToHarEntry);\n```\n\nIf the dispatch returns a plain array (or a shape without .requests), `requestsResult.requests` is undefined, and `.map()` throws.\n\nThe correct pattern is already used in analyze-site/index.ts lines 950-956:\n```\n      const networkResult = (await dispatchToExtension(state, 'browser.getNetworkRequests', {\n        tabId,\n        clear: true,\n      })) as { requests: NetworkRequest[] } | NetworkRequest[];\n      networkRequests = Array.isArray(networkResult)\n        ? networkResult\n        : ((networkResult as { requests?: NetworkRequest[] }).requests ?? []);\n```\n\nApply the same pattern to both requestsResult and framesResult in export-har.ts."
+    }
+  ]
+}

@@ -1,0 +1,106 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource leaks, and missing guards in MCP server core files identified during backend code audit. Covers: silent SDK version fallback that breaks all plugins, dead domain_all permission rules with null domain, config write mutex chain break on error, ungraceful shutdown WebSocket close, and per-write stat() in audit disk.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Log warning when SDK version falls back to 0.0.0",
+      "description": "As a platform operator, I want a visible warning when the SDK version cannot be read so that silent all-plugin-incompatibility failures are diagnosable.",
+      "acceptanceCriteria": [
+        "When readFile for plugin-sdk/package.json fails, a console.error or log.warn message is emitted containing the file path and the fallback value '0.0.0'",
+        "The fallback value '0.0.0' is still used (the module must still export a string), but the operator now has a diagnostic clue",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/sdk-version.ts (27 lines total). The catch block at line 22 is empty — it should log a warning. Cannot import from logger.ts (would create a circular dep or add weight to a top-level-await module), so use console.error directly. The consequence of 0.0.0 is that ALL plugins with a declared sdkVersion fail the major.minor compatibility check in loader.ts, making every plugin a FailedPlugin with a confusing 'rebuild with newer SDK' message."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix domain_all scope creating dead permission rules when domain is null",
+      "description": "As a user, I want 'Allow Always' with domain_all scope to work correctly even when the tool has no identifiable domain so that my permission decision is actually respected.",
+      "acceptanceCriteria": [
+        "isSessionAllowed in state.ts handles the domain_all case when rule.domain is null: a domain_all rule with null domain matches all tool calls regardless of domain (acts as a universal allow for all tools on any domain)",
+        "Alternatively, handleConfirmationResponse in extension-handlers.ts prevents creating a domain_all rule when pending.domain is null (falls back to tool_all scope instead)",
+        "Unit tests in state.test.ts cover: domain_all with null domain matches calls with null domain, domain_all with null domain matches calls with a specific domain, domain_all with a non-null domain only matches calls with that same domain",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two files involved:\n\n1. platform/mcp-server/src/state.ts line 215-227 — isSessionAllowed function. The domain_all case at line 222-223 checks `rule.domain !== null && rule.domain === domain` which returns false when rule.domain is null. A domain_all rule with null domain should either match everything (universal allow) or should never be created.\n\n2. platform/mcp-server/src/extension-handlers.ts line 446-462 — handleConfirmationResponse. When scope is domain_all (line 460-462), rule.tool is set to null but rule.domain keeps pending.domain which may be null.\n\nPreferred fix: In isSessionAllowed, change the domain_all case to: if rule.domain is null, match everything (return true); if rule.domain is not null, match only when domain === rule.domain. This makes domain_all with null domain act as 'allow all tools on all domains', which is the most intuitive interpretation when there's no specific domain to anchor to.\n\nExisting tests: platform/mcp-server/src/state.test.ts — add cases for isSessionAllowed with domain_all scope and null domain."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix config write mutex chain break on error in removeLocalPlugin",
+      "description": "As a developer, I want config file writes to remain properly serialized even after a write failure so that concurrent config modifications don't corrupt config.json.",
+      "acceptanceCriteria": [
+        "The .catch handler in removeLocalPlugin no longer resets state.configWriteMutex to Promise.resolve()",
+        "Instead, the catch handler allows the mutex promise to resolve normally (catch swallows the error but the promise chain continues), preserving serialization for subsequent writes",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/plugin-management.ts lines 361-441 — removeLocalPlugin function.\n\nThe bug is at lines 435-438:\n```\n})().catch((err: unknown) => {\n    state.configWriteMutex = Promise.resolve();\n    log.warn(`Failed to remove local plugin from config:`, err);\n  });\n```\n\nThe `.catch()` handler resets the mutex to `Promise.resolve()`, which means any write that was queued AFTER this one (chaining on state.configWriteMutex before the error) now loses its dependency. Two subsequent writes could overlap.\n\nFix: Remove the `state.configWriteMutex = Promise.resolve()` line from the catch handler. The `.catch()` already converts the rejected promise into a resolved one (that's what .catch does — it returns a new promise that resolves with the catch handler's return value). So after `.catch()`, state.configWriteMutex is already a resolved promise. The reset is both unnecessary and harmful.\n\nThe corrected pattern:\n```\n})().catch((err: unknown) => {\n    log.warn(`Failed to remove local plugin from config:`, err);\n  });\n```\n\nThis ensures the mutex chain is maintained: the next write awaits this (now-resolved-via-catch) promise, preserving serial execution."
+    },
+    {
+      "id": "US-004",
+      "title": "Allow WebSocket close frame to flush before process.exit in shutdown",
+      "description": "As a Chrome extension, I want to receive a clean WebSocket close frame during server shutdown so that I can detect a graceful disconnect vs an abrupt crash.",
+      "acceptanceCriteria": [
+        "After calling ws.close(), the shutdown handler waits briefly (e.g., 100-200ms via setTimeout) before calling process.exit(0)",
+        "The overall shutdown still completes quickly — the delay is a short fixed wait, not indefinite",
+        "If the WebSocket is already null or close throws, the delay is still applied (or skipped if already past)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/shutdown.ts lines 64-76.\n\nCurrent code:\n```\n    if (state.extensionWs) {\n      try {\n        state.extensionWs.close(1001, 'Server shutting down');\n      } catch {\n        // Already closed\n      }\n      state.extensionWs = null;\n    }\n\n    log.info('Shutdown complete');\n    process.exit(0);\n```\n\nThe ws.close() call initiates the WebSocket close handshake but process.exit(0) terminates before the close frame is flushed to the TCP socket. Fix by adding a short setTimeout before process.exit(0):\n\n```\n    log.info('Shutdown complete');\n    setTimeout(() => process.exit(0), 150);\n```\n\nThis gives the event loop one iteration to flush the close frame. The 150ms delay is negligible for user-perceived shutdown time but sufficient for TCP buffer flushing."
+    },
+    {
+      "id": "US-005",
+      "title": "Reduce per-write stat() calls in audit disk rotation",
+      "description": "As a platform operator running high-throughput tool calls, I want audit log rotation to not incur a filesystem stat() on every single write so that audit logging overhead is minimized.",
+      "acceptanceCriteria": [
+        "The rotateIfNeeded check is not called on every single appendAuditEntryToDisk invocation",
+        "Instead, rotation is checked at most once every N writes (e.g., every 50 or 100 writes) using a module-level counter",
+        "The counter is stored on globalThis so it survives hot reloads",
+        "Rotation still works correctly — files are rotated when they exceed 10MB, just with a delay of up to N extra entries",
+        "Existing audit-disk tests pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/audit-disk.ts (86 lines).\n\nLine 64 calls `await rotateIfNeeded(auditPath)` before every single append. Each rotateIfNeeded call does `await stat(auditPath)` which is a filesystem syscall.\n\nFix: Add a globalThis-based counter (similar to the INITIALIZED_KEY pattern already in this file). Increment the counter on each write and only call rotateIfNeeded when counter % 100 === 0. Use a globalThis key like `__opentabs_audit_write_count__` so it survives hot reloads.\n\nThe 10MB file / ~200 bytes per entry = ~50,000 entries before rotation. Checking every 100 writes means we'd catch rotation within 100 extra entries (~20KB), which is negligible.\n\nExisting test file: platform/mcp-server/src/audit-disk.test.ts — may need to account for the counter-based checking in rotation tests."
+    }
+  ]
+}
