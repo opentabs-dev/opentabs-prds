@@ -1,0 +1,57 @@
+## Codebase Patterns
+- `waitFor` in e2e/helpers.ts is the canonical polling helper — takes (predicate, timeoutMs, intervalMs, label) and throws a descriptive error on timeout
+- E2E helper imports live in e2e/helpers.ts; fixture helpers (startMcpServer, createMcpClient, etc.) in e2e/fixtures.ts
+- ESLint `arrow-body-style` rule requires `() => expr` instead of `() => { return expr; }` for single-return arrow functions
+- `testServer.invocations()` returns all recorded API calls — poll it with `waitFor` to deterministically confirm a request arrived (replaces fixed sleeps)
+- `waitForExtensionDisconnected` polls the server health endpoint — cannot be used against a killed server (use fixed sleep instead)
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-080137-e2e-flaky-pattern-fixes~running.json
+Started: Sat Feb 28 16:02:07 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Replaced silent-fallthrough while loop in hot-reload-dynamic.e2e.ts with `waitFor` helper
+- Added `waitFor` to the import from ./helpers.js
+- The while loop at ~line 533 now uses `waitFor(() => page.evaluate(...), 20_000, 500, 'e2e-test adapter...')`
+- Files changed: e2e/hot-reload-dynamic.e2e.ts
+- **Learnings for future iterations:**
+  - `waitFor` throws `Error: waitFor timed out after ${ms}ms waiting for: ${label}` on timeout — provides clear diagnostics
+  - ESLint `arrow-body-style` disallows `async () => { return x; }` — must use `() => x` when the body is a single return
+  - `waitFor` accepts an ordinary `() => Promise<boolean>` (no need for `async` keyword when just returning a promise directly)
+---
+
+## 2026-02-28 - US-002
+- Replaced hardcoded 8s sleep in tab-state-sync.e2e.ts with `waitForExtensionDisconnected(server1, 15_000)`
+- Added `waitForExtensionDisconnected` to the import from './helpers.js' (it was not previously imported)
+- Files changed: e2e/tab-state-sync.e2e.ts
+- **Learnings for future iterations:**
+  - `waitForExtensionDisconnected` signature: `(server: McpServer, timeoutMs?: number): Promise<void>` — default 10s, use 15s for disconnection detection (pong timeout is 5s + buffer)
+  - When adding a new import to an existing import block, the pre-commit hook (prettier/eslint) will reformat — no manual sorting needed
+---
+
+## 2026-02-28 - US-003
+- Wrapped test bodies of two overlapping URL pattern tests in iife-injection.e2e.ts in try/finally
+- Both tests now create tmpDir, then try { ... test body ... } finally { fs.rmSync(tmpDir, ...) }
+- Moved fs.rmSync from end of test body into the finally block; removed duplicates
+- Files changed: e2e/iife-injection.e2e.ts
+- **Learnings for future iterations:**
+  - fixtureTest-based tests clean up MCP server/extension/browser via fixtures automatically — only manually created resources (tmpDir) need explicit cleanup
+  - try/finally indentation adds one level inside the try block; pre-commit hook (prettier) reformats automatically without issues
+  - The two affected tests are `'two plugins matching the same URL both inject adapters into a single tab'` and `'two plugins with different URL patterns both inject into a single matching tab'`
+---
+
+## 2026-02-28 - US-004
+- Replaced hardcoded 500ms `setTimeout` sleeps with `waitFor` polling of `testServer.invocations()` in two files
+- In iife-injection.e2e.ts (~line 602): polls for `/api/echo` invocation with `message === 'in-flight'` body
+- In dispatch-resilience.e2e.ts (~line 518): polls for `/api/echo` invocation with `message === 'should-timeout'` body
+- Added `waitFor` import to dispatch-resilience.e2e.ts (was not previously imported)
+- Fixed US-002 regression: `waitForExtensionDisconnected` cannot poll a killed server's health endpoint; reverted tab-state-sync.e2e.ts reconnect test to 8s sleep with explanatory comment
+- Removed unused `waitForExtensionDisconnected` import from tab-state-sync.e2e.ts
+- Files changed: e2e/iife-injection.e2e.ts, e2e/dispatch-resilience.e2e.ts, e2e/tab-state-sync.e2e.ts
+- **Learnings for future iterations:**
+  - `testServer.invocations()` returns `Array<{ ts, method, path, body }>` — `body` is `unknown`, cast to `Record<string, unknown>` to access fields
+  - The echo tool hits `/api/echo` on the test server; match on both path and body content to avoid false positives from earlier invocations (baseline calls also hit `/api/echo`)
+  - `waitForExtensionDisconnected` polls the server's `/health` endpoint — it CANNOT work when the server is killed (returns null → predicate never evaluated). Use a fixed sleep when testing against a killed server.
+  - ESLint `prettier/prettier` rule enforces line-break formatting inside `.some()` callbacks — multi-line arrow bodies in `.some()` need the arrow and body on the same line when it fits
+---
