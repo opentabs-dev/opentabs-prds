@@ -1,0 +1,44 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-141235-cli-audit-fixes~running.json
+Started: Sat Feb 28 22:13:01 UTC 2026
+---
+
+## Codebase Patterns
+- Test mocks for `fs.watch` return value must be an EventEmitter (not just `{ close: vi.fn() }`) so that `watcher.on(...)` calls don't throw at runtime.
+- `followFile` is exported from `platform/cli/src/commands/logs.ts` for unit testing.
+- Vitest mocks for `node:fs` use the `importOriginal` spread pattern to keep real implementations intact.
+- `StringDecoder` from `node:string_decoder` handles multi-byte UTF-8 sequences split across read cycles; do NOT call `.end()` on it between cycles (that would flush with replacement chars) — let incomplete sequences remain in its buffer.
+- TypeScript's `ReadStream.on('data', cb)` expects `(chunk: string | Buffer) => void`; narrow at runtime with `Buffer.isBuffer(chunk)` rather than narrowing the declared parameter type.
+- When testing across multiple read cycles: spy on `process.stdout.write` and join all call args to assert the full output; always `mockRestore()` in a `finally` block.
+
+## 2026-02-28 - US-002
+- Root cause: `createReadStream` with `encoding: 'utf-8'` uses an internal `StringDecoder` scoped to one stream instance. When a multi-byte UTF-8 char straddles two read cycles (the file's byte count lands mid-char), the first stream's decoder flushes incomplete bytes as U+FFFD on `end`, and the second stream starts fresh — producing a second replacement char for the continuation bytes.
+- Fix: removed `encoding: 'utf-8'` from `createReadStream` and introduced a persistent `let decoder = new StringDecoder('utf-8')` in `followFile`. Each `data` event calls `decoder.write(chunk)` (Buffer path); incomplete sequences are buffered inside the decoder and emitted as complete characters when the remaining bytes arrive in the next read cycle.
+- Decoder is reset (new instance) on file truncation and on stream error to avoid stale state after position resets.
+- TypeScript's `ReadStream` types require `(chunk: string | Buffer) => void`; used `Buffer.isBuffer(chunk)` runtime guard to route Buffers through `decoder.write` and strings (should not occur without encoding, but satisfies the type) through directly.
+- Added test: "does not produce replacement characters when a multi-byte UTF-8 character spans read cycles" — emits the first 2 bytes of 🍎 (0xF0 0x9F) in cycle 1 and the last 2 bytes (0x8D 0x8E) in cycle 2; asserts stdout output equals `'🍎'` with no `\uFFFD`.
+- Files changed: `platform/cli/src/commands/logs.ts`, `platform/cli/src/commands/logs.test.ts`
+- **Learnings for future iterations:**
+  - The across-cycle split (file size lands mid-char) is a different bug from the within-stream split (chunk boundaries inside one stream). Node's stream encoding handles within-stream splits; a persistent `StringDecoder` is needed for across-cycle splits.
+  - Never call `decoder.end()` between read cycles — it flushes incomplete bytes as replacement chars. Only instantiate a new decoder on truncation or error.
+  - The `process.stdout.write` spy correctly captures empty-string calls (when decoder buffers a partial sequence); joining all call args gives the total output.
+---
+
+## 2026-02-28 - US-003
+- Root cause: `logStream.end()` was called but not awaited before `process.exit(exitCode)`. Node.js streams buffer writes internally; calling `process.exit()` immediately terminates the process before the OS flushes those buffers, truncating the final log bytes.
+- Fix: replaced `logStream.end()` with `await new Promise<void>(resolve => logStream.end(() => resolve()))`. The callback form of `.end()` fires only after the stream is fully flushed to the underlying file descriptor.
+- Files changed: `platform/cli/src/commands/start.ts` (line 349, one-line change)
+- No test file exists for `start.ts`; the fix is a correctness guarantee for process shutdown ordering that can't easily be unit-tested without spawning real processes.
+- **Learnings for future iterations:**
+  - The callback form of `WriteStream.end(callback)` is the idiomatic way to await flush; wrapping in `new Promise<void>` makes it awaitable in async functions.
+  - `process.exit()` bypasses Node.js's normal stream drain — always flush streams explicitly before calling it.
+---
+
+## 2026-02-28 - US-001
+- Added `watcher.on('error', () => undefined)` after the `watch()` call in `followFile` (`platform/cli/src/commands/logs.ts`, line 141) to absorb ENOENT/inotify errors on Linux that would otherwise crash the process via an unhandled EventEmitter 'error' event.
+- Updated `platform/cli/src/commands/logs.test.ts`: replaced the `{ close: vi.fn() }` mock watcher with a proper `EventEmitter` + `close` spy helper (`createMockWatcher`) so that the new `watcher.on('error', ...)` call in source doesn't throw at test time.
+- Added a new test: "does not propagate watcher errors (e.g., when the log file is deleted)" — emits an 'error' event on the mock watcher and asserts no throw.
+- **Learnings for future iterations:**
+  - When source code adds `.on()` calls to mocked objects, existing tests that mock those objects as plain `{}` will break — update mocks proactively.
+  - The `readNewContent` function already handles file-deleted via a `statSync` try/catch (lines 92-97), so the watcher error handler is intentionally a no-op.
+---
