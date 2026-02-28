@@ -1,0 +1,97 @@
+## Codebase Patterns
+- `getGlobalNodeModulesPaths()` in `platform/mcp-server/src/resolver.ts` caches via `globalThis` using `__opentabs_global_paths__` key; `resetGlobalPathsCache()` is exported for test cleanup
+- Test files use `vi.mock('node:child_process')` to mock `spawnSync`; `mockedSpawnSync.mockReset()` in `beforeEach` and `resetGlobalPathsCache()` both needed to isolate tests
+- All test state is isolated with `beforeEach`/`afterEach`; temp dirs created via `mkdtempSync` and cleaned with `rmSync`
+- `freezeRegistryMap<K, V>(map: Map<K, V>): ReadonlyMap<K, V>` is exported from `platform/mcp-server/src/state.ts`; it overrides `.set/.delete/.clear` to throw TypeError (Object.freeze alone does not block Map mutation)
+- ESLint rule `import-x/exports-last` requires no non-exported code after any `export const/interface` — avoid placing non-exported helpers after exported ones in state.ts
+- Reload serialization uses a promise chain on `globalThis.__opentabs_reload_chain__`; each caller synchronously get-then-sets the chain before any await to guarantee atomicity in JS's single-threaded model
+- `FileWatcherEntry.lastSeenMtimes: Map<string, number | null>` — null sentinel means file didn't exist at last record; undefined means key not in map (never recorded). Poll condition: `toolsMtime !== null && lastToolsMtime !== undefined && (lastToolsMtime === null || toolsMtime > lastToolsMtime)` handles both file creation and modification
+- When `dist/` doesn't exist for a pending plugin, `watch(distDir)` throws, making `entry.watchers.length === 0` → `anyWatcherFailed = true` → fast poll (200ms) is used automatically
+- `noUncheckedIndexedAccess` is enabled — array[0] returns `T | undefined`; use `expect(entry).toBeDefined(); if (!entry) return;` pattern to narrow before asserting properties
+- `state.activeNetworkCaptures` is `Set<number>`; add tabId before calling browser tool handlers in tests
+- To intercept named fs imports in tests, use `vi.hoisted` for both the mock fn AND the real fn capture object; plain `let` variables in module scope cannot be assigned inside `vi.mock` factory (TDZ error). Pattern: `const { mockFn, capture } = vi.hoisted(() => ({ mockFn: vi.fn(), capture: { realFn: null as null | FnType } }))`, then in factory: `capture.realFn = actual.fn; return { ...actual, fn: mockFn };`
+- `@typescript-eslint/no-non-null-assertion` forbids `!` even in tests — use `const fn = capture.realFn; if (!fn) throw new Error(...); return fn(path);` pattern
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-141235-mcp-server-audit-fixes~running.json
+Started: Sat Feb 28 22:13:04 UTC 2026
+---
+
+## 2026-02-28 22:21 UTC - US-002
+- Exported `freezeRegistryMap<K, V>(map: Map<K, V>): ReadonlyMap<K, V>` from `platform/mcp-server/src/state.ts` — overrides `.set/.delete/.clear` to throw TypeError on any Map passed to it
+- Removed `createFrozenRegistryMap` helper (previously unexported) and replaced its 4 usages in `EMPTY_REGISTRY` with direct `freezeRegistryMap(new Map<...>())` calls
+- Updated `buildRegistry()` in `platform/mcp-server/src/registry.ts` to wrap all 4 Maps (plugins, toolLookup, resourceLookup, promptLookup) with `freezeRegistryMap` before returning
+- Added test `'registry Maps throw on .set() to prevent accidental mutation'` in `registry.test.ts` verifying all 4 Maps throw TypeError on `.set()`
+- Files changed: `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/registry.ts`, `platform/mcp-server/src/registry.test.ts`
+- **Learnings for future iterations:**
+  - `import-x/exports-last` forbids non-exported code after any exported declaration — removing the non-exported wrapper and inlining its logic was the right fix
+  - When casting a `ReadonlyMap<K, V>` in tests to call `.set()`, use `as Map<string, unknown>` cast since TypeScript's `ReadonlyMap` type has no `.set()` method
+---
+
+## 2026-02-28 22:15 UTC - US-001
+- Fixed `getGlobalNodeModulesPaths()` in `platform/mcp-server/src/resolver.ts` to only cache non-empty paths — when npm returns an empty array (transient failure), the cache is left as null so the next call retries
+- Added unit test in `resolver.test.ts` that mocks npm to fail on first call and succeed on second, verifying spawnSync is called again on retry
+- Files changed: `platform/mcp-server/src/resolver.ts`, `platform/mcp-server/src/resolver.test.ts`
+- **Learnings for future iterations:**
+  - The `globalThis`-based cache uses `__opentabs_global_paths__` key; both `resetGlobalPathsCache()` and `mockedSpawnSync.mockReset()` must be called in test setup to fully isolate
+  - The existing `discoverGlobalNpmPlugins` describe block already has all the mock/reset infrastructure needed; new tests can follow the same pattern
+---
+
+## 2026-02-28 22:28 UTC - US-003
+- Replaced the check-then-act reload guard pattern in `performReload` and `performConfigReload` with a promise chain (async mutex) in `platform/mcp-server/src/reload.ts`
+- Renamed `RELOAD_GUARD_KEY` / `__opentabs_reload_guard__` to `RELOAD_CHAIN_KEY` / `__opentabs_reload_chain__` with new semantics: each caller synchronously captures the current chain and replaces it with a new deferred promise before any `await`, then awaits the previous link
+- The guard is no longer cleared to `undefined` in the `finally` block — the chain retains the (resolved) promise so the next caller can chain onto it without a race window
+- Added two serialization tests: `'reload blocks until the previous chain link resolves'` and `'config reload blocks until the previous chain link resolves'` — each sets an unresolved promise as the chain, verifies the reload blocks, then resolves and verifies completion
+- Updated existing tests to use `__opentabs_reload_chain__` and to assert the chain is an instanceof Promise (not undefined) after completion
+- Files changed: `platform/mcp-server/src/reload.ts`, `platform/mcp-server/src/reload.test.ts`
+- **Learnings for future iterations:**
+  - The race window in the old pattern was between `await existingGuard` resolving and `setReloadGuard(guard)` being called — multiple waiters all resumed from the same resolved promise and all passed the undefined check
+  - Promise chain pattern: get-then-set must happen synchronously (no await between them) to be atomic in JavaScript's single-threaded event loop
+  - Testing async serialization: set an unresolved promise as the chain predecessor, use `setTimeout(100)` to flush microtasks, verify the function hasn't completed, then resolve and verify completion
+---
+
+## 2026-02-28 22:35 UTC - US-004
+- Changed `FileWatcherEntry.lastSeenMtimes` in `state.ts` from `Map<string, number>` to `Map<string, number | null>` to allow null as a sentinel for non-existent files
+- Simplified `recordMtime` in `file-watcher.ts` to always call `entry.lastSeenMtimes.set(filePath, getFileMtimeMs(filePath))` — no longer guards on `mtime !== null`
+- Updated both poll conditions (tools.json and IIFE) to trigger when `lastMtime === null` (file was created) in addition to `toolsMtime > lastToolsMtime` (file was modified)
+- Split the longer tools.json condition across multiple lines per Prettier; IIFE condition (shorter identifiers) stays on one line
+- Used `?? 'none'` in log message template literals since `lastToolsMtime / lastIifeMtime` is now `number | null` (not allowed raw in template literals by `@typescript-eslint/restrict-template-expressions`)
+- Added two tests: (1) `recordMtime stores null for non-existent files` — verifies null sentinel is stored in the map, not undefined; (2) `mtime poll updates entry mtime when pending plugin tools.json is created after watcher setup` — creates file after setup, waits 600ms for fast poll cycle, verifies mtime updated from null to number
+- Files changed: `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/file-watcher.ts`, `platform/mcp-server/src/file-watcher.test.ts`
+- **Learnings for future iterations:**
+  - Non-null assertions (`!`) in test files are forbidden by `@typescript-eslint/no-non-null-assertion`; use `if (!entry) return;` after `expect(entry).toBeDefined()` to narrow the type
+  - `@typescript-eslint/restrict-template-expressions` disallows `null` in template literals; use `?? 'none'` or `String(value)` to convert
+  - When `dist/` doesn't exist for a pending plugin, `watch(distDir)` throws → entry has no watchers → `anyWatcherFailed = true` → `startMtimePolling` uses fast 200ms interval automatically
+---
+
+## 2026-02-28 22:43 UTC - US-006
+- Replaced three `.length` calls in `requestToHarEntry` with `Buffer.byteLength(str, 'utf-8')`: `request.bodySize` (line 92), `response.content.size` (line 110), and `response.bodySize` (line 114)
+- Also fixed `wsFrameToHarEntry` `bodySize: frame.data.length` → `Buffer.byteLength(frame.data, 'utf-8')` (same bug, same fix)
+- Created `platform/mcp-server/src/browser-tools/export-har.test.ts` with 3 tests: (1) emoji (`'😀'`) produces bodySize=4 (> string.length=2); (2) ASCII content bodySize equals string.length (no regression); (3) absent bodies use 0/0/-1 sentinel values
+- Files changed: `platform/mcp-server/src/browser-tools/export-har.ts`, `platform/mcp-server/src/browser-tools/export-har.test.ts`
+- **Learnings for future iterations:**
+  - `noUncheckedIndexedAccess` makes `array[0]` return `T | undefined` — use `expect(x).toBeDefined(); if (!x) return;` to narrow
+  - `state.activeNetworkCaptures` is a `Set<number>`; must add the tabId before calling `exportHar.handler`
+  - `dispatchToExtension` mock can return a plain array `[request]` — the handler handles both `CapturedRequest[]` and `{ requests: CapturedRequest[] }` shapes
+---
+
+## 2026-02-28 22:39 UTC - US-005
+- Changed `*` to `+` in the Unix path regex in `platform/mcp-server/src/sanitize-error.ts` line 20: `(?:\/[a-z0-9._-]+)+` now requires at least 2 path segments
+- Updated the 3 existing single-segment tests (`/tmp`, `/etc`, `/var`) from "replaces" to "does not replace" assertions
+- Added 3 new tests: two verifying single-segment URL fragments (`/api`, `/json`) are preserved; one verifying multi-segment paths (`/api/v1/users`) are still replaced with `[PATH]`
+- Files changed: `platform/mcp-server/src/sanitize-error.ts`, `platform/mcp-server/src/sanitize-error.test.ts`
+- **Learnings for future iterations:**
+  - Existing tests for single-segment paths assumed the old `*` (zero-or-more) behavior — they needed to be inverted, not just supplemented
+  - Multi-segment API paths like `/api/v1/users` ARE still replaced with the `+` quantifier (3 segments satisfies the 2+ requirement); the "preserve" mention in acceptance criteria applied only to single-segment paths
+  - `/etc/passwd` (2 segments) still replaced because it meets the 2+ segment requirement — multi-segment system paths are treated identically to filesystem paths
+---
+
+## 2026-02-28 22:52 UTC - US-007
+- Reordered `writeAdapterFile` in `platform/mcp-server/src/adapter-files.ts` to write-then-delete instead of delete-then-write: atomicWrite calls moved before the `Promise.allSettled(oldFiles.map(f => unlink(...)))` cleanup
+- Added test `'new adapter file is on disk when old versions are unlinked'` in `adapter-files.test.ts` using `vi.hoisted` + `vi.mock('node:fs/promises', ...)` to intercept unlink; captures directory contents at first unlink call and asserts the new file is already present
+- Files changed: `platform/mcp-server/src/adapter-files.ts`, `platform/mcp-server/src/adapter-files.test.ts`
+- **Learnings for future iterations:**
+  - To intercept named fs imports (destructured in source files), `vi.mock` is required — `vi.spyOn` on the namespace object alone won't reach already-destructured bindings
+  - `vi.hoisted` must be used for ANY variable referenced inside a `vi.mock` factory (plain `let` in module scope is in TDZ when the hoisted factory runs); use `{ capture: { realFn: null as null | FnType } }` pattern to pass real implementation reference across the hoisting boundary
+  - `@typescript-eslint/no-non-null-assertion` applies in test files too — replace `capture.realFn!(arg)` with `const fn = capture.realFn; if (!fn) throw new Error(...); return fn(arg);`
+---
