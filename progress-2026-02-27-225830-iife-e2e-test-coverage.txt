@@ -1,0 +1,111 @@
+# Ralph Progress Log
+PRD: prd-2026-02-27-225830-iife-e2e-test-coverage~running.json
+Started: Sat Feb 28 07:02:39 UTC 2026
+---
+
+## Codebase Patterns
+- E2E tests use `setupIsolatedIifeTest()` from `e2e/helpers.ts` for standard IIFE injection test setup (MCP server + extension + client + test server + isolated config)
+- `createMinimalPlugin()` from `e2e/fixtures.ts` creates discoverable but non-functional plugins (isReady returns false, no real tools). For functional plugins with real tool dispatch, create a full plugin structure with SDK.
+- To build a custom test plugin through the real pipeline: create `package.json` (with opentabs field), `tsconfig.json`, `src/index.ts`, then symlink `node_modules` from `plugins/e2e-test/` for dependencies, run `tsc`, then `node platform/plugin-tools/dist/cli.js build`
+- `E2E_TEST_PLUGIN_DIR` from `e2e/fixtures.ts` points to `plugins/e2e-test/` — the reference plugin for E2E tests
+- The `stripNodeBuiltins` esbuild plugin at `platform/plugin-tools/src/commands/build.ts:672-681` marks `node:*` imports as `external: true, sideEffects: false`, allowing esbuild to tree-shake them
+- Config setup needs: `config.json` with localPlugins + tools, `extension/auth.json` with secret — see `createTestConfigDir()` in fixtures.ts
+- Set `OPENTABS_CONFIG_DIR` to isolated temp dir and `OPENTABS_SKIP_CONFIRMATION=1` when running the build pipeline in tests
+- The adapter hash chain: build embeds `__adapterHash` in IIFE → server `extractEmbeddedAdapterHash()` reads it via regex → server writes IIFE to `adapters/{name}-{hash8}.js` → extension injects file + verifies `__adapterHash` from page matches expected hash
+- The adapters/ directory is at `configDir/extension/adapters/` (symlinked to extension dir in tests via `setupAdapterSymlink`)
+- To corrupt an adapter file for hash mismatch testing, replace the `__adapterHash="..."` value in the adapters/ directory file (NOT the plugin's dist/). The server still has the original correct hash in memory
+- Avoid `!` non-null assertions in E2E tests — use optional chaining `?.` and `expect().toBeDefined()` assertions instead
+- To tamper with frozen adapters in tests, rebuild `globalThis.__openTabs` entirely via `browser_execute_script` — the hashAndFreeze snippet makes `adapters` and `adapters[name]` non-writable/non-configurable, so property assignment fails silently
+- After `page.reload()`, chain `page.waitForFunction()` (adapter presence) then `waitForToolResult()` (tool readiness) for reliable recovery detection
+- `createMinimalPlugin()` IIFEs lack the IIFE wrapper (no onNavigate interceptor, no hashAndFreeze, no log transport). To test features that rely on the wrapper, build through the real pipeline instead.
+- To remove plugin tools from config without violating `@typescript-eslint/no-dynamic-delete`, rebuild the tools object by filtering entries rather than using `delete config.tools[key]`
+
+## 2026-02-28 07:12 - US-001
+- Implemented E2E test for node:* import stripping in IIFE builds
+- Files changed: `e2e/iife-node-imports.e2e.ts` (new)
+- Test creates a temp plugin importing `node:fs` and `node:crypto`, builds it through the real pipeline, verifies IIFE contains no node:* references, then injects the adapter and verifies tool dispatch returns correct fallback result
+- **Learnings for future iterations:**
+  - Symlink `node_modules` from `plugins/e2e-test/` avoids needing `npm install` for temp plugins — all SDK deps resolve through the symlink
+  - The build CLI is at `platform/plugin-tools/dist/cli.js` (not in the workspace root's `node_modules/.bin/`)
+  - `execFileSync` with `tsc` requires the binary from the plugin's own `node_modules/.bin/tsc`
+  - The `create-plugin` build test (`platform/create-plugin/src/index.test.ts`) is flaky — occasionally fails on `npm install` in full test suite but passes when run in isolation
+---
+
+## 2026-02-28 07:22 - US-002
+- Implemented E2E tests for adapter hash integrity chain and mismatch detection
+- Files changed: `e2e/iife-hash-integrity.e2e.ts` (new)
+- Test 1 (hash chain): Verifies the embedded `__adapterHash` matches across build output, extension adapters/ directory, and injected page. Also verifies content-hashed filename is correctly computed from SHA-256 of the full file content.
+- Test 2 (mismatch + retry + recovery): Corrupts the adapter file in adapters/ dir by replacing `__adapterHash` with fake value, opens new tab to trigger injection of corrupted file, verifies the extension's hash mismatch detection (200ms retry mechanism exercises), then recovers by triggering an IIFE change through the file watcher which writes a new correct adapter file.
+- **Learnings for future iterations:**
+  - The extension injects the adapter file BEFORE verifying the hash. On mismatch, the adapter is still present in the page but with the wrong hash. The error from failed verification is caught by `Promise.allSettled`.
+  - The adapters/ directory is at `configDir/extension/adapters/` — to corrupt adapter files for testing, modify the file there (not the plugin's dist/).
+  - The retry mechanism in `injectAdapterFile()` re-injects the same file path after 200ms delay. If the file on disk is still corrupted, the retry also fails and throws.
+  - Recovery from corruption requires the file watcher to re-read the plugin's dist/adapter.iife.js, which triggers `writeAdapterFile()` to write a new content-hashed file to adapters/ and `sendPluginUpdate` to send the correct hash to the extension.
+  - Use helper functions like `extractEmbeddedHash()` and `findAdapterFile()` to keep tests DRY and avoid non-null assertions.
+---
+
+## 2026-02-28 07:30 - US-003
+- Implemented E2E tests for exec file lifecycle and adapter namespace isolation
+- Files changed: `e2e/exec-file-lifecycle.e2e.ts` (new)
+- Tests verify: (1) `__lastExecResult` is cleaned up and doesn't appear on adapter object after exec, (2) adapter is still present and frozen after exec script runs, (3) `e2e-test_echo` returns correct result after `browser_execute_script`
+- Existing tests in `browser-tools.e2e.ts` already covered: basic exec result verification and exec file cleanup. New tests cover the missing adapter namespace isolation scenarios that require the adapter to be injected.
+- **Learnings for future iterations:**
+  - `browser-tools.e2e.ts` uses `openTestServerTab()` (no adapter) for browser_execute_script tests. Tests requiring an injected adapter need `setupToolTest()` in a separate file.
+  - To get the tabId after `setupToolTest`, use `browser_list_tabs` and find the tab by URL matching 'localhost'. The `setupToolTest` helper doesn't return the tabId.
+  - The exec wrapper writes to `globalThis.__openTabs.__lastExecResult`, NOT to `globalThis.__openTabs.adapters['e2e-test']`. The adapter is a frozen object that exec scripts cannot modify.
+  - `callToolExpectSuccess` from helpers.ts throws with diagnostics if the tool call returns `isError=true` — preferred over raw `callTool` + manual assertions for plugin tool calls.
+---
+
+## 2026-02-28 07:40 - US-004
+- Implemented E2E tests for frozen adapter integrity check and tamper rejection
+- Files changed: `e2e/frozen-adapter-integrity.e2e.ts` (new)
+- Test 1 (tamper detection): Verifies legitimate frozen adapter works, then replaces it with unfrozen copy by rebuilding `globalThis.__openTabs` entirely (since hashAndFreeze makes adapters container non-writable). Tool dispatch returns isError=true with 'integrity' in message.
+- Test 2 (recovery via reload): After tampering and confirming failure, reloads page to trigger re-injection of legitimate frozen adapter. Polls until tool dispatch succeeds again, then verifies adapter is frozen and tool returns correct result.
+- Test 3 (handler not executed): Replaces adapter with unfrozen copy whose tools have trap handlers that set `globalThis.__tampered_handler_called = true`. After tool dispatch fails with integrity error, verifies the trap handler was never called.
+- **Learnings for future iterations:**
+  - The hashAndFreeze snippet makes both `__openTabs.adapters` and `adapters[pluginName]` non-writable and non-configurable. To tamper with the adapter, you must rebuild the entire `globalThis.__openTabs` object with a new adapters container — simple property assignment fails silently.
+  - `browser_execute_script` runs code in MAIN world, making it the right tool for tampering with `globalThis.__openTabs` in E2E tests.
+  - After `page.reload()`, use `page.waitForFunction()` to wait for adapter re-injection, then `waitForToolResult()` to poll until tool dispatch succeeds (covers both adapter injection and tab state readiness).
+  - The integrity check at `tool-dispatch.ts:183` returns `{ type: 'error', code: -32002, message: 'Adapter "<name>" failed integrity check (not frozen)' }` — test for `'integrity'` in the lowercased content.
+---
+
+## 2026-02-28 07:50 - US-005
+- Implemented E2E tests for rapid successive IIFE re-injections
+- Files changed: `e2e/iife-rapid-reinjection.e2e.ts` (new)
+- Test 1 (rapid changes with 300ms gaps): Writes to the IIFE 5 times with ~300ms gaps, each setting a unique `globalThis.__rapidVersion` marker. After changes settle, verifies only the final version is present in the tab, tool dispatch works, only one adapter file remains in the adapters directory, and server health is ok.
+- Test 2 (burst changes within debounce window): Writes 3 changes with 100ms gaps (within the 200ms debounce window), each pushing to a cumulative `globalThis.__rapidBurstVersions` array. Verifies the final version is always the last injected, tool dispatch works, and no stale adapter files persist.
+- **Learnings for future iterations:**
+  - The file watcher debounce timer is 200ms (in `file-watcher.ts`). Writing with gaps shorter than 200ms (e.g., 100ms) means the debounce timer is repeatedly reset, and only the final write triggers `handleIifeChange`.
+  - Writing with gaps longer than the debounce time (e.g., 300ms) may allow some intermediate versions to fire, but `writeAdapterFile` cleans up old content-hashed versions before writing new ones, so stale files don't accumulate.
+  - Global markers (e.g., `globalThis.__rapidVersion`) are the reliable way to verify which IIFE version ran in the page — adapter properties are frozen by hashAndFreeze and can't be modified.
+  - The `originalIife.replace(/}\)\(\);[\s]*$/, ...)` pattern inserts code before the IIFE closing, preserving the valid IIFE structure.
+---
+
+## 2026-02-28 07:55 - US-006
+- Implemented E2E test for navigation interceptor surviving plugin removal when other plugins remain
+- Files changed: `e2e/navigation-interceptor.e2e.ts` (new)
+- Test creates two plugins with onNavigate (e2e-test + custom nav-test built through real pipeline), verifies both receive pushState events, removes nav-test via config change + hot reload, then verifies e2e-test still receives pushState and replaceState events. Also verifies the URL actually changes after plugin removal.
+- **Learnings for future iterations:**
+  - `createMinimalPlugin()` creates plugins with simple IIFEs that don't have the navigation interceptor wrapper. To test navigation interceptor behavior, build the second plugin through the real pipeline (tsc + opentabs-plugin build) so the IIFE wrapper includes the shared interceptor code.
+  - The `@typescript-eslint/no-dynamic-delete` rule prevents using `delete config.tools[t]` with dynamic keys. Rebuild the object by filtering entries instead.
+  - After hot reload removes a plugin, the extension tears down the adapter during sync.full. Use `waitFor()` to poll until the adapter is absent from `globalThis.__openTabs.adapters`.
+  - When testing onNavigate after plugin removal, clear the remaining plugin's URL array first to isolate the assertion to post-removal navigations.
+---
+
+## 2026-02-28 08:25 - US-007 (e2eCheckpoint)
+- Implemented E2E test for log relay nonce validation security in `e2e/log-relay-security.e2e.ts` (new)
+- Test 1 (legitimate logs relayed): Calls `e2e-test_echo` which produces log entries, verifies the server receives plugin log entries containing the expected message via `waitForLog()`.
+- Test 2 (spoofed nonce rejected): Injects page script that sends `postMessage` with correct structure (`type: 'opentabs:plugin-logs'`, valid plugin name, entries array) but wrong nonce (random UUID). Waits 2s, verifies the spoofed message content does NOT appear in server logs while legitimate logs do appear.
+- Test 3 (tool dispatch works after spoofing): After injecting spoofed messages, calls `e2e-test_echo` and verifies it returns the correct result, proving the adapter and log relay are unaffected by spoofing attempts.
+- Also fixed 7 pre-existing E2E test failures in other test files:
+  - `e2e/frozen-adapter-integrity.e2e.ts`: Changed all 3 tamper steps from `browser_execute_script` to `page.evaluate()` to avoid breaking the exec wrapper's `__ot` reference when tamper code replaces `globalThis.__openTabs`
+  - `e2e/iife-hash-integrity.e2e.ts`: (1) Fixed content hash check by reversing `sourceMappingURL` rewrite before hashing; (2) Fixed recovery wait condition to check adapter file content instead of hash value
+  - `e2e/iife-node-imports.e2e.ts`: Updated to use `defineTool()` with zod schemas, added `description` field, used bare imports + `require()` assertions instead of bare string matching (plugin description contains "node:fs" as text)
+  - `e2e/navigation-interceptor.e2e.ts`: Updated to use `defineTool()` with zod schemas, added `description` field
+- **Phase 2 checkpoint**: All 377 E2E tests pass (6 checks: build, type-check, lint, knip, test, test:e2e)
+- **Learnings for future iterations:**
+  - The `browser_execute_script` exec wrapper captures `__ot = globalThis.__openTabs` before user code runs. If user code replaces `globalThis.__openTabs`, the wrapper writes `__lastExecResult` to the OLD object, causing extension reads to fail. Use `page.evaluate()` instead for operations that need to replace `globalThis.__openTabs`.
+  - When asserting IIFE content doesn't contain node:* references, check for `require("node:fs")` specifically, not bare `"node:fs"` — string literals in plugin metadata (description, class properties) may legitimately contain the text.
+  - The `sideEffects: false` flag on external resolves only helps esbuild tree-shake when imported bindings are unused. Assigning imported symbols to a variable (even unused `_nodeRefs`) keeps the `require()` call. Use bare/side-effect-only imports (`import 'node:fs'`) for guaranteed tree-shaking.
+  - Server's `writeAdapterFile()` hashes the IIFE content BEFORE rewriting `sourceMappingURL`. To verify the content hash in tests, reverse the rewrite before computing the expected hash.
+---
