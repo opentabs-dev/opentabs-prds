@@ -17,7 +17,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/browser-commands/extension-commands.ts, lines 350-458.\n\nThe bug: The outer Promise.race (line 450) races injectPromise against timeoutPromise. When timeoutPromise wins (SCRIPT_TIMEOUT_MS = 25s), the catch block at line 456 calls sendErrorResult but never cleans up the page globals __lastExecResult and __lastExecAsync. The cleanup code at lines 424-437 only runs when the inner async-wait loop (EXEC_MAX_ASYNC_WAIT_MS) times out.\n\nFix approach: In the catch block (line 456), before calling sendErrorResult, add a best-effort cleanup call identical to lines 425-437:\n\nawait chrome.scripting.executeScript({\n  target: { tabId },\n  world: 'MAIN',\n  func: () => {\n    const ot = (globalThis as Record<string, unknown>).__openTabs as Record<string, unknown> | undefined;\n    if (ot) {\n      delete ot.__lastExecResult;\n      delete ot.__lastExecAsync;\n    }\n  },\n}).catch(() => {});\n\nNote: tabId is declared at line 341 and is in scope for the catch block. The cleanup must be best-effort (.catch(() => {})) because the tab may have been closed.\n\nTo avoid duplication, consider extracting the cleanup script into a shared helper function used by both cleanup sites (lines 424-437 and the new catch block)."
@@ -38,7 +38,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/browser-commands/interaction-commands.ts, line 206.\n\nThe bug: Line 206 uses `htmlEl.offsetParent !== null` as the primary visibility check. offsetParent returns null for position: fixed and position: sticky elements, even when they are fully visible on screen. This means waitForElement with visible: true always times out (10 seconds) for these elements.\n\nFix approach: Replace the visibility check with one that handles all cases. A robust approach:\n\nconst style = getComputedStyle(htmlEl);\nconst isVisible = style.display !== 'none' && style.visibility !== 'hidden' && (htmlEl.offsetParent !== null || style.position === 'fixed' || style.position === 'sticky');\n\nThis preserves the existing offsetParent check for normal elements while correctly handling fixed/sticky. The getComputedStyle call for display !== 'none' is already on line 206, so this consolidates the two checks.\n\nNote: The injected function runs in the page's MAIN world via chrome.scripting.executeScript, so standard DOM APIs are available."
@@ -57,7 +57,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/browser-commands/tab-commands.ts, line 64.\n\nThe bug: chrome.tabs.update(tabId, { url }) returns the Tab object immediately, before navigation completes. The tab.url field contains the old (pre-navigation) URL. The fallback `?? url` never fires because the old URL is truthy (non-empty string).\n\nFix: Change line 64 from:\n  sendSuccessResult(id, { id: tab?.id ?? tabId, title: tab?.title ?? '', url: tab?.url ?? url });\nto:\n  sendSuccessResult(id, { id: tab?.id ?? tabId, title: tab?.title ?? '', url });\n\nAlways return the requested URL since chrome.tabs.update succeeding means navigation was initiated. The title will also be stale, but there's no way to get the new title without waiting for onComplete — the empty string fallback is acceptable."
@@ -77,7 +77,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/browser-commands/cookie-commands.ts, lines 77-91.\n\nThe bug: chrome.cookies.remove returns null when no matching cookie is found, but the code at line 86-87 unconditionally returns { deleted: true } regardless of the return value.\n\nFix: Capture the return value and check it:\n  const result = await chrome.cookies.remove({ url, name });\n  sendSuccessResult(id, { deleted: result !== null, name, url });\n\nThe chrome.cookies.remove API returns a Details object when the cookie is deleted, and null when no cookie is found. The fix is a one-line change."
@@ -97,7 +97,7 @@
         "npm run test passes"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/browser-commands/extension-commands.ts, lines 151-154 and 258-272.\n\nBug 1 (line 151-154): handleExtensionGetSidePanel creates a setTimeout in a Promise.race without storing the timeout ID. When sendMessage resolves first, the 3-second timer (SIDE_PANEL_TIMEOUT_MS) is never cleared.\n\nBug 2 (lines 258-272): handleExtensionCheckAdapter's isReady probe creates a setTimeout in a Promise.race without storing the timeout ID. When executeScript resolves first, the 5-second timer (IS_READY_TIMEOUT_MS) is never cleared. This runs per matching tab.\n\nFix approach: Follow the same pattern used in dispatch-helpers.ts (executeWithTimeout, lines 56-84). Store the timeout ID and clear it in a finally block:\n\nFor handleExtensionGetSidePanel (lines 151-154):\nlet timeoutId: ReturnType<typeof setTimeout> | undefined;\nconst timeoutPromise = new Promise<null>(resolve => {\n  timeoutId = setTimeout(() => resolve(null), SIDE_PANEL_TIMEOUT_MS);\n});\ntry {\n  sidePanelResult = await Promise.race([sendPromise, timeoutPromise]);\n} finally {\n  clearTimeout(timeoutId);\n}\n\nSame pattern for the isReady probe in handleExtensionCheckAdapter (lines 258-272)."

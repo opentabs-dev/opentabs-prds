@@ -1,0 +1,78 @@
+## Codebase Patterns
+- To test timer cleanup with `vi.spyOn(globalThis, 'clearTimeout')`, spy before handler call, assert `toHaveBeenCalled()`, then `mockRestore()` after — works cleanly with `vi.useFakeTimers()`
+- To use mocked module functions (e.g. `getPluginMeta`, `findAllMatchingTabs`) in tests: add `const { fn } = await import('../module.js')` after `vi.mock(...)`, then call `vi.mocked(fn).mockResolvedValueOnce(...)` in tests
+- `import-x/exports-last` rule: non-exported helpers must be placed BEFORE all `export const` declarations in a module, not between or after them
+- `handleBrowserExecuteScript` validation helpers (`requireTabId`, `requireStringParam`) do NOT throw — they call `sendToServer` and return `null`. Safe to move outside `try` blocks.
+- Test fake timers: use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync(n)` for testing timeout behavior; always `vi.useRealTimers()` to restore after the test
+- `expect.stringContaining()` triggers `@typescript-eslint/no-unsafe-assignment`; use exact strings or `expect.objectContaining()` cast instead
+- `toHaveBeenNthCalledWith(n, ...)` is the idiomatic way to assert specific mock call arguments without accessing `mock.calls` directly (avoids optional chain / unsafe-assignment lint errors)
+- The SCRIPT_TIMEOUT_MS mock value is 30000ms in extension-commands.test.ts
+- To test the inner `func` passed to `chrome.scripting.executeScript`, use `mockExecuteScript.mockImplementation(async (opts: unknown) => { const scriptOpts = opts as { func: (...a: unknown[]) => Promise<unknown>; args: unknown[] }; const result = await scriptOpts.func(...scriptOpts.args); return [{ result }]; })` — use fake timers and `vi.advanceTimersByTimeAsync` inside the implementation to fire any internal `setInterval` before awaiting the result. Set up `(globalThis as Record<string, unknown>).document` and `.getComputedStyle` as mock globals before calling the handler.
+
+# Ralph Progress Log
+PRD: prd-2026-02-27-223309-browser-command-bug-fixes~running.json
+Started: Sat Feb 28 06:33:30 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Extracted `cleanupExecGlobals(tabId)` helper (module-level, before exports) that runs a best-effort `chrome.scripting.executeScript` to delete `__lastExecResult` and `__lastExecAsync` from the page's MAIN world `.catch(() => {})`
+- Moved `tabId` and `execFile` validation (requireTabId, requireStringParam, regex check) outside the `try` block in `handleBrowserExecuteScript` so `tabId` is in scope in the `catch` block
+- Replaced inline cleanup code at the inner async-wait timeout path (was lines 424-437) with `await cleanupExecGlobals(tabId)`
+- Added `await cleanupExecGlobals(tabId)` in the outer `catch (err)` block before `sendErrorResult`, so cleanup runs when the 25s outer timeout fires
+- Added unit test using `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync(30001)` verifying: (1) executeScript called twice (inject + cleanup), (2) cleanup targets correct tabId in MAIN world, (3) error response contains timeout message
+- Files changed: `platform/browser-extension/src/browser-commands/extension-commands.ts`, `platform/browser-extension/src/browser-commands/extension-commands.test.ts`
+- **Learnings for future iterations:**
+  - `import-x/exports-last` requires all non-exported code to come before any `export const` — placing a private helper between exports triggers the rule on all prior exports
+  - Variables declared inside `try { }` are NOT accessible in the corresponding `catch { }` (separate block scopes in JS/TS)
+  - Vitest fake timers work well for testing timeout-driven async code: `vi.useFakeTimers()`, await the call, `vi.advanceTimersByTimeAsync(ms)`, then await the promise
+---
+
+## 2026-02-28 - US-002
+- Replaced single-condition visibility check `htmlEl.offsetParent !== null && getComputedStyle(htmlEl).display !== 'none'` with a robust three-condition check that handles `position: fixed` and `position: sticky` elements whose `offsetParent` is always null
+- New check: `style.display !== 'none' && style.visibility !== 'hidden' && (htmlEl.offsetParent !== null || style.position === 'fixed' || style.position === 'sticky')`
+- Calls `getComputedStyle(htmlEl)` once and reuses the style object for all three conditions
+- Added two unit tests for the `handleBrowserWaitForElement — visibility` describe block: one for `position: fixed`, one for `position: sticky`
+- Tests use `mockExecuteScript.mockImplementation` to actually invoke the injected `func` with fake DOM globals (`globalThis.document`, `globalThis.getComputedStyle`) and fake timers to fire the internal `setInterval` poll
+- Files changed: `platform/browser-extension/src/browser-commands/interaction-commands.ts`, `platform/browser-extension/src/browser-commands/interaction-commands.test.ts`
+- **Learnings for future iterations:**
+  - Testing `chrome.scripting.executeScript` inner functions requires making `mockExecuteScript` invoke the func, setting up DOM globals on `globalThis`, and using fake timers to fire `setInterval` within the mock implementation
+  - Cast `opts` to `{ func: (...a: unknown[]) => Promise<unknown>; args: unknown[] }` inside `mockImplementation` — avoids unsafe-assignment lint errors while giving type-safe access to `func` and `args`
+  - `vi.advanceTimersByTimeAsync(n)` called inside an async mock implementation works correctly — it fires fake timers AND flushes microtasks, resolving nested promises
+---
+
+## 2026-02-28 - US-003
+- Changed `handleBrowserNavigateTab` (tab-commands.ts line 64) to always return the requested `url` parameter instead of `tab?.url ?? url`
+- `chrome.tabs.update` returns the Tab object immediately (before navigation completes), so `tab.url` always contains the pre-navigation URL; the fallback `?? url` never fires since the old URL is a non-empty truthy string
+- Added unit test mocking `mockTabsUpdate` to return a tab with an old URL and verifying the response URL matches the requested navigation URL
+- Files changed: `platform/browser-extension/src/browser-commands/tab-commands.ts`, `platform/browser-extension/src/browser-commands/tab-commands.test.ts`
+- **Learnings for future iterations:**
+  - `chrome.tabs.update` returns the Tab object synchronously reflecting pre-navigation state — never trust `tab.url` after a navigation call for the new URL
+  - For `tab-commands.test.ts`, use `mockTabsUpdate.mockResolvedValueOnce(...)` to return a specific tab object for a single test case; the default mock returns `undefined`
+---
+
+## 2026-02-28 - US-004
+- Changed `handleBrowserDeleteCookies` to capture the return value of `chrome.cookies.remove` and check if it's null
+- Cast result to `chrome.cookies.CookieDetails | null` because Chrome's type declarations define the return as non-nullable, but at runtime it returns `null` when no matching cookie exists
+- Now returns `{ deleted: false, ... }` when cookie was not found, `{ deleted: true, ... }` when it was
+- Created new test file `platform/browser-extension/src/browser-commands/cookie-commands.test.ts` with tests for missing URL, missing name, deleted: true (cookie found), and deleted: false (cookie not found)
+- Files changed: `platform/browser-extension/src/browser-commands/cookie-commands.ts`, `platform/browser-extension/src/browser-commands/cookie-commands.test.ts`
+- **Learnings for future iterations:**
+  - Chrome type declarations may not include `null` in return types even when the API returns null at runtime; cast with `as Type | null` to enable the null check without triggering `@typescript-eslint/no-unnecessary-condition`
+  - Print width is 120 in this project (`.prettierrc`); mocks that fit within 120 chars must be on a single line, not split across lines
+  - `mockCookiesSet` and `mockCookiesGetAll` are safe to include even if not tested — they populate `chrome.cookies` in the `globalThis` stub and are referenced, so no lint/knip unused-var errors
+---
+
+## 2026-02-28 - US-005
+- Fixed `handleExtensionGetSidePanel`: added `let timeoutId`, wrapped `Promise.race` in inner `try...finally` block, cleared timer with `clearTimeout(timeoutId)` in the finally — timer now cleaned up when `sendMessage` resolves before `SIDE_PANEL_TIMEOUT_MS`
+- Fixed `handleExtensionCheckAdapter` isReady probe: same pattern — added `let isReadyTimeoutId`, wrapped `Promise.race` in inner `try...finally`, clears timer when `executeScript` resolves before `IS_READY_TIMEOUT_MS`
+- Both fixes follow the existing `handleBrowserExecuteScript` pattern (already uses try/finally for timer cleanup)
+- Added `handleExtensionGetSidePanel` describe block with two tests: happy path (sendMessage resolves first, clearTimeout called, correct response) and timeout path (no response before 3001ms, returns `{ open: false }`)
+- Added isReady timer cleanup test to `handleExtensionCheckAdapter` describe: mocks `getPluginMeta` and `findAllMatchingTabs` via `await import(...)` + `vi.mocked(...)`, two `executeScript` calls (inspect + isReady), verifies `clearTimeout` called and `isReady: true` in response
+- Imported `getPluginMeta` and `findAllMatchingTabs` mocked modules at test file top-level via `await import(...)` so `vi.mocked()` can override return values per test
+- Files changed: `platform/browser-extension/src/browser-commands/extension-commands.ts`, `platform/browser-extension/src/browser-commands/extension-commands.test.ts`
+- **Learnings for future iterations:**
+  - `vi.spyOn(globalThis, 'clearTimeout')` is the cleanest way to verify timer cleanup — always call `.mockRestore()` after to avoid affecting other tests
+  - To use `vi.mocked()` on mocked module functions in tests: add `const { fn } = await import('../module.js')` after the `vi.mock(...)` setup, then call `vi.mocked(fn).mockResolvedValueOnce(...)` in individual tests
+  - Prettier (120-char print width) wraps array elements onto their own lines when the inline form exceeds 120 chars; always check `.mockResolvedValueOnce` args line length
+  - When adding new dynamic imports, check that Prettier's formatting of the multi-line import matches what lint expects (use `npm run lint:fix` or match exact Prettier output)
+---
