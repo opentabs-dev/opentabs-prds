@@ -1,0 +1,130 @@
+# Ralph Progress Log
+PRD: prd-2026-02-27-224345-dev-proxy-e2e-tests~running.json
+Started: Sat Feb 28 07:00:47 UTC 2026
+## Codebase Patterns
+- Dev proxy tests should use `startMcpServer(configDir, true)` for hot mode and `createTestConfigDir()` for isolated config
+- The proxy's `whenReady()` buffers requests in `pending[]` when `workerPort === null` and drains on IPC 'ready' message
+- `triggerHotReload()` sends SIGUSR1 to the proxy process; use `waitForLog(server, 'Hot reload complete')` to confirm completion
+- Non-null assertions are forbidden by ESLint — use `if (!x) throw new Error(...)` pattern instead
+- The `McpServer` type has `health()`, `waitForHealth()`, `triggerHotReload()`, `kill()`, `port`, `secret`, `configDir`, `logs`
+- Always clean up with `server.kill()` and `cleanupTestConfigDir(configDir)` in `finally` blocks
+- Server secret is read from `<configDir>/extension/auth.json` — pass as `Authorization: Bearer <secret>` header
+- Use `pgrep -P <proxyPid>` + SIGKILL to kill the worker directly for 503 timeout tests
+- For graceful shutdown tests, send SIGTERM via `process.kill(pid, 'SIGTERM')` directly (not via fixture's `kill()`), listen on `proc.once('exit')` to capture code/signal, then call `server.kill().catch(() => {})` defensively in finally
+- Use `process.kill(pid, 0)` to check if a process is still alive (throws if dead)
+- ESLint import-x/order: local imports (./fixtures, ./helpers) must come before node: builtins
+- Use AbortController (not boolean flags) to control async poll loops — ESLint flags `let x = true; while (x)` as always-truthy
+- Use `createMcpClient(server.port, server.secret)` + `client.initialize()` + `client.listTools()` to verify MCP tool registration in non-fixture tests
+- The MCP client auto-reinits sessions after worker restarts (handles 400 "missing session", 502, 503 transparently)
+- Non-hot mode: `startMcpServer(configDir, false)` spawns `dist/index.js --dev` directly; use POST /reload for config rediscovery
+- `createMinimalPlugin(parentDir, pluginName, tools)` creates discoverable plugins; tool prefix is `pluginName_` (not the npm package name)
+- POST /reload returns `{ ok: true, plugins: N, durationMs: N }` — assert plugin count to verify discovery
+- Use `waitForToolList(client, predicate)` to poll tools/list after reload (handles session re-init timing)
+---
+
+## 2026-02-28T07:05 - US-001
+- Implemented E2E test verifying dev proxy buffers HTTP requests during worker restart
+- Created new file `e2e/dev-proxy.e2e.ts` with a `Dev proxy request buffering` describe block
+- Test flow: start hot-mode server → verify healthy → trigger hot reload → immediately fetch /health → verify 200 OK → confirm hot reload completed
+- Files changed: `e2e/dev-proxy.e2e.ts` (new)
+- **Learnings for future iterations:**
+  - The proxy's `whenReady()` mechanism transparently buffers requests — a fetch fired immediately after `triggerHotReload()` is held until the new worker sends 'ready'
+  - The `AbortSignal.timeout(10_000)` on the fetch provides a safety net; the proxy's own READY_TIMEOUT_MS (5s) would trigger 503 first
+  - Existing lifecycle tests in `lifecycle.e2e.ts` focus on extension connectivity; dev proxy HTTP behavior is a separate concern
+---
+
+## 2026-02-28T07:10 - US-002
+- Implemented E2E test verifying dev proxy returns 503 when worker dies without restart
+- Added new `Dev proxy 503 timeout` describe block in `e2e/dev-proxy.e2e.ts`
+- Test flow: start hot-mode server → verify healthy → find worker PID via `pgrep -P <proxyPid>` → kill worker with SIGKILL → wait for "Worker exited" log → fetch /health → verify 503 response after ~5s (READY_TIMEOUT_MS)
+- Files changed: `e2e/dev-proxy.e2e.ts` (modified)
+- **Learnings for future iterations:**
+  - The proxy's worker exit handler only clears `worker = null` and `workerPort = null` — it does NOT restart. Only SIGUSR1 or file changes trigger `startWorker()`
+  - Use `pgrep -P <pid>` to find child processes of the proxy for direct worker manipulation
+  - ESLint import-x/order requires local imports (./fixtures, ./helpers) before node: builtins when they appear in the same block
+  - The `whenReady()` timeout (READY_TIMEOUT_MS = 5s) ensures requests don't hang indefinitely when no worker is available
+---
+
+## 2026-02-28T07:15 - US-003
+- Implemented E2E test verifying dev proxy handles concurrent overlapping hot reloads without deadlock or state corruption
+- Added new `Dev proxy concurrent overlapping reloads` describe block in `e2e/dev-proxy.e2e.ts`
+- Test flow: start hot-mode server → verify healthy → init MCP client → verify tools/list → fire two rapid SIGUSR1 signals back-to-back → wait for 'Hot reload complete' → verify health OK → verify tools/list → check no error logs
+- Added imports for `createMcpClient` and `readPluginToolNames` to the existing import block
+- Files changed: `e2e/dev-proxy.e2e.ts` (modified)
+- **Learnings for future iterations:**
+  - Two synchronous `triggerHotReload()` calls fire SIGUSR1 signals within microseconds — the second startWorker() kills the first replacement worker before it can report ready
+  - The `pending[]` array persists across startWorker() calls — callbacks queued during the first restart are drained by the second worker's 'ready' message
+  - The MCP client's auto-reinit logic (on 400 "missing session" or 502/503) transparently handles the session invalidation after overlapping reloads
+  - The `child.on('exit')` handler only clears state when `worker === child`, so killed intermediate workers don't corrupt the final worker's state
+---
+
+## 2026-02-28T07:20 - US-004
+- Implemented E2E test verifying dev proxy graceful shutdown on SIGTERM
+- Added new `Dev proxy graceful shutdown` describe block in `e2e/dev-proxy.e2e.ts`
+- Test flow: start hot-mode server → verify healthy → find worker PIDs via pgrep → listen on proc 'exit' event → send SIGTERM directly to proxy PID → verify exit code 0 or signal SIGTERM → verify port no longer listening (fetch rejects) → verify worker PIDs are dead via process.kill(pid, 0)
+- Files changed: `e2e/dev-proxy.e2e.ts` (modified)
+- **Learnings for future iterations:**
+  - The proxy's SIGTERM handler calls `worker?.kill('SIGTERM')` then `process.exit(0)` synchronously — the exit is nearly immediate
+  - `process.exit(0)` in the SIGTERM handler produces `code=0` on the ChildProcess 'exit' event (not `signal='SIGTERM'`)
+  - Use `process.kill(pid, 0)` to check if a PID is still alive — it throws ESRCH if the process doesn't exist
+  - When the proxy is killed before the test completes, the fixture's `kill()` must be wrapped in `.catch(() => {})` since killProcess may throw on an already-exited process
+  - Use `AbortController` + `signal.aborted` instead of `let polling = true` to control poll loops — ESLint's `@typescript-eslint/no-unnecessary-condition` flags boolean variables initialized to `true` as always truthy
+---
+
+## 2026-02-28T07:25 - US-005
+- Implemented E2E test verifying dev proxy health endpoint returns degraded state during worker restart window
+- Added new `Dev proxy health during worker restart window` describe block in `e2e/dev-proxy.e2e.ts`
+- Test flow: start hot-mode server → verify healthy → find worker PIDs via pgrep → start rapid poll loop (10ms interval, collecting status codes) → kill worker with SIGKILL → wait for "Worker exited" log → trigger hot reload → wait for "Hot reload complete" → stop polling → verify at least one non-200 (502/503/0) during transition → verify final polls return 200
+- Used AbortController to signal the poll loop to stop (avoids ESLint no-unnecessary-condition on boolean flags)
+- Files changed: `e2e/dev-proxy.e2e.ts` (modified)
+- **Learnings for future iterations:**
+  - Killing the worker with SIGKILL directly (not via SIGUSR1) creates a reliable window where workerPort still points to the dead worker's port — requests forwarded during this window get 502 from proxyReq.on('error')
+  - The proxy's exit handler fires asynchronously (next event loop tick) after the child process dies — this is the timing window where 502s occur
+  - Use AbortController instead of boolean flags for controlling async loops — ESLint treats `let x = true; while (x)` as "unnecessary conditional" since x is always truthy at init time
+  - After killing the worker and triggering a hot reload, buffered requests (those arriving after workerPort = null) are drained when the new worker reports ready via IPC
+---
+
+## 2026-02-28T07:30 - US-006
+- Implemented E2E test verifying SSE stream gets clean error or completes when worker restarts mid-stream
+- Added new `Dev proxy SSE mid-stream worker restart` describe block in `e2e/dev-proxy.e2e.ts`
+- Test flow: full fixture setup (mcpServer, testServer, extensionContext, mcpClient) → setupToolTest → baseline callToolWithProgress (500ms, 2 steps) → start slow callToolWithProgress (5s, 10 steps) producing SSE stream → wait 1s → trigger hot reload → accept either success or error (502/connection reset) → wait for Hot reload complete → wait for extension reconnect → verify subsequent echo tool call succeeds
+- Uses `callToolWithProgress` with `e2e-test_slow_with_progress` to produce an actual SSE stream with progress notifications, unlike the existing in-flight test which uses `callTool` with slow test server mode
+- Files changed: `e2e/dev-proxy.e2e.ts` (modified — added imports + new test block)
+- **Learnings for future iterations:**
+  - `callToolWithProgress` produces SSE (text/event-stream) responses with progress notifications interspersed in the stream — this exercises the proxy's `proxyRes.pipe(res)` code path differently than JSON responses
+  - The `e2e-test_slow_with_progress` tool sleeps directly in the worker (not via test server), so `testServer.setSlow()` is not needed — the duration param controls the delay
+  - When the pipe breaks mid-SSE-stream, `res.text()` in the client either gets a partial response (parse error) or a network error — both are caught by the try/catch
+  - Full fixture tests (with extension) require `test.describe.serial` and `test.slow()` since browser setup is expensive
+  - The `waitForExtensionConnected` call after hot reload is critical — without it, subsequent tool calls may fail with "Extension not connected"
+---
+
+## 2026-02-28T07:35 - US-007
+- Implemented E2E test verifying POST /reload triggers config rediscovery in non-hot (production) mode
+- Added new `POST /reload in non-hot (production) mode` describe block in `e2e/dev-proxy.e2e.ts`
+- Test flow: start non-hot server → verify healthy → init MCP client → verify e2e-test tools → create minimal plugin → update config.json → POST /reload with Bearer auth → verify reload response (ok + plugin count) → waitForToolList until new plugin's tool appears → verify original tools still present
+- Added imports for `createMinimalPlugin`, `readTestConfig`, `writeTestConfig`, `waitForToolList`, and `fs`
+- Files changed: `e2e/dev-proxy.e2e.ts` (modified — added imports + new test block)
+- **Learnings for future iterations:**
+  - Non-hot mode spawns `dist/index.js --dev` directly (no proxy layer), so there's no worker restart mechanism — POST /reload is the only way to trigger rediscovery
+  - `createMinimalPlugin(parentDir, pluginName, tools)` creates a fully discoverable plugin with package.json, dist/tools.json, and adapter IIFE — tool names get prefixed with `pluginName_` (not `opentabs-plugin-pluginName_`)
+  - `readTestConfig` + `writeTestConfig` allow modifying config.json in-place; push new plugin path to `localPlugins` and enable tools in `tools` map
+  - The MCP server's POST /reload returns `{ ok: true, plugins: N, durationMs: N }` — useful for asserting the expected plugin count
+  - `waitForToolList` polls `listTools()` with a predicate — handles the case where the MCP client needs to re-initialize the session after a reload
+- Use `fetchWsInfo(port, secret)` to get WebSocket URL and auth secret; build protocols array with `['opentabs', secret]` for authenticated connections
+- The proxy's upgrade handler uses `whenReady()` to buffer WS upgrades during restart — same pattern as HTTP buffering
+- WebSocket connections during restart window may succeed (buffered and forwarded) or fail cleanly (socket.destroy() on timeout) — both are acceptable
+---
+
+## 2026-02-28T07:40 - US-008
+- Implemented E2E test verifying WebSocket upgrade requests during worker restart window are handled correctly
+- Added new `Dev proxy WebSocket upgrade during worker restart` describe block in `e2e/dev-proxy.e2e.ts`
+- Test flow: start hot-mode server → verify healthy → get WS info (URL + secret) → trigger hot reload → immediately attempt WS connection → verify it either succeeds (buffered) or fails cleanly (no hang) → wait for Hot reload complete → open fresh WS connection → verify it opens successfully → verify bidirectional communication works
+- Added `fetchWsInfo` import to the existing fixtures import block
+- Files changed: `e2e/dev-proxy.e2e.ts` (modified — added import + new test block)
+- **Learnings for future iterations:**
+  - The proxy's upgrade handler (dev-proxy.ts lines 214-227) uses `whenReady()` identically to the HTTP handler — upgrade requests are buffered in `pending[]` and forwarded via `forwardUpgrade()` once the worker is ready
+  - The timeout path for WS upgrades calls `socket.destroy()` (not a graceful close), so the client sees either a close or error event — never a hang
+  - The Node.js 22+ global `WebSocket` is used by E2E tests (not the `ws` npm package) — no import needed
+  - After verifying the mid-reload connection, always clean up with `.close()` if the WebSocket opened, to avoid leaking connections that could interfere with subsequent assertions
+  - This was an `e2eCheckpoint: true` story — Phase 2 (full E2E suite, 370 tests) was run and passed
+---
