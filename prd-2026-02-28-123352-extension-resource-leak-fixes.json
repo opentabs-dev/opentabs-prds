@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two resource management bugs in the browser extension: (1) unbounded growth of clearedConfirmationIds Set in confirmation-badge.ts, and (2) runaway polling IIFE in handleBrowserExecuteScript that continues executing after the outer timeout fires, causing stale globals cleanup to race with subsequent executions.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Prune clearedConfirmationIds Set to prevent unbounded memory growth",
+      "description": "As a developer, I want the clearedConfirmationIds Set in confirmation-badge.ts to be pruned after entries are no longer needed so that long-running sessions don't leak memory.",
+      "acceptanceCriteria": [
+        "clearedConfirmationIds entries are removed when they can no longer serve their idempotency purpose — specifically, after the corresponding confirmationTimeouts entry has been removed (timeout fired or was cleared by the side panel)",
+        "The idempotency guarantee is preserved: calling clearConfirmationBadge twice with the same id still decrements the count only once, as long as both calls happen within the confirmation's lifetime",
+        "clearAllConfirmationBadges still clears the entire Set (existing behavior preserved)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/confirmation-badge.ts\n\nThe clearedConfirmationIds Set (line 18) tracks confirmation IDs that have been resolved, to make clearConfirmationBadge() idempotent — when both the background timeout and the side panel fire for the same ID, the count decrements only once.\n\nThe bug: IDs are added at line 106 (clearConfirmationBadge) but only removed in two places: (1) notifyConfirmationRequest at line 64 (if the same ID is reused for a new confirmation), and (2) clearAllConfirmationBadges at line 134 (WebSocket disconnect). Over a long session with many confirmations, IDs accumulate indefinitely.\n\nFix: Remove the ID from clearedConfirmationIds when the corresponding confirmationTimeouts entry is cleaned up. The key insight is that the clearedConfirmationIds entry is only needed while the background timeout is still pending — once the timeout fires or is cleared, no duplicate clearConfirmationBadge call can happen. Specifically:\n\n1. In the background timeout callback (line 74-77): the ID is already deleted from confirmationTimeouts and clearConfirmationBadge is called. After this, delete the ID from clearedConfirmationIds too (it was just added by clearConfirmationBadge, but it's no longer needed since the timeout has fired).\n\n2. In clearConfirmationBackgroundTimeout (lines 119-125): when the side panel handles the confirmation first, the background timeout is cleared. At this point the ID in clearedConfirmationIds is no longer needed — delete it.\n\nThis ensures clearedConfirmationIds only holds IDs for confirmations that are actively being processed (have a pending background timeout), not historical ones."
+    },
+    {
+      "id": "US-002",
+      "title": "Add cancellation flag to handleBrowserExecuteScript to stop polling after timeout",
+      "description": "As a developer, I want the inner polling IIFE in handleBrowserExecuteScript to stop executing when the outer Promise.race timeout fires so that stale polling doesn't waste resources or clean up globals belonging to a subsequent execution.",
+      "acceptanceCriteria": [
+        "A cancellation flag (e.g., a simple boolean in a closure or object) is checked at the top of each polling iteration; when the flag is set, the loop exits immediately without further chrome.scripting.executeScript calls",
+        "The flag is set in the finally block of the Promise.race (after the timeout fires), ensuring the IIFE stops at its next iteration",
+        "The cleanup script (lines 441-453 that deletes __lastExecResult and __lastExecAsync) only runs if the IIFE itself timed out on EXEC_MAX_ASYNC_WAIT_MS — not if the outer SCRIPT_TIMEOUT_MS fired (the outer timeout means the initial script injection hung, so there are no globals to clean up)",
+        "Normal (non-timeout) execution is unaffected — the polling loop still reads results and returns them correctly",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/browser-commands/extension-commands.ts (handleBrowserExecuteScript, lines 352-475)\n\nThe bug: handleBrowserExecuteScript uses Promise.race between an async IIFE (injectPromise, lines 369-456) and a timeout promise (lines 458-462). When the timeout wins, the error response is sent (line 472-473), but the IIFE keeps running in the background — it has no way to know the race was lost. The IIFE continues calling chrome.scripting.executeScript to poll for results, and eventually runs a cleanup script that deletes __lastExecResult and __lastExecAsync from the page's __openTabs global. If a NEW browser.executeScript call starts before the stale IIFE finishes, the stale cleanup can delete the new call's globals, producing incorrect results.\n\nFix approach: Create a simple cancellation mechanism using a mutable object in the closure:\n\n```typescript\nconst cancelled = { value: false };\n```\n\nPass this into the IIFE and check `cancelled.value` at the top of the while loop (line 382). In the finally block after Promise.race (line 467), set `cancelled.value = true`.\n\nAlso skip the cleanup script (lines 441-453) if cancelled — the outer timeout already sent the error, and running cleanup later would race with subsequent executions.\n\nThe pattern is:\n```typescript\nconst cancelled = { value: false };\nconst injectPromise = (async () => {\n  // ... initial injection ...\n  while (elapsed <= EXEC_MAX_ASYNC_WAIT_MS) {\n    if (cancelled.value) return { value: { error: 'Cancelled by outer timeout' } };\n    // ... existing polling logic ...\n  }\n  // Only clean up if not cancelled\n  if (!cancelled.value) {\n    await chrome.scripting.executeScript({ ... cleanup ... }).catch(() => {});\n  }\n  return { value: { error: `Async code did not resolve within ${EXEC_MAX_ASYNC_WAIT_MS}ms` } };\n})();\n\n// ... timeoutPromise ...\n\ntry {\n  result = await Promise.race([injectPromise, timeoutPromise]);\n} finally {\n  clearTimeout(timeoutId);\n  cancelled.value = true;\n}\n```"
+    }
+  ]
+}
