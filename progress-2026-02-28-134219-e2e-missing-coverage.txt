@@ -1,0 +1,41 @@
+## Codebase Patterns
+- Server-only E2E tests (no browser needed) use `startMcpServer(configDir, true)` + `createTestConfigDir`/`cleanupTestConfigDir` in beforeEach/afterEach
+- `server.secret` holds the auth token; `server.port` holds the ephemeral port
+- `server.waitForHealth(h => h.status === 'ok')` waits for server readiness
+- POST /reload and GET /audit both require `Authorization: Bearer <secret>` header; missing/wrong token returns 401
+- Always call `server.kill()` in a `finally` block to clean up
+- Plugin log entries format in server stdout: `[plugin:<name>] <ts> <LEVEL> <message> <JSON.stringify(data)>` where `data` is the serialized args array (e.g., `[{"level":"debug"}]`)
+- The `log_levels` e2e-test tool already passes structured args `{ level: '<levelname>' }` with each call — no plugin changes needed to test args serialization
+- `mcpServer.waitForHealth(h => buf >= bufferBefore + 4)` is the reliable way to wait for log entries to arrive (polls /health buffer directly vs. stdout which can be buffered)
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-134219-e2e-missing-coverage~running.json
+Started: Sat Feb 28 21:42:47 UTC 2026
+---
+
+## 2026-02-28 - US-002
+- Added two new tests to `e2e/plugin-logging.e2e.ts` within the existing `Plugin logging — full pipeline` describe block
+- **Test 1 (args serialization)**: Calls `log_levels` tool, waits for buffer to fill, then verifies each log line contains the serialized args object (e.g., `${prefix} debug-message [{"level":"debug"}]`). No plugin changes needed — the tool already passes `{ level: '<levelname>' }` as structured args.
+- **Test 2 (exact buffer increment)**: Calls `log_levels` tool, waits for `buf >= bufferBefore + 4`, then asserts `bufferAfter === bufferBefore + 4` (exact match, not `>=`). Catches duplicate-entry bugs.
+- Files changed: `e2e/plugin-logging.e2e.ts`
+- All Phase 1 checks (build, type-check, lint, knip, test) passed
+- Phase 2 (E2E): All 400 tests passed including the 2 new ones
+- **Learnings for future iterations:**
+  - Server log format: `[plugin:<name>] <ts> <LEVEL> <message> [{"key":"val"}]` — args are JSON.stringify of the array passed to the SDK log call
+  - The `log_levels` tool in `plugins/e2e-test/src/tools/log-levels.ts` already logs with structured args — no plugin rebuild needed to test args serialization
+  - For exact buffer increment tests: poll until `buf >= expected`, then assert `buf === expected` with a final health call
+---
+
+## 2026-02-28 - US-001
+- Added a new `test.describe('POST /reload authentication enforcement')` block to `e2e/secret-rotation.e2e.ts`
+- Two new tests:
+  1. POST /reload without Bearer auth header → expect 401
+  2. POST /reload with incorrect Bearer token → expect 401
+- Both tests use `startMcpServer` with isolated `createTestConfigDir`, safe for parallel execution
+- Files changed: `e2e/secret-rotation.e2e.ts`
+- **Learnings for future iterations:**
+  - Server-only E2E tests don't need browser fixtures — use `startMcpServer` directly with `createTestConfigDir`/`cleanupTestConfigDir` lifecycle hooks
+  - The existing secret-rotation.e2e.ts is the natural home for POST /reload tests
+  - `startMcpServer(configDir, true)` starts with hot-reload proxy; `true` = hot mode
+  - Phase 1 checks (build, type-check, lint, knip, test) all passed without issue for adding new E2E test files
+---
