@@ -1,0 +1,28 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-133208-network-capture-clear-data-loss~running.json
+Started: Sat Feb 28 21:32:32 UTC 2026
+---
+
+## Codebase Patterns
+- network-capture.ts has two kinds of internal state: *output buffers* (requests, wsFrames, consoleLogs) that are returned to callers, and *lookup maps* (pendingRequests, requestIdToRequest, wsFramesByRequestId, wsCreatedAt) that are needed for ongoing event routing. clear=true should only reset the output buffers, never the lookup maps.
+- The body-fetch guard at line ~304 (`if (!state.requests.includes(request)) return`) safely handles the case where a loadingFinished async callback fires after clear — no extra guard needed in getRequests.
+- WebSocket entries in wsFramesByRequestId are cleaned up by three mechanisms: webSocketClosed events, the periodic prune interval (WS_TTL_MS = 5 min), and stopCapture. getWsFrames(clear=true) must not interfere with any of these.
+- Chrome API is mocked at the top of network-capture.test.ts using globalThis.chrome; the module is loaded via dynamic import AFTER the mock is set up.
+- Test tab IDs use ranges to avoid collisions: 1xxx=getRequests, 2xxx=loadingFinished, 3xxx=webSocketClosed/stopCapture, 4xxx=pruning interval, 5xxx=wsFramesByRequestId pruning, 6xxx=concurrent startCapture, 7xxx=getWsFrames clear.
+
+## [2026-02-28] - US-001
+- Fixed data loss bugs in getRequests(clear=true) and getWsFrames(clear=true)
+- Files changed:
+  - platform/browser-extension/src/network-capture.ts
+  - platform/browser-extension/src/network-capture.test.ts
+- Changes:
+  - getRequests: removed `state.pendingRequests.clear()` — in-flight requests are now preserved through clears; their responses appear in subsequent reads
+  - getWsFrames: removed `state.wsFramesByRequestId.clear()` and `state.wsCreatedAt.clear()` — existing WebSocket connections continue to have frames captured after a clear
+  - Rewrote existing (buggy-behavior) test "clear=true discards in-flight pending requests" to verify the correct new behavior
+  - Added test for requestIdToRequest partial-clear (completed vs in-flight)
+  - Added two new tests for getWsFrames clear=true (single clear, multiple consecutive clears)
+- **Learnings for future iterations:**
+  - The distinction between output buffers and internal routing maps is the key design insight for correct clear behavior
+  - pendingRequests tracks pre-responseReceived state; requestIdToRequest tracks post-responseReceived/pre-loadingFinished state — they represent different phases of the same request lifecycle
+  - When writing tests for clear behavior, use tab IDs in the 7xxx range to avoid collision with existing tests
+---
