@@ -1,0 +1,127 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource leaks, and safety issues in the MCP server core: partial state update in reloadCore, removeLocalPlugin false-success on write failure, missing HTTP body size limit, stale failure entries in file watcher, fire-and-forget extension.reload using request instead of notification, and 30s domain resolution blocking browser tool calls.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix reloadCore partial state update on loadSecret failure",
+      "description": "As a platform operator, I want reloadCore to not leave state partially updated when loadSecret fails, so that the server's in-memory state is always consistent.",
+      "acceptanceCriteria": [
+        "If loadSecret() throws, none of the state fields (registry, toolConfig, browserToolPolicy, pluginPaths, discoveryErrors, permissions, skipConfirmation) are updated — all remain at their pre-reload values",
+        "The error log message accurately describes what happened (not 'keeping previous state' when state was partially updated)",
+        "If loadSecret() succeeds but returns a different secret, secretChanged is correctly computed and triggers extension reload",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/reload.ts, lines 186-218.\n\nThe bug: state mutations happen at lines 191-197 (state.registry = registry, state.toolConfig = {...}, etc.), then loadSecret() is called at line 215. If loadSecret() throws, the catch at line 217 runs, but registry/toolConfig/etc. are ALREADY updated. The log says 'keeping previous state' which is incorrect.\n\nFix approach: Collect all new values into local variables first (config, registry, secret), then assign them all to state at once AFTER all async operations succeed. Move `state.wsSecret = await loadSecret()` into the same try block but BEFORE the state mutations, or give loadSecret its own independent try-catch so a secret failure doesn't prevent config/registry updates (which is the current intent). The cleanest fix: wrap loadSecret in its own try-catch that logs the error and keeps the old secret, while letting config/registry updates proceed. This makes the catch block's 'keeping previous state' message accurate for config/discovery failures, and loadSecret failures are handled independently."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix removeLocalPlugin reporting success when atomicWrite fails",
+      "description": "As a user removing a local plugin, I want the removal to report failure when the config file write fails, so that I know the plugin was not actually removed.",
+      "acceptanceCriteria": [
+        "If atomicWrite throws inside the mutex closure, removeLocalPlugin returns false (not true)",
+        "The configWriteMutex is properly reset so subsequent writes are not blocked",
+        "If atomicWrite succeeds, removeLocalPlugin still returns true",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/plugin-management.ts, lines 361-441.\n\nThe bug: `removed` is set to `true` at lines 409/419 BEFORE `atomicWrite` at line 431. If atomicWrite throws, the .catch() at line 433 reassigns `state.configWriteMutex = Promise.resolve()` and re-throws. But the outer `await state.configWriteMutex` at line 439 now awaits the REASSIGNED Promise.resolve() (not the original rejected promise), so it resolves successfully and returns `removed = true` even though the write failed.\n\nFix approach: Restructure so the async closure's return value (or rejection) is properly captured. One approach: store the closure's promise in a separate variable and await that directly, rather than re-awaiting the mutex. Another approach: use a result variable that is set to true only AFTER atomicWrite succeeds. The simplest fix: move `removed = true` to after the `atomicWrite` call (after line 431), so it's only set when the write actually succeeds."
+    },
+    {
+      "id": "US-003",
+      "title": "Add HTTP request body size limit to collectBody",
+      "description": "As a security-conscious operator, I want the MCP server to reject oversized HTTP request bodies, so that a local attacker cannot exhaust server memory.",
+      "acceptanceCriteria": [
+        "collectBody enforces a maximum body size of 10MB (matching the WebSocket maxPayload)",
+        "If the body exceeds the limit, the request stream is destroyed and the promise rejects with a descriptive error",
+        "The HTTP request handler catches this rejection and returns a 413 (Payload Too Large) response",
+        "Normal-sized requests continue to work correctly",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/server-node.ts, lines 99-105.\n\nThe current collectBody function reads all chunks with no size check. The WebSocket server already has maxPayload: 10 * 1024 * 1024 at line 227, so use the same 10MB limit for HTTP bodies.\n\nFix approach: Track accumulated size in collectBody. When it exceeds 10MB, call req.destroy() and reject with an error. In handleHttpRequest (lines 111-137), catch this specific error and return a 413 response.\n\nAlso define a constant MAX_BODY_SIZE = 10 * 1024 * 1024 near the top of the file, matching the WebSocket constant."
+    },
+    {
+      "id": "US-004",
+      "title": "Filter stale failure entries in handlePendingPluginChange",
+      "description": "As a plugin developer, I want the /health endpoint to not show my plugin as both loaded and failed after it recovers from a build error.",
+      "acceptanceCriteria": [
+        "When handlePendingPluginChange successfully loads a plugin, the new registry does not contain a failure entry for that plugin's path",
+        "The /health endpoint shows the plugin only in pluginDetails (loaded), not in failedPlugins",
+        "Other failure entries for different plugins are preserved",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/file-watcher.ts, lines 371-401.\n\nAt line 389: `state.registry = buildRegistry(updatedPlugins, [...state.registry.failures])` — the failures list still includes the entry for `pluginDir` that just loaded successfully.\n\nFix: Filter failures before passing to buildRegistry:\n```\nconst updatedFailures = state.registry.failures.filter(f => f.path !== pluginDir);\nstate.registry = buildRegistry(updatedPlugins, updatedFailures);\n```"
+    },
+    {
+      "id": "US-005",
+      "title": "Send extension.reload as a notification instead of a request",
+      "description": "As a developer, I want the extension.reload message to be a proper JSON-RPC notification (no id field), so that the protocol semantics match the fire-and-forget intent.",
+      "acceptanceCriteria": [
+        "sendExtensionReload sends a JSON-RPC notification (no id field) instead of a request",
+        "The extension.reload message has jsonrpc: '2.0' and method: 'extension.reload' but no id",
+        "The return type and behavior remain the same (returns boolean indicating send success)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/extension-protocol.ts, lines 502-509.\n\nCurrent code creates an id via getNextRequestId() and sends a message with method + id (which is a JSON-RPC request expecting a response). But no pending dispatch is registered, so the response is silently dropped. The intent is fire-and-forget.\n\nFix: Remove the id field. Change the message type from JsonRpcRequest to JsonRpcNotification. Remove the getNextRequestId() call. The sendToExtension call stays the same.\n\nAlso check platform/mcp-server/src/browser-tools/reload-extension.ts (lines 20-33) which has the same pattern — sends a request with id but never registers a pending dispatch. Apply the same fix there. Note: the reload-extension.ts test at platform/mcp-server/src/browser-tools/reload-extension.test.ts may need updating if it checks for an id in the sent message."
+    },
+    {
+      "id": "US-006",
+      "title": "Use short timeout for domain resolution in resolveToolDomain",
+      "description": "As an AI agent using browser tools, I want domain resolution to fail fast when a tab is unresponsive, so that browser tool calls don't silently block for 30 seconds.",
+      "acceptanceCriteria": [
+        "resolveToolDomain uses a timeout of 5 seconds (not the default 30s DISPATCH_TIMEOUT_MS) for the browser.getTabInfo dispatch",
+        "If the tab is unresponsive, resolveToolDomain returns null within ~5 seconds instead of ~30 seconds",
+        "The catch block still returns null on timeout (same behavior, just faster)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/mcp-tool-dispatch.ts, lines 70-82.\n\nThe current code calls `dispatchToExtension(state, 'browser.getTabInfo', { tabId: tabIdArg })` with no options, so it uses the default 30s timeout from DISPATCH_TIMEOUT_MS.\n\nThe dispatchToExtension function at platform/mcp-server/src/extension-protocol.ts:119-173 creates the timeout at line 145 using DISPATCH_TIMEOUT_MS. To use a shorter timeout, there are two approaches:\n\n1. Add a `timeoutMs` option to DispatchOptions and use it in dispatchToExtension instead of the default DISPATCH_TIMEOUT_MS. Then pass { label: 'browser.getTabInfo', timeoutMs: 5000 } in resolveToolDomain.\n\n2. Or, wrap the dispatchToExtension call in a Promise.race with a shorter timeout and catch the race.\n\nApproach 1 is cleaner and more reusable. Add an optional `timeoutMs?: number` field to the DispatchOptions interface, and use `opts.timeoutMs ?? DISPATCH_TIMEOUT_MS` for the setTimeout duration at line 145. Then pass `timeoutMs: 5000` in the resolveToolDomain call.\n\nDefine a constant DOMAIN_RESOLVE_TIMEOUT_MS = 5_000 near the top of mcp-tool-dispatch.ts."
+    }
+  ]
+}

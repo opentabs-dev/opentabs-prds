@@ -1,0 +1,135 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs in CLI, plugin-tools, and browser-tools analysis: unbounded module cache in watch mode, parseHex missing RGBA/RRGGBBAA support, SVG style blocks bypassing achromatic validation, formatUptime fractional seconds, Windows path detection, and looksLikeJwt false positives.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix parseHex to handle #RRGGBBAA and #RGBA hex colors",
+      "description": "As a plugin developer, I want my SVG icons using 8-digit hex colors (#RRGGBBAA) to be properly validated for achromatic compliance, so that colored icons don't silently bypass the inactive icon check.",
+      "acceptanceCriteria": [
+        "parseHex correctly parses 5-character hex (#RGBA) and 9-character hex (#RRGGBBAA) colors",
+        "#FF0000FF (red with full opacity) is recognized as a non-achromatic color by isAchromaticColor",
+        "#80808080 (gray with alpha) is recognized as achromatic",
+        "generateInactiveIcon converts 8-digit hex colors to grayscale equivalents",
+        "Existing 4-char (#RGB) and 7-char (#RRGGBB) handling is unchanged",
+        "Unit tests cover #RGBA and #RRGGBBAA parsing",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/validate-icon.ts, lines 129-149.\n\nCurrent parseHex only handles length 4 (#RGB) and 7 (#RRGGBB). CSS also supports #RGBA (5 chars) and #RRGGBBAA (9 chars).\n\nFix: Add two more cases to parseHex:\n- Length 5 (#RGBA): parse like #RGB (expand each digit) and ignore the alpha channel for color comparison\n- Length 9 (#RRGGBBAA): parse first 6 hex digits as #RRGGBB, ignore the last 2 (alpha) for color comparison\n\nThe alpha channel is irrelevant for achromatic detection — we only care about the RGB components.\n\nTest file: platform/plugin-tools/src/validate-icon.test.ts"
+    },
+    {
+      "id": "US-002",
+      "title": "Detect color properties in SVG <style> blocks for inactive icon validation",
+      "description": "As a plugin developer, I want SVG icons using <style> blocks with colored CSS rules to be flagged during inactive icon validation, so that colored icons don't silently bypass the achromatic check.",
+      "acceptanceCriteria": [
+        "validateInactiveIconColors detects non-achromatic colors in <style> blocks (e.g., `<style>circle { fill: red; }</style>`)",
+        "generateInactiveIcon converts colors in <style> blocks to grayscale",
+        "Both fill and stroke color properties in <style> blocks are handled",
+        "CSS hex colors (#rgb, #rrggbb, #rrggbbaa), named colors, and rgb() in <style> blocks are detected",
+        "SVGs with only achromatic colors in <style> blocks pass validation",
+        "Unit tests cover <style> block detection",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/plugin-tools/src/validate-icon.ts, lines 309-442.\n\nBoth validateInactiveIconColors (around line 309) and generateInactiveIcon (around line 389) only check color-carrying attributes (fill='...', stroke='...') and inline style='...' attributes. They do NOT parse <style> blocks.\n\nFix approach: Add a function to extract color declarations from <style> blocks in the SVG. Use a regex to find `<style>` content, then extract fill/stroke property values (e.g., `fill:\\s*([^;]+)`, `stroke:\\s*([^;]+)`). Parse these values through the existing parseColor pipeline.\n\nFor validateInactiveIconColors: check all colors in <style> blocks via isAchromaticColor.\nFor generateInactiveIcon: replace color values in <style> blocks with their grayscale equivalents via colorToGrayscale.\n\nThis is an opus-level story because it requires understanding the existing color parsing pipeline and the regex-based SVG attribute processing, then designing a parallel approach for CSS-in-<style> that integrates cleanly.\n\nTest file: platform/plugin-tools/src/validate-icon.test.ts"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix looksLikeJwt false positives on short dotted strings",
+      "description": "As a plugin developer using the site analyzer, I want JWT detection to not flag version strings like '1.2.3' as JWTs, so that the auth analysis produces accurate results.",
+      "acceptanceCriteria": [
+        "looksLikeJwt returns false for short dotted strings like '1.2.3', '1.0.0', 'a.b.c'",
+        "looksLikeJwt returns true for real JWTs (header segment >= 20 chars typically)",
+        "A minimum segment length of 10 characters is enforced (or first segment is verified to decode to JSON with an 'alg' field)",
+        "Unit tests cover version strings, short dotted strings, and real JWT examples",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts, lines 118-122.\n\nCurrent implementation:\n```typescript\nconst looksLikeJwt = (value: string): boolean => {\n  const parts = value.split('.');\n  if (parts.length !== 3) return false;\n  return parts.every(p => p.length > 0 && BASE64URL_SEGMENT.test(p));\n};\n```\n\nThis matches any 3-segment dotted string where each segment is base64url. Version strings like '1.2.3' pass because digits are valid base64url.\n\nFix: Add a minimum total length check. Real JWT headers are base64-encoded JSON objects (minimum ~36 chars for the header segment). A simple fix: require each segment to be at least 10 characters, or require a minimum total string length of ~40 characters. The most robust fix: try to base64url-decode the first segment and check if it parses as JSON with an 'alg' key.\n\nRecommended approach: Add `parts.every(p => p.length >= 10)` as an additional check. This filters out all version strings while keeping real JWTs (which have segments of 30+ characters).\n\nTest file: platform/mcp-server/src/browser-tools/analyze-site/detect-auth.test.ts"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix formatUptime fractional seconds display",
+      "description": "As a user running opentabs status, I want uptime to display clean values like '2m 3s' instead of '2m 3.456s'.",
+      "acceptanceCriteria": [
+        "formatUptime(123.456) produces '2m 3s' (not '2m 3.456s')",
+        "formatUptime(0.9) produces '0s' (not '0.9s')",
+        "formatUptime(3661.5) produces '1h 1m 1s' (not '1h 1m 1.5s')",
+        "Integer inputs still work correctly",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/status.ts, lines 32-43.\n\nThe function receives `seconds: number` which can be a float. The modulo operations produce fractional results.\n\nFix: Add `seconds = Math.floor(seconds);` as the first line of the function body. This is the standard approach for uptime display.\n\nTest file: platform/cli/src/commands/status.test.ts — add a test case with fractional input."
+    },
+    {
+      "id": "US-005",
+      "title": "Use path.isAbsolute() instead of startsWith('/') for Windows compatibility",
+      "description": "As a plugin developer on Windows, I want opentabs-plugin build to correctly detect absolute paths in config.json's localPlugins, so that plugin path comparison works on Windows.",
+      "acceptanceCriteria": [
+        "resolvePluginPathForComparison uses path.isAbsolute() instead of startsWith('/')",
+        "A Windows-style absolute path like 'C:\\\\plugins\\\\my-plugin' is correctly recognized as absolute",
+        "A Unix-style absolute path '/Users/me/plugins/my-plugin' is still correctly recognized as absolute",
+        "Relative paths are still resolved against configDir",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, lines 156-160.\n\nCurrent code:\n```typescript\nconst resolvePluginPathForComparison = (storedPath: string, configDir: string): string => {\n  if (storedPath.startsWith('/')) return storedPath;\n  ...\n```\n\nFix: Import `isAbsolute` from 'node:path' and replace `storedPath.startsWith('/')` with `isAbsolute(storedPath)`. The `isAbsolute` function handles both Unix (starts with /) and Windows (starts with drive letter like C:\\) absolute paths.\n\nCheck that 'node:path' is already imported in the file (it likely is for other functions like `resolve`, `join`)."
+    },
+    {
+      "id": "US-006",
+      "title": "Mitigate unbounded module cache growth in watch mode",
+      "description": "As a plugin developer using --watch mode for extended sessions, I want the build tool to not leak memory through the Node.js module cache, so that long development sessions remain stable.",
+      "acceptanceCriteria": [
+        "The watch mode rebuild does not accumulate unbounded entries in the Node.js module cache",
+        "Each rebuild either clears the previous cache entry or uses a bounded cache-busting strategy",
+        "Watch mode still correctly picks up source changes on each rebuild",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, around line 1029.\n\nCurrent code: `await import(\\`${entryPoint}?t=${String(Date.now())}\\`)` creates a unique module URL on every rebuild. Node.js caches each URL separately, so the cache grows without bound.\n\nFix approach: Delete the previous cache entry before importing the new one. Node.js ESM modules can be uncached by deleting from the internal module cache, but this is not straightforward for ESM. A simpler approach:\n\n1. Use a fixed small set of cache-busting keys that rotate (e.g., `?t=0` and `?t=1` alternating), so only 2 entries ever exist\n2. Or read the file contents directly with `readFile` and use `new Function()` / `eval()` instead of `import()` — but this changes the semantics\n3. Or use a worker thread for each rebuild that exits after, freeing the module cache\n\nThe rotating key approach is simplest: track a counter that alternates between 0 and 1 (or use modulo on a small number). This bounds the cache to 2 entries.\n\nNote: The import is used to get the plugin's tool definitions from the entry point module. Read the surrounding code carefully to understand what data is extracted from the import."
+    }
+  ]
+}

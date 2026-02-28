@@ -1,0 +1,52 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs in the plugin SDK: safeSerializeArg crashes on SVG elements and non-DOM objects with nodeType property, and retry() throws undefined when maxAttempts is 0 or NaN.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix safeSerializeArg crash on SVG elements and objects with nodeType",
+      "description": "As a plugin developer, I want log.info/error/etc. to never crash even when passed SVG DOM nodes or arbitrary objects with a nodeType property, so that the 'safe serializer' contract is upheld.",
+      "acceptanceCriteria": [
+        "Logging an SVG element (where className is SVGAnimatedString) does not throw and produces a reasonable string representation like '[svg#myId]'",
+        "Logging a non-DOM object like { nodeType: 1, className: 42 } does not throw and falls through to the JSON serialization path",
+        "Logging a normal HTML element still works as before (e.g., '[DIV#myId.myClass]')",
+        "The safeSerializeArg function never throws for any input type",
+        "Unit tests cover SVG elements, objects with numeric nodeType, and normal HTML elements",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/log.ts, lines 46-49.\n\nThe DOM node branch:\n```typescript\nif (typeof (value as { nodeType?: unknown }).nodeType === 'number') {\n    const node = value as { nodeName?: string; id?: string; className?: string };\n    const className = node.className ? `.${node.className.split(' ')[0] ?? ''}` : '';\n    return `[${node.nodeName ?? 'Node'}${node.id ? `#${node.id}` : ''}${className}]`;\n}\n```\n\nTwo issues:\n1. SVG elements have `className` as `SVGAnimatedString` (object, not string). It's truthy, so `.split(' ')` is called on it, which throws TypeError.\n2. Any non-DOM object with numeric nodeType (e.g., `{ nodeType: 1, className: 42 }`) enters this branch and crashes on `.split()`.\n\nFix: Wrap the entire DOM node branch in a try-catch that falls through to the JSON fallback on error. Additionally, guard `typeof node.className === 'string'` before calling `.split()`. For SVG elements, use `node.className?.baseVal` (which is the string version of SVGAnimatedString) as a fallback.\n\nTest file: platform/plugin-sdk/src/log.test.ts. Add test cases for SVG-like objects and objects with numeric nodeType."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix retry() throwing undefined when maxAttempts is 0 or NaN",
+      "description": "As a plugin developer, I want retry() to throw a proper Error when called with invalid maxAttempts, so that downstream catch handlers don't crash with a secondary TypeError.",
+      "acceptanceCriteria": [
+        "retry({ maxAttempts: 0 }) throws an Error with a descriptive message (not undefined)",
+        "retry({ maxAttempts: NaN }) throws an Error with a descriptive message (not undefined)",
+        "retry({ maxAttempts: -1 }) throws an Error with a descriptive message (not undefined)",
+        "retry({ maxAttempts: Infinity }) throws an Error with a descriptive message (not undefined) — infinite loops are prevented",
+        "retry({ maxAttempts: 1 }) still works correctly (single attempt, no retry)",
+        "retry() with no options still defaults to 3 attempts",
+        "Unit tests cover all edge cases",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/timing.ts, lines 35-82.\n\nThe bug: When maxAttempts is 0, the for-loop `for (let attempt = 1; attempt <= 0; attempt++)` never executes. `lastError` stays `undefined`. Line 81 then does `throw lastError` which throws `undefined`. Downstream `catch (e) { e.message }` crashes with TypeError.\n\nFix: Add validation at the top of the retry function, right after reading opts:\n```typescript\nif (!Number.isFinite(maxAttempts) || maxAttempts < 1) {\n  throw new Error(`retry: maxAttempts must be a finite number >= 1, got ${maxAttempts}`);\n}\n```\n\nThis handles 0, negative numbers, NaN, Infinity, and -Infinity.\n\nTest file: platform/plugin-sdk/src/timing.test.ts. Add test cases for maxAttempts: 0, NaN, Infinity, -1."
+    }
+  ]
+}
