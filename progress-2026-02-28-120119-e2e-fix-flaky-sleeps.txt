@@ -1,0 +1,37 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-120119-e2e-fix-flaky-sleeps~running.json
+Started: Sat Feb 28 20:01:47 UTC 2026
+---
+
+## Codebase Patterns
+- File watcher log messages: `'tools.json updated for'` for manifest changes, `'IIFE updated for'` for IIFE changes, `'Invalid JSON'` for corrupt manifests
+- `writeToolsToManifest()` and `readToolsFromManifest()` in hot-reload-dynamic.e2e.ts handle both legacy array and `{ tools: [...] }` object formats
+- `testServer.invocations()` returns `Array<{ ts, method, path, body }>` — use `i.path === '/api/echo'` and check `i.body.message` to match specific tool calls
+- `writeAndWaitForWatcher()` helper in helpers.ts replaces the `waitForLog('File watcher: Watching') + sleep(500)` pattern — accepts a write callback + expected log substring, retries the write if the watcher misses it
+
+## 2026-02-28 20:10 - US-001
+- Created `writeAndWaitForWatcher` helper in `e2e/helpers.ts` that waits for the file watcher to be set up, writes a file, polls for the expected log, and retries with a trivial modification if the watcher misses the change (handles FSEvents registration race on macOS)
+- Replaced all 7 FSEvents 500ms sleep patterns in `e2e/hot-reload-dynamic.e2e.ts` with calls to `writeAndWaitForWatcher`:
+  - Location 1 (add tool to manifest): uses `'tools.json updated for'` log
+  - Location 2 (remove tool from manifest): uses `'tools.json updated for'` log
+  - Location 3 (IIFE change): uses `'IIFE updated for'` log
+  - Location 4 (file watcher + hot reload combined): uses `'tools.json updated for'` log
+  - Location 5 (tool description change): uses `'tools.json updated for'` log
+  - Location 6 (corrupted manifest): uses `'Invalid JSON'` log
+  - Location 7 (input_schema change): uses `'tools.json updated for'` log
+- Replaced in-flight dispatch sleep (Pattern B) with polling `testServer.invocations()` via `waitFor()` — polls until the echo request with `message: 'in-flight'` arrives at the test server before triggering hot reload
+- Files changed: `e2e/helpers.ts`, `e2e/hot-reload-dynamic.e2e.ts`
+- **Learnings for future iterations:**
+  - The lightningcss native module may be missing in worktrees — `npm install lightningcss-linux-x64-gnu` fixes it, but knip flags it as unused. Just install+uninstall to populate the cache.
+  - All test assertions were left unchanged — only the timing mechanism changed (sleeps → deterministic polling/retry)
+---
+
+## 2026-02-28 20:15 - US-002
+- Replaced the fixed 2s sleep at line ~674 in `e2e/dispatch-resilience.e2e.ts` with `waitFor()` polling `testServer.invocations()` until the echo request with `message: 'should-fail'` arrives at the test server
+- File changed: `e2e/dispatch-resilience.e2e.ts`
+- `waitFor` was already imported; the identical polling pattern was already used at line ~522 in the same file for the `should-timeout` test
+- All 394 E2E tests passed (including the target tab-close test)
+- **Learnings for future iterations:**
+  - `dispatch-resilience.e2e.ts` already had the `waitFor(testServer.invocations(), ...)` polling pattern — always check the same file for existing examples before writing new code
+  - Both Pattern B replacements (hot-reload-dynamic.e2e.ts line ~805 and dispatch-resilience.e2e.ts line ~674) use the same `waitFor` + `testServer.invocations()` idiom
+---
