@@ -1,0 +1,72 @@
+## Codebase Patterns
+- MCP client (createMcpClient in e2e/fixtures.ts) throws `Error: MCP request failed (${status}): ${body}` on non-2xx responses — so 401 rejections produce messages containing "401"
+- e2e test files use `let varName = ''` initialization for string vars that might not be set in beforeEach (allows guard `if (varName)` in afterEach)
+- To verify IIFE re-injection in e2e tests: use `replaceIifeClosing` to inject a `globalThis.__e2e<Name>` marker, then poll with `waitFor` until the marker appears in the page. Adapter properties can't be used because the adapter object is frozen.
+- Non-fixture tests that create resources manually should use the `let resource: Type | undefined; try/catch` pattern from `setupIsolatedIifeTest` (helpers.ts) to handle partial-failure cleanup
+- `setupAdapterSymlink` (helpers.ts) encapsulates the adapter symlink boilerplate (mkdir + rmSync + symlinkCrossPlatform)
+- Tool enable/disable is via WebSocket extension protocol methods `config.setToolEnabled` and `config.setAllToolsEnabled` (NOT MCP tools). The PRD referred to "plugin.enable"/"plugin.disable" but the actual API is `config.setAllToolsEnabled { plugin, enabled }` and `config.setToolEnabled { plugin, tool, enabled }`. These trigger `notifyToolListChanged` so MCP clients see updated tools/list.
+- To test tool enable/disable E2E: connect WebSocket via `connectWs` to send config methods, create a separate MCP client via `createMcpClient` to verify `tools/list` changes, and use `waitForToolList` to poll for the change.
+---
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-101808-e2e-standalone-fixes~running.json
+Started: Sat Feb 28 18:29:46 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Strengthened weak assertion in secret-rotation.e2e.ts: replaced `expect(err).toBeDefined()` with checking `err.message` matches `/401|Unauthorized/i`
+- Replaced `expect(true).toBe(false)` unreachable guard with `throw new Error('Expected old-secret client to be rejected during initialize')` for clearer diagnostics
+- Fixed configDir initialization from `let configDir: string` to `let configDir = ''` and added `if (configDir)` guard in afterEach to prevent TypeError if beforeEach throws
+- Files changed: e2e/secret-rotation.e2e.ts
+- **Learnings for future iterations:**
+  - The MCP client throws errors with format `MCP request failed (401): <body>` so asserting `message.match(/401|Unauthorized/i)` is the correct pattern for auth rejection verification
+  - The `configDir` pattern (initialize to `''`, guard cleanup) is the standard defensive pattern for e2e test lifecycle hooks
+---
+
+## 2026-02-28 - US-002
+- Fixed IIFE-only change test false positive in iife-injection.e2e.ts
+- Replaced comment-only IIFE modification (`originalIife + '\n// comment\n'`) with `replaceIifeClosing` marker injection (`globalThis.__e2eIifeOnlyChange = true`)
+- Added baseline check that marker is undefined before modification
+- Replaced weak "adapter object exists" polling with marker-based polling that proves the NEW IIFE code actually ran after re-injection
+- Kept existing health and tool dispatch checks as additional validation
+- Files changed: e2e/iife-injection.e2e.ts
+- **Learnings for future iterations:**
+  - The `replaceIifeClosing` helper injects code before the main IIFE's closing `})();` pattern — this is the standard way to add executable markers to adapter IIFEs in tests
+  - Use `globalThis.__e2e<TestName>` globals (not adapter properties) to verify re-injection, because the adapter object is frozen by the hash-setter snippet
+  - The pattern for verifying re-injection is: (1) check marker undefined before, (2) inject marker with replaceIifeClosing, (3) poll with waitFor until marker appears
+---
+
+## 2026-02-28 - US-003
+- analyze-site.e2e.ts: Extended `analyzeSite` helper to snapshot tab IDs before/after the MCP call and close any leftover tabs as a safety net for tab accumulation
+- strict-csp.e2e.ts: Refactored manual test setup to track resources with `let server: McpServer | undefined` pattern, wrapping creation in try/catch with partial-failure cleanup. Replaced inline symlink code with `setupAdapterSymlink` helper. Moved `client.close()` into the try block before finally.
+- Files changed: e2e/analyze-site.e2e.ts, e2e/strict-csp.e2e.ts
+- **Learnings for future iterations:**
+  - `plugin_analyze_site` already closes its tab in a server-side `finally` block, but the close is best-effort — test-side cleanup via `browser_list_tabs`/`browser_close_tab` provides a safety net
+  - For non-fixture tests that create resources manually (server, testServer, context), use the `let resource: Type | undefined; try { resource = await create(); ... } catch { if (resource) await resource.cleanup().catch(() => {}); }` pattern from `setupIsolatedIifeTest`
+  - `setupAdapterSymlink` from helpers.ts encapsulates the common adapter symlink setup (mkdir, rmSync, symlinkCrossPlatform)
+---
+
+## 2026-02-28 - US-004
+- Replaced fixed 2-second `setTimeout` sleep with a sentinel request pattern in plugin-management.e2e.ts
+- After sending notifications, call `await sendRequest('plugin.checkUpdates')` — when the response arrives, all prior notifications are guaranteed to have been processed (FIFO ordering)
+- Added `sendRequest` to the destructuring of `connectWs()` return value in this test
+- The sentinel response has an `id` field and is filtered out by the existing `m.id === undefined` check, so no changes needed to the assertion logic
+- Files changed: e2e/plugin-management.e2e.ts
+- **Learnings for future iterations:**
+  - The sentinel request pattern is the idiomatic way to establish happens-before ordering for MCP message processing — use `plugin.checkUpdates` as a cheap side-effect-free sentinel
+  - `connectWs()` returns `{ ws, sendRequest, close }` — `sendRequest` can be used alongside raw `ws.send()` in the same test since the `onmessage` interceptor forwards to `originalOnmessage` which routes `sendRequest` promise resolutions
+---
+
+## 2026-02-28 - US-005
+- Added E2E tests for plugin enable/disable via `config.setAllToolsEnabled` and `config.setToolEnabled` extension protocol methods
+- `config.setAllToolsEnabled` tests: disable removes all plugin tools from tools/list, re-enable restores them, calling disabled tool returns isError with "disabled" message, error paths for non-existent plugin and invalid params
+- `config.setToolEnabled` tests: single-tool disable removes only that tool while preserving other plugin tools, error path for non-existent tool
+- Tests use `connectWs` (WebSocket) to send enable/disable commands and `createMcpClient` (MCP HTTP client) to verify `tools/list` changes via `waitForToolList`
+- All tests clean up by re-enabling tools in `finally` blocks to avoid cross-test pollution
+- Files changed: e2e/plugin-management.e2e.ts
+- **Learnings for future iterations:**
+  - The actual API for enabling/disabling plugin tools is `config.setAllToolsEnabled { plugin, enabled }` and `config.setToolEnabled { plugin, tool, enabled }` — these are extension protocol WebSocket methods, not MCP tools
+  - The `tool` parameter in `config.setToolEnabled` uses the unprefixed tool name (e.g., `"echo"` not `"e2e-test_echo"`)
+  - When disabling tools, `notifyToolListChanged` is called which pushes updates to all MCP client sessions, so `waitForToolList` can poll until the change is visible
+  - Calling a disabled tool via MCP `tools/call` returns `{ isError: true, content: "Tool <name> is disabled via configuration" }`
+---
