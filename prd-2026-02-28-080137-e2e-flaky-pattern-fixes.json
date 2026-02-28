@@ -1,0 +1,86 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix flaky patterns in E2E tests: silent fallthrough on adapter injection timeout, hardcoded sleeps that should use polling/helpers, temp dir leaks in iife-injection tests, and hardcoded FSEvents readiness delays.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix silent fallthrough in adapter injection polling in hot-reload-dynamic.e2e.ts",
+      "description": "As a test infrastructure maintainer, I want the adapter injection polling loop to throw a diagnostic error on timeout, so that test failures have clear root cause messages instead of confusing downstream failures.",
+      "acceptanceCriteria": [
+        "The while loop at approximately line 534 in hot-reload-dynamic.e2e.ts throws a descriptive error if the deadline is reached without adapter injection (matching the behavior of openTestAppTab in helpers.ts)",
+        "The error message includes the page URL and plugin name for diagnostics",
+        "Existing test behavior is unchanged when adapter injection succeeds within the deadline",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/hot-reload-dynamic.e2e.ts, around lines 533-543\n\nCurrent code:\n```typescript\nconst deadline = Date.now() + 20_000;\nwhile (Date.now() < deadline) {\n  const injected = await page.evaluate(() => {\n    const ot = (globalThis as Record<string, unknown>).__openTabs as\n      | { adapters?: Record<string, unknown> }\n      | undefined;\n    return ot?.adapters?.['e2e-test'] !== undefined;\n  });\n  if (injected) break;\n  await new Promise(r => setTimeout(r, 500));\n}\n```\n\nProblem: If the deadline passes without adapter injection, execution falls through silently. The test continues to line 546 (waitForToolResult) which eventually fails with a confusing timeout error that doesn't mention adapter injection.\n\nFix: Add a throw after the while loop if the adapter was never injected:\n```typescript\nconst deadline = Date.now() + 20_000;\nlet injected = false;\nwhile (Date.now() < deadline) {\n  injected = await page.evaluate(() => {\n    const ot = (globalThis as Record<string, unknown>).__openTabs as\n      | { adapters?: Record<string, unknown> }\n      | undefined;\n    return ot?.adapters?.['e2e-test'] !== undefined;\n  });\n  if (injected) break;\n  await new Promise(r => setTimeout(r, 500));\n}\nif (!injected) {\n  throw new Error('e2e-test adapter was not injected within 20s');\n}\n```\n\nAlternatively, use the existing `waitFor` helper from helpers.ts which handles this correctly:\n```typescript\nawait waitFor(\n  async () => {\n    return page.evaluate(() => {\n      const ot = (globalThis as Record<string, unknown>).__openTabs as\n        | { adapters?: Record<string, unknown> }\n        | undefined;\n      return ot?.adapters?.['e2e-test'] !== undefined;\n    });\n  },\n  20_000,\n  500,\n  'e2e-test adapter to be injected into tab',\n);\n```"
+    },
+    {
+      "id": "US-002",
+      "title": "Replace hardcoded 8s sleep with waitForExtensionDisconnected in tab-state-sync.e2e.ts",
+      "description": "As a test infrastructure maintainer, I want the disconnection detection test to use the existing polling helper instead of a fixed 8-second sleep, so that the test is faster when disconnection is quick and more reliable when it's slow.",
+      "acceptanceCriteria": [
+        "The 8-second hardcoded sleep at approximately line 316 in tab-state-sync.e2e.ts is replaced with waitForExtensionDisconnected (already imported from helpers.ts)",
+        "The timeout for waitForExtensionDisconnected is at least 15s to account for the offscreen pong timeout plus buffer",
+        "Existing test behavior is unchanged",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/tab-state-sync.e2e.ts, around line 316\n\nCurrent code:\n```typescript\n// 4. Wait a moment for the extension to detect the disconnection.\n// The offscreen document's pong timeout is 5s, so we wait enough time\n// for the WebSocket close to be detected.\nawait new Promise(r => setTimeout(r, 8_000));\n```\n\nThe test already imports waitForExtensionDisconnected from helpers.ts (check the imports at the top of the file). This helper polls the server health endpoint until extensionConnected becomes false, with proper timeout and error messaging.\n\nReplace with:\n```typescript\n// Wait for the extension to detect the disconnection.\n// The offscreen document's pong timeout is 5s, plus buffer for detection.\nawait waitForExtensionDisconnected(server1, 15_000);\n```\n\nNote: Check the imports — if waitForExtensionDisconnected is not imported, add it to the import from './helpers.js'. The function signature is: waitForExtensionDisconnected(server: McpServer, timeoutMs?: number): Promise<void>\n\nAlso note: this test manages its own server lifecycle (server1, server2), not using fixtures. The server1 variable is what should be passed to waitForExtensionDisconnected since it has just been killed on line 311."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix temp dir leaks in iife-injection.e2e.ts overlapping URL pattern tests",
+      "description": "As a test infrastructure maintainer, I want temp directories for extra plugins in iife-injection tests to be cleaned up even when assertions fail, preventing temp dir accumulation on CI.",
+      "acceptanceCriteria": [
+        "The two overlapping URL pattern tests in iife-injection.e2e.ts clean up their tmpDir in a finally block",
+        "If any assertion fails between tmpDir creation and cleanup, the tmpDir is still removed",
+        "Existing test behavior is unchanged when tests pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/iife-injection.e2e.ts\n\nTwo tests in the 'IIFE injection — overlapping URL patterns' describe block create tmpDirs for extra plugins but only clean them up at the end of the test body (happy path). If an assertion or wait fails mid-test, the tmpDir leaks.\n\nTest 1: 'two plugins with overlapping URL patterns both inject adapters' (around lines 419-482)\n- tmpDir created at ~line 419 with fs.mkdtempSync\n- tmpDir cleaned up at ~line 482 with fs.rmSync\n- No try/finally wrapping the assertions\n\nTest 2: 'tool dispatch works with overlapping URL patterns...' (around lines 500-567)\n- tmpDir created at ~line 500 with fs.mkdtempSync\n- tmpDir cleaned up at ~line 566 with fs.rmSync\n- No try/finally wrapping the assertions\n\nThese are fixture-based tests (using fixtureTest), so the MCP server/extension/browser are cleaned up by fixtures. Only the tmpDir needs manual cleanup.\n\nFix: Wrap the test body after tmpDir creation in a try/finally:\n```typescript\nconst tmpDir = fs.mkdtempSync(...);\ntry {\n  // ... existing test body ...\n} finally {\n  fs.rmSync(tmpDir, { recursive: true, force: true });\n}\n```\n\nRemove the existing fs.rmSync at the end of the test body since it's now in the finally block."
+    },
+    {
+      "id": "US-004",
+      "title": "Replace hardcoded 500ms in-flight dispatch sleeps with polling in iife-injection.e2e.ts and dispatch-resilience.e2e.ts",
+      "description": "As a test infrastructure maintainer, I want in-flight tool dispatch tests to deterministically verify the tool call reached the test server before proceeding, so that the tests are reliable under CI load.",
+      "acceptanceCriteria": [
+        "In iife-injection.e2e.ts (~line 597), the fixed 500ms sleep before IIFE modification is replaced with polling the test server's invocations endpoint until the slow tool call appears",
+        "In dispatch-resilience.e2e.ts (~line 518), the fixed 500ms sleep before WebSocket replacement is replaced with polling the test server's invocations endpoint until the in-flight request appears",
+        "Both tests remain functionally correct — the IIFE modification / WebSocket replacement still happens while the tool call is in-flight",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Two files have the same flaky pattern: fire a slow tool call, sleep 500ms, then do something (modify IIFE / replace WebSocket) while the call is in-flight. The 500ms sleep is a guess that may be too short under heavy CI load.\n\nFile 1: e2e/iife-injection.e2e.ts, around line 597\nThe test fires a slow tool call (~10s duration) and then modifies the IIFE file. The 500ms sleep is meant to ensure the slow call has reached the test server before the IIFE modification.\n\nFile 2: e2e/dispatch-resilience.e2e.ts, around line 518\nThe test fires a tool call and then replaces the extension's WebSocket. The 500ms sleep is meant to ensure the tool dispatch message was sent before the WebSocket is replaced.\n\nFix approach: The test server has a /control/invocations endpoint (see test-server.ts). Poll it using waitFor until the in-flight request appears:\n\n```typescript\n// Instead of: await new Promise(r => setTimeout(r, 500));\nawait waitFor(\n  async () => {\n    const invocations = await testServer.invocations();\n    return invocations.some(i => i.path === '/api/slow');\n  },\n  10_000,\n  200,\n  'slow tool call to reach test server',\n);\n```\n\nFor dispatch-resilience.e2e.ts, check what API endpoint the in-flight tool call hits (it may be /api/echo or /api/slow depending on the test). Look at the tool being called and what endpoint it maps to.\n\nNote: The slow tool call in iife-injection.e2e.ts uses the test server's /api/slow endpoint which takes ~10s. The invocations endpoint records all requests, so polling for /api/slow in the invocations list proves the request has arrived.\n\nFor dispatch-resilience.e2e.ts, verify the exact endpoint by reading the test at ~line 510 to see which tool is called. The pattern may use e2e-test_slow_tool or similar. The invocations() helper returns all recorded API calls.\n\nImport waitFor from helpers.ts if not already imported in the affected files."
+    }
+  ]
+}

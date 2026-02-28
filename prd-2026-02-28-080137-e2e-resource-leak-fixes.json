@@ -1,0 +1,85 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix resource leaks across E2E test files: MCP server process leaks when launchExtensionContext fails, temp directory leaks when startMcpServer fails before try blocks, missing null guard in analyze-site afterAll, and conditional assertions that silently skip verification.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix MCP server process leak in onboarding.e2e.ts",
+      "description": "As a test infrastructure maintainer, I want MCP server processes to be properly cleaned up when launchExtensionContext throws, so that orphaned server processes don't accumulate during test failures.",
+      "acceptanceCriteria": [
+        "All four tests in onboarding.e2e.ts wrap startMcpServer inside the try block (or use a nested try around launchExtensionContext that kills the server in its catch)",
+        "If launchExtensionContext throws after startMcpServer succeeds, the server process is killed before the error propagates",
+        "Existing test behavior is unchanged when tests pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/onboarding.e2e.ts\n\nAll 4 tests follow this pattern:\n```\nconst server = await startMcpServer(configDir, true);           // line 50\nconst { context, cleanupDir, extensionDir } = await launchExtensionContext(server.port, server.secret);  // line 51\nsetupAdapterSymlink(configDir, extensionDir);                   // line 52\ntry {                                                           // line 54\n  ...\n} finally {\n  await context.close();\n  await server.kill();\n  ...\n}\n```\n\nIf launchExtensionContext on line 51 throws, server.kill() in the finally block is never reached because the try hasn't started yet. The MCP server process leaks.\n\nFix: Move startMcpServer and launchExtensionContext both inside the try block, with null checks in finally:\n```\nlet server: Awaited<ReturnType<typeof startMcpServer>> | null = null;\nlet context: BrowserContext | null = null;\nlet cleanupDir = '';\ntry {\n  server = await startMcpServer(configDir, true);\n  const ext = await launchExtensionContext(server.port, server.secret);\n  context = ext.context;\n  cleanupDir = ext.cleanupDir;\n  setupAdapterSymlink(configDir, ext.extensionDir);\n  ...\n} finally {\n  if (context) await context.close();\n  if (server) await server.kill();\n  if (cleanupDir) fs.rmSync(cleanupDir, { recursive: true, force: true });\n  cleanupTestConfigDir(configDir);\n}\n```\n\nApply this pattern to all 4 tests:\n- Test 1: 'extension with 0 plugins...' (lines 45-72)\n- Test 2: 'adding a plugin...' (lines 75-118)\n- Test 3: 'disconnected state...' (lines 120-149)\n- Test 4: 'removing all plugins...' (lines 151-192)"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix temp dir leak in npm-discovery.e2e.ts and discovery-edge-cases.e2e.ts",
+      "description": "As a test infrastructure maintainer, I want temp directories and MCP server processes to be properly cleaned up when startMcpServer throws, so that temp directories don't accumulate and server processes don't leak on test failures.",
+      "acceptanceCriteria": [
+        "In npm-discovery.e2e.ts, startMcpServer calls are inside try blocks so that configDir, prefixDir, and tmpDir are cleaned up if startMcpServer throws",
+        "In discovery-edge-cases.e2e.ts, startMcpServer calls are inside try blocks so that configDir and tmpDir are cleaned up if startMcpServer throws",
+        "Existing test behavior is unchanged when tests pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two files have the same pattern: temp dirs created, then startMcpServer called outside try/finally, then try/finally cleans up only if startMcpServer succeeds.\n\nFile: e2e/npm-discovery.e2e.ts\n- Test at ~line 132: configDir created at ~137, startMcpServer at ~141, try starts after. If startMcpServer throws, configDir and prefixDir leak.\n- Same pattern at ~lines 160, 202, 235, 327.\n\nFile: e2e/discovery-edge-cases.e2e.ts\n- Every test: configDir/tmpDir created, startMcpServer called outside try. If startMcpServer throws, temp dirs leak.\n- Affected test starts at approximately lines 54, 93, 140, 190, 243, 315.\n\nFix for both files: Move startMcpServer inside the try block, declare server as a let variable (possibly null), and add null check in finally:\n```\nlet server: McpServer | null = null;\ntry {\n  server = await startMcpServer(configDir, true);\n  // ... rest of test ...\n} finally {\n  if (server) await server.kill();\n  cleanupTestConfigDir(configDir);\n  fs.rmSync(tmpDir, { recursive: true, force: true });\n}\n```\n\nImport the McpServer type from fixtures.js where needed."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix temp dir leak in resources-prompts.e2e.ts",
+      "description": "As a test infrastructure maintainer, I want temp directories to be cleaned up even when startMcpServer throws in the empty resource/prompt list tests.",
+      "acceptanceCriteria": [
+        "In both empty-list tests in resources-prompts.e2e.ts, startMcpServer is called inside the try block",
+        "If startMcpServer throws, tmpDir and configDir are still cleaned up in the finally block",
+        "Existing test behavior is unchanged when tests pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/resources-prompts.e2e.ts\n\nTwo tests in 'Empty resource/prompt lists' describe block (starting around line 246):\n- 'lists zero resources when plugin defines none' (~line 248)\n- 'lists zero prompts when plugin defines none' (~line 275)\n\nBoth follow the pattern:\n```\nconst server = await startMcpServer(configDir, true);  // outside try\nconst client = createMcpClient(server.port, server.secret);\ntry {\n  ...\n} finally {\n  await client.close();\n  await server.kill();\n  cleanupTestConfigDir(configDir);\n  fs.rmSync(tmpDir, ...);\n}\n```\n\nFix: Move startMcpServer and createMcpClient inside the try block with null checks in finally."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix missing null guard in analyze-site.e2e.ts afterAll and conditional assertion skips",
+      "description": "As a test infrastructure maintainer, I want the afterAll hook to safely handle the case where beforeAll failed, and I want assertions to always execute rather than being conditionally skipped.",
+      "acceptanceCriteria": [
+        "test.afterAll in analyze-site.e2e.ts has a null/undefined check before calling analyzeSiteServer.kill()",
+        "Conditional assertions at approximately lines 256-258 and 301-303 are replaced with unconditional assertions (expect the field to be defined, then assert on its value)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: e2e/analyze-site.e2e.ts\n\nIssue 1 (line ~111): afterAll calls analyzeSiteServer.kill() without null check:\n```\nlet analyzeSiteServer: TestServer;  // line 105\ntest.beforeAll(async () => {\n  analyzeSiteServer = await startAnalyzeSiteServer();  // line 108\n});\ntest.afterAll(async () => {\n  await analyzeSiteServer.kill();  // line 112 — TypeError if beforeAll threw\n});\n```\nFix: Add a null check: `if (analyzeSiteServer) await analyzeSiteServer.kill();`\nAlso change the declaration to: `let analyzeSiteServer: TestServer | undefined;`\n\nIssue 2 (lines ~256-258, ~301-303): Conditional assertions silently skip verification:\n```\nif (gqlEndpoint?.requestBodySample) {\n  expect(gqlEndpoint.requestBodySample).toContain('query');\n}\n```\nIf requestBodySample is undefined (timing issue, regression), the test silently passes. Fix by making the assertion unconditional:\n```\nexpect(gqlEndpoint?.requestBodySample).toBeDefined();\nexpect(gqlEndpoint!.requestBodySample).toContain('query');\n```\nNote: The exact line numbers may vary — search for `requestBodySample` to find both occurrences."
+    }
+  ]
+}
