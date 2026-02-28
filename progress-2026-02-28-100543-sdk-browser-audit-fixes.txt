@@ -1,0 +1,56 @@
+## Codebase Patterns
+- `platform/plugin-sdk/src/fetch.ts`: fetchFromPage uses `AbortSignal.any([signal, timeoutSignal])` to merge signals. The catch block must check TimeoutError first (to give it a specific message), then `combinedSignal.aborted` (to catch all abort cases including non-DOMException reasons), then fall through to network_error.
+- Test file `fetch.test.ts` uses a real Node.js HTTP server (createServer from node:http) rather than fetch mocks. Abort tests pass a pre-aborted AbortController signal — no server endpoint needed since fetch throws immediately.
+- `ToolError` defaults `retryable: false` unless explicitly set. `new ToolError(msg, 'aborted')` is non-retryable by default.
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-100543-sdk-browser-audit-fixes~running.json
+Started: Sat Feb 28 18:06:08 UTC 2026
+---
+
+## [2026-02-28] - US-001
+- Fixed fetchFromPage abort error misclassification for non-DOMException abort reasons
+- Replaced `error instanceof DOMException && error.name === 'AbortError'` check with broader `combinedSignal.aborted` check in the catch block of fetchFromPage
+- Added two new tests: one verifying non-DOMException aborts produce code 'aborted', one verifying they produce non-retryable errors
+- **Files changed:**
+  - `platform/plugin-sdk/src/fetch.ts` (lines 72-74: replaced AbortError instanceof check)
+  - `platform/plugin-sdk/src/fetch.test.ts` (added 2 tests after existing abort test)
+- **Learnings for future iterations:**
+  - The `combinedSignal.aborted` check covers all abort cases because: TimeoutError is checked first (throws before reaching this), so any remaining aborted state is from user-initiated aborts regardless of reason type
+  - When `controller.abort(reason)` is called with a plain Error, fetch rejects with that Error. The old code failed to catch it as AbortError because it wasn't a DOMException
+  - `AbortSignal.timeout()` fires a TimeoutError DOMException, not a plain AbortError — so the TimeoutError check must remain before the `combinedSignal.aborted` check
+---
+
+## [2026-02-28] - US-002
+- Added getCookie SecurityError test to verify null is returned when document.cookie getter throws
+- Follows exact same pattern as localStorage/sessionStorage SecurityError tests in the same file
+- Saves and restores the original cookie descriptor to prevent test pollution
+- **Files changed:**
+  - `platform/plugin-sdk/src/storage.test.ts` (added 1 test in getCookie describe block)
+- **Learnings for future iterations:**
+  - `Object.getOwnPropertyDescriptor(win.document, 'cookie')` captures the original descriptor; restore it with `Object.defineProperty` after the test
+  - All getCookie tests use `Object.defineProperty(win.document, 'cookie', { get: () => ..., configurable: true })` — not `globalThis.document` — because `win.document` is the same object after `beforeEach` sets `globalThis.document = win.document`
+  - The `beforeEach`/`afterEach` already creates a fresh `win`, but explicit restore is still best practice for within-describe pollution
+---
+
+## [2026-02-28] - US-003
+- Added 3 new tests in the `safe serialization` describe block for nested non-serializable values inside objects
+- Tests verify the JSON.stringify replacer at log.ts lines 83-85 handles function, bigint, and symbol values nested inside objects
+- **Files changed:**
+  - `platform/plugin-sdk/src/log.test.ts` (added 3 tests at end of `safe serialization` describe block)
+- **Learnings for future iterations:**
+  - ESLint `func-style` rule requires function expressions (arrow functions), not function declarations — use `const myFunc = () => {}` with `Object.defineProperty` to set name when a named function is needed in tests
+  - ESLint `@typescript-eslint/no-unnecessary-condition` flags optional chains (`?.`) on types that TypeScript knows are non-nullish — if the type cast removes nullability, use direct property access (`data['key']` not `data?.['key']`)
+  - The replacer path for nested values (lines 78-87 in log.ts) is triggered when an object falls through to the JSON.stringify fallback — top-level functions/symbols/bigints are handled earlier at lines 42-44 and never reach the replacer
+---
+
+## [2026-02-28] - US-004
+- Added observeDOM cleanup verification test to confirm that after calling the disconnect function, subsequent DOM mutations do NOT trigger the callback
+- Test pattern: observe → mutate (counter = 1) → wait 50ms → disconnect → mutate again → wait 50ms → assert counter still 1
+- **Files changed:**
+  - `platform/plugin-sdk/src/dom.test.ts` (added 1 test in observeDOM describe block)
+- **Learnings for future iterations:**
+  - The existing observeDOM tests use `await new Promise<void>(resolve => setTimeout(resolve, 50))` to wait for MutationObserver callbacks — this same pattern works for both pre-disconnect and post-disconnect waits
+  - happy-dom's MutationObserver fires asynchronously (microtask/macrotask), so a 50ms timeout is sufficient to confirm a callback either did or didn't fire
+  - The cleanup function returned by observeDOM calls `observer.disconnect()`, which immediately stops the observer — mutations after this point are silently ignored
+---
