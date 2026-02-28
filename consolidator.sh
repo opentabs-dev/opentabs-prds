@@ -41,6 +41,7 @@ while [[ $# -gt 0 ]]; do
     --dry-run)     DRY_RUN=true;       shift ;;
     --model)       CONSOLIDATOR_MODEL="$2"; shift 2 ;;
     --model=*)     CONSOLIDATOR_MODEL="${1#*=}"; shift ;;
+    -*)            echo "Warning: unknown option: $1"; shift ;;
     *)             shift ;;
   esac
 done
@@ -53,6 +54,7 @@ fi
 
 # --- Setup ---
 
+RALPH_TZ="${RALPH_TZ:-America/Los_Angeles}"
 CONSOLIDATOR_BASE="$HOME/.ralph-consolidator"
 CODE_DIR="$CONSOLIDATOR_BASE/code"
 LOG_DIR="$CONSOLIDATOR_BASE/logs"
@@ -61,7 +63,7 @@ CONFLICTS_DIR="$CONSOLIDATOR_BASE/conflicts"
 mkdir -p "$CONSOLIDATOR_BASE" "$LOG_DIR" "$CONFLICTS_DIR"
 
 # --- Date-Rotated Logging ---
-LOG_DATE=$(TZ=America/Los_Angeles date '+%Y-%m-%d')
+LOG_DATE=$(TZ="$RALPH_TZ" date '+%Y-%m-%d')
 LOG_FILE="$LOG_DIR/${LOG_DATE}.log"
 ln -sf "${LOG_DATE}.log" "$LOG_DIR/latest.log"
 
@@ -78,9 +80,13 @@ PIDFILE="$CONSOLIDATOR_BASE/.consolidator.pid"
 if [ -f "$PIDFILE" ]; then
   EXISTING_PID=$(cat "$PIDFILE")
   if kill -0 "$EXISTING_PID" 2>/dev/null; then
-    echo "Error: consolidator.sh is already running (PID $EXISTING_PID)."
-    echo "Kill it first: kill $EXISTING_PID"
-    exit 1
+    # Verify the PID is actually a consolidator (not a recycled PID)
+    if ps -p "$EXISTING_PID" -o command= 2>/dev/null | grep -q 'consolidator\.sh'; then
+      echo "Error: consolidator.sh is already running (PID $EXISTING_PID)."
+      echo "Kill it first: kill $EXISTING_PID"
+      exit 1
+    fi
+    echo "Warning: stale PID $EXISTING_PID is not a consolidator. Removing pidfile."
   fi
   rm -f "$PIDFILE"
 fi
@@ -97,7 +103,7 @@ DIM='\033[2m'
 RESET='\033[0m'
 
 ts() {
-  TZ=America/Los_Angeles date +'%H:%M:%S'
+  TZ="$RALPH_TZ" date +'%H:%M:%S'
 }
 
 # --- Clone/Update Code Repo ---
@@ -279,9 +285,9 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
       local remaining_conflicts
       remaining_conflicts=$(git -C "$CODE_DIR" diff --name-only --diff-filter=U 2>/dev/null | wc -l | tr -d ' ')
 
-      # Also check for leftover conflict markers in staged files
+      # Also check for leftover conflict markers in tracked files
       local marker_files
-      marker_files=$(grep -rl '<<<<<<<' "$CODE_DIR" --include='*.ts' --include='*.tsx' --include='*.json' --include='*.md' 2>/dev/null | grep -v node_modules | grep -v .git | head -5)
+      marker_files=$(git -C "$CODE_DIR" grep -l '<<<<<<<' -- '*.ts' '*.tsx' '*.json' '*.md' 2>/dev/null | head -5)
 
       if [ "$remaining_conflicts" -eq 0 ] && [ -z "$marker_files" ]; then
         # AI resolved all conflicts — commit the merge

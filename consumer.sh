@@ -43,12 +43,19 @@ _worker_os=$(uname -s | tr '[:upper:]' '[:lower:]')
 if [ -f /etc/machine-id ]; then
   _worker_machine=$(head -c 8 /etc/machine-id)
 elif command -v sysctl &>/dev/null; then
-  _worker_machine=$(sysctl -n kern.uuid 2>/dev/null | sha256sum 2>/dev/null | head -c 8 || echo "unknown")
+  _worker_uuid=$(sysctl -n kern.uuid 2>/dev/null || echo "")
+  if [ -n "$_worker_uuid" ]; then
+    # sha256sum (Linux/some macOS) or shasum (macOS, Perl-based — always available)
+    _worker_machine=$(echo "$_worker_uuid" | (sha256sum 2>/dev/null || shasum -a 256 2>/dev/null) | head -c 8)
+    [ -z "$_worker_machine" ] && _worker_machine="unknown"
+  else
+    _worker_machine="unknown"
+  fi
 else
   _worker_machine="unknown"
 fi
 WORKER_ID="${_worker_os}-${_worker_machine}-$$"
-unset _worker_os _worker_machine
+unset _worker_os _worker_machine _worker_uuid
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -66,6 +73,7 @@ while [[ $# -gt 0 ]]; do
     --no-docker)   USE_DOCKER=false;   shift ;;
     --worker-id)   WORKER_ID="$2";     shift 2 ;;
     --worker-id=*) WORKER_ID="${1#*=}"; shift ;;
+    -*)            echo "Warning: unknown option: $1"; shift ;;
     *)             shift ;;
   esac
 done
@@ -92,6 +100,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The queue repo is the directory containing this script.
 # We work from a separate clone to avoid conflicts with the producer.
+RALPH_TZ="${RALPH_TZ:-America/Los_Angeles}"
 CONSUMER_BASE="$HOME/.ralph-consumer"
 QUEUE_DIR="$CONSUMER_BASE/queue"
 CODE_DIR="$CONSUMER_BASE/code"
@@ -101,7 +110,7 @@ LOG_DIR="$CONSUMER_BASE/logs"
 mkdir -p "$CONSUMER_BASE" "$WORKTREE_BASE" "$LOG_DIR"
 
 # --- Date-Rotated Logging ---
-LOG_DATE=$(TZ=America/Los_Angeles date '+%Y-%m-%d')
+LOG_DATE=$(TZ="$RALPH_TZ" date '+%Y-%m-%d')
 LOG_FILE="$LOG_DIR/${LOG_DATE}.log"
 ln -sf "${LOG_DATE}.log" "$LOG_DIR/latest.log"
 
@@ -127,8 +136,11 @@ _kill_stale_consumers() {
     echo "Warning: killing stale consumer processes: $stale_pids"
     echo "$stale_pids" | xargs kill -9 2>/dev/null || true
     # Also kill any orphaned Docker containers from stale consumers
-    docker kill $(docker ps --filter 'name=ralph-consumer' -q) 2>/dev/null || true
-    docker rm -f $(docker ps -a --filter 'name=ralph-consumer' -q) 2>/dev/null || true
+    local _containers
+    _containers=$(docker ps --filter 'name=ralph-consumer' -q 2>/dev/null)
+    [ -n "$_containers" ] && echo "$_containers" | xargs docker kill 2>/dev/null || true
+    _containers=$(docker ps -a --filter 'name=ralph-consumer' -q 2>/dev/null)
+    [ -n "$_containers" ] && echo "$_containers" | xargs docker rm -f 2>/dev/null || true
     sleep 1
   fi
 }
@@ -147,7 +159,7 @@ DIM='\033[2m'
 RESET='\033[0m'
 
 ts() {
-  TZ=America/Los_Angeles date +'%H:%M:%S'
+  TZ="$RALPH_TZ" date +'%H:%M:%S'
 }
 
 # --- Background Resource Monitor ---
@@ -157,9 +169,23 @@ _start_resource_monitor() {
   (
     while true; do
       sleep 20
-      local load mem_info container_stats active_containers
       load=$(awk '{print $1}' /proc/loadavg 2>/dev/null || uptime | awk -F'load average:' '{print $2}' | awk '{print $1}' | tr -d ',')
-      mem_info=$(free -g 2>/dev/null | awk '/^Mem:/ {printf "%dG/%dG(%d%%)", $3, $2, ($3/$2)*100}')
+      # Memory: free -g on Linux, vm_stat + sysctl on macOS
+      if command -v free &>/dev/null; then
+        mem_info=$(free -g 2>/dev/null | awk '/^Mem:/ {printf "%dG/%dG(%d%%)", $3, $2, ($3/$2)*100}')
+      else
+        mem_total_bytes=$(sysctl -n hw.memsize 2>/dev/null || echo "0")
+        mem_pages_active=$(vm_stat 2>/dev/null | awk '/Pages active:/ {gsub(/\./,""); print $3}')
+        mem_page_size=$(vm_stat 2>/dev/null | awk -F'page size of ' '/page size/ {gsub(/[^0-9]/,"",$2); print $2}')
+        if [ -n "$mem_total_bytes" ] && [ "$mem_total_bytes" -gt 0 ] && [ -n "$mem_pages_active" ] && [ -n "$mem_page_size" ]; then
+          mem_used_gb=$(( (mem_pages_active * mem_page_size) / 1073741824 ))
+          mem_total_gb=$(( mem_total_bytes / 1073741824 ))
+          mem_pct=$(( (mem_pages_active * mem_page_size * 100) / mem_total_bytes ))
+          mem_info="${mem_used_gb}G/${mem_total_gb}G(${mem_pct}%)"
+        else
+          mem_info="n/a"
+        fi
+      fi
       active_containers=$(docker ps --filter 'name=ralph-consumer' --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
       container_stats=$(docker stats --no-stream --format '{{.Name}}={{.CPUPerc}}/{{.MemUsage}}' 2>/dev/null \
         | grep ralph \
