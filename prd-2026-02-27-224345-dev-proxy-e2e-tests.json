@@ -1,0 +1,169 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add comprehensive E2E tests for the Node.js dev proxy hot reload architecture, covering request buffering during worker restart, 503 timeout behavior, concurrent overlapping reloads, graceful shutdown, health endpoint during transitions, SSE mid-stream worker restart, and production-mode POST /reload.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "E2E test: proxy buffers HTTP requests during worker restart and drains them",
+      "description": "As a platform contributor, I want an E2E test that verifies HTTP requests arriving during the worker restart window are buffered by the dev proxy and drained once the new worker is ready, so that I can confirm the proxy's `whenReady` buffering mechanism works correctly.",
+      "acceptanceCriteria": [
+        "Test triggers a hot reload via SIGUSR1, then immediately sends an HTTP request (e.g., GET /health) BEFORE the new worker reports ready",
+        "The request eventually succeeds (200 OK) because the proxy buffered it and forwarded it once the worker was ready",
+        "Test is in a new file `e2e/dev-proxy.e2e.ts` (or appended to `lifecycle.e2e.ts` in a new describe block)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The dev proxy (`platform/mcp-server/src/dev-proxy.ts`) uses a `whenReady()` function (lines 87-111) that buffers callbacks in a `pending[]` array when `workerPort === null`. When the worker sends the IPC 'ready' message, `drainPending()` executes all buffered callbacks. The test should: (1) start the server in hot mode, (2) wait for initial ready, (3) trigger hot reload, (4) immediately fire an HTTP request to /health (before 'Hot reload complete' appears in logs), (5) verify the request eventually returns 200. Use `mcpServer.triggerHotReload()` then immediately `fetch()` without waiting for logs. The proxy holds the request for up to 5s (READY_TIMEOUT_MS). The test fixtures are in `e2e/fixtures.ts` — use `startMcpServer(configDir, true)` for hot mode. Add the test to a new describe block in `e2e/lifecycle.e2e.ts` or a new `e2e/dev-proxy.e2e.ts` file."
+    },
+    {
+      "id": "US-002",
+      "title": "E2E test: proxy returns 503 when worker restart exceeds READY_TIMEOUT_MS",
+      "description": "As a platform contributor, I want an E2E test that verifies the dev proxy returns 503 Service Unavailable when a request is buffered for longer than READY_TIMEOUT_MS (5 seconds), so that I can confirm the timeout mechanism prevents indefinite hangs.",
+      "acceptanceCriteria": [
+        "Test kills the worker process directly (not via SIGUSR1) so no new worker starts, then sends an HTTP request",
+        "The request returns 503 within approximately 5-6 seconds (READY_TIMEOUT_MS + margin)",
+        "Test does not exceed 15 seconds total",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "This is tricky because the proxy's `startWorker()` is only called internally. The test can't easily prevent a new worker from starting. Alternative approach: start the server in hot mode, then kill the WORKER (not the proxy) using the proxy's process tree. The proxy detects worker exit but doesn't auto-restart (only SIGUSR1 or file changes trigger restart). Look at `dev-proxy.ts` lines 73-79 — the exit handler just clears `worker = null` and `workerPort = null`, it does NOT call `startWorker()`. So: (1) start hot-mode server, (2) find the worker PID from server logs or process tree, (3) kill the worker directly with SIGKILL, (4) immediately send an HTTP request, (5) verify 503 after ~5s. To find the worker PID, look for the `[proxy] Worker ready on port X` log and use the port to identify the process, OR parse the child PID from the fork. Actually, simpler: use `mcpServer.proc.pid` to get the proxy PID, then `pgrep -P <proxy_pid>` to find the worker child. Kill it with SIGKILL. The proxy's `whenReady` will buffer the request for 5s then call `onTimeout` which returns 503."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: concurrent overlapping hot reloads resolve correctly",
+      "description": "As a platform contributor, I want an E2E test that sends SIGUSR1 while a previous hot reload is still in progress (overlapping reloads), so that I can confirm the proxy handles rapid overlapping signals without deadlock or state corruption.",
+      "acceptanceCriteria": [
+        "Test sends two SIGUSR1 signals within 100ms of each other (before the first worker has reported ready)",
+        "After both reloads, the server is healthy and responsive (health returns 200 OK)",
+        "MCP tools/list returns the expected tools",
+        "No error logs related to process management or state corruption",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "In `dev-proxy.ts`, `startWorker()` (lines 44-80) kills the previous worker with SIGTERM and immediately forks a new one. If SIGUSR1 fires twice rapidly, the second call to `startWorker()` kills the first replacement worker before it has sent the 'ready' IPC message. The `pending[]` callbacks from the first restart are still queued. The second worker's 'ready' message calls `drainPending()`, which should flush everything. Test: (1) start hot-mode server, wait for ready, (2) `mcpServer.triggerHotReload()`, (3) immediately (no await) `mcpServer.triggerHotReload()` again, (4) wait for 'Hot reload complete' in logs, (5) verify health is OK and tools/list works. Also verify only one 'Hot reload complete' message appears (the first worker was killed before reporting ready, so only the second worker's ready triggers the log)."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: proxy graceful shutdown on SIGTERM kills worker and exits cleanly",
+      "description": "As a platform contributor, I want an E2E test that sends SIGTERM to the dev proxy process and verifies it kills the worker and exits with code 0, so that I can confirm graceful shutdown works correctly.",
+      "acceptanceCriteria": [
+        "Test starts the hot-mode server, verifies it is healthy",
+        "Sends SIGTERM to the proxy process",
+        "Proxy process exits with code 0 (or null with signal SIGTERM)",
+        "No orphaned worker processes remain (verify by checking that the worker's port is no longer listening)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The proxy's SIGTERM handler (`dev-proxy.ts` lines 249-252) calls `worker?.kill('SIGTERM')` then `process.exit(0)`. Test: (1) start hot-mode server, wait for ready, (2) record the server port, (3) send SIGTERM to `mcpServer.proc.pid` using `process.kill(pid, 'SIGTERM')`, (4) wait for the 'exit' event on `mcpServer.proc`, (5) verify exit code is 0 or signal is SIGTERM, (6) verify `fetch(http://localhost:<port>/health)` fails (ECONNREFUSED). Don't use `mcpServer.kill()` since that uses the fixture's SIGTERM→SIGKILL logic — directly `process.kill()` to test the proxy's own handler. Use a custom server setup (not the fixture) since the fixture's teardown would try to kill an already-dead process."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: health endpoint returns degraded state during worker restart window",
+      "description": "As a platform contributor, I want an E2E test that checks what /health returns during the brief window when the old worker is killed but the new worker hasn't reported ready yet, so that I can confirm the proxy returns 503 (not a stale cached response) during transitions.",
+      "acceptanceCriteria": [
+        "Test triggers a hot reload and polls /health rapidly during the restart window",
+        "At least one poll returns 502 or 503 (proxy cannot reach the worker)",
+        "After the worker is ready, /health returns 200 with status 'ok'",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "During a hot reload, the proxy kills the old worker (workerPort becomes null in the exit handler, line 74-78) and forks a new one. Until the new worker sends 'ready', HTTP requests are buffered via `whenReady()`. If the request arrives after the old worker exits but before the new worker is ready, the request should be buffered (not proxied to a dead port). The proxy should NOT return a stale 200 — it should either buffer the request until the worker is ready (returning the new worker's response) or time out with 503. Test: (1) start hot-mode server, wait for ready, (2) trigger hot reload, (3) start a tight poll loop (every 50ms) hitting /health, (4) collect all responses (status codes), (5) verify at least one non-200 response during the transition (502 from proxyHttp error if the worker port is temporarily dead, or the request is buffered and returns the new worker's 200), (6) verify the final response is 200 OK. Note: the buffering in `whenReady` means requests that arrive AFTER `workerPort = null` but before the new worker's 'ready' are queued and eventually served. Requests in-flight to the old worker when it dies get 502 from `proxyReq.on('error')`. The test should capture at least one 502."
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: MCP SSE stream gets a clean error when worker restarts mid-response",
+      "description": "As a platform contributor, I want an E2E test that starts a long-running tool call (producing an SSE stream) and triggers a hot reload mid-stream, so that I can confirm the MCP client receives a clean error (502 or aborted stream) rather than hanging indefinitely.",
+      "acceptanceCriteria": [
+        "Test starts a slow tool call that produces an SSE response, then triggers hot reload mid-execution",
+        "The MCP client receives either a clean error (502, connection reset) or the tool call result, not a hang",
+        "Subsequent tool calls work after the hot reload completes",
+        "Test completes within 30 seconds",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The proxy pipes HTTP responses via `proxyRes.pipe(res)` (dev-proxy.ts line 119) and destroys the upstream response on client close (line 120). When the worker dies, in-flight piped responses should get an error event. The MCP client in `e2e/fixtures.ts` handles SSE responses by reading the full body text (lines 1131-1160). If the pipe breaks mid-stream, the client's `res.text()` should throw or return a partial response. Test: (1) set up full tool test with extension, (2) set test server to slow mode (5s delay), (3) start a tool call (produces SSE stream), (4) wait 1s then trigger hot reload, (5) the tool call should resolve with either: success (if it completed before the restart), error (502/connection reset), or a re-initialized result (the client auto-reinits on 502). (6) Wait for 'Hot reload complete', then verify subsequent tool calls work. Similar to the existing 'in-flight tool dispatch during hot reload' test in `hot-reload-dynamic.e2e.ts` but focused on verifying the SSE/HTTP proxy pipe behavior rather than the tool result semantics."
+    },
+    {
+      "id": "US-007",
+      "title": "E2E test: POST /reload triggers config rediscovery in production (non-hot) mode",
+      "description": "As a platform contributor, I want an E2E test that verifies POST /reload works correctly in non-hot (production) mode, so that I can confirm plugin developers can trigger rediscovery via `opentabs-plugin build` without requiring the dev proxy.",
+      "acceptanceCriteria": [
+        "Test starts the server in non-hot mode (mcpServerNoHot fixture or startMcpServer with hot=false)",
+        "Adds a new plugin to config.json, then sends POST /reload with Bearer auth",
+        "After POST /reload, tools/list includes the new plugin's tools",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The existing `secret-rotation.e2e.ts` tests POST /reload in hot mode. The `POST /reload` endpoint in `http-routes.ts` calls `performConfigReload()` which runs `reloadCore()`. This works in both dev and production modes. Test: (1) start server with `hot=false` via `startMcpServer(configDir, false)`, (2) create an MCP client, initialize, verify only e2e-test tools exist, (3) create a minimal plugin using `createMinimalPlugin()`, (4) update config.json to include the new plugin via `writeTestConfig()`, (5) POST to `http://localhost:<port>/reload` with Bearer auth header, (6) verify tools/list now includes the new plugin's tools. The server reads the secret from auth.json — read it from `<configDir>/extension/auth.json` for the Bearer token. Rate limiting: POST /reload has a rate limit, but a single call should be fine."
+    },
+    {
+      "id": "US-008",
+      "title": "E2E test: WebSocket upgrade requests during worker restart window are handled correctly",
+      "description": "As a platform contributor, I want an E2E test that attempts a WebSocket upgrade during the worker restart window, so that I can confirm the proxy either buffers and completes the upgrade or cleanly rejects it.",
+      "acceptanceCriteria": [
+        "Test triggers a hot reload, then immediately attempts a WebSocket connection before the worker is ready",
+        "The WebSocket connection either succeeds (buffered and upgraded after worker ready) or fails cleanly (socket destroyed, no hang)",
+        "After the reload completes, a fresh WebSocket connection succeeds",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "The proxy's upgrade handler (dev-proxy.ts lines 214-227) uses `whenReady()` with an `onTimeout` that calls `socket.destroy()`. If the worker is ready, it calls `forwardUpgrade()`. During the restart window, the upgrade request is buffered in `pending[]` and forwarded once the worker reports ready. Test: (1) start hot-mode server, wait for ready, (2) trigger hot reload, (3) immediately attempt a WebSocket connection to `ws://localhost:<port>/ws` with the correct Sec-WebSocket-Protocol (use `fetchWsInfo` first to get the secret), (4) the connection should either: succeed (buffered then forwarded) — verify by sending a ping and receiving a pong, or fail with a close/error event — which is also acceptable since the socket was destroyed by the timeout. (5) After 'Hot reload complete', open a fresh WebSocket and verify it works (ping/pong). This test covers both the happy path (buffered and forwarded) and the timeout path (socket destroyed)."
+    }
+  ]
+}
