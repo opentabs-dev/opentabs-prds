@@ -1,0 +1,48 @@
+## Codebase Patterns
+- `platform/cli/src/commands/status.ts` exports pure utility functions (formatUptime, colorTabState, isTimeout, isNonOpenTabsHttpError) for unit testing — keep new helpers exported
+- `platform/cli/src/commands/doctor.ts` exports helper functions (isCwdProjectDirectory, defaultMcpClientLocations) for unit testing — follow same pattern
+- The MCP server health endpoint returns JSON with a `status: 'ok'` field; its absence signals a non-OpenTabs server
+- `npm run build` at root requires `lightningcss-linux-x64-gnu` native binary (on glibc Linux). If missing: `npm install lightningcss-linux-x64-gnu --no-save`
+- Phase 1 checks: `npm run build && npm run type-check && npm run lint && npm run knip && npm run test`
+- `npm run type-check` is just `tsc --build` (no extension CSS build)
+- Use `vi.spyOn(process, 'cwd').mockReturnValue(dir)` + `afterEach(() => vi.restoreAllMocks())` to test CWD-dependent logic
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-090917-cli-status-doctor-errors~running.json
+Started: Sat Feb 28 17:09:47 UTC 2026
+---
+
+## 2026-02-28 17:14 - US-001
+- Added `isNonOpenTabsHttpError(status, contentType)` helper to `platform/cli/src/commands/status.ts`
+  - Returns true for 4xx (except 401) or non-JSON content-type responses
+  - Exported for unit testing
+- Updated `!res.ok` block to use the helper:
+  - 4xx/non-JSON → "No OpenTabs server found on port X. The port may be in use by another service."
+  - 5xx with JSON → "The server may be misconfigured. Check the server logs for details."
+- Added check after JSON parse: if `data.status` is not a string, show "No OpenTabs server found" error
+- Added 10 unit tests for `isNonOpenTabsHttpError` in `status.test.ts`
+- Files changed: `platform/cli/src/commands/status.ts`, `platform/cli/src/commands/status.test.ts`
+- **Learnings for future iterations:**
+  - The `lightningcss-linux-x64-gnu` native binary was missing from the worktree (only musl was installed). Fixed with `npm install lightningcss-linux-x64-gnu --no-save` before the build could succeed.
+  - 401 must be excluded from `isNonOpenTabsHttpError` since 401 IS an OpenTabs response (auth failed). Only other 4xx mean "different service".
+  - The 401 check in `handleStatus` runs before the `!res.ok` block so `isNonOpenTabsHttpError` will never be called with 401 in practice, but the function should still return false for 401 for semantic clarity.
+---
+
+## 2026-02-28 17:21 - US-002
+- Added `isCwdProjectDirectory()` helper to `platform/cli/src/commands/doctor.ts`
+  - Returns false when CWD is `/` (filesystem root)
+  - Returns false when CWD lacks both `package.json` and `.git`
+  - Returns true when CWD has either `package.json` or `.git`
+  - Exported for unit testing
+- Updated `defaultMcpClientLocations()` to conditionally include CWD-relative entries:
+  - Cursor CWD path (`join(cwd, '.cursor', 'mcp.json')`) only included when `isCwdProjectDirectory()` is true
+  - OpenCode CWD path (`join(cwd, 'opencode.json')`) only included when `isCwdProjectDirectory()` is true
+  - Home-directory paths (Claude Code, Cursor home, OpenCode home, Windsurf) always included
+- Exported `defaultMcpClientLocations` and `McpClientLocation` type for testing
+- Added 8 unit tests in `doctor.test.ts` covering `isCwdProjectDirectory` and `defaultMcpClientLocations`
+- Files changed: `platform/cli/src/commands/doctor.ts`, `platform/cli/src/commands/doctor.test.ts`
+- **Learnings for future iterations:**
+  - Use `vi.spyOn(process, 'cwd').mockReturnValue(dir)` to test CWD-dependent logic; always pair with `afterEach(() => vi.restoreAllMocks())`
+  - `existsSync` is synchronous so no async needed in the helper — the test can create temp dirs with `mkdtempSync` and `writeFileSync`
+  - Exporting types alongside functions (`export type { McpClientLocation }`) allows test files to use typed assertions without importing from implementation files indirectly
+---
