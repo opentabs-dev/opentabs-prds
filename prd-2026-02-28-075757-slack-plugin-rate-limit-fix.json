@@ -1,0 +1,29 @@
+{
+  "project": "OpenTabs Plugin — Slack",
+  "description": "Fix NaN retryAfterMs bug in Slack plugin rate-limit handling — when HTTP 429 has no Retry-After header, parseInt('unknown') produces NaN which is passed as retryAfterMs to ToolError.rateLimited(), making programmatic retry decisions impossible for AI agents.",
+  "workingDirectory": "plugins/slack",
+  "qualityChecks": "cd plugins/slack && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix NaN retryAfterMs on HTTP 429 rate-limit responses",
+      "description": "As an AI agent calling Slack tools, I want the retryAfterMs field in rate-limit errors to be a valid number or undefined so that I can make informed retry decisions.",
+      "acceptanceCriteria": [
+        "When HTTP 429 has a valid numeric Retry-After header (e.g., '30'), retryAfterMs is the value in milliseconds (30000)",
+        "When HTTP 429 has no Retry-After header, retryAfterMs is undefined (not NaN)",
+        "When HTTP 429 has a non-numeric Retry-After header, retryAfterMs is undefined (not NaN)",
+        "The error message includes Retry-After information when the header is present",
+        "The error message does not include 'unknown' as a retry value when the header is absent",
+        "cd plugins/slack && npm run build passes",
+        "cd plugins/slack && npm run type-check passes",
+        "cd plugins/slack && npm run lint passes",
+        "cd plugins/slack && npm run format:check passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: plugins/slack/src/slack-api.ts, lines 397-401.\n\nCurrent code:\n```\nif (response.status === 429) {\n  const retryAfterStr = response.headers.get('Retry-After') ?? 'unknown';\n  const retryMs = retryAfterStr ? parseInt(retryAfterStr, 10) * 1000 : 60000;\n  throw ToolError.rateLimited(`Slack API rate limited (429). Retry after ${retryAfterStr} seconds.`, retryMs);\n}\n```\n\nBug: When Retry-After header is absent, retryAfterStr = 'unknown'. Since 'unknown' is truthy, parseInt('unknown', 10) returns NaN, so retryMs = NaN.\n\nFix: Get the raw header value (which is null when absent). Parse it as a number only if present. Guard against NaN. Pass undefined when no valid retry delay can be determined. Adjust the error message to not include 'unknown'.\n\nExample fix:\n```\nif (response.status === 429) {\n  const retryAfterRaw = response.headers.get('Retry-After');\n  const retrySeconds = retryAfterRaw !== null ? parseInt(retryAfterRaw, 10) : NaN;\n  const retryMs = Number.isNaN(retrySeconds) ? undefined : retrySeconds * 1000;\n  const msg = retryMs !== undefined\n    ? `Slack API rate limited (429). Retry after ${String(retrySeconds)} seconds.`\n    : 'Slack API rate limited (429).';\n  throw ToolError.rateLimited(msg, retryMs);\n}\n```"
+    }
+  ]
+}
