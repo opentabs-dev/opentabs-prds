@@ -199,8 +199,10 @@ merge_branch() {
   fi
 
   # Attempt the merge
+  # --allow-unrelated-histories handles branches created from a different root
+  # commit (e.g., after a repo re-init). Safe because content is the same codebase.
   local merge_output
-  if merge_output=$(git -C "$CODE_DIR" merge --no-edit "$remote_branch" 2>&1); then
+  if merge_output=$(git -C "$CODE_DIR" merge --no-edit --allow-unrelated-histories "$remote_branch" 2>&1); then
     echo -e "$(ts) ${GREEN}  Merged successfully.${RESET}"
 
     # Push main to remote — retry before giving up (preserves merge work)
