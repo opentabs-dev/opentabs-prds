@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two race conditions in the browser extension: (1) confirmation badge double-decrement when both background and side panel timeouts fire for the same confirmation, and (2) missed cleanup on service worker wake when ws:state arrives before restoreWsConnectedState completes.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix confirmation badge double-decrement race",
+      "description": "As a user, I want the confirmation badge count to be accurate so that I know how many confirmations are actually pending.",
+      "acceptanceCriteria": [
+        "clearConfirmationBadge is idempotent per confirmation id — calling it twice with the same id decrements the count only once",
+        "When the background timeout fires and the side panel also sends sp:confirmationTimeout for the same id, pendingConfirmationCount decrements by exactly 1 total",
+        "When 3 confirmations are pending and 1 is resolved via both paths, badge shows 2 (not 1)",
+        "Existing unit tests for confirmation-badge continue to pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Bug location: platform/browser-extension/src/confirmation-badge.ts\n\nThe issue: clearConfirmationBadge(id) at line 85-91 always decrements pendingConfirmationCount regardless of whether this id was already cleared. When both the background timeout (line 63-66) and the side panel timeout (handleSpConfirmationTimeout in background-message-handlers.ts:184-191) fire for the same confirmation id, the count decrements twice.\n\nThe background timeout callback calls clearConfirmationBadge(id) which decrements count. Later, when the side panel sends sp:confirmationTimeout, handleSpConfirmationTimeout calls clearConfirmationBackgroundTimeout(id) (no-op since timeout already fired and was deleted from the map) then calls clearConfirmationBadge(id) which decrements again.\n\nFix: Track which confirmation ids have been cleared. In clearConfirmationBadge, check if the id was already cleared before decrementing. A simple Set<string> of cleared ids works. When a new confirmation arrives with the same id (checked in notifyConfirmationRequest), remove it from the cleared set. Alternatively, only decrement if the id is present in the confirmationTimeouts map or a separate pending set — the key insight is to make the decrement idempotent per id.\n\nSimplest approach: add a Set<string> called `clearedConfirmationIds`. In clearConfirmationBadge, if id is defined and already in the set, skip the decrement. Otherwise add to set and decrement. In notifyConfirmationRequest, remove from clearedConfirmationIds when a new confirmation with that id arrives. In clearAllConfirmationBadges, clear the set."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix restoreWsConnectedState race on service worker wake",
+      "description": "As a developer, I want WebSocket disconnect cleanup to always run so that stale tab state cache and confirmation badges are cleared after service worker suspension.",
+      "acceptanceCriteria": [
+        "When a ws:state connected=false message arrives before restoreWsConnectedState completes, clearTabStateCache and clearAllConfirmationBadges are still called",
+        "The wasConnected vs nowConnected transition detection accounts for the async restore not having completed yet",
+        "No regression when ws:state connected=true arrives (normal connect flow still works)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Bug location: platform/browser-extension/src/background-message-handlers.ts\n\nThe issue: restoreWsConnectedState (line 27-38) reads wsConnected from chrome.storage.session asynchronously via .then(). Meanwhile, wsConnected defaults to false (line 22). If a ws:state connected=false message arrives from the offscreen document before the .then() callback executes, handleWsState (line 71-88) sees wasConnected=false and nowConnected=false. The guard at line 83 `if (!nowConnected && wasConnected)` is false, so clearTabStateCache() and clearAllConfirmationBadges() are never called.\n\nThis matters after MV3 service worker suspension: the service worker was suspended while connected (wsConnected=true was in storage.session). On wake, restoreWsConnectedState starts reading storage. If the offscreen document detects a disconnect and sends ws:state connected=false before the storage read completes, the cleanup is skipped.\n\nFix: In handleWsState, always call clearTabStateCache and clearAllConfirmationBadges on disconnect (when nowConnected=false), regardless of wasConnected. The cleanup functions are idempotent — calling them when already in a clean state is harmless. Change line 83 from `if (!nowConnected && wasConnected)` to `if (!nowConnected)`. This ensures disconnect cleanup always runs, even if the previous state is unknown due to the async restore race.\n\nAlternative: make restoreWsConnectedState synchronous by awaiting it before registering the message listener. But this would require restructuring initBackgroundMessageHandlers to be async, which is a larger change. The simpler fix (always clean up on disconnect) is safer."
+    }
+  ]
+}
