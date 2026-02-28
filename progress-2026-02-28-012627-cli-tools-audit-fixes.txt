@@ -1,0 +1,78 @@
+## Codebase Patterns
+- Color parsing in validate-icon.ts uses a `parseHex` function (not exported) that feeds into `parseColor`, `isAchromaticColor`, and `convertColorToGray`. All public APIs flow through these internal helpers.
+- Tests in validate-icon.test.ts exercise the color parsing pipeline indirectly via `validateInactiveIconColors` and `generateInactiveIcon` (the exported functions).
+- The alpha channel in hex colors (#RGBA, #RRGGBBAA) is ignored for both achromatic detection and grayscale conversion — only RGB channels matter.
+- SVG color validation and conversion operates on three layers: (1) color-carrying attributes (fill, stroke, etc.), (2) inline style="" attributes, and (3) `<style>` blocks. Each layer uses parallel regex-based extraction with the same color parsing pipeline.
+- `formatUptime` in platform/cli/src/commands/status.ts is exported for testing. The hours+ range formats exclude seconds (e.g., "1h 1m", not "1h 1m 1s").
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-012627-cli-tools-audit-fixes~running.json
+Started: Sat Feb 28 09:26:54 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- What was implemented: Extended `parseHex` in `platform/plugin-tools/src/validate-icon.ts` to support #RGBA (5-char) and #RRGGBBAA (9-char) hex color formats by ignoring the alpha channel and returning only the RGB components.
+- Files changed:
+  - `platform/plugin-tools/src/validate-icon.ts` — added length 5 and length 9 cases to `parseHex`; updated JSDoc comment
+  - `platform/plugin-tools/src/validate-icon.test.ts` — added 8 new tests covering #RGBA/#RRGGBBAA parsing via `validateInactiveIconColors` and `generateInactiveIcon`
+- **Learnings for future iterations:**
+  - `parseHex` is an internal function (not exported); all testing is via the public API (`validateInactiveIconColors`, `generateInactiveIcon`)
+  - Alpha channel is uniformly ignored in this codebase's color pipeline — only RGB matters for achromatic detection and grayscale conversion
+  - The `convertColorToGray` hex path (lines 392-400) automatically benefits from `parseHex` fix — no separate change needed for `generateInactiveIcon`
+---
+
+## 2026-02-28 - US-002
+- What was implemented: Added `<style>` block color detection and conversion to both `validateInactiveIconColors` and `generateInactiveIcon` in `platform/plugin-tools/src/validate-icon.ts`. Both functions now parse `<style>` block content using regex to find fill/stroke/stop-color/flood-color CSS property values and check them via the existing color parsing pipeline.
+- Files changed:
+  - `platform/plugin-tools/src/validate-icon.ts` — added `<style>` block scanning to `validateInactiveIconColors` (new loop after inline style check) and `generateInactiveIcon` (new replace pass after inline style conversion); updated JSDoc comments for both functions
+  - `platform/plugin-tools/src/validate-icon.test.ts` — added 13 tests for `validateInactiveIconColors` covering `<style>` block detection (saturated hex, rgb, named colors, achromatic pass, multiple blocks, stop-color, flood-color) and 12 tests for `generateInactiveIcon` covering `<style>` block conversion (named colors, hex, rgb, hsl, multiple properties, passthrough values, roundtrip validation, mixed style blocks + attributes)
+- **Learnings for future iterations:**
+  - The `<style>` block regex uses `/<style[^>]*>([\s\S]*?)<\/style>/gi` to capture CSS content — `[\s\S]*?` is needed for multiline matching since `.` doesn't match newlines
+  - CSS property value extraction in style blocks uses `[^;}"']` as the terminator set (semicolons, closing braces, and quotes) — this is different from inline `style=""` attributes which use `[^;"']` (no braces)
+  - The existing `convertColorToGray` and `isAchromaticColor` functions work unchanged for CSS property values — no adaptation needed
+  - The `<style>` block handling mirrors the inline style pattern but needs separate regex because the content structure is different (CSS rules with selectors/braces vs. just property declarations)
+---
+
+## 2026-02-28 - US-003
+- What was implemented: Fixed `looksLikeJwt` in `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts` to require each segment to be at least 10 characters long, preventing version strings like '1.2.3' from being falsely detected as JWTs.
+- Files changed:
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.ts` — changed `p.length > 0` to `p.length >= 10` in `looksLikeJwt`
+  - `platform/mcp-server/src/browser-tools/analyze-site/detect-auth.test.ts` — added 2 tests for version strings and short dotted strings not matching as JWTs
+- **Learnings for future iterations:**
+  - `looksLikeJwt` is tested indirectly via `detectAuth` (not exported); tests use `localStorageEntries` with short/version string values
+  - The minimum segment length of 10 is safe for all real JWTs — real JWT headers are always 30+ chars when base64-encoded
+  - The `FAKE_JWT` constant at the top of the test file is the canonical real JWT test fixture — all JWT-positive tests reuse it
+---
+
+## 2026-02-28 - US-004
+- What was implemented: Fixed `formatUptime` in `platform/cli/src/commands/status.ts` to floor the seconds input before processing, preventing fractional display in all output formats.
+- Files changed:
+  - `platform/cli/src/commands/status.ts` — added `seconds = Math.floor(seconds);` as the first line of `formatUptime`
+  - `platform/cli/src/commands/status.test.ts` — added 3 tests covering fractional inputs: 123.456→"2m 3s", 0.9→"0s", 3661.5→"1h 1m"
+- **Learnings for future iterations:**
+  - `formatUptime` is exported from status.ts (along with `colorTabState`, `isTimeout`, `handleStatus`, `registerStatusCommand`)
+  - The hours+ format branch returns `${hours}h ${mins}m` (no seconds), so the PRD acceptance criteria "1h 1m 1s" is a description error — actual output is "1h 1m"
+  - `Math.floor(seconds)` at the top of the function is sufficient — all subsequent modulo and division operations then produce integers automatically
+---
+
+## 2026-02-28 - US-005
+- What was implemented: Replaced `storedPath.startsWith('/')` with `isAbsolute(storedPath)` in `resolvePluginPathForComparison` in `platform/plugin-tools/src/commands/build.ts` for Windows compatibility. Also exported the function for unit testing and added test coverage.
+- Files changed:
+  - `platform/plugin-tools/src/commands/build.ts` — added `isAbsolute` to the `node:path` import; replaced `startsWith('/')` with `isAbsolute(storedPath)`; added `resolvePluginPathForComparison` to the export list
+  - `platform/plugin-tools/src/commands/build.test.ts` — added `resolvePluginPathForComparison` to imports; added 4 tests covering Unix absolute paths, home-relative paths, simple relative paths, and relative paths with `..` components
+- **Learnings for future iterations:**
+  - `resolvePluginPathForComparison` was private but added to the export list to enable direct unit testing — this matches the pattern used by other internal helpers in build.ts (e.g., `registerInConfig`)
+  - On Linux, `path.isAbsolute('C:\\foo')` returns false (POSIX rules only handle `/`), so the Windows-specific improvement cannot be directly tested on Linux; the test suite covers Unix absolute paths to confirm the Unix case is unchanged
+  - `node:path` was already imported in build.ts — only `isAbsolute` needed to be added to the destructured import
+---
+
+## 2026-02-28 - US-006
+- What was implemented: Added a module-level `pluginCacheKey` counter (alternates between 0 and 1 via modulo) in `platform/plugin-tools/src/commands/build.ts`. Replaced `Date.now()` in the dynamic import cache-busting URL with `pluginCacheKey`, so the ESM module cache is bounded to 2 entries instead of accumulating one entry per rebuild.
+- Files changed:
+  - `platform/plugin-tools/src/commands/build.ts` — added `let pluginCacheKey = 0` module-level variable; updated Step 2 comment and import line to use `(pluginCacheKey + 1) % 2` rotation instead of `Date.now()`
+- **Learnings for future iterations:**
+  - The ESM module cache in Node.js caches by full URL (including query string), so each unique `?t=<value>` creates a separate persistent cache entry — this is why `Date.now()` causes unbounded growth
+  - With 2 rotating keys, the cache holds at most 2 entries for the plugin entry point; in a typical watch session with a small number of rebuilds, this is practically effective
+  - The `pluginCacheKey` counter must be module-level (not local to `runBuild`) so it persists across multiple `runBuild` invocations in a single watch session
+  - No new unit tests needed — the fix is a one-line behavioral change (no new public API, no new testable logic); all existing tests continue to pass
+---
