@@ -1,0 +1,66 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix safeSerializeArg crash on SVG DOM nodes in log.ts and add missing browser-context test coverage across the plugin SDK.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix safeSerializeArg crash on SVG elements and add top-level try/catch",
+      "description": "As a plugin developer, I want log.info/warn/error to never crash my tool handler so that logging remains safe regardless of what arguments are passed.",
+      "acceptanceCriteria": [
+        "safeSerializeArg checks `typeof node.className === 'string'` before calling `.split()` on it, preventing TypeError on SVG elements where className is an SVGAnimatedString object",
+        "safeSerializeArg has a top-level try/catch that returns a `[Unserializable: ...]` fallback string if any property access throws unexpectedly",
+        "New tests in log.test.ts verify: (1) SVG-like nodes with non-string className serialize without throwing, (2) objects with throwing property getters serialize to the fallback string rather than crashing, (3) anonymous functions serialize as `[Function: anonymous]`",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Bug location: `platform/plugin-sdk/src/log.ts` lines 31-73, the `safeSerializeArg` function.\n\n**Bug 1 — SVG className crash (line 48):**\nThe DOM node serialization branch accesses `node.className` and calls `.split(' ')`. For SVG elements, `className` is an `SVGAnimatedString` (an object with `baseVal`/`animVal` properties, not a string). Calling `.split()` on it throws `TypeError: node.className.split is not a function`.\n\nFix: Change line 48 from:\n```ts\nconst className = node.className ? `.${node.className.split(' ')[0] ?? ''}` : '';\n```\nto:\n```ts\nconst className = typeof node.className === 'string' && node.className ? `.${node.className.split(' ')[0] ?? ''}` : '';\n```\n\n**Bug 2 — No top-level try/catch:**\nThe function handles specific types (primitives, functions, symbols, bigints, DOM nodes, Errors) and then falls through to a JSON round-trip with try/catch. But the DOM node branch (lines 46-49) and Error branch (lines 53-55) have NO try/catch wrapping. If any property access on these objects throws (e.g., a Proxy that throws on property access, or a getter that throws), the error propagates through `safeSerialize` → `makeLogMethod` → the calling tool handler's `log.info()` call, crashing the tool handler. For a function named 'safe serialize', this defeats its purpose.\n\nFix: Wrap the entire function body in try/catch, returning `[Unserializable: <typeof value>]` on any unexpected error. This is the same fallback used by the JSON round-trip catch block.\n\n**Tests:** Add tests in `platform/plugin-sdk/src/log.test.ts` in the 'safe serialization' describe block:\n1. Test with a mock SVG-like object: `{ nodeType: 1, nodeName: 'svg', className: { baseVal: 'my-class', animVal: 'my-class' } }` — should serialize without throwing\n2. Test with an object whose property getter throws: use `Object.defineProperty` to create a throwing getter on a `nodeType`-having object — should return a fallback string\n3. Test anonymous function: `log.info('test', () => {})` — should serialize as `[Function: anonymous]`"
+    },
+    {
+      "id": "US-002",
+      "title": "Add missing browser-context test coverage for dom.ts and storage.ts",
+      "description": "As a platform maintainer, I want comprehensive test coverage for attribute-based selectors in dom.ts and edge-case cookie values in storage.ts so that browser-context regressions are caught.",
+      "acceptanceCriteria": [
+        "dom.test.ts has a new test in the waitForSelector block that verifies a class-based selector (e.g., `.my-class`) resolves when the class is added to an existing element via attribute change — confirming needsAttributeObservation enables attribute observation",
+        "storage.test.ts has a new test in the getCookie block verifying that cookies with `=` in the value are parsed correctly (e.g., `token=abc=def=ghi` returns `abc=def=ghi`)",
+        "storage.test.ts has a new test in the getCookie block verifying that cookies with empty values are parsed correctly (e.g., `empty=` returns empty string `''`)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "**dom.test.ts — attribute-change selector test:**\nFile: `platform/plugin-sdk/src/dom.test.ts`\n\nThe `needsAttributeObservation` helper (line 9 of dom.ts) checks if a selector contains `[` or `.` and adds `attributes: true` to the MutationObserver options. Currently all tests use `#id` selectors, so this code path is untested.\n\nAdd a test that:\n1. Creates a `<div>` without any class\n2. Calls `waitForSelector('.my-class')` (which should set up an observer with `attributes: true`)\n3. In a `queueMicrotask`, adds the `my-class` class to the div: `el.classList.add('my-class')`\n4. Asserts the promise resolves with the element\n\nNote: happy-dom's MutationObserver may or may not support attribute mutations. If the test doesn't work with happy-dom's MutationObserver firing on attribute changes, add a brief comment explaining the limitation and skip the test with `test.skip`.\n\n**storage.test.ts — getCookie edge cases:**\nFile: `platform/plugin-sdk/src/storage.test.ts`\n\nAdd in the getCookie describe block:\n1. Test: `'handles cookies with = in the value'` — mock `document.cookie` as `'token=abc=def=ghi; other=val'`, assert `getCookie('token')` returns `'abc=def=ghi'`\n2. Test: `'handles cookies with empty values'` — mock `document.cookie` as `'empty=; other=val'`, assert `getCookie('empty')` returns `''`\n\nFollow the existing pattern of using `Object.defineProperty(win.document, 'cookie', { get: () => '...', configurable: true })`."
+    },
+    {
+      "id": "US-003",
+      "title": "Add missing test coverage for fetch.ts and timing.ts edge cases",
+      "description": "As a platform maintainer, I want tests for postFormData schema validation, retry abort-during-sleep, and waitUntil with AbortSignal so that timing and fetch edge cases are verified.",
+      "acceptanceCriteria": [
+        "fetch.test.ts has a new test in the postFormData block verifying Zod schema validation works (POST form data, validate response against a schema, assert the validated result)",
+        "timing.test.ts has a new test in the retry block that verifies AbortSignal aborted during the inter-retry sleep causes retry to reject promptly (not after the full sleep duration)",
+        "All new tests pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "**fetch.test.ts — postFormData schema validation:**\nFile: `platform/plugin-sdk/src/fetch.test.ts`\n\nThe `postFormData` function has a Zod schema overload (4th argument) but the test suite doesn't exercise it. Add a test that:\n1. Creates a `FormData` with a field\n2. Defines a Zod schema for the expected response (e.g., `z.object({ contentType: z.string(), hasCookies: z.boolean() })`)\n3. Calls `postFormData(url, formData, undefined, schema)` against the `/echo-headers` endpoint\n4. Asserts the response is validated and returned\n\nFollow the existing `postFormData` test patterns. The test server's `/echo-headers` endpoint returns `{ contentType, hasCookies }`.\n\n**timing.test.ts — retry abort during sleep:**\nFile: `platform/plugin-sdk/src/timing.test.ts`\n\nThe existing abort tests check (1) pre-aborted signals and (2) signals aborted during `fn()`. Missing: signal aborted during the inter-retry sleep (the `abortableSleep` internal function at timing.ts lines 44-61).\n\nAdd a test that:\n1. Creates an `AbortController`\n2. Starts `retry` with a function that always fails, `delay: 5000` (long sleep), and the controller's signal\n3. After a short delay (e.g., 50ms via `setTimeout`), calls `controller.abort(new Error('cancel during sleep'))`\n4. Asserts `retry` rejects with the abort error\n5. Asserts the total elapsed time is well under 5000ms (proving the sleep was interrupted, not completed)\n\nUse `performance.now()` to measure elapsed time, following the pattern in the existing backoff tests."
+    }
+  ]
+}
