@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Strengthen a weak E2E assertion that could mask unexpected failures, and add missing E2E coverage for documented onNavigate lifecycle hook triggers (hashchange and replaceState).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Strengthen negative-only assertion in npm-discovery.e2e.ts to include positive verification",
+      "description": "As a platform contributor, I want the npm plugin dispatch test to positively verify the expected error type (closed/unavailable tab) so that the test fails if the tool errors for an unexpected reason instead of silently passing.",
+      "acceptanceCriteria": [
+        "The assertion at line ~232 of npm-discovery.e2e.ts includes both a negative check (not 'Unknown tool') and a positive check that the error content matches the expected pattern (closed tab or unavailable)",
+        "The positive assertion uses a regex or toContain check for the expected error indicators (e.g., 'closed', 'unavailable', 'no matching tab', or 'not ready')",
+        "The test still verifies that isError is true (existing assertion preserved)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/npm-discovery.e2e.ts, line ~229-232\n\nCurrent code:\n```typescript\n// Tool dispatch should fail because no browser extension is connected\n// (tab state is 'closed'), but the tool is recognized and dispatched.\nconst result = await client.callTool('npm-disc-call_echo', {});\nexpect(result.isError).toBe(true);\n// The error message should indicate the tab is not ready, not \"unknown tool\"\nexpect(result.content).not.toContain('Unknown tool');\n```\n\nThe test verifies that the tool IS recognized (not 'Unknown tool') but doesn't verify what the error actually IS. Since no browser extension is connected in this test (it only starts an MCP server, no Chromium), the expected error is that the tab is closed (no matching tab). The error content should contain 'closed' or 'no matching tab'.\n\nAdd a positive assertion after the existing negative one:\n```typescript\nexpect(result.content).not.toContain('Unknown tool');\nexpect(result.content.toLowerCase()).toMatch(/closed|no matching tab/);\n```\n\nThis ensures the test fails if the tool errors for a completely different reason (e.g., a crash, timeout, or unexpected dispatch error) that happens to not contain 'Unknown tool'."
+    },
+    {
+      "id": "US-002",
+      "title": "Add onNavigate E2E tests for hashchange and replaceState triggers",
+      "description": "As a plugin developer, I want E2E tests to verify that the onNavigate lifecycle hook fires on hashchange and replaceState events (not just pushState) so that regressions in these documented triggers are caught automatically.",
+      "acceptanceCriteria": [
+        "A new test in lifecycle-hooks.e2e.ts verifies that onNavigate fires when window.location.hash is changed (hashchange event)",
+        "A new test in lifecycle-hooks.e2e.ts verifies that onNavigate fires when history.replaceState is called",
+        "Both tests verify the recorded URL in the __opentabs_onNavigate_urls global array contains the expected path/hash",
+        "The tests follow the same pattern as the existing 'onNavigate fires on pushState URL change' test (setupToolTest, page.evaluate to trigger navigation, waitFor to poll for the hook recording, expect assertion on the URL array)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: e2e/lifecycle-hooks.e2e.ts\n\nThe existing onNavigate test (lines 34-60) tests pushState only:\n```typescript\ntest('onNavigate fires on pushState URL change', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n  await page.evaluate(() => history.pushState({}, '', '/navigated-path'));\n  await waitFor(\n    async () => {\n      const urls = await page.evaluate(() => (globalThis as Record<string, unknown>).__opentabs_onNavigate_urls);\n      return Array.isArray(urls) && urls.length > 0;\n    },\n    10_000, 200, 'onNavigate hook to record URL',\n  );\n  const urls = await page.evaluate(\n    () => (globalThis as Record<string, unknown>).__opentabs_onNavigate_urls as string[],\n  );\n  expect(urls).toEqual(expect.arrayContaining([expect.stringContaining('/navigated-path')]));\n});\n```\n\nThe SDK documents that onNavigate fires on: pushState, replaceState, popstate, and hashchange. Add two new tests in the same describe block:\n\n**Test 1: hashchange**\n```typescript\ntest('onNavigate fires on hashchange', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n\n  // Clear any URLs recorded during setup\n  await page.evaluate(() => {\n    (globalThis as Record<string, unknown>).__opentabs_onNavigate_urls = [];\n  });\n\n  // Trigger a hashchange\n  await page.evaluate(() => { window.location.hash = '#test-section'; });\n\n  await waitFor(\n    async () => {\n      const urls = await page.evaluate(() => (globalThis as Record<string, unknown>).__opentabs_onNavigate_urls);\n      return Array.isArray(urls) && urls.length > 0;\n    },\n    10_000, 200, 'onNavigate hook to record hashchange URL',\n  );\n\n  const urls = await page.evaluate(\n    () => (globalThis as Record<string, unknown>).__opentabs_onNavigate_urls as string[],\n  );\n  expect(urls).toEqual(expect.arrayContaining([expect.stringContaining('#test-section')]));\n});\n```\n\n**Test 2: replaceState**\n```typescript\ntest('onNavigate fires on replaceState URL change', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n\n  await page.evaluate(() => {\n    (globalThis as Record<string, unknown>).__opentabs_onNavigate_urls = [];\n  });\n\n  await page.evaluate(() => history.replaceState({}, '', '/replaced-path'));\n\n  await waitFor(\n    async () => {\n      const urls = await page.evaluate(() => (globalThis as Record<string, unknown>).__opentabs_onNavigate_urls);\n      return Array.isArray(urls) && urls.length > 0;\n    },\n    10_000, 200, 'onNavigate hook to record replaceState URL',\n  );\n\n  const urls = await page.evaluate(\n    () => (globalThis as Record<string, unknown>).__opentabs_onNavigate_urls as string[],\n  );\n  expect(urls).toEqual(expect.arrayContaining([expect.stringContaining('/replaced-path')]));\n});\n```\n\nMake sure to import waitFor from './helpers.js' (it should already be imported at line 20).\n\nNote: The e2e-test plugin's adapter IIFE sets up the onNavigate hook to record URLs in globalThis.__opentabs_onNavigate_urls. The pushState test already validates this mechanism works — hashchange and replaceState use the same hook but different browser APIs to trigger the URL change detection."
+    }
+  ]
+}
