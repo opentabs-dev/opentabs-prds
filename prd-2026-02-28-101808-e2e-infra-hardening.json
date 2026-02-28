@@ -1,0 +1,45 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Harden E2E test infrastructure (fixtures.ts) to prevent killProcess hangs, silent auth failures, SSE parsing bugs, and callToolWithProgress fragility during hot-reload.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix killProcess hang and silent auth.json read failure in fixtures.ts",
+      "description": "As a CI maintainer, I want killProcess to have an absolute timeout after SIGKILL and auth.json read failures to produce clear warnings so that stuck processes don't block CI and auth issues are diagnosed immediately.",
+      "acceptanceCriteria": [
+        "killProcess resolves within a bounded time (e.g., 10s) even if the process ignores SIGKILL, by adding an absolute timeout that resolves the promise",
+        "When auth.json read fails or server.secret is undefined after startup, a clear warning is logged (console.warn or thrown error) instead of silently continuing with no auth",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/fixtures.ts\n\nkillProcess hang (lines 385-407): After sending SIGKILL, the function waits indefinitely for the 'close' event. If the process doesn't exit (zombie, kernel hold), the test hangs forever. Add an absolute timeout (e.g., 10 seconds) after SIGKILL that resolves the promise regardless, so CI doesn't get stuck.\n\nSilent auth.json read (lines 527-533): In finalizeServer(), the auth.json read is in a bare catch{} block. If the read fails, server.secret remains undefined, and all subsequent MCP requests silently omit the Authorization header. This causes cryptic 401 failures. Add a warning log when server.secret is undefined after startup. Consider adding a retry (the file may not be written yet when 'Worker ready' is logged)."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix SSE fallback returning progress notifications and add auto-reinit to callToolWithProgress",
+      "description": "As a test author, I want the MCP client SSE parser to throw clear errors when no tool result is found and callToolWithProgress to handle worker restarts transparently so that progress-reporting tool tests are reliable during hot-reload scenarios.",
+      "acceptanceCriteria": [
+        "The request() SSE parser throws an explicit error if no message with result or error (matching the request id) is found, rather than returning the last SSE message blindly",
+        "callToolWithProgress handles 400/502/503 responses by re-initializing the session and retrying, consistent with how callTool works via request()",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "File: e2e/fixtures.ts\n\nSSE fallback (lines 1130-1160): The request() function parses SSE responses and tries to find a matching response by id. The fallback chain at lines 1156-1159 returns 'the last message with result or error', and if that fails, returns messages[messages.length - 1] regardless of type. This could return a progress notification as a 'tool result'. Fix: after the fallback chain, throw an explicit error if no message with result or error was found. Reference callToolWithProgress (line 1337-1338) which already does this correctly.\n\ncallToolWithProgress auto-reinit (lines 1249-1352): This method issues its own fetch() directly (line 1265) without the retry logic that request() has (lines 1104-1117) for 400/502/503 responses. Factor the retry/reinit logic into callToolWithProgress, or have it delegate through request() with appropriate SSE handling."
+    }
+  ]
+}

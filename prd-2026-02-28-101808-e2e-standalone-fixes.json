@@ -1,0 +1,104 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix standalone E2E test issues: secret-rotation weak assertions, iife-injection false positive, analyze-site tab leaks, strict-csp resource leaks, plugin-management timing, and missing plugin.enable/disable coverage.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix weak assertion on old-secret rejection in secret-rotation.e2e.ts",
+      "description": "As a test author, I want the secret rotation test to verify the rejection is specifically an auth rejection so that the test doesn't false-pass on unrelated network errors.",
+      "acceptanceCriteria": [
+        "The catch block (around line 127) asserts that the error message or status contains '401' or 'Unauthorized' or another auth-specific indicator, not just expect(err).toBeDefined()",
+        "The expect(true).toBe(false) unreachable guard (line 125) is replaced with a descriptive throw or expect.fail() with a message like 'Expected old-secret client to be rejected'",
+        "The configDir variable is initialized to empty string and afterEach guards with if (configDir) before calling cleanupTestConfigDir",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/secret-rotation.e2e.ts\n\nWeak assertion (lines 121-131): The test verifies old-secret rejection by catching the error from oldClient.initialize(). The catch block only asserts expect(err).toBeDefined() which is trivially true for ANY error (network timeout, connection refused, etc.). Fix: assert that the error contains '401' or auth-related content. Run the test first to see the exact error message format.\n\nUnreachable guard (line 125): Replace expect(true).toBe(false) with throw new Error('Expected old-secret client to be rejected during initialize') for better diagnostics.\n\nconfigDir cleanup (lines 28-36): configDir is declared as let configDir: string without initialization. If beforeEach throws, afterEach calls cleanupTestConfigDir(configDir) where configDir is undefined, causing a TypeError. Fix: let configDir = ''; and guard: if (configDir) cleanupTestConfigDir(configDir);"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix IIFE-only change test false positive in iife-injection.e2e.ts",
+      "description": "As a test author, I want the IIFE-only change test to verify that re-injection actually occurred so that the test doesn't pass when re-injection silently fails.",
+      "acceptanceCriteria": [
+        "After modifying the IIFE and triggering re-injection (around lines 874-935), the test verifies that the new adapter code is actually running in the page (e.g., by calling a tool that returns a value affected by the IIFE change, or by checking a page global set by the modified adapter)",
+        "The test fails if re-injection did not occur (i.e., the old adapter is still running)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: e2e/iife-injection.e2e.ts\n\nLines 874-935: The test modifies the IIFE (adapter code) and triggers re-injection, but only verifies that the tool list is still correct and the tool is callable. It does NOT verify that the MODIFIED adapter is actually running. If re-injection silently fails and the old adapter remains, the test passes anyway (false positive).\n\nTo fix: use the replaceIifeClosing helper (from helpers.ts) to inject a distinguishable marker into the IIFE. For example, add code that sets a window global: window.__e2eIifeVersion = 2. After re-injection, use browser_execute_script to read this global and verify it has the new value. This proves the new IIFE was actually injected and executed.\n\nThe replaceIifeClosing function is already used in this file for other tests. Look at how other tests in this file modify the IIFE for reference (e.g., the adapter cleanup test)."
+    },
+    {
+      "id": "US-003",
+      "title": "Close tabs in analyze-site.e2e.ts and fix strict-csp.e2e.ts resource leak",
+      "description": "As a CI maintainer, I want analyze-site tests to clean up tabs after each analysis and strict-csp manual tests to use try/finally for intermediate resources so that accumulated tabs don't waste memory and partial failures don't leak resources.",
+      "acceptanceCriteria": [
+        "Each test in analyze-site.e2e.ts closes the tab opened by plugin_analyze_site after the analysis completes (via browser_list_tabs + browser_close_tab or by tracking and closing the page)",
+        "The manual test setup in strict-csp.e2e.ts (around lines 478-496) wraps intermediate resource creation in try/catch so that partial failures clean up already-created resources",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: e2e/analyze-site.e2e.ts\n\nAll 11 test cases call analyzeSite() which opens a new tab via plugin_analyze_site. None close the tab afterward. Tabs accumulate (up to 11 per worker), wasting memory and potentially leaking state (cookies, localStorage) between tests.\n\nFix approach: After each analyzeSite() call, use the MCP client to list tabs (browser_list_tabs), find the tab opened for the analysis URL, and close it (browser_close_tab). Alternatively, track the tab count before/after and close the newest tab. The analyzeSite() helper function (around line 92-98) could be extended to return the tab ID and close it after extracting results.\n\nFile: e2e/strict-csp.e2e.ts\n\nLines 478-496: The manual test setup (setupIsolatedIifeTest alternative) creates resources sequentially: pluginDir, configDir, server, testServer, extensionContext, client. If an intermediate step fails (e.g., startTestServer() throws after server was started), earlier resources leak. The setupIsolatedIifeTest helper in helpers.ts already handles this correctly with a try/catch pattern. Apply the same pattern here, or refactor to use setupIsolatedIifeTest if the test's requirements are compatible."
+    },
+    {
+      "id": "US-004",
+      "title": "Replace fixed 2s sleep with sentinel request pattern in plugin-management.e2e.ts",
+      "description": "As a CI maintainer, I want the notification rejection test to use a happens-before ordering mechanism instead of a fixed sleep so that the test doesn't flake under load.",
+      "acceptanceCriteria": [
+        "The notification rejection test (around line 481) replaces the 2-second setTimeout with a sentinel request pattern: send a real MCP request after the notification and wait for the response, which guarantees the notification was processed first",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/plugin-management.e2e.ts\n\nLine 481: After sending a JSON-RPC notification (which has no response), the test sleeps 2 seconds before checking if the server rejected it. This is timing-dependent.\n\nFix: Instead of sleeping, send a regular MCP request (e.g., tools/list) immediately after the notification. Since MCP processes messages in order, when the tools/list response arrives, the notification has already been processed. Then check the notification was rejected by examining server logs or the response filter.\n\nThe test context has mcpClient which can call listTools(). Use that as the sentinel."
+    },
+    {
+      "id": "US-005",
+      "title": "Add E2E tests for plugin.enable and plugin.disable management tools",
+      "description": "As a test author, I want E2E coverage for plugin.enable and plugin.disable so that regressions in plugin enable/disable functionality are caught before release.",
+      "acceptanceCriteria": [
+        "New test case verifies that plugin.disable disables an enabled plugin: after calling plugin.disable, the plugin's tools no longer appear in tools/list",
+        "New test case verifies that plugin.enable re-enables a disabled plugin: after calling plugin.enable, the plugin's tools reappear in tools/list",
+        "New test case verifies that calling a disabled plugin's tool returns an error",
+        "Tests use the existing fixtureTest pattern from plugin-management.e2e.ts",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "File: e2e/plugin-management.e2e.ts\n\nThe plugin-management.e2e.ts file already tests plugin.search, plugin.install, plugin.updateFromRegistry, plugin.remove, and plugin.checkUpdates. Add a new test.describe block for plugin.enable and plugin.disable.\n\nThe e2e-test plugin is available via the fixture. To test:\n1. Verify the e2e-test plugin's tools are in tools/list (baseline)\n2. Call plugin.disable with the e2e-test plugin name\n3. Verify the plugin's tools are removed from tools/list (use waitForToolList helper)\n4. Verify calling a disabled tool returns isError: true\n5. Call plugin.enable with the e2e-test plugin name\n6. Verify the plugin's tools reappear in tools/list\n\nCheck the MCP server source to confirm the exact tool names and argument schemas for plugin.enable and plugin.disable. Search for 'plugin.enable' or 'plugin.disable' in platform/mcp-server/src/."
+    }
+  ]
+}

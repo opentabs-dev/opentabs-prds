@@ -1,0 +1,67 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix resource leaks (WebSocket connections, MCP sessions) and flaky timing patterns in dispatch-resilience.e2e.ts that cause cascading test failures and CI instability.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Wrap WebSocket connections in try/finally blocks in dispatch-resilience.e2e.ts",
+      "description": "As a CI maintainer, I want leaked WebSocket connections to be cleaned up on test failure so that subsequent tests don't fail due to the extension's connection slot being occupied by a stale WebSocket.",
+      "acceptanceCriteria": [
+        "fakeWs WebSocket at lines 300, 345, and 542 is closed in a finally block (or before assertions that could throw)",
+        "rawWs WebSocket at line 735 is closed before the assertion at line 776 or in a finally block",
+        "All WebSocket close calls are wrapped to handle already-closed sockets gracefully",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/dispatch-resilience.e2e.ts\n\nfakeWs leak (lines 296-329, 341-352, 538-548): In the 'Tool call during reconnect window' tests and 'server-side dispatch timeout' test, a fakeWs WebSocket is created and closed linearly. If waitForLog() throws (times out), fakeWs.close() is never reached. The leaked WebSocket holds the extension's connection slot, preventing reconnection. Wrap in try/finally:\n\nconst fakeWs = ...;\ntry {\n  await waitForLog(...);\n  fakeWs.close();\n  // assertions\n} catch (e) {\n  fakeWs.close();\n  throw e;\n}\n\nrawWs leak (lines 732-779): In 'Malformed WebSocket messages' test, rawWs is created at line 735 and closed at line 779. If expect(pongReceived).toBe(true) at line 776 fails, rawWs.close() is never reached. Move rawWs.close() before the assertion, or wrap in try/finally."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix MCP session leak and replace fixed 2s sleep with polling in dispatch-resilience.e2e.ts",
+      "description": "As a CI maintainer, I want the timeoutClient to be cleaned up on failure and the tab-close-during-dispatch test to poll for request arrival instead of using a fixed sleep so that tests are reliable under load.",
+      "acceptanceCriteria": [
+        "timeoutClient.close() is called in a finally block around lines 504-566 so the MCP session is always cleaned up",
+        "The 'tab closed mid-execution' test (line 670-678) polls testServer.invocations() to confirm the in-flight request has arrived at the test server before closing the tab, replacing the fixed 2-second setTimeout",
+        "The polling pattern matches the existing pattern at line 520-532 (waitFor with testServer.invocations())",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: e2e/dispatch-resilience.e2e.ts\n\ntimeoutClient leak (lines 501-566): The test creates timeoutClient at line 504 and closes it at line 566. If an assertion fails before line 566, the session leaks. Wrap the entire body after initialize() in try/finally with timeoutClient.close() in finally.\n\nFixed 2s sleep (lines 670-678): After firing the tool call, the test sleeps 2s before closing the tab. Under heavy CI load, 2s may not be enough for the request to reach the test server. Replace with the same polling pattern used at line 520-532:\n\nawait waitFor(\n  async () => {\n    const invocations = await testServer.invocations();\n    return invocations.some(i => i.path === '/api/echo');\n  },\n  10_000, 200,\n  'echo request to reach test server'\n);\n\nImport waitFor from '../helpers.js' if not already imported."
+    },
+    {
+      "id": "US-003",
+      "title": "Tighten validation error assertions in dispatch-resilience.e2e.ts",
+      "description": "As a test author, I want validation error assertions to check for specific Zod error content so that regressions in input validation are not masked by coincidental substring matches.",
+      "acceptanceCriteria": [
+        "The assertion at line 597 checks for a more specific error indicator than just 'invalid' (e.g., the specific field name or Zod error format)",
+        "The assertion at line 614 checks for more than just 'url' (e.g., checks for 'tabId' or the specific validation message)",
+        "Tests still pass against the current server implementation",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: e2e/dispatch-resilience.e2e.ts\n\nLines 589-615: The browser tool validation tests use loose assertions:\n- Line 597: expect(result.content.toLowerCase()).toContain('invalid') -- could match any error containing 'invalid'\n- Line 614: expect(result.content.toLowerCase()).toContain('url') -- could match any error mentioning URLs\n\nFirst, run the tests to see what the actual error messages look like (call the tools with invalid input and inspect result.content). Then tighten the assertions to match the specific Zod validation error format. For example, check for the specific field name that failed validation, or the Zod error code."
+    }
+  ]
+}
