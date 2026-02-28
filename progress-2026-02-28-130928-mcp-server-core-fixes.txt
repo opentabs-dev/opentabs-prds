@@ -1,0 +1,69 @@
+## Codebase Patterns
+- sdk-version.ts uses top-level await (ES module with top-level async), so cannot import logger.ts — use console.error for logging in this file
+- Prettier config requires long template literals in function calls to be on their own line with trailing comma
+- Pre-commit hook runs prettier --write + eslint --fix automatically on staged files
+- Import order in test files: local regular imports first, then external packages (vitest), then node built-ins, then type-only local imports last
+- ESLint uses `import-x/consistent-type-specifier-style: prefer-top-level` — always use separate `import type` statements, not inline `type` specifiers
+- When adding a type-only import from the same module as an existing value import, it must be a separate `import type` statement placed AFTER the value import and after external package imports
+- globalThis-based persistence pattern: use `__opentabs_<name>__` keys on `(globalThis as Record<string, unknown>)` for state that must survive hot reloads; always reset ALL globalThis keys in the `_reset*` test helper, not just one
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-130928-mcp-server-core-fixes~running.json
+Started: Sat Feb 28 21:09:51 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Added `console.error` warning in the catch block of `sdk-version.ts` when reading plugin-sdk/package.json fails
+- Moved `sdkPkgPath` declaration outside the try block so it's accessible in the catch handler
+- Files changed: `platform/mcp-server/src/sdk-version.ts`
+- **Learnings for future iterations:**
+  - `sdk-version.ts` uses top-level await; cannot import logger.ts — must use `console.error` directly
+  - Prettier requires long template literals inside function calls to be on their own line
+  - Pre-commit hook auto-formats staged files with prettier + eslint, so minor style issues are self-correcting
+---
+
+## 2026-02-28 - US-002
+- Fixed `isSessionAllowed` in `state.ts`: changed `domain_all` case from `rule.domain !== null && rule.domain === domain` to `rule.domain === null || rule.domain === domain`
+- A `domain_all` rule with null domain now acts as a universal allow (matches any tool call on any domain)
+- A `domain_all` rule with a non-null domain still only matches when the domain equals `rule.domain`
+- Added `isSessionAllowed` unit tests in `state.test.ts` covering: null domain matches null calls, null domain matches specific domain calls, non-null domain only matches same domain
+- Also added tests for `tool_domain` and `tool_all` scopes for completeness, and empty rules array
+- Files changed: `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/state.test.ts`
+- **Learnings for future iterations:**
+  - Import order in test files is unusual: local regular imports first, external packages (vitest) second, node built-ins third, type-only local imports last
+  - ESLint enforces `import-x/consistent-type-specifier-style: prefer-top-level` — type imports must be separate `import type` statements
+  - When adding a type-only import from the same module already imported as a value import, it must be a separate `import type` statement placed after the value import (not merged)
+---
+
+## 2026-02-28 - US-003
+- Removed `state.configWriteMutex = Promise.resolve()` from the `.catch()` handler in `removeLocalPlugin`
+- The `.catch()` call already converts a rejected promise to a resolved one — the explicit reset was both redundant and harmful (it would sever the mutex chain for any write queued after the failed write)
+- Files changed: `platform/mcp-server/src/plugin-management.ts`
+- **Learnings for future iterations:**
+  - A `.catch()` handler that returns `undefined` (no explicit return) resolves the promise chain to `undefined` — there's no need to manually reset a mutex promise after a caught error
+  - Resetting a shared mutex promise inside a catch handler breaks serialization for any writes queued after the failing write
+---
+
+## 2026-02-28 - US-004
+- Changed `process.exit(0)` to `setTimeout(() => process.exit(0), 150)` in `shutdown.ts`
+- This gives the Node.js event loop 150ms to flush the WebSocket close frame to the TCP socket before the process terminates
+- The delay is applied regardless of whether `ws.close()` succeeded or threw — the setTimeout comes after the try/catch block
+- Files changed: `platform/mcp-server/src/shutdown.ts`
+- **Learnings for future iterations:**
+  - `ws.close()` initiates the WebSocket close handshake but does not wait for the frame to be flushed; `process.exit()` immediately kills the process before TCP buffers drain
+  - A 150ms setTimeout is sufficient for TCP buffer flushing while keeping perceived shutdown time negligible
+  - The shutdown handler in this file uses `globalThis` flag to prevent double-registration on hot reloads — existing pattern to follow for any new one-time setup
+---
+
+## 2026-02-28 - US-005
+- Added `WRITE_COUNT_KEY = '__opentabs_audit_write_count__'` on `globalThis` to track write count across hot reloads
+- Added `ROTATION_CHECK_INTERVAL = 100` constant
+- In `appendAuditEntryToDisk`, read the counter and only call `rotateIfNeeded` when `count % ROTATION_CHECK_INTERVAL === 0` (counter is read BEFORE incrementing, so count=0 always checks on the very first write of the process)
+- Updated `_resetInitialized` to also reset `WRITE_COUNT_KEY` to 0 so tests start fresh each run
+- Updated stale docstring comment that said "rotation is checked before each write"
+- Files changed: `platform/mcp-server/src/audit-disk.ts`
+- **Learnings for future iterations:**
+  - Check-first-then-increment pattern (read counter, check if divisible, then increment) ensures the first write always triggers rotation check (counter=0 at startup) — this keeps existing single-call rotation tests working without modification
+  - `_resetInitialized` must reset ALL globalThis state used by the module, not just the initialized flag — otherwise tests leak state across runs
+  - Existing audit-disk tests don't need changes because the first write (counter=0) still checks rotation
+---

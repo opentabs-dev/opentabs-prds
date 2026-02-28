@@ -16,7 +16,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/sdk-version.ts (27 lines total). The catch block at line 22 is empty — it should log a warning. Cannot import from logger.ts (would create a circular dep or add weight to a top-level-await module), so use console.error directly. The consequence of 0.0.0 is that ALL plugins with a declared sdkVersion fail the major.minor compatibility check in loader.ts, making every plugin a FailedPlugin with a confusing 'rebuild with newer SDK' message."
@@ -36,7 +36,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "Two files involved:\n\n1. platform/mcp-server/src/state.ts line 215-227 — isSessionAllowed function. The domain_all case at line 222-223 checks `rule.domain !== null && rule.domain === domain` which returns false when rule.domain is null. A domain_all rule with null domain should either match everything (universal allow) or should never be created.\n\n2. platform/mcp-server/src/extension-handlers.ts line 446-462 — handleConfirmationResponse. When scope is domain_all (line 460-462), rule.tool is set to null but rule.domain keeps pending.domain which may be null.\n\nPreferred fix: In isSessionAllowed, change the domain_all case to: if rule.domain is null, match everything (return true); if rule.domain is not null, match only when domain === rule.domain. This makes domain_all with null domain act as 'allow all tools on all domains', which is the most intuitive interpretation when there's no specific domain to anchor to.\n\nExisting tests: platform/mcp-server/src/state.test.ts — add cases for isSessionAllowed with domain_all scope and null domain."
@@ -55,7 +55,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/plugin-management.ts lines 361-441 — removeLocalPlugin function.\n\nThe bug is at lines 435-438:\n```\n})().catch((err: unknown) => {\n    state.configWriteMutex = Promise.resolve();\n    log.warn(`Failed to remove local plugin from config:`, err);\n  });\n```\n\nThe `.catch()` handler resets the mutex to `Promise.resolve()`, which means any write that was queued AFTER this one (chaining on state.configWriteMutex before the error) now loses its dependency. Two subsequent writes could overlap.\n\nFix: Remove the `state.configWriteMutex = Promise.resolve()` line from the catch handler. The `.catch()` already converts the rejected promise into a resolved one (that's what .catch does — it returns a new promise that resolves with the catch handler's return value). So after `.catch()`, state.configWriteMutex is already a resolved promise. The reset is both unnecessary and harmful.\n\nThe corrected pattern:\n```\n})().catch((err: unknown) => {\n    log.warn(`Failed to remove local plugin from config:`, err);\n  });\n```\n\nThis ensures the mutex chain is maintained: the next write awaits this (now-resolved-via-catch) promise, preserving serial execution."
@@ -75,7 +75,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/shutdown.ts lines 64-76.\n\nCurrent code:\n```\n    if (state.extensionWs) {\n      try {\n        state.extensionWs.close(1001, 'Server shutting down');\n      } catch {\n        // Already closed\n      }\n      state.extensionWs = null;\n    }\n\n    log.info('Shutdown complete');\n    process.exit(0);\n```\n\nThe ws.close() call initiates the WebSocket close handshake but process.exit(0) terminates before the close frame is flushed to the TCP socket. Fix by adding a short setTimeout before process.exit(0):\n\n```\n    log.info('Shutdown complete');\n    setTimeout(() => process.exit(0), 150);\n```\n\nThis gives the event loop one iteration to flush the close frame. The 150ms delay is negligible for user-perceived shutdown time but sufficient for TCP buffer flushing."
@@ -97,7 +97,7 @@
         "npm run test passes"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/audit-disk.ts (86 lines).\n\nLine 64 calls `await rotateIfNeeded(auditPath)` before every single append. Each rotateIfNeeded call does `await stat(auditPath)` which is a filesystem syscall.\n\nFix: Add a globalThis-based counter (similar to the INITIALIZED_KEY pattern already in this file). Increment the counter on each write and only call rotateIfNeeded when counter % 100 === 0. Use a globalThis key like `__opentabs_audit_write_count__` so it survives hot reloads.\n\nThe 10MB file / ~200 bytes per entry = ~50,000 entries before rotation. Checking every 100 writes means we'd catch rotation within 100 extra entries (~20KB), which is negligible.\n\nExisting test file: platform/mcp-server/src/audit-disk.test.ts — may need to account for the counter-based checking in rotation tests."
