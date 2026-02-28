@@ -1,0 +1,106 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix five concrete bugs in browser extension command handlers: stale page globals after executeScript timeout, incorrect visibility check for fixed/sticky elements in waitForElement, pre-navigation URL returned by navigateTab, false positive from deleteCookies on non-existent cookie, and orphaned setTimeout timers in Promise.race patterns.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix stale page globals after executeScript outer timeout",
+      "description": "As a developer using browser.executeScript, I want page globals to be cleaned up even when the outer timeout fires, so that the next executeScript call on the same tab does not read stale results from the previous timed-out execution.",
+      "acceptanceCriteria": [
+        "When SCRIPT_TIMEOUT_MS fires before EXEC_MAX_ASYNC_WAIT_MS, __lastExecResult and __lastExecAsync are deleted from the page via a best-effort chrome.scripting.executeScript cleanup call",
+        "The cleanup is wrapped in .catch(() => {}) so it does not throw if the tab was closed",
+        "A unit test verifies that the cleanup function is called when the outer timeout fires",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/browser-commands/extension-commands.ts, lines 350-458.\n\nThe bug: The outer Promise.race (line 450) races injectPromise against timeoutPromise. When timeoutPromise wins (SCRIPT_TIMEOUT_MS = 25s), the catch block at line 456 calls sendErrorResult but never cleans up the page globals __lastExecResult and __lastExecAsync. The cleanup code at lines 424-437 only runs when the inner async-wait loop (EXEC_MAX_ASYNC_WAIT_MS) times out.\n\nFix approach: In the catch block (line 456), before calling sendErrorResult, add a best-effort cleanup call identical to lines 425-437:\n\nawait chrome.scripting.executeScript({\n  target: { tabId },\n  world: 'MAIN',\n  func: () => {\n    const ot = (globalThis as Record<string, unknown>).__openTabs as Record<string, unknown> | undefined;\n    if (ot) {\n      delete ot.__lastExecResult;\n      delete ot.__lastExecAsync;\n    }\n  },\n}).catch(() => {});\n\nNote: tabId is declared at line 341 and is in scope for the catch block. The cleanup must be best-effort (.catch(() => {})) because the tab may have been closed.\n\nTo avoid duplication, consider extracting the cleanup script into a shared helper function used by both cleanup sites (lines 424-437 and the new catch block)."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix waitForElement visibility check for fixed/sticky elements",
+      "description": "As a developer using browser.waitForElement with visible: true, I want the visibility check to correctly detect position: fixed and position: sticky elements, so that waiting for modals, sticky headers, and fixed navbars does not always time out.",
+      "acceptanceCriteria": [
+        "The visibility check handles position: fixed and position: sticky elements (where offsetParent is null even though the element is visible)",
+        "The visibility check still correctly detects truly hidden elements (display: none, visibility: hidden, zero dimensions)",
+        "A unit test verifies that a position: fixed element is detected as visible",
+        "A unit test verifies that a position: sticky element is detected as visible",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/browser-commands/interaction-commands.ts, line 206.\n\nThe bug: Line 206 uses `htmlEl.offsetParent !== null` as the primary visibility check. offsetParent returns null for position: fixed and position: sticky elements, even when they are fully visible on screen. This means waitForElement with visible: true always times out (10 seconds) for these elements.\n\nFix approach: Replace the visibility check with one that handles all cases. A robust approach:\n\nconst style = getComputedStyle(htmlEl);\nconst isVisible = style.display !== 'none' && style.visibility !== 'hidden' && (htmlEl.offsetParent !== null || style.position === 'fixed' || style.position === 'sticky');\n\nThis preserves the existing offsetParent check for normal elements while correctly handling fixed/sticky. The getComputedStyle call for display !== 'none' is already on line 206, so this consolidates the two checks.\n\nNote: The injected function runs in the page's MAIN world via chrome.scripting.executeScript, so standard DOM APIs are available."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix navigateTab returning pre-navigation URL",
+      "description": "As a developer using browser.navigateTab, I want the response URL to reflect the navigation target, so that the MCP client can correctly confirm the navigation succeeded.",
+      "acceptanceCriteria": [
+        "handleBrowserNavigateTab response URL is always the requested navigation URL, not the tab's pre-navigation URL",
+        "A unit test verifies the response contains the requested URL",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/browser-commands/tab-commands.ts, line 64.\n\nThe bug: chrome.tabs.update(tabId, { url }) returns the Tab object immediately, before navigation completes. The tab.url field contains the old (pre-navigation) URL. The fallback `?? url` never fires because the old URL is truthy (non-empty string).\n\nFix: Change line 64 from:\n  sendSuccessResult(id, { id: tab?.id ?? tabId, title: tab?.title ?? '', url: tab?.url ?? url });\nto:\n  sendSuccessResult(id, { id: tab?.id ?? tabId, title: tab?.title ?? '', url });\n\nAlways return the requested URL since chrome.tabs.update succeeding means navigation was initiated. The title will also be stale, but there's no way to get the new title without waiting for onComplete — the empty string fallback is acceptable."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix deleteCookies false positive on non-existent cookie",
+      "description": "As a developer using browser.deleteCookies, I want the response to accurately indicate whether a cookie was actually deleted, so that the MCP client does not falsely believe the cookie was removed.",
+      "acceptanceCriteria": [
+        "When chrome.cookies.remove returns null (cookie not found), the response contains deleted: false",
+        "When chrome.cookies.remove returns a cookie details object (cookie deleted), the response contains deleted: true",
+        "A unit test verifies the deleted: false case",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/browser-commands/cookie-commands.ts, lines 77-91.\n\nThe bug: chrome.cookies.remove returns null when no matching cookie is found, but the code at line 86-87 unconditionally returns { deleted: true } regardless of the return value.\n\nFix: Capture the return value and check it:\n  const result = await chrome.cookies.remove({ url, name });\n  sendSuccessResult(id, { deleted: result !== null, name, url });\n\nThe chrome.cookies.remove API returns a Details object when the cookie is deleted, and null when no cookie is found. The fix is a one-line change."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix orphaned setTimeout timers in Promise.race patterns",
+      "description": "As a developer, I want setTimeout timers in Promise.race patterns to be cleaned up when the other branch resolves first, so that orphaned timers do not accumulate in the service worker.",
+      "acceptanceCriteria": [
+        "handleExtensionGetSidePanel clears its timeout timer after Promise.race resolves",
+        "handleExtensionCheckAdapter clears its isReady timeout timer after Promise.race resolves for each tab",
+        "A unit test verifies timers are cleared in the happy path (non-timeout branch wins)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/browser-commands/extension-commands.ts, lines 151-154 and 258-272.\n\nBug 1 (line 151-154): handleExtensionGetSidePanel creates a setTimeout in a Promise.race without storing the timeout ID. When sendMessage resolves first, the 3-second timer (SIDE_PANEL_TIMEOUT_MS) is never cleared.\n\nBug 2 (lines 258-272): handleExtensionCheckAdapter's isReady probe creates a setTimeout in a Promise.race without storing the timeout ID. When executeScript resolves first, the 5-second timer (IS_READY_TIMEOUT_MS) is never cleared. This runs per matching tab.\n\nFix approach: Follow the same pattern used in dispatch-helpers.ts (executeWithTimeout, lines 56-84). Store the timeout ID and clear it in a finally block:\n\nFor handleExtensionGetSidePanel (lines 151-154):\nlet timeoutId: ReturnType<typeof setTimeout> | undefined;\nconst timeoutPromise = new Promise<null>(resolve => {\n  timeoutId = setTimeout(() => resolve(null), SIDE_PANEL_TIMEOUT_MS);\n});\ntry {\n  sidePanelResult = await Promise.race([sendPromise, timeoutPromise]);\n} finally {\n  clearTimeout(timeoutId);\n}\n\nSame pattern for the isReady probe in handleExtensionCheckAdapter (lines 258-272)."
+    }
+  ]
+}
