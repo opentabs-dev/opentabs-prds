@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Plugin — slack",
+  "description": "Fix missing error handling and null guards in the Slack plugin — slackApi fetch/network errors propagate as unstructured exceptions, read-thread lacks a has_more fallback, and search-messages crashes on missing response fields.",
+  "workingDirectory": "plugins/slack",
+  "qualityChecks": "cd plugins/slack && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Wrap slackApi fetch call in try-catch for network/timeout errors",
+      "description": "As a plugin user, I want network failures and timeouts from the Slack API to produce structured ToolError responses so that AI agents can distinguish retryable errors from permanent failures.",
+      "acceptanceCriteria": [
+        "The fetch() call in slackApi is wrapped in a try-catch block",
+        "DOMException with name 'TimeoutError' is caught and re-thrown as ToolError.timeout() with a descriptive message including the method name and timeout duration",
+        "Other fetch errors (TypeError for network failures, aborted requests) are caught and re-thrown as ToolError with category 'internal' and retryable: true",
+        "The AbortSignal.aborted case is handled separately and thrown as a non-retryable ToolError",
+        "The existing post-fetch error handling (429, non-ok status, JSON parse, ok:false) remains unchanged",
+        "cd plugins/slack && npm run build passes",
+        "cd plugins/slack && npm run type-check passes",
+        "cd plugins/slack && npm run lint passes",
+        "cd plugins/slack && npm run format:check passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: plugins/slack/src/slack-api.ts, lines 389-395. The fetch() call at line 389 uses AbortSignal.timeout(30_000) but has no try-catch. Compare with the SDK's fetchFromPage() implementation in platform/plugin-sdk/src/fetch.ts lines 62-79 which correctly wraps fetch in try-catch and maps DOMException TimeoutError to ToolError.timeout(), network errors to ToolError with category 'internal' and retryable: true. Follow the same pattern. The slackApi function uses raw fetch() instead of the SDK's fetchFromPage because it needs to send form-encoded bodies with internal Slack headers — this is intentional and correct, but the error handling should still follow SDK conventions."
+    },
+    {
+      "id": "US-002",
+      "title": "Add defensive fallbacks for read-thread has_more and search-messages data.messages",
+      "description": "As a plugin user, I want tool handlers to defensively guard against missing API response fields so that tools return data matching their declared output schemas instead of undefined values or TypeErrors.",
+      "acceptanceCriteria": [
+        "read-thread handler provides a fallback for data.has_more — uses `data.has_more ?? false` instead of bare `data.has_more`",
+        "search-messages handler guards against data.messages being undefined — uses `data.messages ?? { total: 0, matches: [] }` or similar defensive pattern before accessing .total and .matches",
+        "The output shapes continue to match their respective output Zod schemas",
+        "cd plugins/slack && npm run build passes",
+        "cd plugins/slack && npm run type-check passes",
+        "cd plugins/slack && npm run lint passes",
+        "cd plugins/slack && npm run format:check passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two files to fix:\n\n1. plugins/slack/src/tools/read-thread.ts line 44 — `has_more: data.has_more` should be `has_more: data.has_more ?? false`. The output schema at line 30 declares `has_more: z.boolean()` (required). Without the fallback, if Slack omits has_more from the response, `undefined` is returned which doesn't match the boolean schema.\n\n2. plugins/slack/src/tools/search-messages.ts line 86 — `const messages = data.messages` followed by `messages.total` at line 89 and `messages.matches` at line 90. The type parameter `{ messages: SearchMessagesResponse }` is an unchecked assertion. If the API response doesn't include a `messages` key, this crashes with TypeError. Add a guard like `const messages = data.messages ?? { total: 0, matches: [] as SearchMatch[] }` or throw a structured ToolError.internal if messages is missing."
+    }
+  ]
+}
