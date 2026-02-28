@@ -1,0 +1,57 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-110654-security-hardening~running.json
+Started: Sat Feb 28 19:07:16 UTC 2026
+---
+
+## Codebase Patterns
+- EXTENSION_ONLY_TYPES set in background-message-handlers.ts controls which message types require extension-context senders (guard at line 237 checks sender.id !== chrome.runtime.id)
+- All InternalMessage types are defined in platform/browser-extension/src/extension-messages.ts
+
+## 2026-02-28 - US-001
+- Added 'sp:confirmationResponse', 'sp:confirmationTimeout', and 'port-changed' to the EXTENSION_ONLY_TYPES set in platform/browser-extension/src/background-message-handlers.ts
+- Files changed: platform/browser-extension/src/background-message-handlers.ts
+- **Learnings for future iterations:**
+  - EXTENSION_ONLY_TYPES is a ReadonlySet<InternalMessage['type']> — TypeScript validates entries match the union type, so adding invalid strings would be a type error
+  - No test updates needed; there were no existing tests for the guard logic in background-message-handlers.test.ts
+  - The guard at line 237 uses sender.id !== chrome.runtime.id: extension pages (side panel, offscreen) have matching sender.id; content scripts in web pages have a sender.tab property instead
+---
+
+## 2026-02-28 - US-002
+- Added `mode: 0o700` to 7 mkdir/mkdirSync calls across platform/cli and platform/mcp-server
+- Files changed: platform/cli/src/commands/start.ts, platform/cli/src/config.ts, platform/cli/src/commands/config.ts, platform/mcp-server/src/config.ts, platform/mcp-server/src/adapter-files.ts, platform/cli/src/commands/setup.ts
+- **Learnings for future iterations:**
+  - The reference implementation was already at mcp-server/src/config.ts:267 (`await mkdir(configDir, { recursive: true, mode: 0o700 })`) — used as the pattern to follow
+  - mkdirSync and mkdir both accept `mode` as part of the options object; same syntax for both sync and async variants
+  - All 7 locations were simple one-property additions — no structural changes needed
+---
+
+## 2026-02-28 - US-003
+- Added `mode: 0o600` to createWriteStream and writeFile calls for server.log, server.pid, and version marker files
+- Files changed: platform/cli/src/commands/start.ts, platform/cli/src/commands/setup.ts
+- **Learnings for future iterations:**
+  - createWriteStream accepts `mode` in its options object alongside `flags` — `{ flags: 'a', mode: 0o600 }` sets both the open mode and permissions
+  - writeFile also accepts `mode` in its options object; when switching from string encoding shorthand (`'utf-8'`) to include mode, use `{ encoding: 'utf-8', mode: 0o600 }`
+  - 0o600 (owner read/write only) is appropriate for sensitive runtime files; 0o700 (directory) was already used for directory creation in US-002
+---
+
+## 2026-02-28 - US-004
+- Removed `wsSecret` from the `/ws-info` response body in `handleWsInfo`; response now returns only `{ wsUrl }`
+- Files changed: platform/mcp-server/src/http-routes.ts, platform/mcp-server/src/http-routes.test.ts
+- **Learnings for future iterations:**
+  - The extension's offscreen/index.ts already reads wsSecret from auth.json via `bootstrapFromAuthFile()` — it never consumed `wsInfo.wsSecret` from the HTTP response; the type was already `{ wsUrl?: string }` not including wsSecret
+  - The test file had a `WsInfoResponse` interface with `wsSecret?: string` that needed removal along with updating the test "returns wsUrl and wsSecret when auth is configured" to verify the field is absent
+  - The `/ws-info` endpoint is protected by Bearer auth, so only authenticated extension requests reach it; removing the secret echo doesn't break anything
+---
+
+## 2026-02-28 - US-005
+- Changed unauthenticated `/health` response from `{ status, version, extensionConnected }` to `{ status: 'ok' }` only
+- Fixed E2E test in e2e/lifecycle.e2e.ts that still expected `wsSecret` in `/ws-info` response (leftover from before US-004)
+- Files changed: platform/mcp-server/src/http-routes.ts, platform/mcp-server/src/http-routes.test.ts, e2e/lifecycle.e2e.ts
+- **Learnings for future iterations:**
+  - All CLI consumers (`status.ts`, `doctor.ts`) send Bearer tokens via `readAuthSecret()` so they get the full authenticated response — no breakage
+  - `stop.ts` only checks `data.status === 'ok'` from unauthenticated health probe — still works with `{ status: 'ok' }`
+  - `notify-server.ts` only checks `healthRes.ok` — not affected
+  - The E2E test "/ws-info returns URL without leaking the secret in the URL" was never updated after US-004 removed wsSecret from the /ws-info response; it still expected `info.wsSecret` to equal the secret — updated it to expect undefined
+  - The `fetchWsInfo` helper in e2e/fixtures.ts was already correctly updated in US-004 to pass the secret through the caller rather than reading from the response
+  - This story had `e2eCheckpoint: true` and required running the full E2E suite (394 tests)
+---
