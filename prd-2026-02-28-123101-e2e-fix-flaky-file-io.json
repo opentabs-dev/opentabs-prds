@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix flaky file I/O patterns in E2E tests: replace direct fs.writeFileSync with writeAndWaitForWatcher() in hot-reload-dynamic tests, and replace fs.readFileSync polling of config.json with MCP-based state checks in side-panel-plugin-toggle tests.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Use writeAndWaitForWatcher() for manifest writes in hot-reload-dynamic multi-session and reload tests",
+      "description": "As a platform contributor, I want file-watcher writes in hot-reload-dynamic.e2e.ts to use the retry-on-miss pattern so that tests do not flake on macOS FSEvents timing.",
+      "acceptanceCriteria": [
+        "Lines ~1156 and ~1198 in e2e/hot-reload-dynamic.e2e.ts wrap writeToolsToManifest() calls inside writeAndWaitForWatcher(), matching the pattern used elsewhere in the same file (e.g., lines 322, 368, 667, 876, 1086)",
+        "No direct writeToolsToManifest() calls remain outside writeAndWaitForWatcher() in tests that depend on file-watcher detection",
+        "The surrounding test logic (waitForToolList polling) still functions correctly after the change",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/hot-reload-dynamic.e2e.ts\n\nTwo locations need fixing:\n\n1. Around line 1156: Inside the 'multi-session notifications' test group. Currently:\n   ```\n   echoTool.description = 'BEFORE-RELOAD: modified description';\n   writeToolsToManifest(toolsJsonPath, toolsBefore2);\n   ```\n   Should be wrapped in writeAndWaitForWatcher() like line 322:\n   ```\n   await writeAndWaitForWatcher(server, (attempt) => {\n     // modify and write\n     writeToolsToManifest(toolsJsonPath, toolsBefore2);\n   }, 'tools.json updated for');\n   ```\n   The `attempt` param is used by the retry helper to produce slightly different writes on retry (append a comment). For manifest writes, the pattern is to just call writeToolsToManifest — the helper retries the entire callback.\n\n2. Around line 1198: Similar pattern — a writeToolsToManifest() call that should be wrapped.\n\nLook at how existing writeAndWaitForWatcher() calls work in the same file for the exact pattern. The key parameters are: (server, writeCallback, expectedLogSubstring). The expected log is typically 'tools.json updated for' or 'Manifest updated'.\n\nIMPORTANT: The writeAndWaitForWatcher helper's callback receives an `attempt` number. On retry, the caller should produce a slightly different write to guarantee a new FSEvents notification. For writeToolsToManifest calls, the simplest approach is to append a whitespace change to the description on retry (e.g., `echoTool.description = 'BEFORE-RELOAD: modified description' + ' '.repeat(attempt)`)."
+    },
+    {
+      "id": "US-002",
+      "title": "Replace fs.readFileSync config polling with MCP-based state checks in side-panel-plugin-toggle tests",
+      "description": "As a platform contributor, I want side-panel-plugin-toggle.e2e.ts to verify config persistence via MCP state rather than reading config.json from disk, so that tests do not fail from partial file reads during concurrent writes.",
+      "acceptanceCriteria": [
+        "The expect.poll() blocks at lines ~177-187, ~208-218, and ~420-429 in e2e/side-panel-plugin-toggle.e2e.ts no longer use fs.readFileSync to read config.json",
+        "Config persistence is verified via MCP-based checks (e.g., mcpClient.listTools() to confirm tool presence/absence, or polling /health endpoint for plugin state)",
+        "The test still verifies the same functional behavior: that toggling a tool in the side panel persists the change and removes/restores the tool from MCP tools/list",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: e2e/side-panel-plugin-toggle.e2e.ts\n\nThree expect.poll() blocks read config.json from disk while the MCP server is concurrently writing to it. This creates a race condition where fs.readFileSync catches a partial write, causing JSON.parse to throw.\n\nCurrent pattern (lines ~177-187):\n```typescript\nawait expect\n  .poll(\n    () => {\n      const configPath = path.join(configDir, 'config.json');\n      const raw = fs.readFileSync(configPath, 'utf-8');\n      const config = JSON.parse(raw) as { tools: Record<string, boolean> };\n      return config.tools['e2e-test_echo'];\n    },\n    { timeout: 15_000, message: 'MCP server did not persist echo tool as disabled' },\n  )\n  .toBe(false);\n```\n\nReplace with MCP-based verification. The test already uses mcpClient.listTools() elsewhere (e.g., lines ~191-199). The replacement pattern should poll listTools() and verify the tool is present or absent:\n```typescript\nawait expect\n  .poll(\n    async () => {\n      const tools = await mcpClient.listTools();\n      return tools.some(t => t.name === 'e2e-test_echo');\n    },\n    { timeout: 15_000, message: 'e2e-test_echo tool should be removed from tools/list' },\n  )\n  .toBe(false);\n```\n\nApply the same pattern to all three occurrences. For the 'master toggle' test (lines ~420-429), verify that ALL e2e-test tools are absent from listTools().\n\nYou may need to remove the `import fs from 'node:fs'` and `import path from 'node:path'` imports if they become unused after this change. Check with knip.\n\nIMPORTANT: The test needs to verify that the config change PERSISTED (not just that the MCP state changed in-memory). Using listTools() verifies that the server processed the config change and updated its internal state, which is functionally equivalent to verifying the file was written. The MCP server reads config from disk on reload, so if tools/list reflects the change, the config was successfully persisted."
+    }
+  ]
+}
