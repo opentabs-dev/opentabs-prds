@@ -1,0 +1,73 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-133453-mcp-server-audit-fixes~running.json
+Started: Sat Feb 28 21:35:19 UTC 2026
+---
+
+## Codebase Patterns
+- `createHandleWsClose` in `platform/mcp-server/src/http-routes.ts` handles WebSocket disconnect cleanup — the `if (state.extensionWs === ws)` block is where all matching-ws cleanup goes
+- Tests in `http-routes.test.ts` use `createTestHandlers()` and `createMockWsHandle()` helpers; existing describe blocks can be extended with new `test()` calls
+- `TabMapping` type: `{ state: TabState; tabId: number | null; url: string | null }` — no explicit import needed in tests since TypeScript infers from `Map<string, TabMapping>`
+- Browser probe scripts in `analyze-site/index.ts` are plain string templates that run in browser context — they cannot import TS modules. Logic that needs to be unit tested should be extracted into exported TypeScript functions and applied server-side on the script result.
+- `detect-framework.ts` is the pure analysis module for framework detection; `deduplicateFrameworkProbes` is exported from there and called in `index.ts` after the browser script returns raw probes.
+- `state.ts` uses `import-x/exports-last` ESLint rule — ALL non-exported helper functions/variables must be placed BEFORE the first `export` statement in the file (after imports). Inserting a non-export between export statements triggers violations for all preceding exports.
+- `Object.freeze` on a `Map` does NOT prevent `.set()` — Map methods access internal slots, bypassing the frozen property check. To truly prevent mutation, override `.set`/`.delete`/`.clear` via `Object.defineProperty` before freezing.
+
+## [2026-02-28] - US-001
+- Added `state.activeNetworkCaptures.clear()` and `state.tabMapping.clear()` inside the `if (state.extensionWs === ws)` block in `createHandleWsClose`
+- Added unit test `'matching ws clears activeNetworkCaptures and tabMapping'` to the `wsClose handler` describe block in `http-routes.test.ts`
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`
+- **Learnings for future iterations:**
+  - The cleanup block already had a clear pattern for handling disconnect side-effects — adding `.clear()` calls is the right idiom for Map/Set state
+  - All Phase 1 checks passed cleanly with no pre-existing failures
+---
+
+## [2026-02-28] - US-002
+- Added `log.error('HTTP server error:', err.code, err.message)` before `rejectServer(err)` in the `httpServer.on('error')` handler in `platform/mcp-server/src/server-node.ts`
+- Files changed: `platform/mcp-server/src/server-node.ts`
+- **Learnings for future iterations:**
+  - `log` from `./logger.js` is already imported in `server-node.ts` — no new import needed
+  - The error handler is at lines 326-328; the fix is a one-line addition
+  - All Phase 1 checks passed cleanly
+---
+
+## [2026-02-28] - US-004
+- Added `createFrozenRegistryMap` helper in `platform/mcp-server/src/state.ts` that overrides `.set`/`.delete`/`.clear` via `Object.defineProperty` (so calls throw TypeError) and then freezes the Map
+- Updated `EMPTY_REGISTRY` to use `createFrozenRegistryMap()` for all four lookup maps and `Object.freeze([])` for the failures array
+- Placed the helper BEFORE the first export in the file (after imports) to satisfy the `import-x/exports-last` ESLint rule; used `const` arrow function to satisfy `func-style`
+- Added 4 unit tests in `state.test.ts` under a new `EMPTY_REGISTRY` describe block: maps are frozen instances, failures are frozen, `.set()` throws TypeError, regular Maps remain mutable
+- Files changed: `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/state.test.ts`
+- **Learnings for future iterations:**
+  - `Object.freeze` does NOT block `Map.prototype.set` — must override methods via `Object.defineProperty`
+  - `state.ts` enforces `exports-last`: any non-exported code must go BEFORE the first export statement (after imports)
+  - `func-style` rule requires arrow function expressions (`const f = () => {}`) not function declarations (`function f() {}`)
+---
+
+## [2026-02-28] - US-003
+- Extracted `deduplicateFrameworkProbes` as an exported TypeScript function in `detect-framework.ts` — prefers entries with a version over versionless entries for the same framework name using a `Map<string, FrameworkProbe>`
+- Simplified `FRAMEWORK_PROBE_SCRIPT` in `index.ts` to just return raw `probes` (removed the broken inline dedup logic)
+- Applied `deduplicateFrameworkProbes` server-side on the script result in `index.ts`
+- Added 5 unit tests for `deduplicateFrameworkProbes` in `detect-framework.test.ts`
+- Files changed: `platform/mcp-server/src/browser-tools/analyze-site/detect-framework.ts`, `platform/mcp-server/src/browser-tools/analyze-site/detect-framework.test.ts`, `platform/mcp-server/src/browser-tools/analyze-site/index.ts`
+- **Learnings for future iterations:**
+  - Browser probe scripts can't import TypeScript modules — always extract testable logic to server-side TS functions applied on the returned result
+  - `deduplicateFrameworkProbes` now lives in `detect-framework.ts` alongside the detection logic
+---
+
+## [2026-02-28] - US-005
+- Wrapped `deleteExecFile(filename)` in `execute-script.ts` finally block with try-catch to match the pattern already used in `analyze-site/index.ts`
+- Files changed: `platform/mcp-server/src/browser-tools/execute-script.ts`
+- **Learnings for future iterations:**
+  - The pattern for best-effort cleanup in finally blocks: `try { await deleteExecFile(filename); } catch { /* Best-effort cleanup */ }`
+  - Both `execute-script.ts` and `analyze-site/index.ts` use this same pattern consistently
+  - All Phase 1 checks passed cleanly
+---
+
+## [2026-02-28] - US-006
+- Removed `id: getNextRequestId()` from the `plugin.uninstall` message in `handlePluginRemove` (`extension-handlers.ts`) — it is now a JSON-RPC notification; also removed the unused `getNextRequestId` import (import collapsed to a single line to satisfy Prettier)
+- Refactored `removeLocalPlugin` in `plugin-management.ts` to use the same mutex pattern as `saveConfig`/`saveToolConfig` in `config.ts`: create `writePromise` separately, set `state.configWriteMutex = writePromise.catch(() => {})` so the chain always resolves, then `await writePromise` to propagate errors to the caller
+- Files changed: `platform/mcp-server/src/extension-handlers.ts`, `platform/mcp-server/src/plugin-management.ts`
+- **Learnings for future iterations:**
+  - The canonical mutex pattern for `configWriteMutex` in this codebase (see `config.ts`): store `writePromise` separately, set `state.configWriteMutex = writePromise.catch(() => {})`, then `await writePromise` — this lets the mutex chain always resolve while propagating errors to the immediate awaiter
+  - After removing an import member, Prettier may collapse the remaining multi-line import to a single line — run lint after import changes
+  - `sendToExtension` accepts `JsonRpcNotification` (no id) — notifications are a valid and well-typed message type
+---
