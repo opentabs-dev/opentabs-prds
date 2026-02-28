@@ -1,0 +1,86 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-012627-mcp-server-core-bugs~running.json
+Started: Sat Feb 28 09:26:57 UTC 2026
+---
+
+## Codebase Patterns
+- platform/mcp-server/src/reload.ts: reloadCore handles config/registry discovery in one try-catch and loadSecret independently in a separate try-catch
+- arrow-body-style ESLint rule: when a function body contains only a return statement, ESLint requires concise arrow syntax (no braces). Triggered when removing statements that made the block body necessary.
+- MCP server state fields (registry, toolConfig, browserToolPolicy, etc.) are updated from config/discovery; wsSecret is updated separately from loadSecret
+- plugin-management.ts configWriteMutex pattern: async closure chained to prev mutex; catch handler resets mutex to Promise.resolve() and logs; do NOT re-throw or subsequent awaits see rejection instead of false return
+- dispatchToExtension accepts optional `timeoutMs` in DispatchOptions to override the default 30s DISPATCH_TIMEOUT_MS; use this for lightweight/best-effort dispatches (e.g., domain resolution)
+
+## 2026-02-28 - US-001
+- Fixed partial state update in reloadCore when loadSecret fails
+- Moved `loadSecret()` call out of the main config/discovery try-catch into its own independent try-catch
+- `previousSecret` capture and `secretChanged` computation now live in the loadSecret try-catch
+- If loadSecret fails, it logs "Failed to load auth secret, keeping previous secret" (accurate) instead of "Reload failed, keeping previous state" (inaccurate)
+- Files changed: platform/mcp-server/src/reload.ts
+- **Learnings for future iterations:**
+  - The main try-catch in reloadCore covers config loading + plugin discovery + state mutation; loadSecret is now independent
+  - secretChanged is computed inside the loadSecret try-catch: only set if loadSecret succeeds
+  - All Phase 1 checks passed (build, type-check, lint, knip, test)
+---
+
+## 2026-02-28 - US-002
+- Fixed removeLocalPlugin returning true when atomicWrite fails
+- Introduced `found` boolean to track whether a matching plugin was found in the loop (replacing the dual use of `removed`)
+- Moved `removed = true` to after `await atomicWrite(...)` so it's only set when the write actually succeeds
+- Removed `throw err` from the catch handler so the function returns false (not throws) on write failure; the mutex is still reset via `state.configWriteMutex = Promise.resolve()`
+- Files changed: platform/mcp-server/src/plugin-management.ts
+- **Learnings for future iterations:**
+  - The configWriteMutex pattern: `state.configWriteMutex = (async () => {...})().catch(handler)` — the `.catch()` result promise is what line 439 awaits (captured by value at evaluation time). If catch re-throws, the await throws; if catch returns normally, the await resolves.
+  - To return false on failure (rather than throwing), the catch handler must NOT re-throw — it should handle the error gracefully (log it, reset mutex) and let the promise resolve
+  - The `state.configWriteMutex = Promise.resolve()` reassignment inside the catch is for future chainers (they do `const prev = state.configWriteMutex` before enqueueing themselves), not for the current `await state.configWriteMutex` which already captured the original promise reference
+  - All Phase 1 checks passed (build, type-check, lint, knip, test)
+---
+
+## 2026-02-28 - US-003
+- Added HTTP request body size limit (10 MB) to collectBody in platform/mcp-server/src/server-node.ts
+- Defined `MAX_BODY_SIZE = 10 * 1024 * 1024` constant (matching WebSocket maxPayload)
+- Added `BodyTooLargeError` class used to signal size violations
+- collectBody tracks accumulated chunk sizes; on overflow calls `req.destroy()` and rejects with BodyTooLargeError
+- handleHttpRequest catches BodyTooLargeError and returns 413 Payload Too Large; other errors still return 500
+- Updated WebSocket `maxPayload` to reference `MAX_BODY_SIZE` for consistency
+- Files changed: platform/mcp-server/src/server-node.ts
+- **Learnings for future iterations:**
+  - Import ordering matters: ESLint (import-x) requires all imports before any non-import declarations; placing constants/classes between import groups causes "Import in body of module" lint errors
+  - After `req.destroy()`, Node.js may emit an 'error' event on the stream; existing `req.on('error', reject)` handles this safely (second reject call is no-op on settled promise)
+  - All Phase 1 checks passed (build, type-check, lint, knip, test)
+---
+
+## 2026-02-28 - US-005
+- Fixed extension.reload being sent as a JSON-RPC request (with id) instead of a notification (no id)
+- Removed `getNextRequestId()` call and `id` field from `sendExtensionReload` in extension-protocol.ts; simplified to concise arrow body
+- Removed `getNextRequestId` import and usage from reload-extension.ts handler; JSON.stringify call now omits the id field
+- Updated reload-extension.test.ts: changed tests to assert `msg.id` is undefined and added "no id field" test; removed the UUID regex test
+- `sendToExtension` already accepts `JsonRpcNotification` so no type changes were needed
+- Files changed: platform/mcp-server/src/extension-protocol.ts, platform/mcp-server/src/browser-tools/reload-extension.ts, platform/mcp-server/src/browser-tools/reload-extension.test.ts
+- **Learnings for future iterations:**
+  - `arrow-body-style` lint rule triggers when a block-body arrow function has only a return statement — simplify to concise arrow body
+  - `sendToExtension` accepts `JsonRpcNotification | JsonRpcResult | JsonRpcRequest | JsonRpcError` — notifications (no id) are already a valid message type
+  - All Phase 1 checks passed (build, type-check, lint, knip, test)
+---
+
+## 2026-02-28 - US-006
+- Added `timeoutMs?: number` field to `DispatchOptions` interface in extension-protocol.ts with a JSDoc comment explaining the default
+- Updated `dispatchToExtension` to compute `const timeoutMs = opts.timeoutMs ?? DISPATCH_TIMEOUT_MS` and use it for both the `setTimeout` duration and the timeout error message
+- Defined `DOMAIN_RESOLVE_TIMEOUT_MS = 5_000` constant in mcp-tool-dispatch.ts
+- Updated `resolveToolDomain` to pass `{ timeoutMs: DOMAIN_RESOLVE_TIMEOUT_MS }` to the `browser.getTabInfo` dispatch so unresponsive tabs fail in 5s instead of 30s
+- Files changed: platform/mcp-server/src/extension-protocol.ts, platform/mcp-server/src/mcp-tool-dispatch.ts
+- **Learnings for future iterations:**
+  - Prettier requires multi-argument `dispatchToExtension` calls to break each argument to its own line when the line exceeds the print width — format accordingly to avoid lint failure
+  - `DispatchOptions` lives in extension-protocol.ts; adding `timeoutMs` there is the correct extension point, no test changes needed (timeout behavior is structural, not unit-tested directly)
+  - All Phase 1 checks passed (build, type-check, lint, knip, test)
+---
+
+## 2026-02-28 - US-004
+- Fixed handlePendingPluginChange leaving stale failure entry after a pending plugin successfully loads
+- Added `updatedFailures` filter: `state.registry.failures.filter(f => f.path !== pluginDir)` before calling buildRegistry
+- Plugin now appears only in pluginDetails (loaded), not also in failedPlugins, after recovering from a build error
+- Files changed: platform/mcp-server/src/file-watcher.ts
+- **Learnings for future iterations:**
+  - `FailedPlugin` has a `path` field (confirmed via discovery.ts and registry.test.ts)
+  - Other registry rebuild sites in file-watcher.ts (lines 217, 348) spread the full failures list — those are for plugin change/reload scenarios where failure entries are still valid; only the pending-plugin-success path needs filtering
+  - All Phase 1 checks passed (build, type-check, lint, knip, test)
+---
