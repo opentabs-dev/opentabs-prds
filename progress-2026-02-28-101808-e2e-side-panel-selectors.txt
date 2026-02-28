@@ -1,0 +1,72 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-101808-e2e-side-panel-selectors~running.json
+Started: Sat Feb 28 18:25:22 UTC 2026
+---
+
+## Codebase Patterns
+- Side panel React components live in `platform/browser-extension/src/side-panel/components/`
+- `PluginIcon.tsx` renders the plugin icon with a `StatusIndicator` sub-component that shows colored dots for tab state (closed=nothing, unavailable=yellow, ready=green, ready+update=ArrowUp)
+- `PluginCard.tsx` wraps `Accordion.Item` from Radix and renders PluginIcon, tool list, and toggle switch
+- `ToolRow.tsx` highlights with `bg-accent/20` when a tool invocation is active and shows a small Loader animation
+- `EmptyStates.tsx` exports `LoadingState` (Loader component), `DisconnectedState`, and `NoPluginsState`
+- The retro `Loader` component uses `React.forwardRef` and spreads `{...props}`, so it accepts `data-testid` and other HTML attributes
+- `Accordion.Item` also spreads `{...props}`, passing through `data-testid` to the DOM
+- Plugin card testid uses the internal plugin name (not displayName): `plugin-card-e2e-test` for the e2e-test plugin
+- Playwright locators are lazily evaluated — they survive `page.reload()` and can be declared before the reload then used after
+- `opentabs-plugin build` appends a hash+freeze IIFE block immediately after the main IIFE's `})();` (same line, no newline) and then a `//# sourceMappingURL=` comment. `replaceIifeClosing` in `e2e/helpers.ts` must use `/}\)\(\);([\s\S]*)$/` (capturing suffix) to handle this format.
+
+## 2026-02-28 - US-001
+- Added `data-testid` attributes to six side panel elements for stable E2E test selectors
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/PluginIcon.tsx` — `plugin-icon-container` on icon container div (both SVG and letter avatar), `plugin-status-dot` on ready state dot, `connection-status` on unavailable state dot
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — `plugin-card-{pluginName}` on Accordion.Item
+  - `platform/browser-extension/src/side-panel/components/ToolRow.tsx` — `tool-invocation-indicator` on active tool row div (conditional, only set when `active` is true)
+  - `platform/browser-extension/src/side-panel/components/EmptyStates.tsx` — `loading-indicator` on Loader component
+- **Learnings for future iterations:**
+  - No existing CSS classes or styling were changed — only `data-testid` attributes were added
+  - The `tool-invocation-indicator` testid is conditionally applied via spread: `{...(active ? { 'data-testid': 'tool-invocation-indicator' } : {})}` — this keeps the DOM clean when the tool is not active
+  - The `bg-primary.rounded-full` selector used in E2E tests maps to the unavailable status dot (not a tool invocation animation) — this was given `data-testid="connection-status"`
+---
+
+## 2026-02-28 - US-002
+- Updated `e2e/side-panel-icons.e2e.ts` to use data-testid selectors and fix assertion ordering
+- Files changed:
+  - `e2e/side-panel-icons.e2e.ts` — replaced all CSS class selectors with data-testid selectors, scoped to plugin card, fixed capture ordering, replaced count()+expect with toHaveCount(0)
+- Changes made:
+  1. Line 90: `.border-border svg` → `[data-testid="plugin-icon-container"] svg` (removed `.first()`)
+  2. Lines 126-132: Introduced `pluginCard = sidePanelPage.locator('[data-testid="plugin-card-e2e-test"]')` for scoped lookups; `iconContainer` now uses `pluginCard.locator('[data-testid="plugin-icon-container"]')` instead of `.border-border`; status dot check uses `pluginCard.locator('[data-testid="plugin-status-dot"]')` instead of `.bg-success`
+  3. Lines 166-174: Fixed ordering — `toBeVisible()` for status dot comes BEFORE `innerHTML()` capture, so `activeHtml` always reflects the fully-updated active state
+  4. Lines 233-240: `.border-border` → `[data-testid="plugin-icon-container"]`; `count()+expect` replaced by `toHaveCount(0)` for auto-retry
+- **Learnings for future iterations:**
+  - When scoping within a plugin card, use `sidePanelPage.locator('[data-testid="plugin-card-{pluginName}"]')` then chain locators from it — this is more reliable than `.first()` on page-wide selectors
+  - The fix to capture `activeHtml` AFTER `toBeVisible()` on the status dot is critical: without it, the HTML snapshot may still show inactive state because React hasn't re-rendered yet
+  - `toHaveCount(0)` is preferred over `count()+expect` for Playwright assertions — the former auto-retries, making the assertion stable against async DOM updates
+---
+
+## 2026-02-28 - US-003
+- Updated `e2e/side-panel-data-flow.e2e.ts` to use data-testid selectors and fix loader timing
+- Files changed:
+  - `e2e/side-panel-data-flow.e2e.ts` — replaced all CSS class selectors with data-testid selectors, increased slow mode from 3s to 5s
+- Changes made:
+  1. Lines 124, 162, 194, 264, 334: `.locator('.bg-success').first()` → `.locator('[data-testid="plugin-status-dot"]')` (ready/green dot)
+  2. Line 300: `.locator('.bg-primary.rounded-full').first()` → `.locator('[data-testid="connection-status"]')` (unavailable/amber dot)
+  3. Line 423: `.locator('.bg-accent\\/20')` → `.locator('[data-testid="tool-invocation-indicator"]')` (active tool row)
+  4. Loader timing: `setSlow(3_000)` → `setSlow(5_000)` to give more buffer between tool call start and completion
+- **Learnings for future iterations:**
+  - `[data-testid="tool-invocation-indicator"]` is only present in the DOM when `active` is true (conditionally applied in ToolRow.tsx), so `toBeHidden()` on this locator returns true immediately when the tool is not active — this is correct Playwright behavior for absent elements
+  - For the data-flow tests, `.first()` removal is safe without plugin card scoping because each test uses exactly one plugin; but scoping to `[data-testid="plugin-card-e2e-test"]` would be more precise if multiple plugins were ever added
+  - The `connection-status` testid identifies the unavailable (amber) dot, while `plugin-status-dot` identifies the ready (green) dot — the naming is slightly counter-intuitive but was established in US-001
+---
+
+## 2026-02-28 - US-004
+- Updated `e2e/side-panel-plugin-toggle.e2e.ts` to use data-testid selectors for status dot
+- Also fixed `e2e/helpers.ts` `replaceIifeClosing` function — pre-existing E2E failures in iife-injection and strict-csp tests caused by this bug
+- Files changed:
+  - `e2e/side-panel-plugin-toggle.e2e.ts` — lines 72 and 106: `.locator('.bg-success').first()` → `.locator('[data-testid="plugin-status-dot"]')` (removed `.first()`)
+  - `e2e/helpers.ts` — `replaceIifeClosing`: updated regex from `/}\)\(\);[\s]*$/` to `/}\)\(\);([\s\S]*)$/` and replacement from `${injection}\n})();\n` to `${injection}\n})();$1`, preserving the hash+freeze IIFE block and sourcemap comment that `opentabs-plugin build` appends after the main IIFE
+- **Learnings for future iterations:**
+  - `opentabs-plugin build` appends a hash+freeze IIFE block (starting with `(function(){`) directly after the main IIFE's `})();` on the same line (no newline) to avoid shifting source map line numbers, then appends `\n//# sourceMappingURL=...` at the very end. Any code that manipulates the raw IIFE string must account for this suffix.
+  - The `replaceIifeClosing` function in `e2e/helpers.ts` used `/}\)\(\);[\s]*$/` which only matched whitespace after `})();` — updated to `/}\)\(\);([\s\S]*)$/` so it captures and preserves the hash+freeze block and sourcemap comment as `$1`
+  - The e2e-test plugin's compiled IIFE has exactly ONE `})();` in the entire file (the main IIFE's close) — the regex replacement finds this unique occurrence correctly
+  - For `side-panel-plugin-toggle.e2e.ts`, no plugin card scoping is needed since tests use exactly one plugin; the `[data-testid="plugin-status-dot"]` selector is unique on the page
+---
