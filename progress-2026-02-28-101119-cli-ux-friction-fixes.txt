@@ -1,0 +1,75 @@
+## Codebase Patterns
+- CLI commands live in `platform/cli/src/commands/`. Each command has a test file with the same name.
+- Exported pure/testable functions from a command module get tested in the corresponding `.test.ts` file.
+- Test files import from vitest, then `@scoped/packages`, then `node:` built-ins — in that order (after the local relative import).
+- When testing functions that make HTTP calls, prefer `vi.stubGlobal('fetch', vi.fn()...)` pattern + `vi.unstubAllGlobals()` in `afterEach`.
+- `vi.mocked(global.fetch).mock.calls` can have type issues; prefer `let callCount = 0` counter pattern for counting calls.
+- The `no-unsafe-assignment` lint rule fires on `vi.fn()` result assigned to a variable; pass the mock directly to `vi.stubGlobal` when possible, or use `vi.fn().mockImplementation(...)` in the stubGlobal call.
+- Prettier multi-line export: `export { A, B, C }` with many items needs multi-line formatting with trailing comma.
+- `detectRunningServerPort` accepts `secret: string | null` (not calling `readAuthSecret` internally) to keep it testable without filesystem mocks.
+- `DEFAULT_PORT` is available from `@opentabs-dev/shared` — already imported in `platform/cli/src/commands/config.ts`.
+- `@typescript-eslint/no-dynamic-delete` blocks `delete obj[computedKey]` — use `Object.fromEntries(Object.entries(obj).filter(([k]) => k !== key))` to remove a dynamic key instead.
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-101119-cli-ux-friction-fixes~running.json
+Started: Sat Feb 28 18:11:41 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Added `detectRunningServerPort(configPort, secret)` helper to `platform/cli/src/commands/config.ts`
+  - Probes `/health` on configPort first; if that fails, probes DEFAULT_PORT (9515)
+  - Returns the port where server is found, or null if not running
+- Modified `handleConfigShow()` to call `detectRunningServerPort` when `--show-secret` is active
+  - If running port differs from config port, prints yellow warning below MCP client configs
+- Exported `detectRunningServerPort` and added 5 unit tests in `config.test.ts`
+- Files changed: `platform/cli/src/commands/config.ts`, `platform/cli/src/commands/config.test.ts`
+- **Learnings for future iterations:**
+  - Avoid `const mockFn = vi.fn()` at the test variable level — it triggers `no-unsafe-assignment`; instead pass mock directly to `vi.stubGlobal(...)` or use a counter variable for call count assertions
+  - `vi.mocked(global.fetch).mock.calls` destructuring has `any` typing issues; use explicit counter instead
+  - Import order matters: `@scoped` packages before `vitest` before `node:` modules
+  - Prettier formatting: export with 7+ items needs multi-line with trailing comma
+---
+
+## 2026-02-28 - US-002
+- Modified `handleSetPort()` in `platform/cli/src/commands/config.ts`
+  - Before writing config, compares `newPort` to `config.port ?? DEFAULT_PORT`
+  - If equal, prints `port: <value> (unchanged)` and returns early — no config write, no restart warning, no server notify
+  - If different, existing behavior is preserved (write + restart warning + notify server)
+- Files changed: `platform/cli/src/commands/config.ts`
+- **Learnings for future iterations:**
+  - `handleSetPort` is a private async function — no new exports needed for this story; no new unit tests required
+  - The `DEFAULT_PORT` fallback is the correct way to determine the "effective" current port when `config.port` is undefined
+---
+
+## 2026-02-28 - US-003
+- Added one line to the `isConnectionRefused` branch in `handleStatus()` in `platform/cli/src/commands/status.ts`
+  - After the "Start it with: opentabs start" hint, prints: `Run opentabs --help to see all available commands.`
+  - This shows for both `opentabs` (no args) and `opentabs status` when the server isn't running — acceptable UX
+- No new exports or tests needed (the change is a console.error in a catch branch, not a testable pure function)
+- Files changed: `platform/cli/src/commands/status.ts`
+- **Learnings for future iterations:**
+  - The `isConnectionRefused` branch in status.ts is the single place to add hints for the "server not running" case; it covers both `opentabs` (no-args default action) and `opentabs status`
+  - No test changes needed for console output changes in catch blocks — tests only cover exported pure functions
+---
+
+## 2026-02-28 - US-004
+- Modified `handlePluginSearch()` in `platform/cli/src/commands/plugin.ts` (line 424)
+  - Computed `descPart = desc ? \`— ${desc} \` : ''` and used it in the console.log template
+  - When description is empty, the `—` separator and trailing space are omitted entirely
+  - When description is present, output is unchanged
+- Files changed: `platform/cli/src/commands/plugin.ts`
+- **Learnings for future iterations:**
+  - The `desc` variable is already safe (already normalised to empty string when `pkg.description` is falsy) — no additional null check needed
+  - This is a display-only change with no logic impact; no unit tests needed
+---
+
+## 2026-02-28 - US-005
+- Modified `handleSetBrowserTool()` in `platform/cli/src/commands/config.ts` (around line 378-386)
+  - When `value === 'enabled'`, instead of setting `policy[toolName] = true`, rebuild the policy object without that key using `Object.fromEntries(Object.entries(policy).filter(([k]) => k !== toolName))`
+  - When `value === 'disabled'`, existing behavior unchanged (`policy[toolName] = false`)
+  - Server notification and display output unchanged
+- Files changed: `platform/cli/src/commands/config.ts`
+- **Learnings for future iterations:**
+  - `@typescript-eslint/no-dynamic-delete` rule blocks `delete obj[computedKey]` — use `Object.fromEntries(Object.entries(obj).filter(...))` to remove a key without triggering the rule
+  - The `handleSetBrowserTool` function is private (not exported), so no unit tests can be written for it directly; the change is verified via Phase 1 checks only
+---
