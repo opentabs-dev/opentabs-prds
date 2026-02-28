@@ -1,0 +1,115 @@
+## Codebase Patterns
+- E2E test helpers: `initAndListTools()`, `openTestServerTab()`, `waitForNetworkRequests()`, `waitForWebSocketFrames()` are defined at top of `e2e/browser-tools.e2e.ts`
+- `parseToolResult(result.content)` parses the MCP content as JSON; tool return values come back as serialized JSON objects
+- For HAR export: `JSON.parse(parseToolResult(result.content).har as string)` to get the HAR object
+- `browser_export_har` requires active network capture (tracked in `state.activeNetworkCaptures: Set<number>`)
+- `enable-network-capture.ts` adds tabId to `state.activeNetworkCaptures`; `disable-network-capture.ts` removes it
+- Test server WebSocket endpoint is at `testServer.url + '/ws-test'` (defined in `e2e/test-server.ts`)
+- Browser tool handlers throwing errors → caught by mcp-tool-dispatch.ts → returns `{ isError: true, content: [...] }`
+- Hot reload: new `ServerState` fields are auto-patched from `createState()` defaults at `platform/mcp-server/src/index.ts:126-130`
+- Permission system: `evaluatePermission()` in `platform/mcp-server/src/permissions.ts` checks skipConfirmation, domain policies, tool tiers, and trusted domains
+- To test without skipConfirmation: pass `{ OPENTABS_SKIP_CONFIRMATION: '' }` as envOverrides (4th arg) to `startMcpServer()`
+- Default trustedDomains are `['localhost', '127.0.0.1']` — use `127.0.0.2` as a non-trusted loopback alias
+- `callToolWithProgress()` on McpClient captures SSE progress notifications — use it to verify the 'approval' notification from the confirmation flow
+- ESLint import-x/order: groups are `index, sibling, parent, internal, external, builtin, object, type` — sibling imports (`./foo.js`) must come before `@playwright/test` (internal via pathGroup)
+- Confirmation timeout is 30s (CONFIRMATION_TIMEOUT_MS in state.ts) — tools blocked on confirmation return `CONFIRMATION_TIMEOUT` error after that
+- Side panel confirmation dialog: `openSidePanel(extensionContext)` opens the side panel page; dialog has `role="alert"`, "Allow Once" button, "Allow Always" dropdown, "Deny" button
+- To test confirmation flow: use `Promise.all([mcpClient.callTool(...), clickAllowOnce(sidePanel)])` — tool call blocks while side panel interaction happens concurrently
+- `browser_get_cookies` takes `{ url: string }` — good for testing sensitive-tier confirmation without needing an open tab on the target domain
+- "Deny" button: `getByRole('button', { name: 'Deny' })` — returns `PERMISSION_DENIED` error
+- "Allow Always" dropdown: `getByRole('button', { name: 'Allow Always' })` to open, then `getByRole('menuitem', { name: 'For this tool on this domain' })` to select scope
+- `resolveToolDomain()` extracts domain from `url` arg first, then `tabId` — `browser_open_tab` with non-trusted URL triggers confirmation because it has a `url` param
+- `browserToolPolicy` in config.json: `{ browser_screenshot_tab: false }` disables a tool from both tools/list and dispatch; `isBrowserToolEnabled()` checks `state.browserToolPolicy[toolName] !== false`
+- `OpentabsConfig` in fixtures.ts only has `localPlugins`/`tools` — extend with `browserToolPolicy` by spreading and casting
+- `getByText()` matches substrings by default — use `{ exact: true }` when text may appear inside JSON args or other nested content
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-091505-e2e-browser-permissions-har~running.json
+Started: Sat Feb 28 17:15:46 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Added `activeNetworkCaptures: Set<number>` to `ServerState` to track which tabs have active network capture
+- Modified `platform/mcp-server/src/browser-tools/enable-network-capture.ts` to add tabId to `state.activeNetworkCaptures` on success
+- Modified `platform/mcp-server/src/browser-tools/disable-network-capture.ts` to delete tabId from `state.activeNetworkCaptures` on disable
+- Modified `platform/mcp-server/src/browser-tools/export-har.ts` to throw an error when `state.activeNetworkCaptures` does not contain the given tabId
+- Added 4 E2E tests to `e2e/browser-tools.e2e.ts` in the 'Browser tools — network capture lifecycle' describe block:
+  1. `export_har returns valid HAR 1.2 JSON with entries` — enable capture, navigate, wait for requests, export HAR, verify 1.2 structure
+  2. `export_har with includeWebSocketFrames includes WebSocket synthetic entries` — navigate to /ws-test, wait for WS frames, export with includeWebSocketFrames: true, verify status 101 entries with Upgrade: websocket header
+  3. `export_har with clear=true empties the capture buffer` — export with clear=true then poll until get_network_requests returns empty
+  4. `export_har returns error when network capture is not active` — open tab without enabling capture, verify isError=true
+- All Phase 1 checks (build, type-check, lint, knip, test) passed
+- All 377 Phase 2 E2E tests passed (e2eCheckpoint: true)
+- **Learnings for future iterations:**
+  - The PRD said export_har should error when capture not active, but original implementation just returned empty HAR silently — added `activeNetworkCaptures` Set to ServerState to enforce this invariant
+  - Browser tool handler thrown errors become `{ isError: true, content: ['Browser tool error: ...'] }` via catch in `mcp-tool-dispatch.ts:284`
+  - Prettier enforces single-line template literals when they fit within the 120-char line limit — don't break the error message across lines
+  - New `ServerState` fields don't need `STATE_SCHEMA_VERSION` bump — the hot reload patching code at `index.ts:126-130` auto-fills missing fields from `createState()` defaults
+---
+
+## 2026-02-28 - US-002
+- Created `e2e/permissions.e2e.ts` with a custom Playwright fixture that starts the MCP server without skipConfirmation
+- The custom fixture uses `startMcpServer(configDir, true, undefined, { OPENTABS_SKIP_CONFIRMATION: '' })` to disable the confirmation bypass
+- Test 1: Observe-tier tool (`browser_list_tabs`) auto-allows without confirmation — verifies the tool succeeds immediately
+- Test 2: Interact-tier tool (`browser_navigate_tab`) on non-trusted domain (127.0.0.2) triggers confirmation flow — verifies:
+  - The tool returns `CONFIRMATION_TIMEOUT` error (no one responds to the dialog)
+  - A progress notification containing 'approval' is sent to the MCP client via SSE while the tool is pending
+- All Phase 1 checks (build, type-check, lint, knip, test) passed
+- Phase 2 (E2E) skipped — e2eCheckpoint: false
+- **Learnings for future iterations:**
+  - The `startMcpServer` function's 4th arg `envOverrides` allows overriding env vars — `{ OPENTABS_SKIP_CONFIRMATION: '' }` effectively disables the bypass since the check is `=== '1'`
+  - `127.0.0.2` is a loopback alias that works on Linux without any extra configuration — it's not in the default trustedDomains so it triggers the confirmation flow
+  - `callToolWithProgress()` captures progress notifications from the SSE stream — perfect for verifying the confirmation flow sends the 'approval' notification
+  - ESLint import-x/order groups: sibling imports (`./fixtures.js`, `./helpers.js`) must come before `@playwright/test` (which is classified as `internal` via pathGroup `@*/**`)
+  - The extensionContext fixture must be declared even if unused by the test body — it triggers the browser launch needed for the extension to connect to the MCP server. Use `extensionContext: _ctx` destructuring to satisfy no-unused-vars.
+---
+
+## 2026-02-28 - US-003
+- Added 2 E2E tests to `e2e/permissions.e2e.ts` in a new 'Confirmation dialog — Allow Once' describe block:
+  1. `Allow Once grants permission and tool completes successfully` — opens side panel, calls `browser_get_cookies` on 127.0.0.2 (sensitive tier, non-trusted), verifies dialog shows correct tool name/domain/header, clicks "Allow Once", verifies tool completes successfully
+  2. `Allow Once does not persist — subsequent call triggers new confirmation dialog` — grants "Allow Once" for first call, then calls the same tool again and verifies a new confirmation dialog appears (clicking "Allow Once" again to verify full round-trip)
+- Added helper functions: `waitForConfirmationDialog()` (waits for `[role="alert"]`) and `clickAllowOnce()` (waits + clicks)
+- Imported `openSidePanel` from `./helpers.js` and `Page` type from `@playwright/test`
+- All Phase 1 checks (build, type-check, lint, knip, test) passed
+- Phase 2 (E2E) skipped — e2eCheckpoint: false
+- **Learnings for future iterations:**
+  - The confirmation dialog has `role="alert"` attribute — use `sidePanel.locator('[role="alert"]')` to detect it
+  - Tool name and domain are rendered inside the dialog — use `getByText('browser_get_cookies')` and `getByText('127.0.0.2')` to verify
+  - `browser_get_cookies` is a convenient sensitive-tier tool for testing: takes `{ url }` param, no tab needed
+  - `Promise.all` pattern with tool call + side panel interaction is the standard approach for concurrent confirmation testing
+  - The "Allow Once" button uses `getByRole('button', { name: 'Allow Once' })` — it's a standard Button component
+---
+
+## 2026-02-28 - US-004
+- Added 2 E2E tests to `e2e/permissions.e2e.ts`:
+  1. `Deny returns PERMISSION_DENIED error` — opens side panel, calls `browser_get_cookies` on 127.0.0.2, clicks "Deny", verifies tool returns `isError: true` with `PERMISSION_DENIED` in content
+  2. `Allow Always (tool_domain) grants permission and persists for session` — opens side panel, calls `browser_get_cookies` on 127.0.0.2, clicks "Allow Always" → "For this tool on this domain", verifies tool succeeds. Then calls the same tool again and verifies it succeeds immediately without triggering a new confirmation dialog (10s timeout proves no dialog blocking).
+- Added helper functions: `clickDeny()` and `clickAllowAlwaysToolDomain()`
+- All Phase 1 checks (build, type-check, lint, knip, test) passed
+- Phase 2 (E2E) skipped — e2eCheckpoint: false
+- **Learnings for future iterations:**
+  - The "Deny" button uses `getByRole('button', { name: 'Deny' })` — standard Button component
+  - The "Allow Always" dropdown is a Radix DropdownMenu: click `getByRole('button', { name: 'Allow Always' })` to open, then `getByRole('menuitem', { name: 'For this tool on this domain' })` to select
+  - For session persistence tests: after "Allow Always", the second call can use a short timeout (10s) since it should resolve immediately — no `Promise.all` needed
+  - Prettier enforces single-line destructuring for short argument lists — don't break `({ mcpServer, testServer, extensionContext, mcpClient })` across multiple lines if it fits
+---
+
+## 2026-02-28 - US-005
+- Added 2 E2E tests to `e2e/permissions.e2e.ts`:
+  1. `interact-tier tool on trusted domain (localhost) succeeds without confirmation` — opens tab on localhost (trusted), calls `browser_navigate_tab` to `/interactive` on same domain, verifies tool succeeds immediately (10s timeout) without triggering any confirmation dialog
+  2. `disabled tool is hidden from tools/list and returns error on call` — creates config with `browserToolPolicy: { browser_screenshot_tab: false }`, starts server, verifies `browser_screenshot_tab` is absent from tools/list and returns `disabled` error on direct call
+- Fixed pre-existing bugs:
+  - `browser_open_tab` with non-trusted URL (127.0.0.2) triggers confirmation because `resolveToolDomain` extracts domain from the `url` arg — fixed by opening tab on localhost first, then navigating to non-trusted domain
+  - `getByText('127.0.0.2')` in Allow Once test matched 2 elements (domain display + JSON args preview) — fixed with `{ exact: true }`
+  - `waitForWebSocketFrames` returned on 1 frame but test expected >= 2 — added `minFrames` parameter to poll until enough frames are captured
+- Files changed: `e2e/permissions.e2e.ts`, `e2e/browser-tools.e2e.ts`
+- All Phase 1 checks (build, type-check, lint, knip, test) passed
+- All 385 Phase 2 E2E tests passed (e2eCheckpoint: true)
+- **Learnings for future iterations:**
+  - `browser_open_tab` uses `resolveToolDomain()` which extracts domain from the `url` argument — interact-tier tool with non-trusted URL will trigger confirmation even without an existing tab
+  - `OpentabsConfig` in `e2e/fixtures.ts` only has `localPlugins` and `tools` — to add `browserToolPolicy`, spread and cast: `{ ...config, browserToolPolicy: {...} } as typeof config`
+  - `writeTestConfig(configDir, config)` overwrites config.json — use `readTestConfig` first to preserve existing fields
+  - The browserToolPolicy test doesn't need an extension or side panel — purely server-side (MCP client + server)
+  - `getByText()` without `{ exact: true }` matches substring — use exact match when the text appears in JSON args or other contexts
+  - `waitForWebSocketFrames` now supports `minFrames` parameter to avoid race conditions where polling resolves too early
+---
