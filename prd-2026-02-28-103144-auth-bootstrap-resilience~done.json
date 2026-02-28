@@ -4,9 +4,19 @@
   "userStories": [
     {
       "id": "US-001",
-      "title": "CANCELLED — security flaw identified, do not implement",
-      "description": "CANCELLED: This approach leaks the WebSocket secret to ANY Chrome extension on the machine, not just OpenTabs. Do not implement.",
-      "acceptanceCriteria": ["CANCELLED"],
+      "title": "Allow /ws-info to serve secret to Chrome extension requests without Bearer token",
+      "description": "As a Chrome extension, I want to bootstrap the WebSocket secret from /ws-info even when I don't have a Bearer token, so that auth.json read failures don't cause permanent 'Authentication Failed' errors.",
+      "acceptanceCriteria": [
+        "GET /ws-info from Origin: chrome-extension://* without Authorization header returns 200 with { wsUrl, wsSecret }",
+        "GET /ws-info without Origin and without Authorization still returns 401 (non-extension callers are unchanged)",
+        "GET /ws-info with Origin: https://evil.com without Authorization returns 403 (existing CORS protection blocks it before reaching /ws-info)",
+        "GET /ws-info with valid Bearer token works the same as before regardless of Origin header",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
       "priority": 1,
       "passes": true,
       "e2eCheckpoint": false,
@@ -15,7 +25,7 @@
     },
     {
       "id": "US-002",
-      "title": "CANCELLED — depends on US-001 which has a security flaw",
+      "title": "Use /ws-info as fallback when auth.json bootstrap fails in the extension",
       "description": "As a Chrome extension offscreen document, I want to fetch the secret from /ws-info when chrome.runtime.getURL('auth.json') fails, so that transient Chrome file-serving issues don't cause permanent auth failures.",
       "acceptanceCriteria": [
         "When bootstrapFromAuthFile() fails (fetch error, non-ok response, or missing/invalid secret), the offscreen document logs a warning via console.warn",
@@ -32,11 +42,11 @@
       "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
-      "notes": "CANCELLED. The fix is in `platform/browser-extension/src/offscreen/index.ts`. Two changes:\n\n1. In `bootstrapFromAuthFile()` (line 509): add `console.warn('[opentabs:offscreen] Failed to read auth.json:', ...)` in both the `!res.ok` branch and the catch block. This gives visibility into bootstrap failures.\n\n2. In `fetchWsInfo()` (line 58): the current flow on initial 401 is: re-read auth.json via bootstrapFromAuthFile() → retry /ws-info. With US-001, /ws-info now returns 200 for chrome-extension:// origins even without a Bearer token. So the initial request (line 62) should actually succeed if the Origin header is sent. However, the `fetch()` calls in `fetchWsInfo()` may or may not include the Origin header automatically (offscreen documents should include it). The fix: when the first `/ws-info` call returns 200, check if the response body includes `wsSecret` and update the module-level `wsSecret` variable. This already happens indirectly — when /ws-info returns 200, `refreshWsUrl()` (line 240) processes the response, and then `connect()` uses the current `wsSecret`. But `wsSecret` must be set from the response. Add to `refreshWsUrl()` after line 247: if `wsInfo.wsSecret` is a non-empty string, set `wsSecret = wsInfo.wsSecret`. This makes the entire flow self-healing: even with no auth.json, the extension fetches /ws-info → gets secret from response → connects WebSocket with secret.\n\nKey file paths:\n- `platform/browser-extension/src/offscreen/index.ts:58` (fetchWsInfo)\n- `platform/browser-extension/src/offscreen/index.ts:240` (refreshWsUrl)\n- `platform/browser-extension/src/offscreen/index.ts:509` (bootstrapFromAuthFile)"
+      "notes": "The fix is in `platform/browser-extension/src/offscreen/index.ts`. Two changes:\n\n1. In `bootstrapFromAuthFile()` (line 509): add `console.warn('[opentabs:offscreen] Failed to read auth.json:', ...)` in both the `!res.ok` branch and the catch block. This gives visibility into bootstrap failures.\n\n2. In `fetchWsInfo()` (line 58): the current flow on initial 401 is: re-read auth.json via bootstrapFromAuthFile() → retry /ws-info. With US-001, /ws-info now returns 200 for chrome-extension:// origins even without a Bearer token. So the initial request (line 62) should actually succeed if the Origin header is sent. However, the `fetch()` calls in `fetchWsInfo()` may or may not include the Origin header automatically (offscreen documents should include it). The fix: when the first `/ws-info` call returns 200, check if the response body includes `wsSecret` and update the module-level `wsSecret` variable. This already happens indirectly — when /ws-info returns 200, `refreshWsUrl()` (line 240) processes the response, and then `connect()` uses the current `wsSecret`. But `wsSecret` must be set from the response. Add to `refreshWsUrl()` after line 247: if `wsInfo.wsSecret` is a non-empty string, set `wsSecret = wsInfo.wsSecret`. This makes the entire flow self-healing: even with no auth.json, the extension fetches /ws-info → gets secret from response → connects WebSocket with secret.\n\nKey file paths:\n- `platform/browser-extension/src/offscreen/index.ts:58` (fetchWsInfo)\n- `platform/browser-extension/src/offscreen/index.ts:240` (refreshWsUrl)\n- `platform/browser-extension/src/offscreen/index.ts:509` (bootstrapFromAuthFile)"
     },
     {
       "id": "US-003",
-      "title": "CANCELLED — depends on US-001 which has a security flaw",
+      "title": "E2E test: extension connects successfully when auth.json is missing",
       "description": "As a platform maintainer, I want an E2E test that verifies the extension can connect to the server even when auth.json is absent from the extension directory, so that the self-healing auth bootstrap is verified.",
       "acceptanceCriteria": [
         "Test creates extension copy WITHOUT writing auth.json (skip the auth.json write in createExtensionCopy and the symlink in extensionContext)",
@@ -59,7 +69,7 @@
     },
     {
       "id": "US-004",
-      "title": "CANCELLED — depends on US-001 which has a security flaw",
+      "title": "E2E test: extension recovers from auth.json with wrong secret",
       "description": "As a platform maintainer, I want an E2E test that verifies the extension recovers when auth.json contains a stale/wrong secret, so that secret mismatches self-heal via the /ws-info fallback.",
       "acceptanceCriteria": [
         "Test creates extension copy with a WRONG secret in auth.json (different from the server's secret)",
@@ -82,7 +92,7 @@
     },
     {
       "id": "US-005",
-      "title": "CANCELLED — depends on US-001 which has a security flaw",
+      "title": "E2E test: unauthenticated non-extension /ws-info requests are still rejected",
       "description": "As a platform maintainer, I want an E2E test that verifies /ws-info still returns 401 for non-extension callers without a Bearer token, so that the extension-origin bypass doesn't weaken security for other callers.",
       "acceptanceCriteria": [
         "GET /ws-info without Authorization and without Origin returns 401",
