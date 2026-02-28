@@ -1,0 +1,57 @@
+## Codebase Patterns
+- platform/cli/src/commands/config.ts: `resolveStoredPluginPath` at line ~359 is the canonical pattern for tilde expansion — `if (storedPath.startsWith('~/')) return resolve(homedir(), storedPath.slice(2))`
+- `homedir` from `node:os` and `join`, `resolve`, `isAbsolute`, `dirname` from `node:path` are already imported in config.ts
+- platform/cli/src/config.ts: `homedir` is now imported from `node:os` (added in US-002); `resolvePluginPath` expands `~/` before other path logic
+- Unhandled promise rejection pattern: when a promise may be rejected before it's awaited (e.g., due to async gap), add `.catch(() => {})` immediately after creation to suppress the unhandled rejection warning. The error still propagates when the promise is awaited later.
+- Source map preservation: when injecting code after esbuild bundling, keep injected snippets on the same line (no leading/trailing newlines) to avoid shifting the .map file's line mappings. The hashAndFreeze snippet in plugin-tools build.ts follows this pattern.
+---
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-080636-cli-plugin-tools-fixes~running.json
+Started: Sat Feb 28 16:07:03 UTC 2026
+---
+
+## [2026-02-28] - US-001
+- Expanded tilde in `handleSetLocalPluginsAdd` and `handleSetLocalPluginsRemove` in `platform/cli/src/commands/config.ts`
+- Both functions now expand `~/...` to `homedir()/...` before calling `resolve()`, matching the existing `resolveStoredPluginPath` helper pattern
+- Files changed: `platform/cli/src/commands/config.ts` (lines 366-367 and 396-397)
+- **Learnings for future iterations:**
+  - `path.resolve()` does NOT expand `~` — it's a shell feature. Always expand tilde manually before calling `resolve()`
+  - The existing `resolveStoredPluginPath` helper at line ~359 is the reference pattern for tilde expansion
+  - Both `homedir` (node:os) and `join` (node:path) were already imported — no import changes needed
+---
+
+## [2026-02-28] - US-002
+- Fixed `resolvePluginPath` in `platform/cli/src/config.ts` to handle `~/` paths by expanding to `homedir()` before path resolution
+- Added `homedir` import from `node:os` to `config.ts`
+- Added a new test case in `config.test.ts` covering tilde expansion
+- Files changed: `platform/cli/src/config.ts` (lines 14-15, 59-62), `platform/cli/src/config.test.ts` (lines 10, 12, 166-169)
+- **Learnings for future iterations:**
+  - `config.ts` (not `commands/config.ts`) had no `homedir` import before this fix — needed to add it
+  - The fix pattern is identical to `resolveStoredPluginPath` in `commands/config.ts`: check `startsWith('~/')` first, then absolute check, then relative resolution
+  - When adding tests that use `homedir()`, import it from `node:os` in the test file and use it to construct the expected value (don't hardcode `/home/user`)
+---
+
+## [2026-02-28] - US-003
+- Added `proc.exited.catch(() => {})` immediately after spawning the MCP server process in `platform/cli/src/commands/start.ts`
+- This prevents Node.js from reporting an unhandled promise rejection if the child process fails to spawn (e.g., ENOENT) during the async gap before `await proc.exited` is reached at line 299
+- The error still surfaces correctly when `proc.exited` is awaited — the `.catch(() => {})` only silences the unhandled rejection warning
+- Files changed: `platform/cli/src/commands/start.ts` (lines 287-289)
+- **Learnings for future iterations:**
+  - The unhandled rejection window exists because `proc.exited` is created synchronously inside `spawnStreaming` but not awaited until after `Promise.all([stdoutPipe, stderrPipe])` completes
+  - Pattern: `somePromise.catch(() => {})` is the idiomatic way to suppress unhandled rejection warnings when you intend to await the promise later
+  - The `spawnStreaming` helper (lines 35-64 of start.ts) creates the `exited` promise with `child.on('error', reject)` — a spawn error fires synchronously and rejects immediately
+---
+
+## [2026-02-28] - US-004
+- Fixed source map invalidation caused by the hashAndFreeze snippet in `platform/plugin-tools/src/commands/build.ts`
+- The `hashAndFreeze` template literal previously had a leading `\n` and trailing `\n`, adding 2 extra lines between the IIFE content and the sourceMappingURL comment, which shifted all source map line mappings
+- Removed the leading and trailing newlines so the hashAndFreeze snippet stays on the same line as the IIFE's closing `})();`, preserving source map alignment
+- Updated the comment block to document the source map preservation rationale
+- Files changed: `platform/plugin-tools/src/commands/build.ts` (lines 1095-1098)
+- **Learnings for future iterations:**
+  - esbuild's `sourcemap: 'linked'` generates a `.map` file with line mappings matching the output. Any post-build injection that adds newlines will shift those mappings.
+  - The regex at line 1079 strips `\n//# sourceMappingURL=...` from the raw IIFE output, so `iifeContent` ends without a trailing newline.
+  - The `sourceMappingUrlSuffix` starts with `\n`, providing the newline between the code and the sourceMappingURL comment.
+  - Pattern: when injecting code after esbuild bundling, keep it on a single line with no leading/trailing newlines to avoid source map drift.
+---
