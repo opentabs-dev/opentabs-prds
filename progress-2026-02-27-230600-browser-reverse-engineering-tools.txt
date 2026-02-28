@@ -1,0 +1,85 @@
+## Codebase Patterns
+- `network-capture.ts` manages per-tab capture state via a `Map<number, CaptureState>`. All state is cleared by `captures.delete(tabId)` in both `stopCapture` and cleanup listeners.
+- The Chrome extension uses `chrome.debugger.onEvent.addListener` (registered once at module load) for all CDP event handling — add new event handlers in the existing if/else chain.
+- The `import-x/exports-last` ESLint rule requires `export interface` / `export type` to be moved to standalone `export type { ... }` statements at the bottom of the file, not declared inline with `export interface`.
+- Exports in the browser-extension follow the pattern: inline `export const`/`export function` for values, bare `export { name }` and `export type { TypeName }` for re-exports at the bottom.
+- CDP WebSocket frame events: `Network.webSocketFrameSent` and `Network.webSocketFrameReceived` both carry `{ requestId, response: { opcode, mask, payloadData } }`. The `requestId` maps to the WS URL from `Network.webSocketCreated`.
+- Adding a new browser method requires updates in 5 places: (1) browser-commands handler, (2) browser-commands/index.ts export, (3) message-router.ts dispatch table, (4) known-methods.ts DISPATCH_METHODS, (5) tests in both message-router.test.ts and known-methods.test.ts.
+- Import ordering in browser-tools/index.ts is alphabetical by filename — `get-websocket-frames.js` goes after `get-tab-info.js` (w > t).
+- Adding a new MCP browser tool requires updates in 5 places: (1) new tool file in browser-tools/, (2) browser-tools/index.ts (import + array), (3) browser-tool-names.ts, (4) permissions.ts TOOL_TIERS, (5) extension handler.
+- Server-side-only browser tools (e.g., `browser_export_har`) don't need a new extension dispatch method — they reuse existing dispatch methods and do conversion server-side. Only 4 places need updating: (1) new tool file, (2) index.ts barrel, (3) browser-tool-names.ts, (4) permissions.ts.
+- When adding new browser tools, the E2E helpers file `e2e/helpers.ts` has a separate `BROWSER_TOOL_NAMES` array that must also be updated — it's separate from `browser-tool-names.ts` and the E2E tests fail if it's out of sync.
+- `detect-apis.ts` accepts optional `WsFrame[]` as second argument to `detectApis()` for enriching WebSocket endpoint detections with frame samples.
+
+# Ralph Progress Log
+PRD: prd-2026-02-27-230600-browser-reverse-engineering-tools~running.json
+Started: Sat Feb 28 07:15:58 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Added `WsFrame` interface (url, direction, data, opcode, timestamp)
+- Added `wsFrames: WsFrame[]`, `maxWsFrames: number`, and `wsFramesByRequestId: Map<string, string>` to `CaptureState`
+- Updated `Network.webSocketCreated` handler to store `requestId → url` in `wsFramesByRequestId`
+- Added handlers for `Network.webSocketFrameSent` and `Network.webSocketFrameReceived` CDP events
+- Updated `startCapture` to accept `maxWsFrames` param (default 200)
+- Exported `getWsFrames(tabId, clear?)` function
+- Files changed: `platform/browser-extension/src/network-capture.ts`
+- **Learnings for future iterations:**
+  - The `import-x/exports-last` rule means `export interface Foo` mid-file fails lint; use a private interface and add `export type { Foo }` at the bottom instead.
+  - The lint rule specifically flags standalone export declarations (like `export interface`, `export type { ... }`) appearing in the middle of the file. Inline `export const` is fine anywhere.
+  - `wsFramesByRequestId` cleanup on `clear` in `getWsFrames` is important to prevent unbounded map growth when frames are periodically cleared.
+---
+
+## 2026-02-28 - US-002
+- Created `platform/mcp-server/src/browser-tools/get-websocket-frames.ts` with `browser_get_websocket_frames` tool
+- Added `handleBrowserGetWebSocketFrames` to `platform/browser-extension/src/browser-commands/network-commands.ts` (calls `getWsFrames`)
+- Updated `handleBrowserEnableNetworkCapture` in `network-commands.ts` to read and forward `maxWsFrames` param
+- Exported `handleBrowserGetWebSocketFrames` from `browser-commands/index.ts`
+- Registered `browser.getWebSocketFrames` in `message-router.ts` dispatch table (`wrapSync`)
+- Added `browser.getWebSocketFrames` to `known-methods.ts` DISPATCH_METHODS
+- Added `browser_get_websocket_frames` to `browser-tool-names.ts` BROWSER_TOOL_NAMES
+- Added `getWebSocketFrames` to `browser-tools/index.ts` (import + array)
+- Added `browser_get_websocket_frames: 'interact'` to `permissions.ts` TOOL_TIERS
+- Updated `enable-network-capture.ts`: description mentions WebSocket frame capture; `maxWsFrames` param added
+- Updated `message-router.test.ts` and `known-methods.test.ts` with new handler mocks
+- Files changed: 11 files (1 new, 10 modified)
+- **Learnings for future iterations:**
+  - Adding a new browser dispatch method requires updating `known-methods.ts` DISPATCH_METHODS in addition to `message-router.ts` — the `known-methods.test.ts` enforces this invariant.
+  - Both `message-router.test.ts` AND `known-methods.test.ts` maintain separate mock objects for `browser-commands/index.js` — both must be updated when adding a new handler.
+  - Import ordering in `browser-tools/index.ts` is alphabetical by filename (enforced by `import-x/order` lint rule).
+---
+
+## 2026-02-28 - US-003
+- Created `platform/mcp-server/src/browser-tools/export-har.ts` with `browser_export_har` tool
+- Tool accepts `tabId`, `clear` (optional), and `includeWebSocketFrames` (optional) parameters
+- Handler dispatches `browser.getNetworkRequests` to get captured requests, converts to HAR 1.2 format server-side
+- Optionally dispatches `browser.getWebSocketFrames` and includes WS frames as synthetic HAR entries
+- HAR output conforms to HAR 1.2 spec: `{ log: { version, creator, entries } }` with full request/response details
+- Each entry includes: startedDateTime (ISO 8601), time, request (method, url, headers, queryString, postData), response (status, headers, content), cache, timings
+- Headers converted from `Record<string, string>` to HAR array format `[{ name, value }]`
+- Query parameters parsed from URL via `new URL().searchParams`
+- Returns `{ har: harJsonString }` — dispatch pipeline wraps it as text content
+- Added `browser_export_har` to `browser-tool-names.ts`, `permissions.ts` (interact tier), and `browser-tools/index.ts`
+- Files changed: 4 files (1 new, 3 modified)
+- **Learnings for future iterations:**
+  - Server-side-only browser tools (no extension dispatch method needed) are simpler — they call `dispatchToExtension` for existing methods and do the processing server-side.
+  - Prettier enforces single-line Zod chains like `.boolean().optional()` when they fit — multi-line causes lint error.
+  - `@typescript-eslint/no-unnecessary-condition` flags `?? []` on typed properties that are not optional — use the type assertion directly.
+---
+
+## 2026-02-28 - US-004
+- Modified `detect-apis.ts` to accept optional `WsFrame[]` parameter and enrich WebSocket `ApiEndpoint` results with `wsFrameSamples` field
+- Added `WsFrame` interface and exported it from `detect-apis.ts`
+- Added `wsFrameSamples: string[] | undefined` to `ApiEndpoint` interface
+- Enrichment logic collects up to 5 unique received text frames (opcode 1, direction 'received'), truncated to 500 chars each, matched by URL
+- Modified `analyze-site/index.ts` orchestrator to dispatch `browser.getWebSocketFrames` after the wait period and pass frames to `detectApis()`
+- Updated `analyze-site.ts` tool description to mention WebSocket frame content capture
+- Updated `e2e/helpers.ts` BROWSER_TOOL_NAMES to include `browser_get_websocket_frames` and `browser_export_har` (missing from US-002 and US-003)
+- Added `wsFrameSamples: undefined` default to test helper in `index.test.ts`
+- Added comprehensive test suite in `detect-apis.test.ts` for WS frame samples (8 tests covering: basic attachment, direction/opcode filtering, limit to 5, deduplication, truncation, undefined when no frames, URL matching, non-WS endpoints excluded)
+- Files changed: 6 files modified
+- **Learnings for future iterations:**
+  - The E2E helpers file `e2e/helpers.ts` maintains its own `BROWSER_TOOL_NAMES` array separate from `browser-tool-names.ts` — when adding new browser tools, BOTH must be updated or E2E tests fail with "Expected: 0, Received: N" errors on the plugin tools count check.
+  - When adding a new field to an interface used in Map value types, use the interface name directly as the Map generic parameter instead of inline object types — otherwise TS reports "does not exist in type" errors.
+  - `@typescript-eslint/no-non-null-assertion` bans `!` assertions in tests; use explicit runtime checks (`if (!x) throw new Error(...)`) instead.
+---
