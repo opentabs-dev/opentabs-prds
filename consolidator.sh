@@ -502,6 +502,14 @@ while true; do
 
     while IFS= read -r remote_branch; do
       [ -z "$remote_branch" ] && continue
+
+      # Clean state before each merge — abort any stale merge/rebase from
+      # a previous branch's failed resolution, then reset to remote HEAD.
+      git -C "$CODE_DIR" merge --abort 2>/dev/null || true
+      git -C "$CODE_DIR" rebase --abort 2>/dev/null || true
+      git -C "$CODE_DIR" checkout main --quiet 2>/dev/null || true
+      git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
+
       merge_branch "$remote_branch" || true
 
       # Re-fetch after each merge — another worker may have pushed a new branch
