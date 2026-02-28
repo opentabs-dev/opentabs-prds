@@ -1,0 +1,45 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-085828-fix-network-capture-map-leaks~running.json
+Started: Sat Feb 28 16:59:00 UTC 2026
+---
+
+## Codebase Patterns
+- network-capture.ts module-level `captures` Map holds all CaptureState; listeners are registered once at module load
+- CaptureState.requestIdToRequest maps requestId → CapturedRequest for body attachment in loadingFinished
+- CaptureState.pendingRequests maps requestId → partial request data between requestWillBeSent and responseReceived
+- CaptureState.wsFramesByRequestId maps requestId → WebSocket URL; entries are added in webSocketCreated and removed in webSocketClosed or stopCapture
+- Tests use unique tabIds per test to avoid state contamination (module-level captures Map)
+- Chrome API mocks (debugger, tabs, runtime) are set on globalThis.chrome before the module is dynamically imported
+- vi.useFakeTimers() / vi.useRealTimers() work correctly for setInterval tests; vi.getTimerCount() verifies active timer count
+- Verify interval was cleared by checking vi.getTimerCount() === 0 after stopCapture
+- The pre-commit hook runs prettier and eslint --fix automatically; inline objects that exceed line length get expanded to multi-line by prettier
+- All cleanup paths in stopCapture must explicitly clear Maps before captures.delete(tabId) for deterministic memory release
+
+## [2026-02-28] - US-001
+- Added PRUNE_INTERVAL_MS = 30_000 constant
+- Added pruneIntervalId field to CaptureState interface
+- In startCapture: create captureState object, start setInterval that prunes pendingRequests and requestIdToRequest entries older than PENDING_REQUEST_TTL_MS (60s), store state in captures map
+- In stopCapture: clearInterval(state.pruneIntervalId) before detach and delete
+- In chrome.tabs.onRemoved listener: clearInterval before detach and delete
+- In chrome.debugger.onDetach listener: clearInterval before delete
+- Added two unit tests using vi.useFakeTimers():
+  1. Advancing 90s triggers the interval which prunes stale requestIdToRequest entries; loadingFinished becomes a no-op
+  2. vi.getTimerCount() === 0 after stopCapture confirms the interval was cleared
+- **Learnings for future iterations:**
+  - The interval closes over the local captureState variable rather than re-fetching from the captures map; this ensures the interval always operates on the right state object
+  - All three capture-cleanup paths (stopCapture, onRemoved, onDetach) must clearInterval to prevent orphaned timers
+  - The pruning condition is `now - timestamp > PENDING_REQUEST_TTL_MS` (strictly greater), so testing requires advancing past TTL: with TTL=60s and interval=30s, a 90s advance is needed (first tick=30s: not stale; second tick=60s: 60>60 is false; third tick=90s: 90>60 is true)
+---
+
+## [2026-02-28] - US-002
+- Added `state.wsFramesByRequestId.clear()` to `stopCapture` before `captures.delete(tabId)` for explicit deterministic cleanup
+- Added unit test "stopCapture cleans up wsFramesByRequestId entries when stopCapture is called without webSocketClosed":
+  1. Start capture, fire webSocketCreated, verify frame is captured via webSocketFrameReceived
+  2. Call stopCapture without webSocketClosed
+  3. Verify getWsFrames returns [] (cleanup confirmed)
+- Files changed: platform/browser-extension/src/network-capture.ts, platform/browser-extension/src/network-capture.test.ts
+- **Learnings for future iterations:**
+  - wsFramesByRequestId is not accessible via any public export; behavioral testing (getWsFrames returns [] after stop) is the most direct verification
+  - captures.delete(tabId) removes the state from the Map so GC handles cleanup, but explicit .clear() is still valuable for deterministic release and code clarity
+  - The wsFramesByRequestId leak is bounded to the lifetime of a single capture session; stopCapture cleanup is sufficient without needing TTL-based pruning
+---
