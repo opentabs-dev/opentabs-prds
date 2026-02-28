@@ -1,0 +1,50 @@
+## Codebase Patterns
+- platform/plugin-sdk/src/fetch.ts: httpStatusToToolError maps HTTP status to ToolError; explicitly handled codes (400, 401, 403, 404, 408, 422, 429, 5xx) each have specific categories; unhandled 4xx uses no category with retryable:false; unmatched codes (non-4xx, non-5xx) use category:'internal'
+- fetch.test.ts uses a real HTTP server (createServer) started in beforeAll; add new endpoints using the established if (url.pathname === '/path') pattern before the catch-all 404 at the bottom
+- ToolError constructor: new ToolError(message, code, { category?, retryable?, retryAfterMs? }); category is an optional ErrorCategory ('auth'|'rate_limit'|'not_found'|'validation'|'internal'|'timeout')
+- log.ts safeSerializeArg: instanceof checks go after Error check (line ~71) and before JSON.stringify fallback; same types must also be added in the replacer function inside the JSON.stringify call; both direct values and nested values need handling
+- log.test.ts safe serialization tests: use collect() helper which calls _setLogTransport and returns entries array; assert on entries[0]?.data[0] for single-arg tests
+- timing.ts retry: signal is only checked at top of loop and after fn() fails (line 109-110); if fn() succeeds while signal is aborted, the result is returned immediately (no post-success abort check)
+- page-state.test.ts afterEach: cleans up `__testGlobal`, `__testProxy`, and `TS` from globalThis; add new test-global keys here when adding tests that set globalThis properties
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-130049-sdk-browser-audit-fixes~running.json
+Started: Sat Feb 28 21:01:16 UTC 2026
+---
+
+## 2026-02-28 21:04 - US-001
+- Implemented: split the catch-all fallback in `httpStatusToToolError` into two branches — unhandled 4xx returns `ToolError('http_error', { retryable: false })` (no `category`); unmatched non-4xx/non-5xx codes retain the original `{ category: 'internal' }` behavior
+- Added `/error-409` and `/error-413` endpoints to the test HTTP server in `fetch.test.ts`
+- Added two unit tests verifying 409 and 413 produce `code: 'http_error'`, `category: undefined`, `retryable: false`
+- Files changed: `platform/plugin-sdk/src/fetch.ts`, `platform/plugin-sdk/src/fetch.test.ts`
+- **Learnings for future iterations:**
+  - The 5xx branch comes before the catch-all, so the 4xx split must be added after the 5xx block but before the final return
+  - Test server endpoints go between the last named endpoint and the catch-all `res.writeHead(404)` at the bottom of the handler
+  - All Phase 1 checks (build, type-check, lint, knip, test) passed cleanly on first run
+---
+
+## 2026-02-28 21:07 - US-002
+- Implemented: added instanceof checks for WeakRef, WeakMap, WeakSet, ArrayBuffer, SharedArrayBuffer in `safeSerializeArg` (after Error check, before JSON fallback); added the same checks in the JSON.stringify replacer for nested values
+- Added 7 unit tests in the 'safe serialization' describe block covering each exotic type at top-level and nested inside objects
+- Files changed: `platform/plugin-sdk/src/log.ts`, `platform/plugin-sdk/src/log.test.ts`
+- **Learnings for future iterations:**
+  - The replacer receives values that have already passed the seen-set check, so instanceof checks on exotic objects work correctly after `seen.add(v)`
+  - SharedArrayBuffer guard (`typeof SharedArrayBuffer !== 'undefined'`) is needed because it may not be available in all contexts (cross-origin isolation)
+  - All Phase 1 checks (build, type-check, lint, knip, test) passed cleanly on first run
+---
+
+## 2026-02-28 21:12 - US-003
+- Added two tests to `timing.test.ts` in the 'retry' describe block:
+  1. "returns fn result when signal is aborted while fn is executing and fn succeeds" — verifies that when fn resolves after signal is aborted mid-attempt, the result is returned (no post-success abort check in retry)
+  2. "throws abort reason when signal is aborted while fn is executing and fn fails" — verifies that when fn rejects after signal is aborted mid-attempt, the abort reason is thrown and calls stays at 1 (no retry)
+- Added one test to `page-state.test.ts` in the 'getPageGlobal' describe block:
+  1. "returns undefined when a Proxy get-trap throws" — creates a Proxy with a get trap that always throws, assigns to globalThis.__testProxy, verifies getPageGlobal('__testProxy.anything') returns undefined
+- Updated afterEach in page-state.test.ts to also delete `__testProxy`
+- The fetch.test.ts 409/413 acceptance criteria were already satisfied by US-001 — no changes needed
+- Files changed: `platform/plugin-sdk/src/timing.test.ts`, `platform/plugin-sdk/src/page-state.test.ts`
+- **Learnings for future iterations:**
+  - retry's signal check only fires at top of loop and after fn() fails; a successful fn() returns immediately regardless of signal state
+  - Proxy get-trap tests require a two-segment path like 'obj.prop' — the first segment retrieves the Proxy, the second triggers the trap
+  - The page-state.test.ts afterEach is the canonical cleanup location for globalThis test properties — add new keys there
+  - All Phase 1 checks (build, type-check, lint, knip, test) passed cleanly on first run
+---
