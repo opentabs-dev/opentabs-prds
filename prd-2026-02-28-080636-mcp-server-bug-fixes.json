@@ -1,0 +1,71 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three bugs in the MCP server: incorrect regex ordering in error sanitization, WebSocket frame sample matching failure when URLs have query params, and detectPrimaryApiBaseUrl using call counts instead of endpoint counts for the shared-prefix threshold.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix sanitize-error.ts regex ordering so URLs are fully replaced",
+      "description": "As a platform developer, I want error messages containing URLs to be fully sanitized to [URL] so that protocol prefixes like 'https:' do not leak to external MCP clients.",
+      "acceptanceCriteria": [
+        "The URL regex (.replace(/https?:\\/\\/.../) runs BEFORE the Unix path regex (.replace(/\\/[a-z].../) in sanitizeErrorMessage",
+        "Input 'Failed to connect to https://internal.corp/api/v2' produces 'Failed to connect to [URL]' (not 'Failed to connect to https:[PATH]')",
+        "Input 'Error at /usr/local/bin/node' still produces 'Error at [PATH]' (Unix paths without protocol still work)",
+        "Input 'Bad path C:\\Users\\admin\\file.txt' still produces 'Bad path [PATH]' (Windows paths still work)",
+        "Existing unit tests in sanitize-error.test.ts pass (update any that depended on the old ordering)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/sanitize-error.ts (31 lines total).\n\nThe bug: line 15 (Unix path regex) runs before line 17 (URL regex). For input like 'https://example.com/api', the Unix path regex matches '/example.com/api' first → 'https:[PATH]'. Then the URL regex fails because '://' is gone.\n\nFix: Swap line 15 and line 17 — move the URL regex (.replace(/https?:\\/\\/[^\\s,;)}\\]]+/gi, '[URL]')) to run before the Unix path regex. The Windows path regex on line 12 must stay first (it uses a different pattern that won't conflict).\n\nNew order should be: (1) Windows paths, (2) Full URLs with protocol, (3) Unix paths, (4) localhost, (5) IPv4.\n\nCheck platform/mcp-server/src/sanitize-error.test.ts for existing tests. Add a test case for 'https://internal.corp/api/v2' → '[URL]' to prevent regression."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix WebSocket frame URL matching in detect-apis.ts",
+      "description": "As a plugin developer using browser_analyze_site, I want WebSocket frame samples to be correctly attached to WebSocket endpoints so that I can see real-time API payloads even when the WebSocket URL includes query parameters.",
+      "acceptanceCriteria": [
+        "WebSocket frame URLs are normalized to origin+pathname (stripping query params) before comparison with ep.url",
+        "A frame with url 'wss://example.com/ws?token=abc' matches an endpoint with url 'wss://example.com/ws'",
+        "Existing unit tests in detect-apis.test.ts pass",
+        "A new test verifies frame-to-endpoint matching when the WS URL has query params",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts, line 450.\n\nThe bug: At line 450, `frame.url !== ep.url` uses a strict equality comparison. But `ep.url` was normalized at lines 417-420 to `${parsed.origin}${parsed.pathname}` (no query string), while `frame.url` retains the raw URL which may include query parameters (e.g., `wss://example.com/ws?token=abc`). This means frames never match WebSocket endpoints that use query params.\n\nFix: Normalize `frame.url` the same way before comparison. At line 450, instead of `if (frame.url !== ep.url) continue;`, normalize frame.url:\n```\nlet normalizedFrameUrl: string;\ntry {\n  const parsed = new URL(frame.url);\n  normalizedFrameUrl = `${parsed.origin}${parsed.pathname}`;\n} catch {\n  normalizedFrameUrl = frame.url;\n}\nif (normalizedFrameUrl !== ep.url) continue;\n```\n\nCheck platform/mcp-server/src/browser-tools/analyze-site/detect-apis.test.ts for existing tests. Add a test with wsFrames that have query params in their URLs."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix detectPrimaryApiBaseUrl to count distinct endpoints",
+      "description": "As a plugin developer using browser_analyze_site, I want the primary API base URL detection to identify the deepest path prefix shared by multiple distinct endpoints so that tool suggestions are based on a genuine common base, not an overly-specific single-endpoint path.",
+      "acceptanceCriteria": [
+        "Prefix accumulation counts distinct endpoints contributing to each prefix, not their callCount sums",
+        "The minCount threshold is based on endpoint count (endpoints.length), not summed call counts",
+        "A single endpoint called 10 times does NOT produce a deep prefix like '/api/v1/users'; it produces at most the origin",
+        "Two distinct endpoints sharing '/api/v1' with different leaf paths correctly identify '/api/v1' as primary base",
+        "Existing unit tests pass; new test case verifies the fix",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts, function detectPrimaryApiBaseUrl (around line 330-374).\n\nThe bug: At line 342-346, prefixes are accumulated using `endpoint.callCount` instead of 1 per endpoint. At line 355, `totalEndpoints` sums callCounts across all endpoints. This means a single endpoint called N times gets N added to prefix counts, so minCount (line 356) can be satisfied by a single heavily-called endpoint.\n\nFix: Change the prefix counting to count each endpoint once (use `+1` instead of `+endpoint.callCount`). Change `totalEndpoints` at line 355 to use `endpoints.length` instead of reducing callCounts. This ensures the threshold correctly requires multiple DISTINCT endpoints to share a prefix.\n\nCheck platform/mcp-server/src/browser-tools/analyze-site/detect-apis.test.ts for existing tests."
+    }
+  ]
+}

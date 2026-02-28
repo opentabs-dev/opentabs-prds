@@ -1,0 +1,90 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix four bugs across the CLI and plugin-tools packages: tilde expansion missing in localPlugins add/remove commands, resolvePluginPath missing tilde handling, unhandled promise rejection on spawn failure in start command, and source map invalidation from post-esbuild hashAndFreeze injection.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix tilde expansion in localPlugins add and remove commands",
+      "description": "As a user, I want `opentabs config set localPlugins.add ~/my-plugin` to correctly resolve to my home directory so that the plugin is found at the correct absolute path.",
+      "acceptanceCriteria": [
+        "handleSetLocalPluginsAdd expands ~/... to homedir()/... before calling resolve()",
+        "handleSetLocalPluginsRemove expands ~/... to homedir()/... before calling resolve()",
+        "`opentabs config set localPlugins.add ~/projects/my-plugin` stores '/home/user/projects/my-plugin' (not '/cwd/~/projects/my-plugin')",
+        "`opentabs config set localPlugins.remove ~/projects/my-plugin` correctly matches an entry stored as the expanded path",
+        "Existing tests pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/config.ts, lines 366 and 395.\n\nThe bug: Both `handleSetLocalPluginsAdd` (line 366) and `handleSetLocalPluginsRemove` (line 395) call `resolve(value)` directly. Node's `path.resolve()` does NOT expand `~` — that's a shell feature. So `resolve('~/projects/my-plugin')` from cwd `/home/user` produces `/home/user/~/projects/my-plugin`.\n\nNote: `resolveStoredPluginPath` at line 359-363 DOES handle `~/` correctly. The fix should follow the same pattern.\n\nFix for both functions: Before calling `resolve(value)`, expand tilde:\n```typescript\nimport { homedir } from 'node:os';\n// ...\nconst expandedValue = value.startsWith('~/') ? join(homedir(), value.slice(2)) : value;\nconst pluginPath = resolve(expandedValue);\n```\n\nCheck if `homedir` and `join` are already imported in this file. `homedir` is likely already imported since `resolveStoredPluginPath` uses it."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix resolvePluginPath to handle tilde prefix",
+      "description": "As a user, I want plugin paths stored as '~/my-plugin' in config.json to resolve correctly when used by doctor and plugin commands so that they are consistent with the config set command.",
+      "acceptanceCriteria": [
+        "resolvePluginPath in platform/cli/src/config.ts handles ~/... paths by expanding to homedir()",
+        "A config entry '~/projects/my-plugin' resolves to '/home/user/projects/my-plugin' (not '~/.opentabs/~/projects/my-plugin')",
+        "Absolute paths and relative paths continue to resolve correctly",
+        "Existing tests pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/config.ts, lines 59-60.\n\nThe bug: `resolvePluginPath` only checks `isAbsolute(pluginPath)`. If the path starts with `~/`, it's not absolute, so it falls through to `resolve(dirname(configPath), pluginPath)` which produces `~/.opentabs/~/projects/my-plugin`.\n\nNote: The commands/config.ts file has `resolveStoredPluginPath` (line 359-363) which correctly handles `~/`. The fix should match that pattern.\n\nFix:\n```typescript\nimport { homedir } from 'node:os';\n// ...\nexport const resolvePluginPath = (pluginPath: string, configPath: string): string => {\n  if (pluginPath.startsWith('~/')) return resolve(homedir(), pluginPath.slice(2));\n  return isAbsolute(pluginPath) ? pluginPath : resolve(dirname(configPath), pluginPath);\n};\n```"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix unhandled promise rejection in start.ts spawnStreaming",
+      "description": "As a user, I want `opentabs start` to show a clean error message when the node binary cannot be found so that I don't see an unhandled promise rejection warning.",
+      "acceptanceCriteria": [
+        "The exited promise from spawnStreaming does not cause an unhandled rejection when the child process fails to spawn",
+        "If spawn fails (e.g., ENOENT), the error is caught and a user-friendly message is shown",
+        "Normal operation (successful spawn) is unaffected",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/start.ts, lines 54-57 and 281-292.\n\nThe bug: At line 54, the `exited` promise is created with `child.on('error', reject)`. If the child fails to spawn (e.g., node binary not found), the 'error' event fires synchronously, rejecting `exited` immediately. But the code at lines 281-289 first awaits stream pipes (`Promise.all([stdoutPipe, stderrPipe])`) before awaiting `proc.exited` at line 292. The unhandled rejection fires during the gap.\n\nFix: Add a no-op catch immediately after creating the proc to prevent unhandled rejection:\n```typescript\nconst proc = spawnStreaming(platformExec('node'), [serverEntry], { env, stdin: 'inherit' });\n// Prevent unhandled rejection if spawn fails before we await proc.exited\nproc.exited.catch(() => {});\n```\n\nThe error will still be surfaced when `await proc.exited` runs at line 292 (re-throws the rejection). The `.catch(() => {})` just prevents the Node.js unhandled rejection warning in the gap.\n\nAlternative: Use `Promise.allSettled` to await all three concurrently:\n```typescript\nconst [, , exitResult] = await Promise.all([stdoutPipe, stderrPipe, proc.exited.catch(e => { throw e; })]);\n```\nBut the simpler `.catch(() => {})` is cleaner since we still need sequential behavior (streams end, then check exit code)."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix source map invalidation from hashAndFreeze injection",
+      "description": "As a plugin developer, I want source maps in the adapter IIFE to have correct line mappings so that stack traces and breakpoints in Chrome DevTools align with the actual TypeScript source.",
+      "acceptanceCriteria": [
+        "The hashAndFreeze snippet is included in the esbuild bundle (via footer or banner option) so that esbuild accounts for it in the source map",
+        "OR the source map's mappings are adjusted after injection to account for the added lines",
+        "OR the hashAndFreeze is injected on the same line as the end of the IIFE (no extra newlines) so line mappings are not shifted",
+        "Source map file (.map) correctly maps lines after the injection point",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, lines 1065-1093.\n\nThe bug: At line 1065, esbuild bundles the IIFE and generates a source map with line mappings for the original output. Then at line 1090-1093, a hashAndFreeze snippet (2 lines: 1 blank + 1 code) is inserted between the IIFE content and the sourceMappingURL comment. This shifts all lines after the insertion point, but the .map file's `mappings` field still references the original line numbers.\n\nResult: When debugging in Chrome DevTools, breakpoints and stack traces for code after the injection point are off by ~2 lines.\n\nBest fix approach: The hashAndFreeze snippet currently starts with `\\n` (line 1090). Change it to NOT add a leading newline — instead, keep it on the same line as the end of the IIFE. Since the IIFE ends with `})();` and the hashAndFreeze starts with `(function(){...`, they can be concatenated without a newline. This avoids shifting source map line numbers entirely.\n\nChange line 1090 from:\n```\nconst hashAndFreeze = `\\n(function(){...`;\n```\nto:\n```\nconst hashAndFreeze = `(function(){...`;\n```\n\nThe esbuild IIFE output ends with `})();\\n`. The `\\n` after the IIFE content is already stripped by the regex on line 1072. So the concatenation at line 1093 would be: `iifeContent` (no trailing newline) + `hashAndFreeze` (no leading newline, single line) + `sourceMappingUrlSuffix` (starts with `\\n`). This keeps everything on the same line as the IIFE's last line, preserving source map alignment.\n\nIMPORTANT: The hashAndFreeze must remain a single line (no newlines within it). It already is a single line at line 1091. Just remove the leading `\\n` from line 1090.\n\nNote: the bundleIIFE function starts around line 683. Read it to understand the esbuild config (especially sourcemap and footer options)."
+    }
+  ]
+}

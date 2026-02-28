@@ -1,0 +1,50 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two bugs in the plugin SDK: a runtime crash when logging SVG DOM elements (className is SVGAnimatedString, not string), and getPageGlobal failing to traverse through function-typed intermediate values.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix safeSerializeArg crash on SVG DOM elements",
+      "description": "As a plugin developer, I want logging SVG DOM elements to produce a safe string representation instead of throwing a TypeError so that the safe serializer in the SDK log infrastructure actually lives up to its name.",
+      "acceptanceCriteria": [
+        "safeSerializeArg handles SVG elements where node.className is an SVGAnimatedString (not a string)",
+        "For SVG elements, the class name is obtained via node.getAttribute('class') or a typeof guard",
+        "Logging an SVG element produces a string like '[SVG#myId.myClass]' or '[SVG]' — not a crash",
+        "Logging regular HTML elements still works as before",
+        "Existing unit tests pass; new test case covers SVG element serialization",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/log.ts, around line 46-50.\n\nThe bug: Line 48 does `node.className.split(' ')`. For SVG elements (`<svg>`, `<rect>`, `<path>`, etc.), `className` is an `SVGAnimatedString` object, not a string. `SVGAnimatedString` has no `.split()` method, so this throws `TypeError: node.className.split is not a function`.\n\nThis is especially bad because `safeSerializeArg` is the 'safe' serializer — it should NEVER throw. If a plugin does `log.info('Found element', svgNode)`, the entire log call crashes.\n\nFix: Replace line 48 with a typeof guard:\n```typescript\nconst cls = typeof node.className === 'string' ? node.className : (node as Element).getAttribute?.('class') ?? '';\nconst className = cls ? `.${cls.split(' ')[0] ?? ''}` : '';\n```\n\nCheck platform/plugin-sdk/src/log.test.ts for existing tests. The test environment is jsdom which may or may not support SVGAnimatedString. If not available in jsdom, mock the node with `{ nodeType: 1, nodeName: 'SVG', className: { baseVal: 'myClass' } }` — the key thing to test is that a non-string className doesn't crash."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix getPageGlobal to traverse function-typed values",
+      "description": "As a plugin developer, I want getPageGlobal('SomeLib.config.token') to work when SomeLib is a function/constructor with properties so that I can read globals from function-based namespaces.",
+      "acceptanceCriteria": [
+        "getPageGlobal allows traversal through values where typeof === 'function' (in addition to 'object')",
+        "getPageGlobal('SomeConstructor.staticProp') returns the static property value when SomeConstructor is a function",
+        "getPageGlobal still returns undefined for null and undefined intermediate values",
+        "getPageGlobal still returns undefined for primitive intermediates (string, number, boolean)",
+        "Existing unit tests pass; new test case covers function-typed traversal",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/page-state.ts, line 17.\n\nThe bug: The guard `typeof current !== 'object'` on line 17 rejects function-typed values. In JavaScript, functions can have properties (e.g., `MyLib.config.token` where `MyLib` is a function). `typeof function === 'function'`, not `'object'`, so the traversal returns undefined when hitting a function in the path.\n\nFix: Change line 17 from:\n```typescript\nif (current === null || current === undefined || typeof current !== 'object') return undefined;\n```\nto:\n```typescript\nif (current === null || current === undefined) return undefined;\nif (typeof current !== 'object' && typeof current !== 'function') return undefined;\n```\n\nCheck platform/plugin-sdk/src/page-state.test.ts for existing tests."
+    }
+  ]
+}
