@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Plugin — Slack",
+  "description": "Fix bugs found during plugin audit: unstructured errors from raw fetch in upload-file, and missing guard in create-channel before calling setTopic",
+  "workingDirectory": "plugins/slack",
+  "qualityChecks": "cd plugins/slack && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Wrap raw fetch in upload-file.ts with try-catch for structured error handling",
+      "description": "As an AI agent, I want file upload network/timeout errors to be returned as structured ToolError so that I can determine whether to retry the operation",
+      "acceptanceCriteria": [
+        "The fetch() call at line 96 of upload-file.ts is wrapped in a try-catch block",
+        "DOMException with name 'TimeoutError' is caught and re-thrown as ToolError.timeout() with a descriptive message including the timeout duration",
+        "If signal.aborted is true after the catch, a ToolError with code 'aborted' is thrown",
+        "All other fetch errors (TypeError from redirect:'error', network errors) are caught and re-thrown as ToolError with category 'internal' and retryable: true",
+        "The error handling pattern matches slackApi() in slack-api.ts lines 392-412 (same structure: TimeoutError check, aborted check, generic network error with category/retryable)",
+        "cd plugins/slack && npm run build passes",
+        "cd plugins/slack && npm run type-check passes",
+        "cd plugins/slack && npm run lint passes",
+        "cd plugins/slack && npm run format:check passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: plugins/slack/src/tools/upload-file.ts, lines 96-102.\n\nThe raw fetch() call for file upload at line 96 uses AbortSignal.timeout(30_000) but is not wrapped in try-catch. When the upload times out, a raw DOMException propagates instead of ToolError.timeout(). When the network fails or redirect:'error' triggers, a raw TypeError propagates instead of a structured ToolError.\n\nCompare with the pattern in plugins/slack/src/slack-api.ts lines 392-412 which correctly wraps fetch() in try-catch:\n- Catches DOMException with name 'TimeoutError' → ToolError.timeout()\n- Checks signal.aborted → ToolError with code 'aborted'\n- Catches all other errors → ToolError with category 'internal', retryable: true\n\nApply the same pattern to the upload fetch. Import ToolError if not already imported (it is already imported at line 2). The timeout value to reference in the error message is 30_000ms."
+    },
+    {
+      "id": "US-002",
+      "title": "Guard setTopic call in create-channel.ts against missing channel ID",
+      "description": "As a developer, I want the create-channel tool to guard against a missing channel ID before calling setTopic so that error messages are accurate if the API response is unexpected",
+      "acceptanceCriteria": [
+        "The setTopic call at line 43 of create-channel.ts is guarded by a check that data.channel.id is truthy",
+        "If data.channel.id is falsy and params.topic was requested, the warning field is set to a message indicating the channel ID was missing (e.g., 'Channel created but could not set topic: missing channel ID in API response')",
+        "The guard does NOT change the behavior when data.channel.id is present — the existing try-catch for setTopic remains intact",
+        "cd plugins/slack && npm run build passes",
+        "cd plugins/slack && npm run type-check passes",
+        "cd plugins/slack && npm run lint passes",
+        "cd plugins/slack && npm run format:check passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: plugins/slack/src/tools/create-channel.ts, lines 40-48.\n\nThe current code calls slackApi('conversations.setTopic', { channel: data.channel.id, topic: params.topic }) without checking if data.channel.id is defined. The type annotation declares id as optional (id?: string). If id is undefined, slackApi's parameter serialization (slack-api.ts lines 371-375) silently skips the undefined value, sending a setTopic request with no channel parameter. Slack returns an error, caught by the try-catch, producing a misleading warning about 'failed to set topic' when the real issue is a missing channel ID.\n\nFix: Add a guard before the setTopic call:\n```typescript\nif (params.topic) {\n  if (!data.channel.id) {\n    warning = 'Channel created but could not set topic: missing channel ID in API response';\n  } else {\n    try {\n      await slackApi('conversations.setTopic', { channel: data.channel.id, topic: params.topic });\n    } catch (err) {\n      warning = `Channel created but failed to set topic: ${err instanceof Error ? err.message : String(err)}`;\n    }\n  }\n}\n```"
+    }
+  ]
+}
