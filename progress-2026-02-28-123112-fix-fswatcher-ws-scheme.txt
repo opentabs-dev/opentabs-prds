@@ -1,0 +1,41 @@
+## Codebase Patterns
+- `file-watcher.ts` uses three `fs.watch()` FSWatcher instances: one in `watchPendingPlugin()`, one in `watchPlugin()`, one in `startConfigWatching()`. All live in `platform/mcp-server/src/`.
+- `log` from `./logger.js` is already imported in `file-watcher.ts` and is a plain object with `warn/info/error/debug` methods — use `vi.spyOn(log, 'warn')` in tests.
+- `FileWatcherEntry` has a `watchers: FSWatcher[]` field — access watcher instances from `state.fileWatching.entries[n].watchers[0]` in tests.
+- Tests must guard for EMFILE: `if (!entry || entry.watchers.length === 0) return;` since `fs.watch()` can fail under parallel test load.
+- ESLint forbids non-null assertions (`@typescript-eslint/no-non-null-assertion`); use explicit null/undefined guards instead.
+- For `startConfigWatching`, use a local `const configWatcher = watch(...)` to avoid TypeScript null narrowing issues before calling `.on('error', ...)`, then assign to `fw.configWatcher`.
+- `detect-apis.ts` normalizes WebSocket URLs for comparison using `normalizeWsUrl` helper (wss→https, ws→http). WebSocket endpoints from HTTP upgrade requests use `https://`, but frames report `wss://` — always normalize both sides when comparing.
+---
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-123112-fix-fswatcher-ws-scheme~running.json
+Started: Sat Feb 28 20:31:56 UTC 2026
+---
+
+## [2026-02-28] - US-001
+- Added `error` event handlers to all three FSWatcher instances in `platform/mcp-server/src/file-watcher.ts`:
+  - `watchPendingPlugin()`: handler logs warning with `pluginDir` label and closes watcher
+  - `watchPlugin()`: handler logs warning with `pluginName` label and closes watcher
+  - `startConfigWatching()`: refactored to use local `const configWatcher` before attaching handler, then assigned to `fw.configWatcher`; handler also sets `fw.configWatcher = null`
+- Added unit test `'error event on dist watcher logs warning and does not throw'` in `platform/mcp-server/src/file-watcher.test.ts` in new `describe('FSWatcher error event handlers', ...)` block
+- Added `vi` and `log` imports to the test file
+- Fixed lint: removed non-null assertion, relied on guard check instead
+- All Phase 1 checks passed: build, type-check, lint, knip, test (2589 tests)
+- **Learnings for future iterations:**
+  - Prettier enforces single-arg arrow functions without parens: `err => {...}` not `(err) => {...}`
+  - Long template literals in `log.warn(...)` get wrapped by prettier to multiline form
+  - TypeScript does NOT narrow mutable object properties between statements; use local variable to capture FSWatcher before calling `.on('error', ...)`
+  - Existing FSWatcher mtime polling in `startMtimePolling()` continues to work after a watcher is closed by error handler — no additional recovery needed
+---
+
+## [2026-02-28] - US-002
+- Added `normalizeWsUrl` helper in `platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts` that converts `wss://` → `https://` and `ws://` → `http://`, returning `origin + pathname`
+- Replaced the per-frame URL normalization block in the frame matching loop with `normalizeWsUrl(frame.url) !== normalizeWsUrl(ep.url)` — normalizes both sides so cross-scheme URLs compare equal
+- Added new test `'attaches wss:// frame samples to https:// endpoint from HTTP upgrade request'` in `detect-apis.test.ts` verifying the cross-scheme match scenario
+- All Phase 1 checks passed: build, type-check, lint, knip, test (2590 tests)
+- **Learnings for future iterations:**
+  - WebSocket upgrade requests captured by Chrome have `https://` scheme; WebSocket frames reported by the browser use `wss://`. Always normalize both when comparing WS URLs.
+  - The simpler fix is to normalize at comparison time (not when building the endpoint URL), which preserves existing `ep.url` values and avoids breaking tests that assert on the URL field.
+  - `new URL('wss://example.com/ws').origin` returns `wss://example.com` — the origin includes the protocol, so direct string comparison of `origin + pathname` across different WS schemes always fails.
+---
