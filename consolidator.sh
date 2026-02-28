@@ -23,6 +23,16 @@
 
 # NOTE: set -e is intentionally NOT used.
 
+# --- Ensure user-local npm binaries are on PATH ---
+# Claude CLI may be installed in ~/.npm-global/bin or similar user-local prefix.
+# Non-login shells (cron, systemd, tmux new-session) don't source ~/.bashrc,
+# so we add common user-local bin paths explicitly.
+for _p in "$HOME/.npm-global/bin" "$HOME/.local/bin" "$HOME/bin"; do
+  [ -d "$_p" ] && case ":$PATH:" in *":$_p:"*) ;; *) PATH="$_p:$PATH" ;; esac
+done
+unset _p
+export PATH
+
 # --- Argument Parsing ---
 
 CODE_REPO=""
@@ -124,6 +134,17 @@ fi
 git -C "$CODE_DIR" config user.name "Ralph"
 git -C "$CODE_DIR" config user.email "ralph@opentabs.dev"
 
+# --- Verify Claude CLI ---
+CLAUDE_BIN=""
+if command -v claude &>/dev/null; then
+  CLAUDE_BIN=$(command -v claude)
+  echo -e "$(ts) ${DIM}Claude CLI: $CLAUDE_BIN ($(claude --version 2>/dev/null | head -1))${RESET}"
+else
+  echo -e "$(ts) ${YELLOW}Warning: 'claude' CLI not found in PATH. AI conflict resolution will be unavailable.${RESET}"
+  echo -e "$(ts) ${YELLOW}Install: npm install -g @anthropic-ai/claude-code${RESET}"
+  echo -e "$(ts) ${YELLOW}PATH=$PATH${RESET}"
+fi
+
 # --- Cleanup ---
 
 cleanup() {
@@ -207,13 +228,56 @@ merge_branch() {
     fi
   else
     # Merge conflict — use AI to resolve
+    # Use ls-files --unmerged for reliable conflict detection (catches rename/rename,
+    # tree conflicts, etc. that --diff-filter=U can miss).
     local conflicted_files
-    conflicted_files=$(git -C "$CODE_DIR" diff --name-only --diff-filter=U 2>/dev/null)
-    local conflict_count
-    conflict_count=$(echo "$conflicted_files" | grep -c . 2>/dev/null || echo "0")
+    conflicted_files=$(git -C "$CODE_DIR" ls-files --unmerged 2>/dev/null | awk '{print $4}' | sort -u)
+    if [ -z "$conflicted_files" ]; then
+      # Fallback: diff --name-only --diff-filter=U
+      conflicted_files=$(git -C "$CODE_DIR" diff --name-only --diff-filter=U 2>/dev/null)
+    fi
+    local conflict_count=0
+    if [ -n "$conflicted_files" ]; then
+      conflict_count=$(echo "$conflicted_files" | wc -l | tr -d ' ')
+    fi
 
-    echo -e "$(ts) ${YELLOW}  MERGE CONFLICT: $branch_name ($conflict_count files)${RESET}"
-    echo -e "$(ts) ${YELLOW}  Conflicted: $(echo "$conflicted_files" | tr '\n' ' ')${RESET}"
+    echo -e "$(ts) ${YELLOW}  MERGE CONFLICT: $branch_name ($conflict_count file(s))${RESET}"
+    if [ -n "$conflicted_files" ]; then
+      echo -e "$(ts) ${YELLOW}  Conflicted: $(echo "$conflicted_files" | tr '\n' ' ')${RESET}"
+    fi
+    echo -e "$(ts) ${DIM}  Merge output: $(echo "$merge_output" | head -5)${RESET}"
+
+    # If no conflicted files detected, the merge failed for a non-content reason
+    # (e.g., tree conflict, permission issue). Abort and write breadcrumb.
+    if [ "$conflict_count" -eq 0 ]; then
+      echo -e "$(ts) ${RED}  No conflicted files detected — merge failed for a non-content reason.${RESET}"
+      echo -e "$(ts) ${RED}  Aborting merge. Branch preserved for manual resolution.${RESET}"
+      git -C "$CODE_DIR" merge --abort 2>/dev/null || git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
+
+      local breadcrumb="$CONFLICTS_DIR/${branch_name}.merge-conflict.txt"
+      {
+        echo "MERGE FAILED — non-content conflict, manual resolution required"
+        echo "================================================================="
+        echo ""
+        echo "Branch:    $branch_name"
+        echo "Commits:   $commit_count"
+        echo "Timestamp: $(date)"
+        echo ""
+        echo "Merge output:"
+        echo "$merge_output"
+        echo ""
+        echo "To resolve:"
+        echo "  cd $CODE_DIR"
+        echo "  git fetch origin"
+        echo "  git checkout main && git reset --hard origin/main"
+        echo "  git merge origin/$branch_name"
+        echo "  # Fix issues, then: git add . && git commit && git push origin main"
+        echo "  git push origin --delete $branch_name"
+      } > "$breadcrumb"
+      echo -e "$(ts) ${YELLOW}  Wrote: $breadcrumb${RESET}"
+      return 1
+    fi
+
     echo -e "$(ts) ${CYAN}  Invoking AI to resolve...${RESET}"
 
     # Build context for AI: branch commits, conflicted file contents, PRD description
@@ -266,15 +330,22 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
     local ai_ok=false
     local ai_exit=0
 
-    # Run with timeout to prevent indefinite hangs
-    timeout 600 bash -c '
-      echo "$1" | (cd "$2" && claude \
-        --dangerously-skip-permissions \
-        --print \
-        --model "$3" \
-        --output-format stream-json \
-      ) 2>"$5" > "$4"
-    ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" || ai_exit=$?
+    # Check that claude CLI is available before attempting AI resolution
+    if [ -z "$CLAUDE_BIN" ]; then
+      echo -e "$(ts) ${RED}  Skipping AI resolution: 'claude' CLI not found in PATH.${RESET}"
+      ai_exit=127
+    else
+      # Run with timeout to prevent indefinite hangs.
+      # Pass PATH explicitly so the subshell can find claude + node.
+      timeout 600 env PATH="$PATH" bash -c '
+        echo "$1" | (cd "$2" && claude \
+          --dangerously-skip-permissions \
+          --print \
+          --model "$3" \
+          --output-format stream-json \
+        ) 2>"$5" > "$4"
+      ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" || ai_exit=$?
+    fi
 
     if [ "$ai_exit" -eq 124 ]; then
       echo -e "$(ts) ${RED}  AI timed out after 10 minutes.${RESET}"
