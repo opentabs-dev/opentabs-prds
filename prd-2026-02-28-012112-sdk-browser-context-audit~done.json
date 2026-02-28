@@ -21,7 +21,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/plugin-sdk/src/dom.ts\n\nThe issue: document.querySelector() throws DOMException when given an invalid CSS selector string. Currently, waitForSelector (line 37), waitForSelectorRemoval (line 78), querySelectorAll (line 112), getTextContent (line 120), and observeDOM (line 135) all call querySelector/querySelectorAll without catching DOMException.\n\nFor waitForSelector and waitForSelectorRemoval: the querySelector call is inside a Promise constructor, so the DOMException will reject the promise — but the error message is the browser's cryptic DOMException rather than a clear SDK message. Wrap the initial querySelector in try-catch and re-throw with a descriptive message like: `waitForSelector: invalid CSS selector \"${selector}\": ${error.message}`.\n\nFor querySelectorAll: wrap in try-catch, return empty array on DOMException (consistent with 'no match' behavior).\n\nFor getTextContent: wrap in try-catch, return null on DOMException (consistent with 'no match' behavior).\n\nFor observeDOM: the existing error on line 137 already throws for 'no element found'. Add a try-catch around querySelector to produce a similar message for invalid selectors: `observeDOM: invalid CSS selector \"${selector}\": ${error.message}`.\n\nAlso add a test in dom.test.ts for needsAttributeObservation — use a class selector like waitForSelector('.my-class', { timeout: 100 }) to verify the observer gets attributes: true. This is a separate test gap but belongs in the same file.\n\nTest file: platform/plugin-sdk/src/dom.test.ts"
@@ -43,7 +43,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/plugin-sdk/src/page-state.ts, line 17\n\nCurrent code:\n```\nif (current === null || current === undefined || typeof current !== 'object') return undefined;\n```\n\nThis check rejects functions because `typeof function === 'function'`, not 'object'. But functions in JS are objects that can have properties (e.g., `Array.isArray`, `Object.keys`, or framework singletons like `window.React.createElement`).\n\nFix: change the condition to also allow functions:\n```\nif (current == null || (typeof current !== 'object' && typeof current !== 'function')) return undefined;\n```\n\nNote: `current == null` covers both null and undefined in one check.\n\nTest file: platform/plugin-sdk/src/page-state.test.ts\nAdd tests:\n1. Set globalThis.__testGlobal to a function with a property: `const fn = () => {}; fn.version = '1.0'; globalThis.__testGlobal = fn;` then verify `getPageGlobal('__testGlobal.version')` returns '1.0'.\n2. Verify `getPageGlobal('Array.isArray')` returns a function (since Array is a function with isArray property)."
@@ -66,7 +66,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/plugin-sdk/src/log.ts, lines 58-73\n\nThe issue: safeSerializeArg has top-level handling for DOM nodes (line 46), functions (line 41), symbols (line 42), and bigints (line 43). But the JSON.stringify replacer function (lines 60-68) only handles functions (line 65), bigints (line 66), and symbols (line 67) — it does NOT handle DOM nodes. When an object's property value is a DOM node, the replacer tries to stringify it as a plain object, which recursively traverses the entire DOM subtree before either producing a massive string or hitting a circular reference or error.\n\nFix: Add DOM node detection in the replacer function, between the circular-reference check and the function check:\n```typescript\nconst json = JSON.stringify(value, (_key, v: unknown) => {\n  if (typeof v === 'object' && v !== null) {\n    if (seen.has(v)) return '[Circular]';\n    seen.add(v);\n    // DOM node check — must come after circular ref check\n    if (typeof (v as { nodeType?: unknown }).nodeType === 'number') {\n      const node = v as { nodeName?: string; id?: string; className?: string };\n      const className = node.className ? `.${node.className.split(' ')[0] ?? ''}` : '';\n      return `[${node.nodeName ?? 'Node'}${node.id ? `#${node.id}` : ''}${className}]`;\n    }\n  }\n  if (typeof v === 'function') return `[Function: ${(v as { name?: string }).name || 'anonymous'}]`;\n  if (typeof v === 'bigint') return `[BigInt: ${v.toString()}]`;\n  if (typeof v === 'symbol') return `[Symbol: ${v.description ?? ''}]`;\n  return v;\n});\n```\n\nTest file: platform/plugin-sdk/src/log.test.ts\nThe test needs a mock DOM node object — create it as a plain object: `{ nodeType: 1, nodeName: 'DIV', id: 'test', className: 'foo bar' }`. This avoids needing happy-dom in log.test.ts. Test both top-level DOM node args (already implicitly covered) and DOM nodes nested inside objects (the new path).\n\nAlso add tests for objects containing functions and symbols as property values — these exercise the JSON replacer paths at lines 65 and 67 which currently have no dedicated test."
@@ -90,7 +90,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/plugin-sdk/src/timing.ts\n\n1. Add `signal?: AbortSignal` to the WaitUntilOptions interface (line 19-23).\n\n2. In the waitUntil function (line 89), check `signal?.aborted` early and reject immediately:\n```typescript\nif (signal?.aborted) {\n  return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error('waitUntil: aborted'));\n}\n```\n\n3. Inside the promise constructor, add an abort listener that calls cleanup() and reject():\n```typescript\nconst onAbort = () => {\n  if (isSettled()) return;\n  cleanup();\n  reject(signal.reason instanceof Error ? signal.reason : new Error('waitUntil: aborted'));\n};\nif (signal) {\n  signal.addEventListener('abort', onAbort, { once: true });\n}\n```\n\n4. Update the cleanup function to also remove the abort listener:\n```typescript\nconst cleanup = () => {\n  settled = true;\n  clearTimeout(timer);\n  clearTimeout(poller);\n  if (signal) signal.removeEventListener('abort', onAbort);\n};\n```\n\nNote: the onAbort function must be defined before cleanup references it, or use a variable. Structure the code so onAbort is defined first, then cleanup references it.\n\nAlso export the updated WaitUntilOptions type — it's already exported in index.ts.\n\nTest file: platform/plugin-sdk/src/timing.test.ts\nAdd tests:\n1. `waitUntil(() => false, { signal: AbortSignal.abort(new Error('cancelled')) })` rejects immediately with 'cancelled'\n2. Create a controller, start waitUntil with a slow predicate, abort the controller mid-poll, verify it rejects with the abort reason and doesn't keep polling\n3. Also add a test for retry's abortableSleep: start retry with a slow delay, abort during the delay between retries, verify it rejects promptly (this covers the existing abortableSleep code path in timing.ts lines 44-61 which has no dedicated test)"
@@ -110,7 +110,7 @@
         "npm run test passes"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/plugin-sdk/src/fetch.test.ts\n\nThe fetchJSONImpl function (platform/plugin-sdk/src/fetch.ts, line 95) has a branch:\n```typescript\nif (response.status === 204 || response.headers.get('content-length') === '0') {\n```\n\nThe 204 case is tested (test at line 432: 'returns undefined for 204 response when no schema is provided'). But the content-length: 0 case on a 200 response is not tested.\n\nAdd a new endpoint to the test HTTP server:\n```typescript\nif (url.pathname === '/empty-200') {\n  res.writeHead(200, { 'Content-Length': '0' });\n  res.end();\n  return;\n}\n```\n\nThen add two tests in the fetchJSON describe block:\n1. 'returns undefined for 200 response with content-length 0 when no schema is provided' — `const data = await fetchJSON(baseUrl + '/empty-200'); expect(data).toBeUndefined();`\n2. 'throws ToolError.validation for 200 response with content-length 0 when schema is provided' — same as the 204 schema test but hitting /empty-200"

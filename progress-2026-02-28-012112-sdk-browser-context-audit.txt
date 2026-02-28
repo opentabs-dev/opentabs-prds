@@ -1,0 +1,79 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-012112-sdk-browser-context-audit~running.json
+Started: Sat Feb 28 09:21:37 UTC 2026
+---
+
+## Codebase Patterns
+- Plugin SDK tests use happy-dom via `GlobalWindow` for DOM mocking; set `globalThis.document` and `globalThis.MutationObserver` in beforeEach.
+- Invalid CSS selector tests use `'[invalid'` (unclosed bracket) — triggers DOMException in both browsers and happy-dom.
+- The pre-commit hook (lint-staged) runs prettier and eslint --fix automatically on staged files.
+- All five platform quality checks (`build`, `type-check`, `lint`, `knip`, `test`) must exit 0. No E2E checkpoint needed for SDK-only changes.
+
+## [2026-02-28] - US-001
+- Wrapped querySelector/querySelectorAll calls in try-catch in all five DOM utilities in `platform/plugin-sdk/src/dom.ts`
+- `waitForSelector` and `waitForSelectorRemoval`: reject with descriptive 'invalid CSS selector' error message on DOMException
+- `querySelectorAll`: returns empty array on DOMException (consistent with 'no match' behavior)
+- `getTextContent`: returns null on DOMException (consistent with 'no match' behavior)
+- `observeDOM`: throws descriptive 'invalid CSS selector' error on DOMException
+- Added 5 invalid-selector unit tests (one per utility) in `platform/plugin-sdk/src/dom.test.ts`
+- Added attribute-observation test verifying class selectors (containing '.') cause `attributes: true` in the MutationObserver
+- **Learnings for future iterations:**
+  - The initial `querySelector` inside Promise constructors can throw synchronously — must try-catch before setting up timers/observers
+  - MutationObserver callbacks for valid selectors don't need try-catch because selector validity was already confirmed by the initial call
+  - `needsAttributeObservation` is private (unexported), so test it indirectly by observing that class attribute changes trigger promise resolution
+---
+
+## [2026-02-28] - US-002
+- Changed type guard in `getPageGlobal` (platform/plugin-sdk/src/page-state.ts, line 17) to allow function-type intermediates
+- Old: `typeof current !== 'object'` — rejected functions since `typeof fn === 'function'`
+- New: `typeof current !== 'object' && typeof current !== 'function'` — allows traversal of callable objects with properties
+- Added two unit tests in `platform/plugin-sdk/src/page-state.test.ts`:
+  1. Function with a `.version` property as intermediate — verifies `getPageGlobal('__testGlobal.version')` returns `'1.0'`
+  2. Built-in `Array.isArray` — verifies `getPageGlobal('Array.isArray')` returns the function itself
+- **Learnings for future iterations:**
+  - The `eqeqeq` ESLint rule requires `===` — can't use `== null` shorthand; must write `=== null || === undefined` explicitly
+  - Prettier (printWidth: 120) may reformat multi-line conditions back to single-line if they fit within 120 chars; let it auto-format via `npx prettier --write`
+  - All existing tests continued passing — no regression on primitive/null/undefined guard behavior
+---
+
+## [2026-02-28] - US-003
+- Added DOM node detection inside the JSON replacer in `safeSerializeArg` (`platform/plugin-sdk/src/log.ts`, lines 63-67)
+- The replacer now checks `nodeType` after the circular-reference check, before the function/bigint/symbol checks
+- DOM nodes nested in objects now serialize as `[nodeName#id.firstClass]` strings, preventing recursive DOM traversal
+- Added 3 new tests in `platform/plugin-sdk/src/log.test.ts`:
+  1. DOM node nested in object (`{ el: mockDomNode, name: 'hello' }`) → `el` becomes `'[DIV#test.foo]'`
+  2. Function nested in object (`{ fn: myFunc }`) → `fn` becomes `'[Function: myFunc]'`
+  3. Symbol nested in object (`{ sym: Symbol('x') }`) → `sym` becomes `'[Symbol: x]'`
+- **Learnings for future iterations:**
+  - `func-style` ESLint rule requires function expressions (arrow functions), not function declarations — use `const fn = () => {}` with `Object.defineProperty` for name if needed
+  - Mock DOM nodes in log tests use plain objects with `nodeType` — no need for happy-dom
+  - The JSON replacer's circular-reference tracking (`seen` WeakSet) adds objects before the DOM node check; DOM nodes get added to `seen` but then return early — this is correct
+---
+
+## [2026-02-28] - US-004
+- Added `signal?: AbortSignal` to `WaitUntilOptions` interface in `platform/plugin-sdk/src/timing.ts`
+- Added early-exit check before the Promise constructor: rejects immediately if signal is already aborted
+- Added `onAbort` event listener inside the Promise constructor (registered only when signal is provided)
+- Updated `cleanup` to call `signal?.removeEventListener('abort', onAbort)` — prevents listener leaks
+- `onAbort` uses `const reason: unknown = signal?.reason` to avoid `@typescript-eslint/no-unsafe-assignment` (AbortSignal.reason is typed as `any`)
+- Added 3 new tests in `platform/plugin-sdk/src/timing.test.ts`:
+  1. `waitUntil` with already-aborted signal rejects immediately with abort reason
+  2. `waitUntil` with signal fired during polling rejects before timeout, stops polling
+  3. `retry` abortableSleep: signal fired during inter-retry sleep delay rejects promptly
+- **Learnings for future iterations:**
+  - `AbortSignal.reason` is typed as `any` — always annotate as `unknown` before using: `const reason: unknown = signal?.reason`
+  - `onAbort` can safely reference `cleanup` (defined after it) because closures capture by reference; `cleanup` is defined before `onAbort` is ever called
+  - The non-null assertion `signal!` inside conditional code registered on signal events can be replaced with optional chaining `signal?.reason` + `unknown` annotation to avoid lint errors
+  - The existing `abortReason` helper in `retry` avoids the `any` issue because `instanceof Error` narrows `any` to `Error` before assignment — direct assignment of `any` is what triggers the rule
+---
+
+## [2026-02-28] - US-005
+- Added `/empty-200` endpoint to the test HTTP server in `platform/plugin-sdk/src/fetch.test.ts` — responds with `200` and `Content-Length: 0`, no body
+- Added two new tests in the `fetchJSON` describe block:
+  1. 'returns undefined for 200 response with content-length 0 when no schema is provided' — hits `/empty-200`, expects `undefined`
+  2. 'throws ToolError.validation for 200 response with content-length 0 when schema is provided' — hits `/empty-200` with a Zod schema, expects `VALIDATION_ERROR`
+- No production code changes — this was a test-only story covering the existing `content-length: 0` branch in `fetchJSONImpl` (line 95 of fetch.ts)
+- **Learnings for future iterations:**
+  - The `content-length: 0` branch in `fetchJSONImpl` shares the same logic path as the 204 branch — both return `undefined` (no schema) or run schema validation on `undefined` (with schema). Tests follow the same pattern as the 204 tests.
+  - The test HTTP server uses `res.writeHead(200, { 'Content-Length': '0' }); res.end();` — Node's HTTP server does NOT automatically set Content-Length when you call `res.end()` with no body, so it must be set explicitly in the header.
+---
