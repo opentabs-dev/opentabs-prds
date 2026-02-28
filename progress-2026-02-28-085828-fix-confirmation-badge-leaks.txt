@@ -1,0 +1,37 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-085828-fix-confirmation-badge-leaks~running.json
+Started: Sat Feb 28 16:58:56 UTC 2026
+---
+
+## Codebase Patterns
+- confirmation-badge.ts uses a `confirmationTimeouts` Map<string, ReturnType<typeof setTimeout>> to track pending confirmation background timeouts keyed by confirmation id
+- Chrome notification IDs use the pattern `opentabs-confirm-${id}` (prefixed); the confirmation id itself is the key in confirmationTimeouts
+- `clearConfirmationBadge(id?: string)` accepts an optional id; when provided it clears the Chrome notification via `chrome.notifications.clear('opentabs-confirm-<id>')`. `clearConfirmationBackgroundTimeout(id)` is the separate function that cancels the background timeout.
+- background-message-handlers.ts extracts id as a const before using it in both clearConfirmationBackgroundTimeout and clearConfirmationBadge to avoid duplicating the typeof check
+- The test file uses `vi.useFakeTimers()` in `beforeEach` and resets state via `clearAllConfirmationBadges()` + `mockClear()` on all mocks
+
+## [2026-02-28] - US-001
+- Implemented duplicate confirmation ID handling in `notifyConfirmationRequest`
+- Extracted `id` extraction before the count increment so we can check for duplicates
+- For a duplicate id: clear the existing timeout via `clearTimeout`, skip `pendingConfirmationCount++` and `updateConfirmationBadge()`, then store the new timeout
+- For a new id: increment count and update badge as before (existing behavior unchanged)
+- Added two new unit tests: one verifying count stays at 1 for duplicate ids, one verifying the old timeout does not fire after being replaced
+- Files changed: `platform/browser-extension/src/confirmation-badge.ts`, `platform/browser-extension/src/confirmation-badge.test.ts`
+- **Learnings for future iterations:**
+  - The existing test file already had Chrome API mocks set up correctly (including `mockNotificationsClear`) — no mock setup changes were needed
+  - The test structure uses top-level `await import()` for the module under test, which means module state persists across tests unless explicitly reset via `clearAllConfirmationBadges()` in `beforeEach`
+  - All 87 test files (2513 tests) passed with no pre-existing failures
+---
+
+## [2026-02-28] - US-002
+- Added `id?: string` parameter to `clearConfirmationBadge` — when provided, calls `chrome.notifications.clear('opentabs-confirm-<id>').catch(() => {})` to dismiss the notification
+- Updated background timeout callback in `notifyConfirmationRequest` to pass `id` to `clearConfirmationBadge(id)`
+- Updated `clearAllConfirmationBadges` to iterate `confirmationTimeouts.entries()` and call `chrome.notifications.clear` for each id before clearing the map
+- Updated `handleSpConfirmationResponse` and `handleSpConfirmationTimeout` in `background-message-handlers.ts` to extract id as a const and pass it to `clearConfirmationBadge`
+- Added 4 new unit tests: clears Chrome notification when id is provided, does not call clear when no id, background timeout auto-clear now also clears notification, clearAllConfirmationBadges clears all Chrome notifications
+- Files changed: `platform/browser-extension/src/confirmation-badge.ts`, `platform/browser-extension/src/confirmation-badge.test.ts`, `platform/browser-extension/src/background-message-handlers.ts`
+- **Learnings for future iterations:**
+  - The `mockNotificationsClear` mock was already set up in `confirmation-badge.test.ts` from US-001 — no additional mock setup was needed
+  - `background-message-handlers.test.ts` mocks `clearConfirmationBadge` entirely, so the signature change is invisible to those tests and they required no updates
+  - All 87 test files (2516 tests) passed after implementation
+---
