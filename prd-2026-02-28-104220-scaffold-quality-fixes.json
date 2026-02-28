@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix scaffolded plugin code to pass its own lint and format checks out of the box, improve non-interactive error messages, and fix npx create-opentabs-plugin 404 by publishing an unscoped wrapper package or updating docs. These are HIGH-severity frictions that break the first-time plugin developer experience.\n\nKnown LOW-severity issues (not addressed here):\n- localPlugins.add accepts nonexistent paths with only a dim warning (could be stricter but not a blocker)",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Scaffold generates code that passes lint and format checks",
+      "description": "As a plugin developer, I want the scaffolded code from `opentabs plugin create` to pass `npm run lint` and `npm run format:check` without any modifications, so that my first impression of the project is not broken code with 7 lint errors.",
+      "acceptanceCriteria": [
+        "The `generatePluginIndex` function in scaffold.ts produces single-quoted string literals for `name`, `description`, `displayName`, and `urlPatterns` fields (matching .prettierrc singleQuote:true)",
+        "The `generateExampleTool` function in scaffold.ts produces single-quoted string concatenation for `description` and the `handle` return value",
+        "The `generateExampleTool` function produces `async params =>` (no parens) instead of `async (params) =>` (matching .prettierrc arrowParens:avoid)",
+        "Running the scaffold in a temp dir, then `npm install && npm run lint` produces 0 errors",
+        "Running the scaffold in a temp dir, then `npm install && npm run format:check` reports all files use Prettier code style",
+        "The scaffold.test.ts tests still pass (if any cover generated content)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The root cause is in `platform/cli/src/scaffold.ts`.\n\n`generatePluginIndex` (line 342): Uses `JSON.stringify(args.name)` etc. which produces double-quoted strings. Fix: use a helper that wraps values in single quotes instead, e.g., `'${value.replace(/'/g, \"\\\\'\")}'` or simply use template literals with single quotes around values.\n\nSpecific lines:\n- Line 351: `readonly name = ${JSON.stringify(args.name)};` → should produce single-quoted\n- Line 353: `readonly description = ${JSON.stringify(desc)};` → should produce single-quoted\n- Line 354: `override readonly displayName = ${JSON.stringify(displayName)};` → should produce single-quoted\n- Line 355: `readonly urlPatterns = [${JSON.stringify(urlPattern)}];` → should produce single-quoted\n\n`generateExampleTool` (line 373):\n- Line 376: `const escaped = JSON.stringify(displayName);` → this produces double-quoted string. Need single-quoted.\n- Line 384: Uses `${escaped}` in template which produces double-quoted strings in the concatenation\n- Line 392: `handle: async (params) => {` → should be `handle: async params => {` (arrowParens: avoid)\n- Line 393: Same `${escaped}` issue\n\nA clean approach: create a helper `singleQuote(value: string): string` that returns `'${value}'` (with proper escaping for single quotes in the value). Use it instead of JSON.stringify for string literal generation.\n\nAlso verify the scaffold test at `platform/cli/src/scaffold.test.ts` and the create-plugin test at `platform/create-plugin/src/index.test.ts` — they may need to be updated if they assert on the generated content."
+    },
+    {
+      "id": "US-002",
+      "title": "Improve non-interactive scaffold error message with full flag syntax",
+      "description": "As a plugin developer running in Docker/CI (non-TTY), I want the error message from `opentabs plugin create` to show me the exact command with flags I need to run, so that I can fix the issue without guessing.",
+      "acceptanceCriteria": [
+        "When running `opentabs plugin create` in a non-TTY context without required args, the error message includes an example command with all required flags: `opentabs plugin create <name> --domain <domain>`",
+        "The error no longer says 'run interactively' which is unhelpful in a non-TTY context",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The error is thrown in `platform/cli/src/scaffold.ts` at line 421-425 in the `promptForMissingArgs` function:\n\n```typescript\nif (!process.stdin.isTTY) {\n  const missing = [!name && 'name', !domain && '--domain'].filter(Boolean);\n  throw new ScaffoldError(\n    `Missing required arguments: ${missing.join(', ')}. Provide them as flags or run interactively.`,\n  );\n}\n```\n\nChange to something like:\n```typescript\nthrow new ScaffoldError(\n  `Missing required arguments: ${missing.join(', ')}.\\n\\nUsage: opentabs plugin create <name> --domain <domain>\\nExample: opentabs plugin create my-app --domain .example.com --display \"My App\"`,\n);\n```\n\nAlso check if the `create-opentabs-plugin` binary path (`platform/create-plugin/src/index.ts`) shows the same error — it uses the same scaffold function so it should get the fix automatically."
+    }
+  ]
+}
