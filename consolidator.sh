@@ -62,6 +62,11 @@ if [ -z "$CODE_REPO" ]; then
   exit 1
 fi
 
+if ! [[ "$POLL_INTERVAL" =~ ^[0-9]+$ ]] || [ "$POLL_INTERVAL" -lt 1 ]; then
+  echo "Error: --poll must be a positive integer (got '$POLL_INTERVAL')."
+  exit 1
+fi
+
 # --- Setup ---
 
 RALPH_TZ="${RALPH_TZ:-America/Los_Angeles}"
@@ -71,6 +76,7 @@ LOG_DIR="$CONSOLIDATOR_BASE/logs"
 CONFLICTS_DIR="$CONSOLIDATOR_BASE/conflicts"
 
 mkdir -p "$CONSOLIDATOR_BASE" "$LOG_DIR" "$CONFLICTS_DIR"
+chmod 700 "$CONSOLIDATOR_BASE" 2>/dev/null || true
 
 # --- Date-Rotated Logging ---
 LOG_DATE=$(TZ="$RALPH_TZ" date '+%Y-%m-%d')
@@ -101,7 +107,7 @@ if [ -f "$PIDFILE" ]; then
   rm -f "$PIDFILE"
 fi
 
-echo $$ > "$PIDFILE"
+(umask 077 && echo $$ > "$PIDFILE")
 
 # Colors
 RED='\033[31m'
@@ -353,9 +359,9 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
     # stages with git add, and verifies the build compiles.
     # Timeout: 10 minutes. Most conflicts resolve in 2-5 minutes.
     local ai_result_file
-    ai_result_file=$(mktemp)
+    ai_result_file=$(mktemp) && chmod 600 "$ai_result_file"
     local ai_stderr_file
-    ai_stderr_file=$(mktemp)
+    ai_stderr_file=$(mktemp) && chmod 600 "$ai_stderr_file"
     local ai_ok=false
     local ai_exit=0
 

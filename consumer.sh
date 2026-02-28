@@ -94,6 +94,11 @@ if ! [[ "$MAX_WORKERS" =~ ^[0-9]+$ ]] || [ "$MAX_WORKERS" -lt 1 ]; then
   exit 1
 fi
 
+if ! [[ "$POLL_INTERVAL" =~ ^[0-9]+$ ]] || [ "$POLL_INTERVAL" -lt 1 ]; then
+  echo "Error: --poll must be a positive integer (got '$POLL_INTERVAL')."
+  exit 1
+fi
+
 # --- Setup ---
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -110,6 +115,7 @@ LOG_DIR="$CONSUMER_BASE/logs"
 CONFIG_FILE="$CONSUMER_BASE/config"
 
 mkdir -p "$CONSUMER_BASE" "$WORKTREE_BASE" "$LOG_DIR"
+chmod 700 "$CONSUMER_BASE" 2>/dev/null || true
 
 # --- Date-Rotated Logging ---
 LOG_DATE=$(TZ="$RALPH_TZ" date '+%Y-%m-%d')
@@ -149,7 +155,7 @@ _kill_stale_consumers() {
 
 _kill_stale_consumers
 rm -f "$PIDFILE"
-echo $$ > "$PIDFILE"
+(umask 077 && echo $$ > "$PIDFILE")
 
 # Colors
 RED='\033[31m'
@@ -297,11 +303,12 @@ SLOT_HIGH_WATER=$((MAX_WORKERS - 1))
 # Write current config so it can be edited and reloaded via SIGHUP.
 
 _write_config() {
-  cat > "$CONFIG_FILE" <<EOF
+  (umask 077 && cat > "$CONFIG_FILE" <<EOF
 # Ralph consumer config — edit and send SIGHUP to reload.
 #   kill -HUP \$(cat ~/.ralph-consumer/.consumer.pid)
 workers=$MAX_WORKERS
 EOF
+  )
 }
 
 _write_config
@@ -903,7 +910,11 @@ cleanup() {
         git -C "$wt" commit -m "wip: auto-save on consumer shutdown [worker=$WORKER_ID]" --no-verify --quiet 2>/dev/null || true
       fi
 
-      # Push branch to remote (with or without new commit — ensures all work is saved)
+      # Push branch to remote (with or without new commit — ensures all work is saved).
+      # --no-verify: skip hooks intentionally during emergency shutdown to avoid blocking.
+      # Fallback from --force-with-lease to plain push: if the remote branch was updated
+      # by another process, force-with-lease fails. Plain push is acceptable because
+      # each ralph-* branch has a single writer (the worker that owns it).
       local commit_count
       commit_count=$(git -C "$wt" rev-list --count "origin/main..$br" 2>/dev/null || echo "0")
       if [ "$commit_count" -gt 0 ]; then
