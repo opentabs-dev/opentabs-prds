@@ -1,0 +1,113 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add HAR export and WebSocket frame capture tools to the browser tools suite, dramatically improving the platform's ability to reverse-engineer web services. HAR export converts captured network traffic into the standard HAR 1.2 format for sharing and analysis. WebSocket frame capture extends the existing network capture engine to record WebSocket message payloads (send/receive), making real-time API traffic visible.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add WebSocket frame capture to the network capture engine",
+      "description": "As an engineer reverse-engineering a web service, I want WebSocket frame-level capture (sent and received messages) so that I can see the payloads of real-time API communication, not just the initial connection handshake.",
+      "acceptanceCriteria": [
+        "network-capture.ts subscribes to Network.webSocketFrameSent and Network.webSocketFrameReceived CDP events",
+        "WebSocket frames are stored in a new per-tab wsFrames array on CaptureState with a configurable max (default 200)",
+        "Each captured frame includes: url (from webSocketCreated), direction ('sent' | 'received'), data (payload string), opcode, timestamp",
+        "Frames are associated with the WebSocket URL from the corresponding Network.webSocketCreated event via requestId",
+        "Binary frames (opcode 2) store a truncated base64 preview; text frames (opcode 1) store the payload directly",
+        "Frame payloads are truncated to MAX_BODY_LENGTH (102,400 chars) just like request bodies",
+        "The urlFilter parameter on startCapture also applies to WebSocket frame capture (filters by WS URL)",
+        "Cleanup on stopCapture and tab close includes clearing wsFrames",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Edit platform/browser-extension/src/network-capture.ts. Add a WsFrame interface: { url: string; direction: 'sent' | 'received'; data: string; opcode: number; timestamp: number }. Add wsFrames: WsFrame[] and maxWsFrames: number to CaptureState (lines 73-82). Add wsFramesByUrl: Map<string, string> to map requestId -> url from webSocketCreated events. In the chrome.debugger.onEvent listener (line 159), add handlers for Network.webSocketFrameSent (params: { requestId, response: { payloadData, opcode } }) and Network.webSocketFrameReceived (same shape). Look up the WS URL via wsFramesByUrl map. Also update the existing Network.webSocketCreated handler (line 280) to store requestId -> url in the map. Update startCapture to accept maxWsFrames param (default 200). Update stopCapture and the cleanup listeners. Export a getWsFrames(tabId, clear?) function. Also update platform/browser-extension/src/browser-commands/network-commands.ts to add a handler for getting WS frames, but that will be wired up in the next story."
+    },
+    {
+      "id": "US-002",
+      "title": "Add browser_get_websocket_frames MCP tool",
+      "description": "As an engineer reverse-engineering a web service, I want an MCP tool to retrieve captured WebSocket frames so that I can inspect real-time API message payloads through the MCP protocol.",
+      "acceptanceCriteria": [
+        "New file platform/mcp-server/src/browser-tools/get-websocket-frames.ts defines browser_get_websocket_frames tool",
+        "Tool accepts tabId (required) and clear (optional boolean, default false) parameters",
+        "Tool dispatches to extension via browser.getWebSocketFrames method",
+        "Tool description explains it requires browser_enable_network_capture to be active",
+        "Tool has a SECURITY warning matching the pattern of other network tools",
+        "New handler handleBrowserGetWebSocketFrames added to network-commands.ts in the extension",
+        "Handler calls getWsFrames() from network-capture.ts and returns { frames: [...] }",
+        "New method browser.getWebSocketFrames registered in message-router.ts dispatch table",
+        "browser_get_websocket_frames added to BROWSER_TOOL_NAMES in browser-tool-names.ts",
+        "Tool added to browserTools array in browser-tools/index.ts",
+        "Tool tier set to 'interact' in permissions.ts TOOL_TIERS",
+        "enable_network_capture tool description updated to mention WebSocket frame capture",
+        "maxWsFrames parameter added to browser_enable_network_capture input schema",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Follow the exact pattern of browser-tools/get-network-requests.ts for the new tool definition. Use defineBrowserTool from './definition.js'. Zod schema: z.object({ tabId: z.number().int().positive(), clear: z.boolean().optional() }). Handler dispatches via dispatchToExtension(state, 'browser.getWebSocketFrames', { tabId, ...(clear ? { clear } : {}) }). Add the tool to the barrel in browser-tools/index.ts (import + array entry). Add 'browser_get_websocket_frames' to BROWSER_TOOL_NAMES array in platform/mcp-server/src/browser-tool-names.ts. Add browser_get_websocket_frames: 'interact' to TOOL_TIERS in permissions.ts. In the extension: add handleBrowserGetWebSocketFrames to browser-commands/network-commands.ts following the exact pattern of handleBrowserGetNetworkRequests. Add 'browser.getWebSocketFrames': wrapSync(handleBrowserGetWebSocketFrames) to the methodHandlers in message-router.ts. Also update enable-network-capture.ts to add maxWsFrames to its Zod input schema (z.number().int().positive().optional()) and pass it through to the extension dispatch. Update the enable handler in network-commands.ts to read maxWsFrames from params."
+    },
+    {
+      "id": "US-003",
+      "title": "Add browser_export_har MCP tool for HAR 1.2 export",
+      "description": "As an engineer reverse-engineering a web service, I want to export captured network traffic as a HAR 1.2 JSON file so that I can analyze it in standard tools like Chrome DevTools, Charles Proxy, Fiddler, or share it with teammates.",
+      "acceptanceCriteria": [
+        "New file platform/mcp-server/src/browser-tools/export-har.ts defines browser_export_har tool",
+        "Tool accepts tabId (required) and clear (optional boolean, default false) parameters",
+        "Tool fetches captured requests via browser.getNetworkRequests dispatch, then converts to HAR 1.2 format server-side",
+        "HAR output conforms to HAR 1.2 spec: { log: { version: '1.2', creator: { name, version }, entries: [...] } }",
+        "Each entry includes: startedDateTime (ISO 8601), time (0, since detailed timing unavailable), request: { method, url, httpVersion, headers, queryString, bodySize, postData? }, response: { status, statusText, httpVersion, headers, content: { size, mimeType, text? }, bodySize }, cache: {}, timings: { send: -1, wait: -1, receive: -1 }",
+        "Headers are converted from Record<string,string> to HAR array format [{ name, value }]",
+        "Query string parameters are parsed from the URL and included in request.queryString",
+        "Request body (requestBody) is included as postData.text with mimeType from Content-Type header",
+        "Response body (responseBody) is included as content.text",
+        "Sensitive headers remain redacted (they come from getNetworkRequests which already scrubs them)",
+        "Tool returns the HAR JSON as a text content block so MCP clients can save it to a file",
+        "browser_export_har added to BROWSER_TOOL_NAMES in browser-tool-names.ts",
+        "Tool added to browserTools array in browser-tools/index.ts",
+        "Tool tier set to 'interact' in permissions.ts TOOL_TIERS",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The HAR conversion is done server-side in the MCP server, not in the extension. The handler calls dispatchToExtension to get raw captured requests (same as browser_get_network_requests), then converts them to HAR format. This avoids adding HAR-specific code to the extension. The tool should use defineBrowserTool from './definition.js'. For HAR format details, see http://www.softwareishard.com/blog/har-12-spec/. Key implementation: the handler first dispatches 'browser.getNetworkRequests' to get { requests }, then maps each CapturedRequest to a HAR entry. Since CapturedRequest only has a timestamp (epoch ms), convert it to ISO 8601 for startedDateTime. The tool should return the HAR JSON stringified (pretty-printed with 2-space indent) as text content. Use the pattern from other browser tools: define with defineBrowserTool, add to index.ts barrel, add to browser-tool-names.ts, add to permissions.ts TOOL_TIERS as 'interact'. The response shape should be { content: [{ type: 'text', text: harJsonString }] } — look at how other tools return text results in mcp-tool-dispatch.ts to match the pattern (the handler returns the result object and mcp-tool-dispatch wraps it). Actually, the handler should return the raw object and let the dispatch pipeline handle it. Return { har: harJsonString } and the dispatch pipeline will wrap it. Also consider that the HAR should include the WebSocket frames if available — add an optional includeWebSocketFrames boolean parameter."
+    },
+    {
+      "id": "US-004",
+      "title": "Update analyze-site detection modules to use WebSocket frame data",
+      "description": "As an engineer analyzing a web service, I want plugin_analyze_site to include WebSocket frame samples in its analysis so that the API detection can provide richer intelligence about real-time protocols (e.g., detecting GraphQL subscriptions, Socket.IO message formats, or custom binary protocols).",
+      "acceptanceCriteria": [
+        "detect-apis.ts receives WebSocket frames in its input and includes frame samples in WebSocket API detections",
+        "When WebSocket frames are available, the detection includes up to 5 sample frame payloads (truncated to 500 chars each) in a new wsFrameSamples field on the API detection result",
+        "analyze-site.ts fetches WebSocket frames via browser_get_websocket_frames after the wait period and passes them to detect-apis",
+        "The analyze-site tool description updated to mention it captures WebSocket frame content",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "The analyze-site orchestrator is in platform/mcp-server/src/browser-tools/analyze-site.ts (line 17). It already calls browser_enable_network_capture and browser_get_network_requests during its analysis flow. After the wait period and before calling detect-apis, add a call to dispatch browser.getWebSocketFrames to get captured WS frames. Pass the frames to detectApis() in detect-apis.ts. In detect-apis.ts, when classifying WebSocket connections (look for existing WebSocket detection logic), add the frame samples to the result. The frame samples should be the first 5 unique text frames (direction: 'received'), truncated to 500 chars each. This gives the AI agent enough context to understand the WS protocol without overwhelming the output. Read platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts to understand the current detection structure before making changes."
+    }
+  ]
+}
