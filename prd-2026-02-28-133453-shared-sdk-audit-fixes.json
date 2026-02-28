@@ -1,0 +1,54 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix validation gaps in shared URL pattern validation and add size limits to plugin SDK log serialization.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Reject wildcard-host URL patterns like https://*/*",
+      "description": "As a platform operator, I want overly broad URL patterns with wildcard hosts to be rejected so that plugins cannot accidentally inject adapters into every website.",
+      "acceptanceCriteria": [
+        "validateUrlPattern rejects 'https://*/*' with a clear error message about the host being too broad",
+        "validateUrlPattern rejects 'http://*/*' with the same error",
+        "validateUrlPattern still accepts 'https://*/api' — a wildcard host with a restrictive path is allowed (existing test at line 189)",
+        "Wait — re-check: 'https://*/api' currently passes. The fix should reject host='*' entirely when the path is also a wildcard (/*). Actually, host='*' is inherently too broad regardless of path. Reject any pattern where host is exactly '*'.",
+        "validateUrlPattern rejects any pattern where the host component is exactly '*' (bare wildcard host)",
+        "Existing patterns like '*://*.example.com/*' (wildcard subdomain) still pass",
+        "Existing patterns like '*://example.com/*' (specific domain) still pass",
+        "Unit tests in platform/shared/src/validation.test.ts cover the new rejection cases",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/shared/src/index.ts, lines 424-425. The condition `host !== '*'` on line 425 allows bare wildcard hosts through. A pattern like 'https://*/*' matches every HTTPS page — this is as broad as the already-rejected '*://*/*'. Fix: add a check after line 419 (after the bare TLD wildcard check) that rejects host === '*'. Something like:\n\nif (host === '*') {\n  return `URL pattern \"${pattern}\" is too broad — \"*\" matches all domains. Use a specific domain or wildcard subdomain (e.g., *.example.com)`;\n}\n\nThen remove `host !== '*' &&` from the validation condition on line 425 since it's now handled above.\n\nAlso update the test at platform/shared/src/validation.test.ts line 189 — the test currently asserts 'https://*/api' is valid. After this fix, it should be rejected. Add new test cases for 'https://*/*', 'http://*/*', and '*://*/path' to verify they are all rejected.\n\nNote: The IP validation allowing octets > 255 (line 427) is a very low-severity issue — do not fix it in this story to keep the change focused."
+    },
+    {
+      "id": "US-002",
+      "title": "Add size limit to log argument serialization",
+      "description": "As a platform operator, I want log entry serialization to be bounded so that a single log call with a huge object does not produce a multi-megabyte message over WebSocket.",
+      "acceptanceCriteria": [
+        "safeSerializeArg truncates JSON-serialized output to a maximum size (e.g., 64KB or similar reasonable limit)",
+        "When truncation occurs, the output includes a marker indicating it was truncated (e.g., appending '...[truncated]')",
+        "Small objects (under the limit) are serialized unchanged",
+        "The MAX_STRING_LENGTH constant (4096) for individual string arguments is preserved",
+        "The MAX_DATA_LENGTH constant (10) for top-level argument count is preserved",
+        "Unit test verifies that a large nested object is truncated to within the size limit",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/log.ts, lines 82-103 (safeSerializeArg function, JSON fallback branch). The JSON.stringify at line 85 has no size limit. After the JSON round-trip at line 100, check the stringified length. If it exceeds a limit (suggest MAX_SERIALIZED_SIZE = 65536 or 64 * 1024), return a truncated version. For example:\n\nconst json = JSON.stringify(value, replacer);\nif (json.length > MAX_SERIALIZED_SIZE) {\n  return json.slice(0, MAX_SERIALIZED_SIZE) + '...[truncated]';\n}\nreturn JSON.parse(json);\n\nActually, since the function returns `unknown` (parsed JSON), not a string, you need to handle this differently. The simplest approach: if json.length > MAX_SERIALIZED_SIZE, return the string `[Object truncated: ${json.length} chars]` instead of the parsed object. This avoids parsing a huge string just to truncate it.\n\nAdd test in platform/plugin-sdk/src/log.test.ts (create if needed, or find existing tests)."
+    }
+  ]
+}

@@ -1,0 +1,128 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource leaks, and missing guards found during a systematic audit of the MCP server backend code.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Clear activeNetworkCaptures and tabMapping on extension disconnect",
+      "description": "As a platform operator, I want stale state to be cleaned up when the extension disconnects so that the server does not report phantom network captures or stale tab states after reconnection.",
+      "acceptanceCriteria": [
+        "createHandleWsClose clears state.activeNetworkCaptures (call .clear()) when the disconnecting ws matches state.extensionWs",
+        "createHandleWsClose clears state.tabMapping (call .clear()) when the disconnecting ws matches state.extensionWs",
+        "Existing behavior preserved: pendingDispatches and pendingConfirmations are still rejected on disconnect",
+        "Unit test in http-routes.test.ts verifies activeNetworkCaptures and tabMapping are cleared on matching ws close",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/http-routes.ts, lines 593-614 (createHandleWsClose function). Currently only rejects pendingDispatches and pendingConfirmations. Add state.activeNetworkCaptures.clear() and state.tabMapping.clear() inside the `if (state.extensionWs === ws)` block, after the existing cleanup. The activeNetworkCaptures set tracks tab IDs with active debugger sessions — if the extension disconnects, those sessions are gone. The tabMapping tracks plugin-to-tab state — stale entries cause the server to dispatch to tabs that may no longer exist. Add a test case in platform/mcp-server/src/http-routes.test.ts (look for existing test 'matching ws rejects all pending dispatches') that populates activeNetworkCaptures and tabMapping before calling wsClose, then asserts both are empty."
+    },
+    {
+      "id": "US-002",
+      "title": "Log post-startup HTTP server errors instead of silently swallowing them",
+      "description": "As a platform operator, I want HTTP server errors that occur after startup to be logged so that I can diagnose issues like file descriptor exhaustion or socket errors.",
+      "acceptanceCriteria": [
+        "httpServer.on('error') handler logs the error via log.error (or console.error) in addition to calling rejectServer",
+        "The log message includes the error code and message",
+        "Pre-startup errors still reject the server promise as before",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/server-node.ts, lines 326-328. The error handler only calls rejectServer(err), which is a no-op after the server promise has resolved. Add a log statement (import log from ./logger.js) so post-startup errors are at least visible in server logs. The fix is simply adding a log line before the rejectServer call — e.g., log.error('HTTP server error:', err.code, err.message). The rejectServer call is harmless (no-op after resolution) so keep it for the pre-startup case."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix Vue version lost in analyze-site framework deduplication",
+      "description": "As a plugin developer using analyze-site, I want Vue version information to be preserved so that the site analysis report shows the actual Vue version instead of undefined.",
+      "acceptanceCriteria": [
+        "FRAMEWORK_PROBE_SCRIPT deduplication prefers entries with a version over entries without a version for the same framework name",
+        "When both window.__VUE__ and __VUE_DEVTOOLS_GLOBAL_HOOK__ are present, the version from the devtools hook is preserved in the output",
+        "Deduplication still removes true duplicates (same name, same version)",
+        "Unit test in detect-framework.test.ts (or analyze-site test) verifies that a probes array with [{name:'vue',version:undefined},{name:'vue',version:'3.4.1'}] deduplicates to [{name:'vue',version:'3.4.1'}]",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts, lines 203-212. The comment says 'keep first occurrence with version' but the code just keeps the first occurrence regardless. The dedup loop should prefer an entry with a defined version. Fix: change the dedup logic so that if a name is already seen but the existing entry has no version and the new entry does, replace it. For example: track entries in a Map<string, probe> instead of a Set, and when a duplicate name is found with a version where the existing one has none, overwrite it. The FRAMEWORK_PROBE_SCRIPT is a string template that runs in the browser — keep it concise. The Vue probe pushes versionless first (line 162) then versioned (line 167), so the dedup must handle this order."
+    },
+    {
+      "id": "US-004",
+      "title": "Deep-freeze EMPTY_REGISTRY to prevent accidental mutation",
+      "description": "As a platform developer, I want the EMPTY_REGISTRY sentinel to be truly immutable so that accidental .set() calls on its maps produce runtime errors instead of silently corrupting shared state.",
+      "acceptanceCriteria": [
+        "EMPTY_REGISTRY.plugins, .toolLookup, .resourceLookup, .promptLookup maps are all frozen (Object.freeze)",
+        "EMPTY_REGISTRY.failures array is frozen",
+        "Attempting to call .set() on any of the frozen maps throws a TypeError",
+        "Existing code that replaces state.registry with a new registry still works (the new registry's maps are NOT frozen)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/state.ts, lines 329-335. Object.freeze is shallow — the Maps and array inside EMPTY_REGISTRY are still mutable. Fix: freeze each inner collection before freezing the outer object. E.g.:\n\nconst plugins = new Map(); Object.freeze(plugins);\n... repeat for toolLookup, resourceLookup, promptLookup, failures ...\nexport const EMPTY_REGISTRY: PluginRegistry = Object.freeze({ plugins, toolLookup, ... });\n\nNote: Object.freeze on a Map prevents adding properties to the Map object but does NOT prevent .set() in all engines. To truly prevent mutation, you may need to override .set/.delete to throw, or simply document that the freeze is for the outer shape. Check if Map.prototype.set respects Object.freeze in Node.js 22 — if it does, freezing alone is sufficient. If not, wrap the maps in a Proxy or use Object.defineProperty to make them non-writable on the parent object (they already are via Object.freeze on the parent)."
+    },
+    {
+      "id": "US-005",
+      "title": "Add try-catch around deleteExecFile in execute-script finally block",
+      "description": "As a platform developer, I want consistent error handling for temp file cleanup so that a deleteExecFile failure does not swallow the original dispatch error.",
+      "acceptanceCriteria": [
+        "execute-script.ts finally block wraps deleteExecFile call in try-catch, matching the pattern used in analyze-site/index.ts",
+        "If deleteExecFile throws, the error is logged but does not replace the original dispatch result or error",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/execute-script.ts, lines 49-51. Currently: `finally { await deleteExecFile(filename); }`. Change to: `finally { try { await deleteExecFile(filename); } catch { /* best-effort cleanup */ } }`. Compare with platform/mcp-server/src/browser-tools/analyze-site/index.ts lines 83-87 which already uses this pattern. The deleteExecFile function in adapter-files.ts currently has its own try-catch, but the execute-script caller should not rely on that implementation detail."
+    },
+    {
+      "id": "US-006",
+      "title": "Remove unhandled plugin.uninstall response and misleading removeLocalPlugin error",
+      "description": "As a platform developer, I want clean protocol semantics so that fire-and-forget messages use notifications (no id) and config write failures surface the real error message.",
+      "acceptanceCriteria": [
+        "handlePluginRemove sends plugin.uninstall as a JSON-RPC notification (no id field) instead of a request",
+        "removeLocalPlugin propagates config write errors to the caller instead of silently returning removed=false",
+        "If atomicWrite fails during removeLocalPlugin, the error message reaches the MCP client (not 'Plugin not found')",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two fixes in this story:\n\n1. File: platform/mcp-server/src/extension-handlers.ts, lines 582-587. Change the plugin.uninstall message from a request (has id: getNextRequestId()) to a notification (no id field). The extension's response is never handled anyway. Remove the `id` property from the JSON-RPC object.\n\n2. File: platform/mcp-server/src/plugin-management.ts, lines 361-441. The .catch() on line 435 catches atomicWrite errors and logs them, but sets removed=false. The caller then returns 'Plugin not found in localPlugins config' which is misleading. Fix: re-throw the error from the catch block so it propagates to the caller (removePlugin), which already has a try-catch that sends proper error responses. Alternatively, set an error variable in the catch block and check it after awaiting the mutex."
+    }
+  ]
+}
