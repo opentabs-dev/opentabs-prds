@@ -1,0 +1,59 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-090051-e2e-remove-external-network~running.json
+Started: Sat Feb 28 17:01:21 UTC 2026
+---
+
+## Codebase Patterns
+- The e2e-test plugin's URL match pattern is `http://localhost/*` (defined in `plugins/e2e-test/src/index.ts:76`)
+- To get a non-matching URL from the test server, access it via `127.0.0.1` instead of `localhost` — the plugin pattern only matches `localhost`
+- The test server (`e2e/test-server.ts`) serves pages at `/`, `/interactive`, `/sdk-test`, `/post-test`, `/ws-test`, and now `/non-matching`
+- `TestServer` fixture (in `e2e/fixtures.ts`) exposes `url` (e.g., `http://localhost:PORT`), `port`, `control()`, and `controlGet()` methods
+- For non-matching URLs in tests, two approaches: `about:blank` for simple navigation tests, or `testServer.url.replace('localhost', '127.0.0.1') + '/non-matching'` for tests needing real page content (title, cookies, etc.)
+
+## 2026-02-28 - US-001
+- Added `/non-matching` endpoint to `e2e/test-server.ts` serving a minimal HTML page with title "Non-Matching Page"
+- Added `NON_MATCHING_HTML` constant and route handler
+- Files changed: `e2e/test-server.ts`
+- **Learnings for future iterations:**
+  - The e2e-test plugin URL pattern is `http://localhost/*` — any page on localhost matches regardless of path
+  - Accessing the same test server via `127.0.0.1` bypasses the match pattern since Chrome extension URL match patterns match exact hostnames
+  - `about:blank` is sufficient for tests that just need to navigate away from a matching URL (no page content needed)
+  - For browser_open_tab tests that need real HTML pages (title, cookies), use `testServer.url.replace('localhost', '127.0.0.1')` paths
+---
+
+## 2026-02-28 - US-002
+- Replaced `https://example.com` in `e2e/tool-dispatch.e2e.ts:613` with `about:blank` — test only checks adapter non-injection, no page content required
+- Replaced `https://example.com` in `e2e/tab-state-sync.e2e.ts:70` with `testServer.url.replace('localhost', '127.0.0.1') + '/non-matching'` — test needs a different origin to trigger tab state transition to 'closed'
+- Files changed: `e2e/tool-dispatch.e2e.ts`, `e2e/tab-state-sync.e2e.ts`
+- **Learnings for future iterations:**
+  - `about:blank` works cleanly for adapter non-injection tests — Playwright's `page.evaluate()` executes fine on about:blank pages
+  - For tab state sync tests, `about:blank` might also work but using the 127.0.0.1 origin is more reliable since it guarantees a real HTTP response and exercises the actual URL-mismatch code path
+  - The `testServer.url` format is `http://localhost:PORT` so `.replace('localhost', '127.0.0.1')` gives `http://127.0.0.1:PORT`
+---
+
+## 2026-02-28 - US-003
+- Replaced all `https://example.com` and `https://example.org` references in `e2e/browser-tools.e2e.ts`
+- Added `testServer` to the fixture destructuring for 6 tests that previously lacked it: browser_open_tab "creates a new tab", browser_close_tab "closes a tab", browser_navigate_tab "navigates an existing tab", URL validation "accepts valid https: URL", browser_focus_tab "focuses a tab", browser_get_tab_info "returns correct fields"
+- URL replacements applied:
+  - `https://example.com` → `testServer.url` for browser_open_tab, browser_close_tab, browser_get_tab_info, URL validation, browser_focus_tab (first tab), browser_get_tab_info tests
+  - `https://example.org` → `testServer.url + '/non-matching'` for browser_navigate_tab destination and browser_focus_tab second tab
+  - `https://nonexistent.example.com/fake-resource.js` → `testServer.url + '/nonexistent-resource.js'` for resource content error test
+  - `https://example.com/some-resource.js` → `http://localhost/some-resource.js` for non-existent tab test (no network request occurs, tabId: 999999)
+- Renamed "accepts valid https: URL" to "accepts valid http: URL" to match the actual URL scheme used
+- Files changed: `e2e/browser-tools.e2e.ts`
+- **Learnings for future iterations:**
+  - For browser tool tests that open tabs (browser_open_tab, browser_close_tab, etc.), `testServer.url` is the natural local substitute — it's always running during E2E tests
+  - Tests don't need to be on different URLs just because they open multiple tabs — tab IDs uniquely identify them
+  - For `browser_get_resource_content` with a non-existent tab ID (999999), the URL parameter is irrelevant — no network request occurs, so `http://localhost/path` works fine as a placeholder
+  - The `/non-matching` endpoint (added in US-001) is useful when two distinct URLs are needed (e.g., navigation target that differs from origin)
+---
+
+## 2026-02-28 - US-004
+- Replaced `https://example.com` in `e2e/dispatch-resilience.e2e.ts:238` with `testServer.url.replace('localhost', '127.0.0.1') + '/non-matching'` — test needs to navigate to a non-matching URL and wait for tool failure; the 127.0.0.1 approach ensures the page actually loads (real HTTP response) while not matching the plugin's `http://localhost/*` pattern
+- Replaced `https://example.com` in `e2e/dispatch-resilience.e2e.ts:591` with `http://localhost/` — test validates Zod type checking on `tabId: 'not-a-number'` which fails before the URL is ever used, so any valid URL works as a placeholder
+- Files changed: `e2e/dispatch-resilience.e2e.ts`
+- **Learnings for future iterations:**
+  - For dispatch-resilience nav-away tests, the 127.0.0.1 + real page approach is necessary because the test polls for tool failure after navigation — the page must actually load to trigger the URL change event in the extension
+  - Input validation tests that fail on the first field (tabId) don't care about subsequent fields (url) — `http://localhost/` is a clean placeholder that requires no fixture
+  - All 373 E2E tests pass with these changes
+---
