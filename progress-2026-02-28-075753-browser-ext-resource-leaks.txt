@@ -1,0 +1,67 @@
+## Codebase Patterns
+- network-capture.ts: CDP event dispatch uses a flat if/else if chain in `chrome.debugger.onEvent.addListener`; new event types go there
+- network-capture.test.ts: Chrome APIs are stubbed at module-level before dynamic import; `capturedOnEventListener` captures the registered handler for test invocation
+- The `wsFramesByRequestId` Map stores requestId → WebSocket URL for active connections; entries added on `webSocketCreated`, deleted on `webSocketClosed` (cleanup)
+- `getWsFrames` is exported from network-capture.ts and is importable in tests
+- tab-state.ts: `withPluginLock` is NOT exported; test it indirectly via `updateLastKnownState`, `checkTabChanged`, `checkTabRemoved`
+- ESLint rule `@typescript-eslint/no-floating-promises` IS configured; use `void` operator for intentional fire-and-forget promises
+- side-panel-toggle.ts: MV3 service workers can miss events while suspended; validate window existence with `chrome.windows.get(windowId)` in a try/catch before trusting in-memory Set state
+- `void (async () => { ... })()` pattern is the correct way to run async logic inside a synchronous Chrome event listener without triggering floating-promise lint errors
+- iife-injection.ts: `injectLogRelay` ISOLATED world func uses a `win[guard]` idempotency check; on re-injection, clear the nonces Set before adding the new nonce (old nonces are invalid after adapter replacement)
+- iife-injection.test.ts: to test ISOLATED world funcs, set `(globalThis as Record<string, unknown>).window = {}` before running them (funcs reference `window` which is undefined in Node.js); clean up with `afterEach`
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-075753-browser-ext-resource-leaks~running.json
+Started: Sat Feb 28 15:58:16 UTC 2026
+---
+
+## 2026-02-28 16:12 UTC - US-003
+- Modified `chrome.action.onClicked.addListener` in `platform/browser-extension/src/side-panel-toggle.ts` to validate window existence before trusting `openWindows` Set
+- Wrapped the handler body in `void (async () => { ... })()` to enable `await chrome.windows.get(windowId)` without floating-promise lint errors
+- On `chrome.windows.get` rejection (window gone), delete the stale ID and open the panel; on success, proceed with close as before
+- No test file existed for this module; acceptance criteria does not require new tests — existing test suite (2492 passing) confirms no regressions
+- **Learnings for future iterations:**
+  - `void (async () => { ... })()` IIFE pattern is the right way to do async work inside a Chrome event listener callback (synchronous return type required)
+  - `chrome.windows.get(windowId)` rejects if the window no longer exists — correct API to validate stale IDs
+  - MV3 service worker suspension can cause any in-memory state to be stale on wake; always validate with a live Chrome API call before acting on Set/Map state
+---
+
+## 2026-02-28 16:08 UTC - US-002
+- Modified `withPluginLock` in `platform/browser-extension/src/tab-state.ts` (lines 35-48) to break the promise chain after each operation
+- Implementation: split `next` into `operation` (raw fn result, returned to caller) and `lock` (error-swallowed version stored in map); after `lock` resolves, reset the `pluginLocks` entry to `Promise.resolve()` if no new work was enqueued
+- Used `void lock.then(...)` pattern to fire-and-forget the chain-reset without creating a floating promise lint error
+- Added a new `describe('withPluginLock (via updateLastKnownState)')` block in `tab-state.test.ts` with 3 tests:
+  1. 100 sequential operations complete without chain growth
+  2. Concurrent operations for same plugin serialize (final state matches last enqueued)
+  3. Concurrent operations for different plugins run independently
+- **Learnings for future iterations:**
+  - `@typescript-eslint/no-floating-promises` is enabled (from preset); always use `void` or `.catch()` for intentional fire-and-forget
+  - Forward-reference pattern for self-referential promise: create `operation = prev.then(fn)`, then `lock = operation.catch(...)`, then `void lock.then(() => { if get(name) === lock ... reset })` — `lock` is assigned before the callback fires
+  - `withPluginLock` is internal; test via exported functions like `updateLastKnownState`
+---
+
+## 2026-02-28 16:18 UTC - US-004
+- Modified `injectLogRelay` guard path in `platform/browser-extension/src/iife-injection.ts` (line ~124): changed `nonceSet.add(n)` to `nonceSet.clear(); nonceSet.add(n)` so re-injection replaces stale nonces instead of accumulating them
+- Updated the guard comment to accurately describe the current behavior (clear + replace, not accumulate)
+- Added two unit tests in `platform/browser-extension/src/iife-injection.test.ts`:
+  1. `replaces stale nonces with the new nonce on re-injection` — verifies nonces Set has exactly 1 entry after two injections, with the second nonce replacing the first
+  2. `nonces Set always has exactly one entry regardless of injection count` — verifies invariant holds across 10 consecutive injections
+- Tests work by capturing the ISOLATED world func from `mockExecuteScript` calls and running it against a fake `window = {}` set on `globalThis`
+- **Learnings for future iterations:**
+  - ISOLATED world funcs reference `window` — set `(globalThis as Record<string, unknown>).window = {}` in test setup to provide a context; clean up in `afterEach`
+  - `mockExecuteScript` receives `unknown` typed injection arg; cast to `Record<string, unknown>` inside the implementation
+  - The `isSafePluginName` check in `injectPluginIntoMatchingTabs` means test plugin names must pass the `isValidPluginName` regex and not be a reserved name
+---
+
+## 2026-02-28 16:02 UTC - US-001
+- The `Network.webSocketClosed` handler was already implemented in `platform/browser-extension/src/network-capture.ts` (lines 341-346), deleting `wsFramesByRequestId` entries on WebSocket close
+- Added two unit tests in `platform/browser-extension/src/network-capture.test.ts` verifying the cleanup behavior:
+  1. `deletes the requestId entry from wsFramesByRequestId on close` — confirms frames received after close are not stored
+  2. `is a no-op when requestId is missing from params` — robustness check
+- Updated import on line 30 to include `getWsFrames`
+- Fixed prettier formatting (line wrap on import line)
+- **Learnings for future iterations:**
+  - The `Network.webSocketClosed` fix was already in the source; the story needed unit test coverage
+  - `getWsFrames` is exported from `network-capture.ts` and available for tests
+  - The test file uses dynamic `await import()` at module level; all Chrome API stubs must be set up before that import
+---

@@ -17,7 +17,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/network-capture.ts\n\nThe wsFramesByRequestId Map (line ~113) stores WebSocket frame buffers keyed by requestId. Entries are added on Network.webSocketCreated (line ~321) and frames appended on Network.webSocketFrameReceived (line ~334), but there is no handler for Network.webSocketClosed. Over long capture sessions with many WS connections opening and closing, this map grows unboundedly.\n\nFix: In the chrome.debugger.onEvent handler (the big switch/if chain starting around line 216), add a case for 'Network.webSocketClosed' that calls wsFramesByRequestId.delete(params.requestId). Also ensure the event handler filters for this event name alongside the existing WS events.\n\nThe stopCapture function (around line 165) already clears the entire map, and getWsFrames with clear=true also clears it, but those only run on explicit stop/clear. The webSocketClosed handler provides incremental cleanup during active capture."
@@ -36,7 +36,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/tab-state.ts, lines 27-42\n\nThe pluginLocks Map stores per-plugin serialization promises. withPluginLock chains each new operation onto the previous promise via .then(). The chain grows linearly — each new promise holds a reference to the prior one, preventing GC of fulfilled promises.\n\nCurrent code (simplified):\n```\nconst prev = pluginLocks.get(name) ?? Promise.resolve();\nconst next = prev.then(fn).catch(() => {});\npluginLocks.set(name, next);\n```\n\nFix: After the operation completes (in the .then callback), check if the lock still points to `next`. If so, reset it to Promise.resolve() to break the chain. This is safe because any concurrent withPluginLock call will have already chained onto `next`, creating a new promise that becomes the lock. The key insight: we only reset if no new work has been enqueued.\n\nExample fix pattern:\n```\nconst next = prev.then(fn).catch(() => {}).then(() => {\n  if (pluginLocks.get(name) === next) {\n    pluginLocks.set(name, Promise.resolve());\n  }\n});\npluginLocks.set(name, next);\n```\n\nNote: The .catch(() => {}) must come BEFORE the chain-breaking .then() so errors don't propagate."
@@ -55,7 +55,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/side-panel-toggle.ts\n\nThe openWindows Set (line 6) tracks which windows have the side panel open. It is populated by chrome.sidePanel.onOpened (line 23) and cleaned by chrome.sidePanel.onClosed (line 27) and chrome.windows.onRemoved (line 31). However, in MV3, the service worker can be suspended — if a window is closed during suspension, onRemoved is missed and the stale ID persists in the Set.\n\nThe toggleSidePanel function (line 8) checks `openWindows.has(windowId)` — if a stale ID matches, it calls close() instead of open(), causing the toggle to appear broken.\n\nFix: In toggleSidePanel, before the openWindows.has check, verify the window actually exists. If chrome.windows.get(windowId) throws, delete the stale ID from openWindows and fall through to the open() path.\n\nAlternatively, since the Set is in-memory and the service worker can restart at any time (losing all state), consider always checking the actual side panel state via the Chrome API rather than relying on the in-memory Set. But the simplest fix is the get() validation."
@@ -74,7 +74,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/iife-injection.ts, lines 107-167\n\nThe injectLogRelay function injects an ISOLATED-world content script that listens for opentabs:console CustomEvents and relays them to the background. Each injection generates a crypto.randomUUID() nonce and adds it to a `nonces` Set on the document object in the ISOLATED world (line ~126). The listener checks nonces.has(nonce) to verify the event came from a legitimate injection.\n\nThe problem: each re-injection (triggered by plugin updates or adapter hash changes) adds a NEW nonce without clearing old ones. The nonces Set grows by one entry per re-injection per tab. Old nonces are never removed.\n\nFix options (pick the simplest):\n1. Clear the nonces Set before adding the new nonce. Since re-injection replaces the previous console interceptors in MAIN world (which use the new nonce), old nonces are no longer valid anyway.\n2. Check if the relay listener is already installed (e.g., via a flag on the document) and skip re-injection entirely. The relay just forwards events — it doesn't need to be reinstalled on adapter updates.\n\nOption 2 is cleaner if the relay truly doesn't need updating. Option 1 is simpler if there's any reason the relay code might change between versions."
