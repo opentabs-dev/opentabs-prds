@@ -1,0 +1,147 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource leaks, and missing guards discovered during systematic audit of the mcp-server package",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Prevent permanent caching of empty npm global paths on transient failure",
+      "description": "As a platform operator, I want npm plugin discovery to recover from transient npm unavailability so that plugins are discovered correctly even if npm was briefly unavailable at startup.",
+      "acceptanceCriteria": [
+        "getGlobalNodeModulesPaths() only caches the result when the paths array is non-empty",
+        "When paths is empty (npm failed), the cached value is set to null so the next call retries the npm root -g command",
+        "Existing behavior preserved: non-empty results are still cached for the process lifetime",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/resolver.ts, lines 155-174. The function getGlobalNodeModulesPaths() runs `npm root -g` via spawnSync and caches the result on globalThis. If npm is transiently unavailable, it caches an empty array `[]`. Since getCachedGlobalPaths() checks `!== null`, the empty array is truthy and subsequent calls never retry. Fix: only call setCachedGlobalPaths(paths) when paths.length > 0. When paths is empty, leave the cache as null so the next call retries. Add a unit test that verifies: when npm root -g fails, the next call retries instead of returning cached empty array."
+    },
+    {
+      "id": "US-002",
+      "title": "Freeze registry Maps to prevent accidental mutation",
+      "description": "As a platform developer, I want the plugin registry's internal Maps to be immutable so that accidental .set() or .delete() calls cannot corrupt the registry.",
+      "acceptanceCriteria": [
+        "buildRegistry() returns a registry whose plugins, toolLookup, resourceLookup, and promptLookup Maps throw on .set(), .delete(), and .clear() calls",
+        "The same createFrozenRegistryMap pattern used for EMPTY_REGISTRY is applied to all non-empty registries",
+        "Existing read operations (get, has, values, entries, size, forEach) continue to work",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/registry.ts, lines 96-131. buildRegistry() creates plain Maps for plugins, toolLookup, resourceLookup, promptLookup and then calls Object.freeze(registry). Object.freeze only prevents property add/remove on the object itself — Map.set/delete/clear operate on internal slots and are NOT blocked by freeze. The EMPTY_REGISTRY (created via emptyRegistry() -> buildRegistry([], [])) currently also has plain Maps. The fix is to wrap each Map with a frozen variant that throws on mutation. Check if createFrozenRegistryMap already exists somewhere in the codebase (look in state.ts) — the audit agent mentioned EMPTY_REGISTRY uses it. If it exists, reuse it. If not, create a small helper that wraps a Map and overrides set/delete/clear to throw TypeError. Apply it to all four Maps before returning from buildRegistry(). Add a test that calling .set() on a returned registry's toolLookup throws."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix reload guard race condition allowing concurrent reloads",
+      "description": "As a platform operator, I want reload operations to be properly serialized so that concurrent reloads cannot corrupt the plugin registry.",
+      "acceptanceCriteria": [
+        "performReload and performConfigReload atomically check-and-set the guard: the guard is set before any await after the check",
+        "Two concurrent calls to performReload result in the second waiting for the first to complete before executing",
+        "Two concurrent calls to performConfigReload result in the second waiting for the first to complete before executing",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/mcp-server/src/reload.ts, lines 310-322 (performReload) and lines 427-436 (performConfigReload). Both functions have a check-then-act race: after `await existingGuard` resolves, the current function resumes but another queued caller can also pass the guard check before the first sets its new guard. The window is: existingGuard resolves -> setReloadGuard(undefined) in finally -> second caller reads undefined guard -> both proceed. Fix: instead of await-then-set, use a pattern where the guard is set synchronously after the check. One approach: replace the pattern with a mutex-style guard where setReloadGuard is called before any await. For example, immediately after detecting no existing guard, set a new deferred guard synchronously. If there IS an existing guard, await it, then loop back to check again (spin until you can claim the guard without an interleaving await). Alternatively, use a simple async mutex: store a promise chain and append to it. Both performReload and performConfigReload need the same fix."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix mtime polling to detect newly-created files for pending plugins",
+      "description": "As a plugin developer, I want pending plugins to be discovered via mtime polling when fs.watch becomes stale so that newly-built plugin artifacts are picked up even when fs.watch fails.",
+      "acceptanceCriteria": [
+        "recordMtime records an mtime entry even when the file does not exist (storing null or a sentinel value)",
+        "The mtime poll check detects when a file transitions from non-existent to existent (mtime was null/sentinel, now has a real value)",
+        "Pending plugins whose dist/tools.json is created after watcher setup are detected by the mtime poll fallback",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/file-watcher.ts. The issue is in two places: (1) recordMtime (lines 110-115) only stores the mtime when the file exists (mtime !== null). For non-existent files, no entry is set in lastSeenMtimes. (2) The poll loop (lines 626-655) requires `lastToolsMtime !== undefined` to detect a change, which means files that were never recorded are never detected. Fix recordMtime to always set the mtime in the map — use null (or -1) as the sentinel for non-existent files. Then update the poll check: if lastMtime is null/sentinel and current mtime is a real number, treat it as a change. This allows detecting file creation, not just file modification."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix sanitize-error regex stripping legitimate path-like content from error messages",
+      "description": "As a developer debugging tool errors, I want error messages to preserve legitimate path-like content (e.g., /api/v1/users) so that API endpoint references are not incorrectly stripped.",
+      "acceptanceCriteria": [
+        "The Unix path regex requires at least 2 path segments (e.g., /foo/bar matches, but /api alone does not)",
+        "Error messages containing URL path fragments like '/api/v1/users' preserve the path content",
+        "Actual filesystem paths like '/Users/foo/bar/baz.js' are still replaced with [PATH]",
+        "Single-segment paths like '/api' are NOT replaced (they are more likely URL path fragments than filesystem paths)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/sanitize-error.ts, line 20. The current regex `/\\/[a-z][a-z0-9._-]*(?:\\/[a-z0-9._-]+)*/gi` matches even a single segment like `/api`. The `(?:\\/[a-z0-9._-]+)*` quantifier allows zero repetitions, so any `/word` matches. The fix: change the quantifier from `*` (zero or more) to `+` (one or more), requiring at least 2 path segments. This means `/api` alone won't match, but `/Users/foo` will. Alternatively, increase the minimum by requiring 2+ additional segments. Update the existing tests in sanitize-error.test.ts — verify that single-segment paths like '/api' and '/json' are preserved, while multi-segment paths like '/Users/foo/bar' are still sanitized."
+    },
+    {
+      "id": "US-006",
+      "title": "Fix HAR export bodySize using string.length instead of byte length",
+      "description": "As a developer using HAR export, I want correct bodySize and content.size values in the HAR output so that performance analysis tools get accurate size data.",
+      "acceptanceCriteria": [
+        "HAR bodySize and content.size fields use byte length (Buffer.byteLength or TextEncoder) instead of string.length",
+        "ASCII content produces the same sizes as before (no regression)",
+        "Non-ASCII content (e.g., CJK characters, emoji) produces correct byte counts",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/export-har.ts, lines 92, 110, 114. Three places use `.length` on strings for HAR size fields: (1) line 92: `bodySize: req.requestBody ? req.requestBody.length : 0` (2) line 110: `size: req.responseBody ? req.responseBody.length : 0` (3) line 114: `bodySize: req.responseBody ? req.responseBody.length : -1`. Replace all three with `Buffer.byteLength(str, 'utf-8')` which returns the correct byte count. This is a server-side file (Node.js), so Buffer is available. Add a test case that verifies non-ASCII content (e.g., a string with emoji) produces a bodySize greater than string.length."
+    },
+    {
+      "id": "US-007",
+      "title": "Write adapter files atomically: write new file before deleting old ones",
+      "description": "As a platform operator, I want adapter file updates to be atomic so that the extension never encounters a window where neither old nor new adapter files exist.",
+      "acceptanceCriteria": [
+        "writeAdapterFile writes the new hashed adapter file before deleting old versions",
+        "At no point during the write process are there zero adapter files for a plugin on disk",
+        "Old files are cleaned up after the new file is confirmed written",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/adapter-files.ts, lines 62-86. Currently the function: (1) reads directory entries, (2) deletes old files matching the plugin, (3) writes the new file. If the extension reads between steps 2 and 3, it finds no adapter file. Fix: reorder to write-then-delete. Move the atomicWrite calls (lines 83-86) before the old file deletion (line 74). The new hashed filename is unique (content-hashed), so it won't conflict with old files. After the new file is written successfully, then delete the old versions. This ensures there is always at least one valid adapter file on disk."
+    }
+  ]
+}

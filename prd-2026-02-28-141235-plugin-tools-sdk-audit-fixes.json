@@ -1,0 +1,66 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix critical watch-mode cache bug in plugin-tools and edge cases in plugin-sdk fetch utilities",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix watch-mode module cache causing stale plugin code on alternating rebuilds",
+      "description": "As a plugin developer using watch mode, I want every rebuild to load the latest plugin code so that tools.json and the IIFE bundle always reflect the current source.",
+      "acceptanceCriteria": [
+        "Each watch-mode rebuild uses a unique, monotonically increasing cache key that never repeats",
+        "The 3rd, 4th, and subsequent rebuilds all load fresh plugin code, not stale cached modules",
+        "Module cache entries do not grow unboundedly (old cache entries are naturally garbage collected or bounded)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, line 1034-1036. The current code: `pluginCacheKey = (pluginCacheKey + 1) % 2;` alternates between 0 and 1. On the 3rd build, cache key cycles back to 1, and Node.js returns the cached module from the 1st build (same URL `?t=1`). Fix: use a monotonically increasing counter instead of modulo 2. Change to `pluginCacheKey++` (or use Date.now()). Node.js ESM module cache entries for `file:///...?t=N` URLs will accumulate but each is small (just the module namespace object). For a typical watch session (dozens of rebuilds), this is negligible. The variable `pluginCacheKey` is declared at module scope — find it (search for `let pluginCacheKey`) and change the increment from `(pluginCacheKey + 1) % 2` to just `pluginCacheKey + 1` or `++pluginCacheKey`."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix tsc spawn failing on Windows due to missing shell execution",
+      "description": "As a Windows plugin developer, I want opentabs-plugin build to find and run tsc correctly so that the build command does not fail with ENOENT.",
+      "acceptanceCriteria": [
+        "spawnSync for tsc uses shell: true or platformExec('tsc') to correctly resolve .cmd files on Windows",
+        "The PATH augmentation (envWithBin) is preserved so project-local tsc is found",
+        "Build command works on both Unix and Windows (no regression on Unix)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, line 1010. `spawnSync('tsc', [], { cwd: projectDir, env: envWithBin })` — on Windows, `spawnSync` without `shell: true` cannot find `tsc.cmd` in `node_modules/.bin/`. The PATH variable is correctly set via `envWithBin`, but the fundamental issue is that .cmd files need shell resolution. Fix: add `shell: true` to the spawnSync options. This allows the shell to resolve `tsc.cmd` on Windows while still working on Unix. The `envWithBin` PATH augmentation still works with `shell: true`. Also consider adding `stdio: ['ignore', 'pipe', 'pipe']` explicitly (currently defaults to 'pipe' for all three, which is fine, but explicit is clearer). Note: the existing code at lines 1011-1015 already handles ENOENT — the fix should prevent it from happening in the first place."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix fetchJSON misleading error on 204 No Content responses with schema validation",
+      "description": "As a plugin developer, I want a clear error message when a 204 No Content response is received with a schema that expects content so that I can debug API integration issues easily.",
+      "acceptanceCriteria": [
+        "When fetchJSON receives a 204 response and a schema is provided, the error message indicates the response had no content body rather than a generic 'schema validation failed' message",
+        "When fetchJSON receives a 204 response without a schema, undefined is returned (existing behavior preserved)",
+        "When fetchJSON receives a 200 response with a schema, normal validation applies (no regression)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/fetch.ts, lines 104-123. The issue: when the response is 204 No Content, `data` is set to `undefined` (line 108). If a schema is provided, `schema.safeParse(undefined)` is called (line 118), which fails for any schema that doesn't accept undefined (like z.object({})). The error message says 'response from [URL] failed schema validation' which is misleading — the real issue is there was no response body. Fix: before the schema validation block (line 117), add a check: if `response.status === 204 && schema` then throw a ToolError.validation with a message like `'Expected JSON response from ${url} but received 204 No Content — the server returned no body to validate'`. This gives plugin developers a clear, actionable error. The check should go between the JSON parsing block and the schema validation block."
+    }
+  ]
+}

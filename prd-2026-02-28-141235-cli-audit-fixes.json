@@ -1,0 +1,65 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix resource leaks and missing error handling in the CLI package discovered during systematic audit",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add error handler to fs.watch in logs follow mode",
+      "description": "As a CLI user running opentabs logs -f, I want the process to handle file watcher errors gracefully so that it does not crash if the log file is deleted and re-created.",
+      "acceptanceCriteria": [
+        "The fs.watch watcher in followFile has an error event handler registered",
+        "When the watched file is deleted, the watcher error does not crash the process",
+        "The follow mode continues operating after a watcher error (falls back to polling or re-watches)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/logs.ts, line 140. `const watcher = watch(filePath, () => readNewContent());` — no error handler is registered. fs.watch can emit 'error' events (e.g., when the file is deleted on Linux with inotify). An unhandled 'error' event crashes the Node.js process. Fix: add `watcher.on('error', () => { /* silently ignore — readNewContent already handles missing files via statSync try/catch */ });` right after the watch call. The readNewContent function already handles the file-deleted case (lines 92-97 catch statSync failure), so the error handler just needs to prevent the crash. Add a unit test that verifies the watcher error does not propagate."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix follow mode byte offset splitting multi-byte UTF-8 characters",
+      "description": "As a CLI user with non-ASCII log content, I want opentabs logs -f to correctly display multi-byte characters so that output is not garbled.",
+      "acceptanceCriteria": [
+        "Follow mode uses character-aware offset tracking that does not split multi-byte UTF-8 sequences",
+        "Log content containing emoji, CJK characters, or other multi-byte UTF-8 sequences displays correctly",
+        "No U+FFFD replacement characters appear in follow output for valid UTF-8 content",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/logs.ts, lines 81-137. The issue: `offset` is tracked in bytes (from `statSync(filePath).size`), but `createReadStream` with `encoding: 'utf-8'` starts decoding at the byte offset. If a multi-byte UTF-8 character spans a chunk boundary, the decoder starts mid-character and produces a replacement character (U+FFFD). Fix approach: track offset in bytes but update it using the actual bytes consumed, not the file size. After reading, update offset by adding the byte length of the data actually read (using Buffer.byteLength on each chunk) rather than setting `offset = currentSize` on end. Alternatively, since the stream reads from `start: offset` to EOF, and `currentSize` at that point is the file size, the current approach works IF no other writer appends between the statSync and the stream end. The real fix is to not set encoding on createReadStream, read Buffers, and handle the decoding manually using a StringDecoder (which properly handles split multi-byte chars across chunks). Use `new StringDecoder('utf-8')` from 'node:string_decoder' — it buffers incomplete multi-byte sequences across write() calls."
+    },
+    {
+      "id": "US-003",
+      "title": "Await log stream flush before process.exit in foreground start mode",
+      "description": "As a platform operator, I want the server log file to be fully flushed before the CLI exits so that the final log entries are not truncated.",
+      "acceptanceCriteria": [
+        "In foreground mode, logStream.end() is awaited (via the 'finish' event) before process.exit() is called",
+        "The final bytes of log output are not truncated when the server exits",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/start.ts, lines 340-353. After awaiting the pipe promises, `logStream.end()` is called but not awaited. Then `process.exit(exitCode)` is called, which may kill the process before the stream's internal buffer is flushed. Fix: wrap logStream.end() in a promise that resolves on the 'finish' event, and await it before calling process.exit(). Something like: `await new Promise<void>(resolve => logStream.end(() => resolve()));` — the callback form of .end() fires after the stream is fully flushed. Then proceed to process.exit()."
+    }
+  ]
+}
