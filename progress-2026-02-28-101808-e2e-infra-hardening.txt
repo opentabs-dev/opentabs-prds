@@ -1,0 +1,34 @@
+## Codebase Patterns
+- `e2e/fixtures.ts` is a standalone E2E helper file (not compiled to `dist/`); it's type-checked via `tsconfig.test.json` but not part of `npm run build`'s output
+- `lightningcss-linux-x64-gnu` is an optional dep of `lightningcss` that may be missing from the worktree's `node_modules`; running `npm rebuild lightningcss` or `npm install lightningcss-linux-x64-gnu` (without saving to package.json) fixes `build:tailwind` failures
+- The `killProcess` function in `e2e/fixtures.ts` sends SIGTERM → (graceMs) → SIGKILL; it now also has an absolute timeout (graceMs + 10s) to prevent zombie process hangs
+- `prefer-const` ESLint rule: avoid `let x; x = setTimeout(...)` — use `const x = setTimeout(...)` or restructure with a `done` flag to avoid circular references in closures
+- `replaceIifeClosing` in `e2e/helpers.ts`: the adapter IIFE now has a freezer closure appended after the main `})();` — the regex must match `})();(function(){` not just `})();[\s]*$`
+- `callToolWithProgress` in `e2e/fixtures.ts`: uses its own `fetch()` call — any retry/reinit logic added to `request()` must also be added here via a `doFetch(retried)` helper
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-101808-e2e-infra-hardening~running.json
+Started: Sat Feb 28 18:18:43 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Added absolute timeout (graceMs + 10_000ms) to `killProcess` in `e2e/fixtures.ts` to prevent CI hangs from zombie processes
+- Used a `done` flag + `finish()` helper to prevent double-resolution when both the exit event and absolute timeout fire in quick succession
+- Added `console.warn` after `finalizeServer`'s auth.json try-catch block to surface missing/unreadable auth.json diagnostics instead of silently continuing with no auth
+- Files changed: `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - `lightningcss-linux-x64-gnu` optional dep may be missing — `npm install lightningcss-linux-x64-gnu` (without --save) installs it to node_modules without touching package.json; avoids knip "unused dependency" false positive
+  - Circular closure references (`A` references `B`, `B` references `A`) can be broken with a `done` flag — avoids `prefer-const` violations from `let x; x = setTimeout(...)` pattern
+  - `e2e/fixtures.ts` is not built into dist/ so `npm run build` failures are always pre-existing infrastructure issues when only modifying this file
+---
+
+## 2026-02-28 - US-002
+- Fixed SSE fallback in `request()`: replaced the blind `messages[messages.length - 1]` fallback with an explicit error throw when no JSON-RPC result or error message is found in the SSE stream
+- Added auto-reinit retry logic to `callToolWithProgress`: extracted fetch into a `doFetch(retried)` helper that handles 400 (missing session), 502, and 503 responses by re-initializing the session and retrying, consistent with how `request()` handles worker restarts
+- Fixed `replaceIifeClosing` in `e2e/helpers.ts`: updated regex from `/}\)\(\);[\s]*$/` to `/}\)\(\);(\(function\(\)\{|[\s]*$)/` to handle the freezer IIFE that is now appended after the main adapter body
+- Files changed: `e2e/fixtures.ts`, `e2e/helpers.ts`
+- **Learnings for future iterations:**
+  - The adapter IIFE build now appends a "freezer" IIFE after the main body — any regex matching the IIFE closing must account for `})();(function(){` not just `})();` at EOF
+  - `callToolWithProgress` bypasses `request()` with its own `fetch()` call, so retry/reinit logic must be duplicated or factored into a shared helper
+  - Prettier sometimes wants multi-line function signatures but single-line regex replacements — always run lint after editing to catch formatting issues early
+---
