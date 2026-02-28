@@ -1,0 +1,130 @@
+## Codebase Patterns
+- `ws` package is a root workspace dependency — importable in e2e/test-server.ts without adding to e2e package.json
+- ESLint import-x/order groups: `['index', 'sibling', 'parent', 'internal', 'external', 'builtin', 'object', 'type']` — external (ws) before builtin (node:http), all `import type` last
+- For ws RawData: use `Buffer.isBuffer(data) ? data.toString('utf-8') : Array.isArray(data) ? Buffer.concat(data).toString('utf-8') : Buffer.from(data).toString('utf-8')` to avoid @typescript-eslint/no-base-to-string
+- WebSocket server created with `new WebSocketServer({ server, path: '/ws' })` to share the same HTTP port
+- WebSocket HTML page uses `'ws://' + location.host + '/ws'` for the connection URL
+- Adding a new browser tool requires updating 8+ files: network-capture.ts (CDP events + public API), network-commands.ts (handler), browser-commands/index.ts (export), message-router.ts (import + dispatch), known-methods.ts (DISPATCH_METHODS), browser-tool-names.ts (server), browser-tools/index.ts (barrel), e2e/helpers.ts (BROWSER_TOOL_NAMES), and message-router.test.ts + known-methods.test.ts (mocks)
+- After modifying extension source, `npm run build:force` is needed (not just `npm run build`) because tsc incremental compilation may not rebuild esbuild bundles with new code
+- Extension tools dispatch via `browser.<methodName>` JSON-RPC methods; sync handlers use wrapSync, async use wrapAsync in message-router.ts
+- CDP WebSocket events: webSocketCreated (provides requestId + url mapping), webSocketFrameSent/Received (provides frame payload via response.payloadData), webSocketClosed (cleanup)
+- Adding a HAR export tool follows the same 8+ file pattern as other browser tools — network-capture.ts (public API), network-commands.ts (handler), barrel, router, known-methods, tool-names, MCP definition, E2E helpers, test mocks
+- HAR 1.2 conversion: map CapturedRequest fields to HAR entry structure. Use `new URL(req.url).searchParams` for query string parsing. Headers are scrubbed before export.
+- The `exportHar()` function in network-capture.ts is a sync function (no CDP calls) that converts the in-memory request buffer to HAR JSON, so the handler uses wrapSync in the dispatch table
+- Chrome's CDP does NOT expose `Cookie` request headers or `Set-Cookie` response headers in Network events (privacy/security restriction). Test header scrubbing with explicitly-set custom headers (X-Api-Key, X-Auth-Token, etc.) which CDP does report
+- CDP `Runtime.consoleAPICalled` uses `type = 'warning'` for `console.warn` (not 'warn'). Stored level in consoleLogs is 'warning'. The MCP level filter with `level='error'` filters using exact match against stored levels
+- The waitForConsoleLogs helper accepts a predicate and returns all logs (not just matching entries) — use it to wait, then find specific entries manually
+
+# Ralph Progress Log
+PRD: prd-2026-02-27-230600-browser-tools-e2e-coverage~running.json
+Started: Sat Feb 28 07:16:18 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Added `WebSocketServer` from `ws` package to e2e/test-server.ts
+- Created WebSocket server at `/ws` path on the same HTTP server — sends 'welcome' on connect, echoes messages with 'echo: ' prefix
+- Added `WEBSOCKET_TEST_HTML` constant with page that connects to /ws and sends 'hello', 'world', JSON.stringify({type:'ping'}) with 100ms delays; displays messages in #ws-messages
+- Added `/websocket-test` route handler serving the HTML page
+- Updated shutdown handler to call `wss.close()` before `server.close()`
+- Files changed: `e2e/test-server.ts`
+- **Learnings for future iterations:**
+  - ESLint auto-fix (`npx eslint --fix`) reliably fixes import order issues — use it instead of manually guessing the order
+  - The `ws` package's `RawData` type needs explicit Buffer/Array handling; `String(data)` triggers lint error
+  - The /websocket-test page uses setTimeout delays (0ms, 100ms, 200ms) in the 'open' handler to send messages with gaps
+---
+
+## 2026-02-28 - US-002
+- Added `HAR_TEST_HTML` constant in e2e/test-server.ts with page that triggers: GET /api/status-code/200, GET /api/status-code/200?foo=bar (for query string testing in US-004), POST /api/echo with JSON body, GET /api/status-code/404
+- Page uses Promise.all to wait for all requests, then sets `#har-done` textContent to 'done'
+- Added `/har-test` route handler serving the HTML page
+- Files changed: `e2e/test-server.ts`
+- **Learnings for future iterations:**
+  - Included the query-string request (/api/status-code/200?foo=bar) proactively since US-004 requires it — better to add it now than in another story
+  - The pre-commit hook (lint-staged) runs prettier and eslint --fix automatically on staged files — no manual formatting needed
+  - The /api/status-code/:code route only matches GET method; POST to the same path would fall through to 404
+---
+
+## 2026-02-28 - US-003
+- Implemented full browser_get_websocket_frames tool across the entire stack (tool didn't exist yet — PRD assumed it did)
+- Chrome extension (network-capture.ts): added WsFrame interface, wsFrames/wsRequestIdToUrl to CaptureState, handlers for Network.webSocketFrameSent/Received/Closed CDP events, getWsFrames() public API
+- Chrome extension (network-commands.ts): added handleBrowserGetWebsocketFrames handler
+- Chrome extension: updated barrel export (index.ts), message-router.ts (import + dispatch table), known-methods.ts (DISPATCH_METHODS)
+- MCP server: created get-websocket-frames.ts tool definition, registered in index.ts barrel, added to browser-tool-names.ts
+- E2E helpers: added browser_get_websocket_frames to BROWSER_TOOL_NAMES
+- Unit tests: updated message-router.test.ts and known-methods.test.ts mocks
+- E2E tests (browser-tools.e2e.ts): added waitForWsFrames helper + 5 tests:
+  1. enable capture → navigate → get frames → verify sent/received direction, url, data
+  2. clear=true empties frame buffer
+  3. urlFilter excludes non-matching WebSocket frames
+  4. empty array when no WebSocket connections on page
+  5. empty array for non-existent tabId
+- Files changed: e2e/browser-tools.e2e.ts, e2e/helpers.ts, platform/browser-extension/src/browser-commands/index.ts, platform/browser-extension/src/browser-commands/network-commands.ts, platform/browser-extension/src/known-methods.test.ts, platform/browser-extension/src/known-methods.ts, platform/browser-extension/src/message-router.test.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/network-capture.ts, platform/mcp-server/src/browser-tool-names.ts, platform/mcp-server/src/browser-tools/index.ts, platform/mcp-server/src/browser-tools/get-websocket-frames.ts
+- **Learnings for future iterations:**
+  - The PRD assumed browser_get_websocket_frames existed — it didn't. Had to implement the full tool stack before writing E2E tests.
+  - After modifying extension source files, `npm run build:force` is required for the esbuild bundle to pick up changes. `npm run build` uses incremental tsc which may skip re-bundling.
+  - Adding a new browser tool touches 8+ files across the stack: capture engine, command handler, barrel export, message router, known methods, browser-tool-names, MCP tool definition, and E2E helpers — plus test mocks.
+  - CDP WebSocket frame events use `response.payloadData` for the frame content and link back to the connection via `requestId` (mapped to URL from webSocketCreated).
+  - The extension's getWsFrames() returns empty array (not error) when no capture state exists for a tab, matching getRequests() behavior.
+---
+
+## 2026-02-28 - US-004
+- Implemented full browser_export_har tool across the entire stack (tool didn't exist — PRD assumed it did, same as US-003)
+- Chrome extension (network-capture.ts): added exportHar() function that converts CapturedRequest[] to HAR 1.2 JSON with scrubbed headers, query string parsing, postData, response content
+- Chrome extension (network-commands.ts): added handleBrowserExportHar sync handler
+- Chrome extension: updated barrel export (index.ts), message-router.ts (import + wrapSync dispatch), known-methods.ts (DISPATCH_METHODS)
+- MCP server: created export-har.ts tool definition, registered in index.ts barrel, added to browser-tool-names.ts
+- E2E helpers: added browser_export_har to BROWSER_TOOL_NAMES
+- Unit tests: updated message-router.test.ts and known-methods.test.ts mocks
+- E2E tests (browser-tools.e2e.ts): added 9 tests in 'Browser tools — HAR export' describe block:
+  1. HAR 1.2 structure validation (version, creator, entries array)
+  2. Expected requests present (GET 200, POST with body, 404)
+  3. Request fields correct (method, url, headers as {name,value} array)
+  4. Response fields correct (status as number, content.mimeType)
+  5. POST entry includes postData.text with request body
+  6. Response includes content.text with response body
+  7. queryString correctly parses URL parameters (foo=bar)
+  8. clear=true clears request buffer (second export returns empty)
+  9. Non-existent tabId returns empty HAR (not error)
+- Files changed: e2e/browser-tools.e2e.ts, e2e/helpers.ts, platform/browser-extension/src/browser-commands/index.ts, platform/browser-extension/src/browser-commands/network-commands.ts, platform/browser-extension/src/known-methods.test.ts, platform/browser-extension/src/known-methods.ts, platform/browser-extension/src/message-router.test.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/network-capture.ts, platform/mcp-server/src/browser-tool-names.ts, platform/mcp-server/src/browser-tools/index.ts, platform/mcp-server/src/browser-tools/export-har.ts
+- **Learnings for future iterations:**
+  - Same pattern as US-003: PRD assumed the tool existed but it needed full-stack implementation first
+  - exportHar() is a pure function (no async CDP calls) — it converts the in-memory request buffer to HAR JSON, so it uses wrapSync in the dispatch table
+  - HAR 1.2 query string parsing uses `new URL(req.url).searchParams` — wrap in try/catch since URLs from CDP can be malformed
+  - Headers are scrubbed via scrubHeaders() before HAR export, consistent with getRequests() behavior
+  - For E2E tests that need response bodies in the HAR, must wait for loadingFinished + async body fetch — poll for responseBody on the request before exporting HAR
+---
+
+## 2026-02-28 - US-005
+- Added 'Browser tools — network capture edge cases' describe block with 7 tests in e2e/browser-tools.e2e.ts:
+  1. Authorization header redacted to 'Bearer [REDACTED]' — uses browser_execute_script to inject fetch with Authorization header, verifies scrubbing preserves auth scheme
+  2. Cookie header redacted to '[REDACTED]' — sets document.cookie then fetches, verifies full redaction
+  3. maxRequests=2 limits buffer size — generates 5 sequential fetches, verifies only 2 remain in buffer
+  4. Concurrent captures on two tabs are independent — opens two tabs, generates different traffic, verifies no cross-contamination
+  5. Disabling capture on one tab does not affect another — enables both, disables tab A, generates traffic on tab B, verifies B still captures
+  6. Network capture survives page navigation — enables capture, navigates twice, verifies requests from each page
+  7. Aborted/failed requests are captured — fetches /api/slow-forever with AbortSignal.timeout(100), verifies failed request appears
+- Files changed: e2e/browser-tools.e2e.ts
+- **Learnings for future iterations:**
+  - browser_execute_script can inject fetch() calls with custom headers for testing header redaction — the headers show up in CDP requestWillBeSent
+  - The scrubHeaders function preserves the auth scheme prefix for Authorization headers ('Bearer [REDACTED]') but fully redacts Cookie headers ('[REDACTED]')
+  - For maxRequests testing, use sequential fetches (await inside loop) so CDP events are ordered; parallel fetches can have unpredictable buffer state
+  - Concurrent tab captures have fully isolated state — each tab has its own CaptureState in the captures Map
+  - /api/slow-forever endpoint never responds, making it ideal for testing aborted requests with AbortSignal.timeout
+---
+
+## 2026-02-28 - US-006
+- Added 'Browser tools — console log edge cases' describe block with 6 tests in e2e/browser-tools.e2e.ts:
+  1. console.warn captured with level 'warning' — CDP stores the level as the `type` field from Runtime.consoleAPICalled; warn → 'warning'
+  2. console.info captured with level 'info'
+  3. console.debug captured with level 'debug'
+  4. level filter returns only matching entries — produces log/warn/error, calls get_console_logs with level='error', verifies only error entries returned
+  5. console.log with multiple arguments joins them with spaces ('hello world 42')
+  6. console.log with object argument includes object description (message starts with prefix and has additional content)
+- Also fixed pre-existing US-005 test failure: 'Cookie header is redacted to [REDACTED]' was failing because Chrome's CDP does not expose Cookie request headers in Network events for privacy/security reasons. Renamed and changed to test 'x-api-key request header is redacted to [REDACTED]' which reliably works via CDP (same scrubHeaders code path, just a different sensitive header)
+- Files changed: e2e/browser-tools.e2e.ts
+- **Learnings for future iterations:**
+  - CDP `Runtime.consoleAPICalled` type field for console.warn is 'warning' (not 'warn') — must assert `level === 'warning'` not `level === 'warn'`
+  - Chrome strips Cookie request headers AND Set-Cookie response headers from CDP Network events entirely for privacy/security — cannot test these via CDP network capture
+  - To test header scrubbing for non-Authorization headers, use explicitly-set custom headers like X-Api-Key, X-Auth-Token, X-Api-Token (all in SENSITIVE_HEADERS list)
+  - For object console.log args: the CDP description field is something like 'Object' for `{key: 'value'}` — the test checks startsWith(prefix) and message.length > prefix.length rather than exact value
+---
