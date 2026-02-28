@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix misleading error messages in the CLI status and doctor commands. When `opentabs status --port <port>` hits a non-OpenTabs HTTP server, the error says 'The server may be misconfigured' which is misleading — the port isn't running OpenTabs at all. The doctor command's MCP client config hint includes CWD-relative paths that resolve to root (/) in containers/headless environments, producing confusing output like '/.cursor/mcp.json'.\n\nKnown LOW issues (not addressed): plugin search shows empty description for packages without one; no config unset command; logs --lines N may return N-1 lines due to trailing newline.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Improve status error when port hosts a non-OpenTabs HTTP server",
+      "description": "As a user running `opentabs status --port <port>` against a port that hosts a different HTTP server (e.g., Next.js), I want a clear error message saying the port is not running an OpenTabs server, so that I don't waste time debugging a 'misconfigured' server that doesn't exist.",
+      "acceptanceCriteria": [
+        "When the /health endpoint returns a non-2xx status (e.g., 404 from a non-OpenTabs server), the error message says something like 'No OpenTabs server found on port <port>. The port may be in use by another service.' instead of 'The server may be misconfigured'",
+        "When the /health response is valid JSON but not a recognized health response (missing 'status' field), the message also indicates it's not an OpenTabs server",
+        "The existing 401 authentication error handling is unchanged",
+        "The connection refused (server not running) error handling is unchanged",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/status.ts, around line 76-79. Currently the catch for non-ok responses is a generic 'Error: MCP server returned HTTP ${res.status}' with 'The server may be misconfigured'. Change the message for 4xx responses (especially 404) to indicate the port likely isn't running OpenTabs. A good heuristic: if the response status is 404, say 'No OpenTabs server found on port ${port}. The port may be in use by another service.' If 5xx, keep the 'misconfigured' hint. Also consider checking the Content-Type header — a non-JSON response (text/html from Next.js) strongly indicates it's not OpenTabs."
+    },
+    {
+      "id": "US-002",
+      "title": "Filter CWD-relative paths from doctor MCP client config hint",
+      "description": "As a user running `opentabs doctor` in a container or from root directory, I want the MCP client config hint to only show useful paths, so that I'm not confused by entries like '/.cursor/mcp.json' or '/opencode.json' that resolve to filesystem root.",
+      "acceptanceCriteria": [
+        "The doctor MCP client config check no longer includes CWD-relative paths (e.g., join(process.cwd(), '.cursor', 'mcp.json')) when CWD is the filesystem root ('/')",
+        "Alternatively: CWD-relative paths are only included when the CWD appears to be a project directory (e.g., has a package.json or .git directory)",
+        "The hint text that lists checked paths omits any CWD-relative paths that were skipped",
+        "Home-directory-relative paths (Claude Code, Windsurf) are always included regardless of CWD",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/doctor.ts, around line 230-237. The `defaultMcpClientLocations()` function includes CWD-relative paths for Cursor and OpenCode. These produce confusing output when CWD is '/' (common in Docker containers). Two approaches: (1) Only include CWD-relative paths if CWD is not the filesystem root AND CWD looks like a project (has package.json or .git). (2) Always include them but when displaying the hint, skip any path whose parent is '/'. Approach 1 is cleaner. The check function `checkMcpClientConfig` at line 239 iterates through clients — it already skips non-existent files, so the main issue is the hint text at line 266-272 which lists ALL checked paths. A CWD guard in `defaultMcpClientLocations()` is the simplest fix."
+    }
+  ]
+}
