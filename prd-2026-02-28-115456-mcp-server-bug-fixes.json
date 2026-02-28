@@ -1,0 +1,63 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix resource leaks, missing error handling, and unguarded error paths in the MCP server discovered during a comprehensive backend code audit.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix unbounded endpointCallTimestamps map growth",
+      "description": "As a server operator, I want the rate-limit timestamp map to not grow unboundedly so that long-running servers do not leak memory.",
+      "acceptanceCriteria": [
+        "Stale endpoint entries (no calls in the last 60 seconds) are removed from state.endpointCallTimestamps during the rate limit check or via periodic cleanup",
+        "A unit test verifies that endpoints with only expired timestamps are pruned from the map",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In platform/mcp-server/src/http-routes.ts at line 135-145, the checkEndpointRateLimit function filters expired timestamps per-endpoint but never removes endpoints whose timestamp arrays are empty after filtering. Over a long server lifetime, endpoints that were called once but never again accumulate as empty arrays in the map. Fix: after filtering timestamps, if the resulting array is empty, delete the endpoint key from the map instead of storing the empty array back. This is a one-line fix inside checkEndpointRateLimit — after the filter on line 137, check if the filtered array is empty and delete the key if so. Also check the set-after-push path on line 142-143."
+    },
+    {
+      "id": "US-002",
+      "title": "Add error handling to setTimeout sendExtensionReload calls",
+      "description": "As a server operator, I want unhandled errors in delayed sendExtensionReload calls to be caught and logged so that the server does not crash silently.",
+      "acceptanceCriteria": [
+        "All three setTimeout(() => sendExtensionReload(state), 500) call sites wrap the call in a try-catch or use a .catch() pattern",
+        "Errors are logged via log.warn or log.error, not silently swallowed",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Three call sites need fixing:\n1. platform/mcp-server/src/reload.ts line 260: `setTimeout(() => sendExtensionReload(state), 500);`\n2. platform/mcp-server/src/reload.ts line 335: `setTimeout(() => sendExtensionReload(state), 500);`\n3. platform/mcp-server/src/http-routes.ts line 565: `setTimeout(() => sendExtensionReload(state), 500);`\n\nThe sendExtensionReload function (in extension-protocol.ts) could throw if the WebSocket is in a bad state. Since setTimeout callbacks run outside the caller's try-catch, any thrown error becomes an unhandled exception that crashes the process.\n\nFix pattern: replace each with:\n```\nsetTimeout(() => {\n  try {\n    sendExtensionReload(state);\n  } catch (err) {\n    log.warn('Failed to send extension reload signal:', err);\n  }\n}, 500);\n```\n\nAlternatively, extract a helper like `delaySendExtensionReload(state)` to avoid repeating the pattern."
+    },
+    {
+      "id": "US-003",
+      "title": "Add error handler for piped ReadableStream in server-node.ts",
+      "description": "As a server operator, I want stream errors during HTTP response piping to be handled so that they don't become unhandled error events.",
+      "acceptanceCriteria": [
+        "An 'error' event handler is registered on the nodeStream returned by Readable.fromWeb in the sendResponse function",
+        "The error handler destroys the response and logs a warning",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In platform/mcp-server/src/server-node.ts at lines 64-66, the sendResponse function pipes a web ReadableStream through a Node.js Readable to the ServerResponse:\n```\nconst nodeStream = Readable.fromWeb(body as unknown as NodeReadableStream);\nnodeStream.pipe(res);\nres.on('close', () => nodeStream.destroy());\n```\n\nIf the ReadableStream errors (e.g., SSE response generation throws), the error event on nodeStream is unhandled, which in Node.js causes an 'Unhandled error' exception. Add:\n```\nnodeStream.on('error', (err) => {\n  log.warn('Response stream error:', err);\n  if (!res.headersSent) {\n    res.writeHead(500);\n  }\n  res.end();\n});\n```\n\nPlace it after the pipe() call, before the res.on('close') handler."
+    }
+  ]
+}
