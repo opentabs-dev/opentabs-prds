@@ -17,7 +17,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/shared/src/constants.ts (line 46 area). Add a new function after `getLogFilePath`:\n\n```ts\nexport const getPidFilePath = (): string => join(getConfigDir(), 'server.pid');\n```\n\nExport it from platform/shared/src/index.ts (line 30 area, alongside getConfigDir, getLogFilePath, etc.).\n\nRe-export from platform/cli/src/config.ts (line 18) — add `getPidFilePath` to the re-export list from @opentabs-dev/shared."
@@ -43,7 +43,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "File: platform/cli/src/commands/start.ts.\n\nThe key change is in `handleStart`. When `options.background` is true:\n1. Still do all the same initialization (autoInitialize, ensureAuthSecret, isPortInUse check)\n2. Still print the startup banner and first-time instructions (so user sees MCP configs)\n3. Instead of spawning with `teeStream` to the terminal, spawn detached:\n   ```ts\n   const logStream = createWriteStream(logFilePath, { flags: 'a' });\n   const child = spawn(platformExec('node'), [serverEntry], {\n     env,\n     stdio: ['ignore', logStream, logStream],\n     detached: true,\n   });\n   child.unref();\n   ```\n4. Write the PID to `getPidFilePath()`:\n   ```ts\n   await writeFile(getPidFilePath(), String(child.pid));\n   ```\n5. Print confirmation and exit:\n   ```ts\n   console.log(`Server started in background (PID: ${child.pid})`);\n   console.log(pc.dim(`Logs: ${logFilePath}`));\n   console.log(pc.dim(`Stop: opentabs stop`));\n   ```\n\nAdd the option to `registerStartCommand`:\n```ts\n.option('--background', 'Start the server in the background')\n```\n\nAdd `background?: boolean` to the `StartOptions` interface.\n\nFor PID file cleanup: the spawned server process should remove the PID file on exit. One approach is to use a wrapper that writes the PID file and cleans up, or to add a small SIGTERM/exit handler. Since the server entry point is `@opentabs-dev/mcp-server`, the simplest approach is to have the start command write the PID file after spawn and have the stop command clean it up after killing.\n\nImport `writeFile` from `node:fs/promises` and `getPidFilePath` from `../config.js`."
@@ -67,7 +67,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Create a new file: platform/cli/src/commands/stop.ts.\n\nFollow the pattern of other commands (e.g., status.ts):\n```ts\nimport { getPidFilePath } from '../config.js';\nimport { resolvePort, parsePort } from '../parse-port.js';\nimport pc from 'picocolors';\nimport { readFile, unlink, access } from 'node:fs/promises';\nimport type { Command } from 'commander';\n\ninterface StopOptions { port?: number; }\n\nconst handleStop = async (options: StopOptions): Promise<void> => {\n  const pidPath = getPidFilePath();\n  // Try PID file first\n  // ... read PID, check if process exists (process.kill(pid, 0)), send SIGTERM, wait, clean up\n  // Fall back to port check if no PID file\n};\n```\n\nTo check if a process is still alive: `process.kill(pid, 0)` — this sends signal 0 (checks existence without killing). If it throws with code ESRCH, the process is gone.\n\nTo wait for process exit after SIGTERM: poll with `process.kill(pid, 0)` every 200ms with a 5s timeout. If it doesn't exit, warn the user.\n\nRegister in platform/cli/src/commands/index.ts:\n```ts\nexport { registerStopCommand } from './stop.js';\n```\n\nRegister in platform/cli/src/cli.ts:\n```ts\nimport { ..., registerStopCommand } from './commands/index.js';\nregisterStopCommand(program);\n```\n\nAdd examples to the help text:\n```ts\n.addHelpText('after', `\\nExamples:\\n  $ opentabs stop\\n  $ opentabs stop --port 3000`)\n```"
@@ -88,7 +88,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "Files: platform/cli/src/commands/status.ts, platform/cli/src/commands/doctor.ts.\n\nIn status.ts `handleStatus`, after printing the 'Status running' line (around line 123), read the PID file and check if the process is alive:\n```ts\nconst pidPath = getPidFilePath();\ntry {\n  const pid = parseInt(await readFile(pidPath, 'utf-8'), 10);\n  if (!isNaN(pid)) {\n    try {\n      process.kill(pid, 0); // check alive\n      console.log(`${pad('PID')}${pid} ${pc.dim('(background)')}`);\n    } catch {\n      // Stale PID file — clean up silently\n      await unlink(pidPath).catch(() => {});\n    }\n  }\n} catch {\n  // No PID file — foreground mode, skip\n}\n```\n\nInsert this between the 'Port' and 'Uptime' lines for clean layout.\n\nIn doctor.ts, in the MCP server check section, add similar PID info to the passing message. Find where it prints the server check result and append PID info when available."

@@ -1,0 +1,64 @@
+## Codebase Patterns
+- `platform/shared/src/constants.ts` holds all path helpers (`getConfigDir`, `getConfigPath`, `getExtensionDir`, `getLogFilePath`). New path helpers go here, then exported from `platform/shared/src/index.ts`.
+- `platform/cli/src/config.ts` imports path helpers from `@opentabs-dev/shared` and re-exports them for CLI commands to consume.
+- The `handleStart` function in `platform/cli/src/commands/start.ts` handles all initialization (autoInitialize, ensureAuthSecret, port check, banner) before branching on mode (background vs foreground). Background mode uses `spawn` with `detached: true` + `child.unref()`.
+- The `StartOptions` interface in start.ts holds all `--flag` options. The `registerStartCommand` function uses Commander's `.option()` to register flags.
+- `child.pid` from `spawn` is `number | undefined` — must narrow before using in template literals (ESLint `@typescript-eslint/restrict-template-expressions`).
+- New CLI commands follow the pattern: `commands/<name>.ts` exports `register<Name>Command`, which is re-exported from `commands/index.ts` and called in `cli.ts`.
+- `process.kill(pid, 0)` checks process existence without sending a signal — throws if dead (used in stop command and can be used elsewhere for PID checks).
+---
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-104311-server-lifecycle~running.json
+Started: Sat Feb 28 18:44:09 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Added `getPidFilePath` function to `platform/shared/src/constants.ts` after `getLogFilePath`, following same pattern
+- Exported `getPidFilePath` from `platform/shared/src/index.ts` alongside other path helpers
+- Added `getPidFilePath` to the import and re-export in `platform/cli/src/config.ts`
+- Files changed: `platform/shared/src/constants.ts`, `platform/shared/src/index.ts`, `platform/cli/src/config.ts`
+- **Learnings for future iterations:**
+  - Path helpers follow a simple pattern: `export const getXxxPath = (): string => join(getConfigDir(), 'filename');`
+  - The CLI's `config.ts` acts as a re-export barrel for path helpers used by CLI commands
+  - All Phase 1 checks passed cleanly with minimal changes
+---
+
+## 2026-02-28 - US-002
+- Added `--background` flag to `opentabs start` command
+- When `--background` is set: spawns MCP server as a detached child process, writes PID to `~/.opentabs/server.pid`, redirects stdout/stderr to log file, prints confirmation message with PID, and exits
+- First-time setup instructions still print before the server detaches
+- Port-in-use check still runs before attempting background start
+- Foreground mode (without `--background`) is completely unchanged
+- Files changed: `platform/cli/src/commands/start.ts`
+- **Learnings for future iterations:**
+  - `spawn()` with `detached: true` + `child.unref()` detaches the child process so the parent can exit
+  - `child.pid` is `number | undefined` — need to narrow type before using in string templates (ESLint restriction)
+  - The logStream for background mode uses `createWriteStream` as both stdout and stderr for the child's stdio array
+  - Restructured code to create logStream after the background/foreground branch to avoid leaking an unused stream in background mode
+---
+
+## 2026-02-28 - US-003
+- Created `platform/cli/src/commands/stop.ts` with `handleStop` and `registerStopCommand`
+- When PID file exists: reads PID, checks if process alive via `process.kill(pid, 0)`, sends SIGTERM, polls for exit (200ms interval, 5s timeout), cleans up PID file
+- When PID file exists but process is dead: cleans up stale PID file with informative message
+- When no PID file: falls back to health endpoint check on the configured port, guides user to use Ctrl+C for foreground servers
+- Registered stop command in `platform/cli/src/commands/index.ts` and `platform/cli/src/cli.ts`
+- Files changed: `platform/cli/src/commands/stop.ts` (new), `platform/cli/src/commands/index.ts`, `platform/cli/src/cli.ts`
+- **Learnings for future iterations:**
+  - New commands follow the pattern: create `commands/<name>.ts` with `handle<Name>` + `register<Name>Command`, export from `commands/index.ts`, register in `cli.ts`
+  - `process.kill(pid, 0)` is the standard way to check if a process is alive without killing it — throws if dead
+  - The `isConnectionRefused` helper from `config.ts` is useful for detecting "no server running" in health-check fallbacks
+  - Commander action handlers use `command.optsWithGlobals()` to inherit global options (like `--port`)
+---
+
+## 2026-02-28 - US-004
+- Updated `platform/cli/src/commands/status.ts` to show PID line between Port and Uptime when background server is running
+- Updated `platform/cli/src/commands/doctor.ts` to augment the MCP server check result with `(background, PID <pid>)` when PID file exists and process is alive
+- Both commands silently clean up stale PID files (ESRCH) and skip gracefully when no PID file exists (ENOENT)
+- Files changed: `platform/cli/src/commands/status.ts`, `platform/cli/src/commands/doctor.ts`
+- **Learnings for future iterations:**
+  - `CheckResult` (plain object interface) can be non-destructively augmented with spread syntax: `{ ...result, detail: '...' }`
+  - The nested try-catch pattern for PID checks: outer catch handles missing PID file (ENOENT), inner catch handles dead process (ESRCH from `process.kill(pid, 0)`)
+  - `unlink(path).catch(() => {})` is the idiomatic way to delete a file best-effort (don't throw if already gone)
+---
