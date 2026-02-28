@@ -1,0 +1,69 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Improve E2E test assertion quality and add missing test coverage: better assertion diagnostics in analyze-site tests, add tests for browser_get_websocket_frames tool, and add positive test for extension_get_side_panel.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Improve analyze-site test assertions for better failure diagnostics",
+      "description": "As a platform contributor, I want analyze-site E2E test failures to show the actual data instead of 'expected false to be true' so that debugging is faster.",
+      "acceptanceCriteria": [
+        "Suggestion presence checks use expect(array).toContainEqual(expect.objectContaining({ toolName: '...' })) instead of expect(array.some(...)).toBe(true)",
+        "At least 5 assertion sites in analyze-site.e2e.ts are updated with this pattern",
+        "All updated assertions still pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/analyze-site.e2e.ts\n\nThroughout the file, suggestion presence checks use this pattern:\n```\nexpect(result.suggestions.some(s => s.toolName === 'get_profile')).toBe(true);\n```\n\nThis produces a useless failure message: 'expected false to be true'. Replace with:\n```\nexpect(result.suggestions).toContainEqual(expect.objectContaining({ toolName: 'get_profile' }));\n```\n\nThis shows the actual suggestions array on failure, making it clear which suggestions were generated vs expected.\n\nSearch for all instances of `.some(s =>` followed by `.toBe(true)` and replace with the `toContainEqual` pattern. There are at least 10-15 instances across the file in tests for cookie-session, JWT, GraphQL, JSON-RPC, API key, tRPC, WebSocket, mixed auth, SPA, and Basic Auth scenarios.\n\nNote: Do NOT change the `auth.types` assertions that use `toContain` — those check string arrays and `toContain` is correct for them."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E test for browser_get_websocket_frames tool",
+      "description": "As a platform contributor, I want E2E test coverage for the browser_get_websocket_frames tool so that regressions in WebSocket frame capture are caught.",
+      "acceptanceCriteria": [
+        "A new test in browser-tools.e2e.ts exercises browser_get_websocket_frames",
+        "The test opens a page that establishes a WebSocket connection, enables network capture, and verifies captured frames",
+        "The test handles the case where WebSocket frame capture may not be available (debugger API limitation) gracefully",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: e2e/browser-tools.e2e.ts\n\nThe `browser_get_websocket_frames` tool is listed in BROWSER_TOOL_NAMES (e2e/helpers.ts:233) but has zero E2E test coverage. The analyze-site-test-server.ts has a WebSocket scenario at /websocket-app/ that creates a WebSocket server (using the 'ws' package) which could be reused as the test target.\n\nApproach:\n1. Add a new test.describe block after the 'Browser tools -- network capture lifecycle' block (~line 1729)\n2. The test should:\n   a. Open a tab to a URL that establishes a WebSocket connection (could use the analyze-site test server's /websocket-app/ endpoint, or add a /ws endpoint to the main test-server.ts)\n   b. Call browser_enable_network_capture on the tab\n   c. Wait briefly for the page's WebSocket to connect and exchange messages\n   d. Call browser_get_websocket_frames with the tabId\n   e. Verify the result contains frame entries (or handle gracefully if the feature is not supported)\n\nNote: The analyze-site test server already has a WebSocket server at e2e/analyze-site-test-server.ts. To use it, you'd need to start it via the fixture. Alternatively, it may be simpler to add a basic WebSocket endpoint to the existing test-server.ts. Check what's easiest.\n\nAnother option is to use the existing test server and open the /websocket-app/ scenario from analyze-site-test-server. But since browser-tools tests use the standard testServer fixture, the simplest approach might be to add a WebSocket endpoint to test-server.ts or to use a data: URL page that connects to an echo WebSocket."
+    },
+    {
+      "id": "US-003",
+      "title": "Add positive test for extension_get_side_panel when panel is open",
+      "description": "As a platform contributor, I want a test that verifies extension_get_side_panel returns { open: true } when the side panel is actually open so that the tool is verified in both states.",
+      "acceptanceCriteria": [
+        "A new test verifies extension_get_side_panel returns open: true when the side panel page is open",
+        "The test opens the side panel, calls extension_get_side_panel, and asserts open is true",
+        "The existing negative test (open: false when not open) is preserved",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: e2e/browser-tools.e2e.ts, approximately line 2670.\n\nThe existing test at line ~2670 is:\n```\ntest('extension_get_side_panel returns { open: false } when side panel is not open', async ({ mcpServer, ... }) => {\n  ...\n  const result = await callToolExpectSuccess(mcpClient, mcpServer, 'extension_get_side_panel');\n  expect(result.open).toBe(false);\n});\n```\n\nAdd a companion test that:\n1. Opens the side panel using the openSidePanel helper from helpers.ts\n2. Calls extension_get_side_panel\n3. Asserts result.open === true\n4. Closes the side panel page\n\nNote: The side panel detection works by checking if any extension pages with the side panel URL are open. In Playwright, opening the side panel URL via `context.newPage()` + `page.goto('chrome-extension://.../side-panel/side-panel.html')` should be detected. Import { openSidePanel } from './helpers.js' for this.\n\nIMPORTANT: The extension_get_side_panel tool may detect the panel by checking extension views or ports. In Playwright's test environment, the side panel is opened as a regular page (not via chrome.sidePanel API), so the detection mechanism might not work the same way. If the tool always returns { open: false } in the test environment regardless, the test should document this limitation and skip with a comment. Read the tool's implementation first (search for 'extension_get_side_panel' or 'get_side_panel' in platform/mcp-server/src/browser-tools/ and platform/browser-extension/src/background.ts) to understand the detection mechanism before writing the test."
+    }
+  ]
+}
