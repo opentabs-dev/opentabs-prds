@@ -1,0 +1,45 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-101102-network-capture-clear-bugs~running.json
+Started: Sat Feb 28 18:11:26 UTC 2026
+---
+
+## Codebase Patterns
+- `getWsFrames`/`getRequests` clear-reads should only reset user-facing buffer arrays, not internal tracking maps (`wsFramesByRequestId`, `pendingRequests`, `requestIdToRequest`)
+- `stopCapture` is the correct teardown path for clearing all internal maps; it calls `captures.delete(tabId)` which removes the entire state
+- Pre-commit hook (lint-staged) runs prettier + eslint automatically on staged `.ts` files
+- `webSocketCreated` adds a synthetic CapturedRequest to `state.requests` (status 101) in addition to updating `wsFramesByRequestId` — test assertions on request counts must account for this
+- `e2e/helpers.ts` `replaceIifeClosing` strips the trailing `//# sourceMappingURL=` comment before regex matching because `opentabs-plugin build` appends the freeze IIFE and source map after the main IIFE's `})();`
+
+## [2026-02-28] - US-001
+- Removed `state.wsFramesByRequestId.clear()` from `getWsFrames` in `platform/browser-extension/src/network-capture.ts` (line 541)
+- `wsFramesByRequestId` maps CDP requestId → WebSocket URL and must persist across clear-reads so that subsequent frame events from existing connections are captured correctly
+- `stopCapture` (line 475) still calls `wsFramesByRequestId.clear()` for full teardown — unchanged
+- **Learnings for future iterations:**
+  - Same pattern applies to `getRequests(clear=true)` for US-002: only clear `state.requests`, not `pendingRequests`/`requestIdToRequest`
+  - All 87 test files (2551 tests) pass after the fix
+---
+
+## [2026-02-28] - US-002
+- Removed `state.requestIdToRequest.clear()` and `state.pendingRequests.clear()` from `getRequests` in `platform/browser-extension/src/network-capture.ts` (lines 495-496)
+- `pendingRequests` maps requestId → partial request while awaiting `responseReceived`; clearing it on a read causes in-flight requests to be silently dropped when the response arrives
+- `requestIdToRequest` maps requestId → completed request for async body attachment by `loadingFinished`; clearing it breaks response body attachment for recently-completed requests
+- Updated the existing test in `platform/browser-extension/src/network-capture.test.ts` that was asserting the old (buggy) behavior — it now verifies the correct behavior: in-flight pending requests survive a clear-read and appear after `responseReceived` fires
+- Used `toHaveProperty('url', value)` pattern (not direct `.url` access) to satisfy `noUncheckedIndexedAccess` TypeScript check, matching existing test conventions
+- **Learnings for future iterations:**
+  - An existing test explicitly asserted the buggy behavior ("clear discards in-flight requests") — when fixing data-loss bugs, always check for tests that may have been written to document the bug rather than the desired behavior
+  - `noUncheckedIndexedAccess` is enabled: use `expect(arr[0]).toHaveProperty(...)` instead of `expect(arr[0].field).toBe(...)` to avoid TS2532 errors
+  - All 87 test files (2551 tests) pass after the fix
+---
+
+## [2026-02-28] - US-003
+- Added 3 new test suites to `platform/browser-extension/src/network-capture.test.ts`:
+  - `getWsFrames`: verifies `clear=true` preserves `wsFramesByRequestId` so new frames from existing connections are captured after the buffer is cleared
+  - `Network.loadingFinished after getRequests clear`: verifies `sendCommand` is called by `loadingFinished` after a `getRequests(clear=true)` because `requestIdToRequest` is preserved
+  - `stopCapture`: verifies `isCapturing` returns false and all buffers return empty after `stopCapture`
+- Fixed `replaceIifeClosing` in `e2e/helpers.ts` to strip the trailing `//# sourceMappingURL=` comment before applying the `})();` regex — this was a pre-existing failure (4 E2E tests) caused by `opentabs-plugin build` appending a freeze IIFE + source map after the main IIFE's closing `})();`
+- 87 test files (2554 tests) pass; 385 E2E tests pass
+- **Learnings for future iterations:**
+  - `Network.webSocketCreated` pushes a synthetic CapturedRequest (status 101) to `state.requests` in addition to writing `wsFramesByRequestId` — tests counting requests before stopCapture must expect 2 items if both HTTP and WS events fire
+  - `e2e/helpers.ts` `replaceIifeClosing` had a brittle end-of-file regex assumption; the fix strips the source map suffix before regex matching and re-appends it after
+  - When a test fails inconsistently (passes alone, fails in suite), check for global state pollution before investigating the test logic itself
+---

@@ -18,7 +18,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/network-capture.ts\n\nBug location: getWsFrames function (line 534-544). The `if (clear)` block on line 540-543 currently clears both `state.wsFrames` and `state.wsFramesByRequestId`. The fix is to remove the `state.wsFramesByRequestId.clear()` call.\n\nRoot cause: `wsFramesByRequestId` maps CDP requestId → WebSocket URL, populated by `Network.webSocketCreated` (line 309) and used by `Network.webSocketFrameSent`/`Received` handlers (line 331) to look up the URL for each frame. Clearing it makes subsequent frame events silently discard all frames because the URL lookup returns undefined. The mapping should persist until the WebSocket is closed (Network.webSocketClosed at line 348) or capture is stopped (stopCapture at line 475).\n\nThe fix is a one-line removal:\n```\nif (clear) {\n  state.wsFrames = [];\n  // REMOVE: state.wsFramesByRequestId.clear();\n}\n```\n\nVerify that stopCapture (line 474-477) still calls wsFramesByRequestId.clear() — that's the correct teardown path."
@@ -39,7 +39,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/network-capture.ts\n\nBug location: getRequests function (line 484-498). The `if (clear)` block on lines 493-497 currently clears `state.requests`, `state.requestIdToRequest`, and `state.pendingRequests`. The fix is to remove the requestIdToRequest.clear() and pendingRequests.clear() calls.\n\nRoot cause:\n- `pendingRequests` tracks HTTP requests between `Network.requestWillBeSent` (line 208) and `Network.responseReceived` (line 220). Clearing it drops in-flight requests — when the response arrives, the handler checks `state.pendingRequests.get(requestId)` and finds nothing, silently discarding the completed request.\n- `requestIdToRequest` maps completed requests for async body attachment by `Network.loadingFinished` (line 272). Clearing it means the loadingFinished handler can't find the request to attach the response body.\n\nThe fix:\n```\nif (clear) {\n  state.requests = [];\n  // REMOVE: state.requestIdToRequest.clear();\n  // REMOVE: state.pendingRequests.clear();\n}\n```\n\nVerify that stopCapture (line 474-477) still clears wsFramesByRequestId — that's the correct teardown path. Note: stopCapture does NOT explicitly clear pendingRequests or requestIdToRequest, but it calls captures.delete(tabId) which removes the entire CaptureState including those maps. This is correct because stopCapture is full teardown."
@@ -61,7 +61,7 @@
         "npm run test:e2e passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/network-capture.test.ts (existing test file — add new tests)\n\nThe existing test file already mocks chrome.debugger APIs. Follow the existing test patterns. Key test scenarios:\n\n1. **WS frames survive clear**: Start capture → simulate webSocketCreated (adds to wsFramesByRequestId) → simulate webSocketFrameReceived (adds frame) → getWsFrames(tabId, true) to read+clear → simulate another webSocketFrameReceived for the same requestId → getWsFrames(tabId, false) should return the new frame.\n\n2. **In-flight requests survive clear**: Start capture → simulate requestWillBeSent (adds to pendingRequests) → getRequests(tabId, true) to read+clear → simulate responseReceived for the same requestId → getRequests(tabId, false) should return the completed request.\n\n3. **Response body attachment survives clear**: Start capture → simulate requestWillBeSent → simulate responseReceived (moves to requestIdToRequest) → getRequests(tabId, true) to read+clear → simulate loadingFinished for the same requestId → the request's responseBody should be populated.\n\n4. **stopCapture clears everything**: Start capture → add some state → stopCapture → verify captures map no longer has the tabId entry.\n\nThe existing tests use a pattern of manually calling the chrome.debugger.onEvent listener with simulated CDP events. Look at the existing test file to follow this pattern.\n\nImportant: the test file path is platform/browser-extension/src/network-capture.test.ts — read it first to understand the existing test structure and mocking patterns before adding new tests."
