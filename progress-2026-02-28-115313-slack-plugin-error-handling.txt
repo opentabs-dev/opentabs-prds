@@ -1,0 +1,32 @@
+## Codebase Patterns
+- The slack plugin lives in `plugins/slack/` and does NOT have node_modules pre-installed; run `npm install` from that directory before running quality checks
+- The SDK's `fetchFromPage` error handling pattern (platform/plugin-sdk/src/fetch.ts lines 62-79) is the reference: DOMException TimeoutError → ToolError.timeout(), signal.aborted → non-retryable ToolError('aborted'), other errors → retryable ToolError with category 'internal'
+- The `slackApi` function uses raw `fetch()` (not SDK's fetchFromPage) because it needs form-encoded bodies with internal Slack headers — error handling must follow SDK conventions manually
+- `ToolError` static factories: `.timeout()` = retryable, `.internal()` = non-retryable; for retryable internal errors use `new ToolError(msg, code, { category: 'internal', retryable: true })`
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-115313-slack-plugin-error-handling~running.json
+Started: Sat Feb 28 19:53:44 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Wrapped the `fetch()` call in `slackApi` (plugins/slack/src/slack-api.ts lines 389-395) in a try-catch block
+- Extracted `AbortSignal.timeout(30_000)` into a `signal` variable so it can be referenced in the catch block
+- Maps DOMException TimeoutError → `ToolError.timeout()` with method name and 30000ms duration
+- Maps signal.aborted (but not TimeoutError) → non-retryable `ToolError('aborted')`
+- Maps all other errors → retryable `new ToolError(..., 'network_error', { category: 'internal', retryable: true })`
+- Files changed: `plugins/slack/src/slack-api.ts`
+- **Learnings for future iterations:**
+  - The slack plugin node_modules are not pre-installed; `npm install` is required before running quality checks
+  - The timeout signal from `AbortSignal.timeout()` IS aborted when a TimeoutError fires, so always check `error instanceof DOMException && error.name === 'TimeoutError'` BEFORE `signal.aborted` to correctly distinguish them
+  - The SDK's `fetchFromPage` in platform/plugin-sdk/src/fetch.ts is the canonical reference for fetch error handling patterns
+---
+
+## 2026-02-28 - US-002
+- Fixed `read-thread.ts` line 52: changed `has_more: data.has_more` to `has_more: data.has_more ?? false` to prevent undefined being returned for the required boolean output field
+- Fixed `search-messages.ts` line 85-86: changed the type parameter to `{ messages?: SearchMessagesResponse }` (marking messages as optional) and added `?? { total: 0, matches: [] as SearchMatch[] }` fallback to guard against undefined data.messages
+- Files changed: `plugins/slack/src/tools/read-thread.ts`, `plugins/slack/src/tools/search-messages.ts`
+- **Learnings for future iterations:**
+  - When the API type assertion uses a required field (`{ messages: T }`) but the actual API may omit it, mark the type as optional (`{ messages?: T }`) and add a nullish coalescing fallback to avoid TypeErrors at runtime
+  - The `??` operator is idiomatic for providing default values for fields that Slack's API may omit from responses
+---
