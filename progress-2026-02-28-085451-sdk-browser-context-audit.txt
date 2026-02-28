@@ -1,0 +1,51 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-085451-sdk-browser-context-audit~running.json
+Started: Sat Feb 28 16:55:20 UTC 2026
+---
+
+## Codebase Patterns
+- plugin-sdk DOM utilities use happy-dom (GlobalWindow) in tests; MutationObserver and document are set as globals in beforeEach
+- vi.spyOn(document, 'querySelector') works on the happy-dom document object for mocking querySelector behavior
+- lint:fix (prettier/eslint) is run via pre-commit hook automatically; also run manually after implementing to avoid commit failures
+- Tests for dom.ts live in platform/plugin-sdk/src/dom.test.ts
+- AbortSignal pattern in timing.ts: define abortReason() helper outside the Promise, check signal?.aborted before creating Promise, register listener with { once: true }, remove listener in cleanup(); closures can safely reference later-declared consts (e.g., timer, onAbort) since they're only called after initialization
+- In Node.js 22, DOMException extends Error, so signal.reason instanceof Error is true for default abort() calls — the abortReason() helper preserves the DOMException as-is
+
+## 2026-02-28 - US-001
+- Implemented invalid CSS selector handling across all 5 exported DOM utility functions in platform/plugin-sdk/src/dom.ts
+- waitForSelector and waitForSelectorRemoval: wrap initial querySelector in try-catch, reject with descriptive error; wrap observer callback querySelector in try-catch, clean up timer/observer and reject on error
+- querySelectorAll: wrap in try-catch, return empty array on error
+- getTextContent: wrap querySelector in try-catch, return null on error
+- observeDOM: wrap querySelector in try-catch, throw descriptive error mentioning selector
+- Added 7 new unit tests in platform/plugin-sdk/src/dom.test.ts covering all new behaviors
+- Files changed: platform/plugin-sdk/src/dom.ts, platform/plugin-sdk/src/dom.test.ts
+- **Learnings for future iterations:**
+  - The pre-commit hook runs prettier and eslint --fix automatically on staged files, so formatting is self-correcting at commit time
+  - For observer callback error testing, vi.spyOn on the happy-dom document's querySelector method works reliably — first call returns null (initial check passes), subsequent calls throw to simulate the error
+  - DOMException from invalid CSS selectors is caught by bare `catch` — no need to check instanceof DOMException
+---
+
+## 2026-02-28 - US-002
+- Added `signal?: AbortSignal` to `WaitUntilOptions` interface in platform/plugin-sdk/src/timing.ts
+- Added `abortReason()` helper (same pattern as retry) outside the Promise constructor
+- Added early-exit path: `if (signal?.aborted) return Promise.reject(abortReason())`
+- Registered `onAbort` listener with `{ once: true }` on the signal; `cleanup()` removes it via `signal?.removeEventListener`
+- `onAbort` checks `isSettled()` to guard against double-settling if timeout races with abort
+- Added 4 new unit tests in platform/plugin-sdk/src/timing.test.ts: already-aborted signal, abort during polling (promptly rejects), stops further predicate calls, DOMException for no-reason abort
+- Files changed: platform/plugin-sdk/src/timing.ts, platform/plugin-sdk/src/timing.test.ts
+- **Learnings for future iterations:**
+  - closures in the Promise constructor can reference `const` variables declared later in the same block (e.g., `cleanup` references `onAbort`, `timer`) — safe because the closure is only called after all variables are initialized
+  - The `abortReason()` helper must be defined outside the Promise so it's accessible for the early-abort check before `new Promise(...)` is called
+  - DOMException is an instance of Error in Node.js 22, so `signal.reason instanceof Error` returns true for default `controller.abort()` calls — the reason is preserved as-is
+---
+
+## 2026-02-28 - US-003
+- Added a `global registration` describe block to platform/plugin-sdk/src/log.test.ts
+- Test 1: verifies `(globalThis as Record<string, unknown>).__openTabs._setLogTransport` is a function
+- Test 2: verifies `(globalThis as Record<string, unknown>).__openTabs.log === log` (same reference as the exported log object)
+- No source changes needed — module already registers on globalThis.__openTabs at load time; the imported module is already loaded when tests run
+- Files changed: platform/plugin-sdk/src/log.test.ts
+- **Learnings for future iterations:**
+  - Module-level side effects (globalThis registrations) in log.ts are exercised as soon as the module is imported — tests just need to assert the registered values
+  - Using `(globalThis as Record<string, unknown>).__openTabs` type assertion pattern matches the source code convention in log.ts
+---
