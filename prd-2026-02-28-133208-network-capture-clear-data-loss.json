@@ -1,0 +1,28 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix data loss bugs in network-capture.ts where getRequests(clear=true) and getWsFrames(clear=true) destroy internal lookup maps needed by ongoing CDP event handlers, silently dropping subsequent HTTP responses and WebSocket frames until new connections are created.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Preserve lookup maps when clearing network capture buffers",
+      "description": "As a developer using browser_get_network_requests or browser_get_websocket_frames with clear=true, I want the clear operation to only remove completed entries from the output buffers so that in-flight HTTP requests and existing WebSocket connections continue to be captured correctly.",
+      "acceptanceCriteria": [
+        "getRequests(tabId, clear=true) clears the `requests` output array but does NOT clear `pendingRequests` — in-flight HTTP requests that have not yet received a response continue to be tracked and appear in subsequent getRequests calls",
+        "getRequests(tabId, clear=true) removes completed entries from `requestIdToRequest` (entries that are in the returned `requests` array) but preserves entries for in-flight requests still in `pendingRequests`",
+        "getWsFrames(tabId, clear=true) clears the `wsFrames` output array but does NOT clear `wsFramesByRequestId` or `wsCreatedAt` — existing WebSocket connections continue to have their frames captured and appear in subsequent getWsFrames calls",
+        "Unit tests verify that after clear, new events from in-flight HTTP requests are still captured",
+        "Unit tests verify that after clear, new WebSocket frames from existing connections are still captured",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/network-capture.ts\n\nBug 1 — getRequests (line 527-542):\nWhen clear=true, line 538 calls `state.pendingRequests.clear()`. This destroys the Set of requestIds for HTTP requests that sent `Network.requestWillBeSent` but haven't received `Network.responseReceived` yet. The `responseReceived` handler at line ~236 checks `if (!pending) return;` — so any in-flight request's response data is silently dropped after clear.\n\nLine 539 also clears `requestIdToRequest`, which is needed by `loadingFinished`/`loadingFailed` handlers to finalize requests. In-flight requests will lose their response data.\n\nFix for getRequests:\n- Remove `state.pendingRequests.clear()` from the clear path entirely — these are in-flight requests that haven't completed\n- For `requestIdToRequest`, only delete entries whose requestIds are NOT in `pendingRequests` (i.e., completed requests). Simplest approach: rebuild requestIdToRequest from only the pending entries after clearing.\n\nBug 2 — getWsFrames (line 577-588):\nWhen clear=true, lines 584-585 clear `wsFramesByRequestId` and `wsCreatedAt`. These maps store the requestId→URL mapping populated by `Network.webSocketCreated` events. The frame handlers (`webSocketFrameSent`, `webSocketFrameReceived`) at lines ~343-362 look up `state.wsFramesByRequestId.get(requestId)` — after clear, ALL subsequent frames from existing WebSocket connections are silently dropped because the lookup returns undefined.\n\nFix for getWsFrames:\n- Do NOT clear `wsFramesByRequestId` or `wsCreatedAt` when clear=true. Only clear the `wsFrames` output array. The lookup maps are lightweight (one entry per WebSocket connection) and are needed for ongoing frame capture.\n- `wsFramesByRequestId` entries are already cleaned up by `webSocketClosed` handler, so they don't leak.\n\nThese maps ARE properly cleaned up in stopCapture() (line ~382-404) which tears down the entire capture session. The clear operation should only reset the output buffers, not the internal bookkeeping state.\n\nExisting tests are in platform/browser-extension/src/network-capture.test.ts — add test cases that verify capture continues working after clear."
+    }
+  ]
+}
