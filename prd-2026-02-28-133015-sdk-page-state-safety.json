@@ -1,0 +1,56 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Block prototype chain traversal in getPageGlobal and add missing test coverage for browser-context edge cases in the plugin SDK page-state module.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Block prototype chain traversal in getPageGlobal",
+      "description": "As a platform maintainer, I want getPageGlobal to block prototype chain segments (__proto__, constructor, prototype) so that plugins cannot leak Object.prototype contents or traverse the constructor chain via paths like '__proto__.toString' or 'constructor.prototype.constructor'.",
+      "acceptanceCriteria": [
+        "getPageGlobal('__proto__') returns undefined",
+        "getPageGlobal('constructor') returns undefined",
+        "getPageGlobal('constructor.prototype') returns undefined",
+        "getPageGlobal('__proto__.toString') returns undefined",
+        "getPageGlobal('TS.boot_data.__proto__') returns undefined (blocked at any depth)",
+        "Legitimate paths like getPageGlobal('TS.boot_data.api_token') still work correctly",
+        "A BLOCKED_SEGMENTS Set containing '__proto__', 'constructor', 'prototype' is checked for each segment during traversal",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/page-state.ts, lines 12-25.\n\nThe current getPageGlobal function uses `(current as Record<string, unknown>)[segment]` to traverse properties on globalThis. Paths like '__proto__' resolve to Object.prototype, and 'constructor.prototype' traverses the constructor chain. This is a read-only information disclosure — the function never writes — but it contradicts the 'safe deep property access' contract.\n\nFix: Add a constant `BLOCKED_SEGMENTS = new Set(['__proto__', 'constructor', 'prototype'])` and check `if (BLOCKED_SEGMENTS.has(segment)) return undefined;` inside the for loop, before the property access on line 19. Place the check after the null/undefined and type guards (lines 17-18) but before the property read (line 19).\n\nThe MCP server already has output sanitization (sanitizeOutput in platform/mcp-server/src/mcp-tool-dispatch.ts), but this SDK-level guard is the correct first line of defense.\n\nDo NOT modify any other file. The test file changes go in US-002."
+    },
+    {
+      "id": "US-002",
+      "title": "Add tests for getPageGlobal prototype blocking and edge cases",
+      "description": "As a platform maintainer, I want comprehensive test coverage for the getPageGlobal prototype chain blocking and path edge cases so that regressions are caught immediately.",
+      "acceptanceCriteria": [
+        "Test: getPageGlobal('__proto__') returns undefined",
+        "Test: getPageGlobal('constructor') returns undefined",
+        "Test: getPageGlobal('prototype') returns undefined",
+        "Test: getPageGlobal('constructor.prototype') returns undefined",
+        "Test: getPageGlobal('__proto__.toString') returns undefined",
+        "Test: getPageGlobal('TS.__proto__.hasOwnProperty') returns undefined (mid-path blocking)",
+        "Test: getPageGlobal('') returns undefined for empty string path (edge case)",
+        "Test: getPageGlobal('a..b') returns undefined for consecutive dots (empty segment edge case)",
+        "All new tests are in a describe('prototype chain blocking') group inside the existing getPageGlobal describe block",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/page-state.test.ts, inside the existing describe('getPageGlobal') block (starts at line 25).\n\nAdd a nested describe('prototype chain blocking') group with tests for each blocked segment. The tests should set up globals like `(globalThis as Record<string, unknown>).TS = { boot_data: { api_token: 'xoxs-abc' } }` and verify that prototype paths return undefined while legitimate paths still work.\n\nAlso add an edge case section testing:\n- Empty string path: getPageGlobal('') — should return undefined since '' is an empty segment\n- Consecutive dots: getPageGlobal('a..b') — produces an empty segment '' in the split result\n\nNote: getPageGlobal('') calls ''.split('.') which returns [''], so it accesses globalThis[''] which is undefined. With the blocked segments fix, empty string '' is NOT in the blocked set, so this is fine — it naturally returns undefined. Just add a test to document this behavior.\n\nClean up test globals in afterEach — the existing afterEach at line 13-19 already deletes __testGlobal, __testProxy, and TS."
+    }
+  ]
+}
