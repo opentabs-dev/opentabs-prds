@@ -1,0 +1,68 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-080137-e2e-resource-leak-fixes~running.json
+Started: Sat Feb 28 16:02:11 UTC 2026
+---
+
+## Codebase Patterns
+- `McpServer` type is exported from `e2e/fixtures.ts` and should be imported with `import type { McpServer } from './fixtures.js'`
+- `BrowserContext` type is NOT re-exported from fixtures; import it directly with `import type { BrowserContext } from '@playwright/test'`
+- In E2E test files, import order: relative value imports → node: built-ins → type-only imports (relative then external)
+- `killProcess` in fixtures.ts checks `proc.exitCode !== null` before killing, so calling `server?.kill()` on an already-dead server is safe
+- Resource leak fix pattern: declare `let server: McpServer | undefined` and `let context: BrowserContext | undefined` before try, assign inside try, use `?.` optional chaining in finally
+- For module-level shared test servers (`beforeAll`/`afterAll`), use `let server: TestServer | undefined` and `${server?.url ?? ''}` in template literals — `!` non-null assertion and `?.url` in templates are both banned by strict ESLint rules (`no-non-null-assertion`, `restrict-template-expressions` with `allowNullish: false`)
+
+## [2026-02-28] - US-001
+- Fixed resource leak in all 4 tests in `e2e/onboarding.e2e.ts`
+- Moved `startMcpServer` and `launchExtensionContext` inside try blocks; declared `server`/`context`/`cleanupDir` with `let` before try
+- Used `context?.close()` and `server?.kill()` with optional chaining in finally blocks
+- Added `import type { McpServer } from './fixtures.js'` and `import type { BrowserContext } from '@playwright/test'` (after node: imports)
+- Files changed: `e2e/onboarding.e2e.ts`
+- **Learnings for future iterations:**
+  - Type-only imports in E2E files go at the end of the import block, after `node:` imports
+  - The `import-x/order` lint rule enforces: relative value imports → node built-ins → type imports
+  - Pre-commit hook runs prettier + eslint --fix automatically, so minor formatting is auto-corrected
+---
+
+## [2026-02-28] - US-002
+- Fixed resource leaks in `e2e/discovery-edge-cases.e2e.ts` (all 6 tests)
+- `e2e/npm-discovery.e2e.ts` was already correctly fixed (all 5 tests already use `let server: McpServer | undefined` inside try blocks)
+- Added `import type { McpServer, McpClient } from './fixtures.js'` to discovery-edge-cases.e2e.ts
+- For each of the 6 tests: changed `const server = await startMcpServer(...)` before try to `let server: McpServer | undefined` before try, then `server = await startMcpServer(...)` inside try
+- For tests using client (tests 5 and 6): added `let client: McpClient | undefined` before try, moved `client = createMcpClient(...)` inside try
+- Changed `server.kill()` / `client.close()` in finally blocks to `server?.kill()` / `client?.close()`
+- Files changed: `e2e/discovery-edge-cases.e2e.ts`
+- **Learnings for future iterations:**
+  - When `McpClient` is needed as a type, it is exported from `e2e/fixtures.ts` (alongside `McpServer`)
+  - `createMcpClient` does not allocate OS resources (it's just a wrapper constructor), but for consistency the null-check pattern is still applied
+  - Check that npm-discovery.e2e.ts was already fixed before starting — it had been corrected in a prior run
+---
+
+## [2026-02-28] - US-003
+- Fixed resource leaks in `e2e/resources-prompts.e2e.ts` empty-list tests
+- Two tests in `Empty resource/prompt lists` describe block (lines ~247, ~278): moved `startMcpServer` and `createMcpClient` inside try blocks
+- Added `let server: McpServer | undefined` and `let client: McpClient | undefined` before each try block
+- Changed `server.kill()` / `client.close()` to `server?.kill()` / `client?.close()` in finally blocks
+- Added `import type { McpClient, McpServer } from './fixtures.js'` (after node: built-in imports)
+- Files changed: `e2e/resources-prompts.e2e.ts`
+- **Learnings for future iterations:**
+  - Both `McpServer` and `McpClient` types are available from `./fixtures.js`
+  - The type import should be placed after `node:` built-in imports to follow the import-x/order lint rule
+  - Pre-commit hook auto-runs prettier and eslint --fix, so minor style issues are auto-corrected
+---
+
+## [2026-02-28] - US-004
+- Fixed missing null guard in `e2e/analyze-site.e2e.ts` afterAll
+- Changed `let analyzeSiteServer: TestServer` to `let analyzeSiteServer: TestServer | undefined`
+- Updated `afterAll` to `if (analyzeSiteServer) await analyzeSiteServer.kill()`
+- Changed all `${analyzeSiteServer.url}/path/` template literals to `${analyzeSiteServer?.url ?? ''}/path/` (13 occurrences) to satisfy `restrict-template-expressions` (allowNullish: false)
+- Replaced conditional assertions with unconditional ones:
+  - GraphQL test: `if (gqlEndpoint?.requestBodySample) { expect(...) }` → `expect(gqlEndpoint?.requestBodySample).toBeDefined(); expect(gqlEndpoint?.requestBodySample).toContain('query')`
+  - JSON-RPC test: same pattern for `rpcEndpoint?.requestBodySample` / `'jsonrpc'`
+- Files changed: `e2e/analyze-site.e2e.ts`
+- All 373 E2E tests passed
+- **Learnings for future iterations:**
+  - ESLint config uses `strictTypeChecked` preset with `no-non-null-assertion` (no `!` on expressions), `restrict-template-expressions` with `allowNullish: false` (no `string | undefined` in templates), and `no-unnecessary-condition`
+  - For module-level `beforeAll`/`afterAll` servers, use `TestServer | undefined` + `?.url ?? ''` in template literals
+  - The definite assignment assertion `let x!: T` in declarations is NOT banned by `no-non-null-assertion`, but subsequent null checks on it trigger `no-unnecessary-condition` since TypeScript narrows the condition as always-truthy
+  - `?.` optional chain followed by `?? ''` fallback produces `string` type and is valid in template literals
+---
