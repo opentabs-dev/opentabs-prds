@@ -1,0 +1,86 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix flaky E2E test patterns: replace fixed setTimeout waits with polling, add assertion guards on IIFE regex replacements, and add AbortSignal.timeout to inline health fetches.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Replace 8s fixed sleep with polling in tab-state-sync reconnect test",
+      "description": "As a platform contributor, I want the server-restart reconnect test to use polling instead of a fixed 8-second sleep so it is both faster and more reliable under varying load.",
+      "acceptanceCriteria": [
+        "The fixed `await new Promise(r => setTimeout(r, 8_000))` at line ~316 is replaced with a polling approach",
+        "The polling confirms the extension has detected the disconnection (e.g., by trying to connect to the killed server port and confirming refusal, or by checking the extension's state via the side panel)",
+        "The test still passes reliably",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: e2e/tab-state-sync.e2e.ts, line ~316. After killing server1 (line 311), the test sleeps 8 seconds to wait for the extension to detect disconnection (pong timeout 5s + buffer). This is flaky: under load, 8s may not be enough; under no load, it wastes 8s.\n\nThe challenge is that the server is killed, so we cannot poll /health. Options:\n1. Poll the old server port to confirm it's refusing connections (try fetch with AbortSignal.timeout and expect ECONNREFUSED).\n2. Use the extension context to evaluate the offscreen document's connection state.\n3. Simply attempt to start server2 and then poll server2's /health — the extension will reconnect once server2 is up.\n\nOption 3 is simplest: remove the 8s sleep entirely, start server2 immediately after killing server1, and let waitForExtensionConnected(server2) handle the timing. The extension's reconnect logic will find server2 once it's up. The 8s sleep was originally added to 'wait for the extension to detect disconnect and exhaust reconnect attempts' but this is unnecessary — we just need the extension to eventually connect to server2, and waitForExtensionConnected already polls with a 45s timeout."
+    },
+    {
+      "id": "US-002",
+      "title": "Add IIFE regex replacement assertion guards in iife-injection.e2e.ts",
+      "description": "As a platform contributor, I want IIFE regex replacements to assert that the replacement actually modified the content so that a regex mismatch fails immediately with a clear error instead of a misleading 15-second timeout.",
+      "acceptanceCriteria": [
+        "After every `originalIife.replace(/}\\)\\(\\);[\\s]*$/, ...)` call, there is an assertion that the result differs from the original",
+        "If the regex doesn't match, the test fails immediately with a message like 'IIFE regex replacement failed — the IIFE closing pattern may have changed'",
+        "All existing iife-injection tests still pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/iife-injection.e2e.ts. The IIFE replacement pattern `originalIife.replace(/}\\)\\(\\);[\\s]*$/, ...)` is used at approximately lines 77, 530, 622, 711, 893, 957. If the build output format changes (e.g., a trailing sourcemap comment), the regex silently fails — .replace() returns the original string unchanged. The modified file is written, the watcher sees no real change, and the test hangs for 15 seconds before a confusing timeout.\n\nFix: After each replace call, add:\n```typescript\nif (modifiedIife === originalIife) {\n  throw new Error(\n    'IIFE regex replacement did not match — the adapter.iife.js closing pattern may have changed. ' +\n    'Expected to find })(); at end of file.'\n  );\n}\n```\n\nAlternatively, create a small helper function `replaceIifeClosing(iife: string, injection: string): string` that does the replace + assertion, to avoid repeating this at every call site."
+    },
+    {
+      "id": "US-003",
+      "title": "Add IIFE regex replacement assertion guards in strict-csp.e2e.ts",
+      "description": "As a platform contributor, I want the strict-csp IIFE modification test to assert that the regex replacement succeeded.",
+      "acceptanceCriteria": [
+        "The IIFE replacement in the strict-csp file-watcher test has the same assertion guard as US-002",
+        "If using the shared helper from US-002, it is imported and reused",
+        "The strict-csp tests still pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/strict-csp.e2e.ts, line ~530. Same pattern as iife-injection.e2e.ts — the IIFE regex replacement can silently fail. If US-002 creates a shared helper in helpers.ts, import and use it here. Otherwise, add the inline assertion guard."
+    },
+    {
+      "id": "US-004",
+      "title": "Add AbortSignal.timeout to inline health fetch calls in test files",
+      "description": "As a platform contributor, I want inline `fetch('/health')` calls inside expect.poll() to include AbortSignal.timeout so that a hung server does not cause the poll to stall past its timeout.",
+      "acceptanceCriteria": [
+        "All inline `fetch('http://localhost:.../health', ...)` calls in e2e test files include `signal: AbortSignal.timeout(3_000)` or similar",
+        "The fetch calls that already use mcpServer.waitForHealth() or the fixture's fetchHealth are not affected (they already have timeouts)",
+        "Tests still pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Multiple files have inline health polling without AbortSignal.timeout:\n- e2e/tab-state-sync.e2e.ts: lines ~55, 77, 127, 149, 174, 211, 237, 298, 332\n- e2e/side-panel-data-flow.e2e.ts: lines ~137, 168, 234, 266, 294, 361\n- e2e/side-panel-plugin-toggle.e2e.ts: lines ~84-85\n- e2e/side-panel-icons.e2e.ts: line ~144\n\nThe fixtures.ts fetchHealth helper (line ~133) already includes `AbortSignal.timeout(2_000)`. The inline fetches in test files should match.\n\nFix: Add `signal: AbortSignal.timeout(3_000)` to the fetch options. Use 3s (slightly longer than the fixture's 2s) to be generous but still prevent indefinite hangs. Pattern:\n```typescript\nconst res = await fetch(`http://localhost:${port}/health`, {\n  headers: { Authorization: `Bearer ${secret}` },\n  signal: AbortSignal.timeout(3_000),\n});\n```\n\nWrap in try/catch inside the poll callback so AbortError from timeout triggers a retry rather than crashing the poll."
+    }
+  ]
+}

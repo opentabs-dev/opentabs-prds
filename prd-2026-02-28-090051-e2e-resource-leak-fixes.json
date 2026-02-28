@@ -1,0 +1,87 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix resource leaks and cleanup failures in E2E tests where manually-managed test infrastructure crashes in the finally block when partial setup fails, leaving orphaned servers, temp dirs, and browser contexts behind.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix partial-setup resource leak in tab-state-sync.e2e.ts reconnect test",
+      "description": "As a platform contributor, I want the reconnect test's finally block to handle undefined variables gracefully so that server processes and temp directories are cleaned up even when launchExtensionContext fails.",
+      "acceptanceCriteria": [
+        "The finally block at line ~372 uses optional chaining or conditional checks for context, cleanupDir, and extensionDir before calling .close() or fs.rmSync()",
+        "If launchExtensionContext throws, server1, testServer, and configDir are still properly cleaned up",
+        "The test still passes when all setup steps succeed (no behavioral regression)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/tab-state-sync.e2e.ts, lines 270-377. The test creates resources sequentially: configDir (line 277), server1 (280), testServer (282), then destructures { context, cleanupDir, extensionDir } from launchExtensionContext (283). If launchExtensionContext throws, the const destructuring never assigns the variables. The finally block (lines 371-377) then crashes on `await context.close()` (undefined), `fs.rmSync(cleanupDir, ...)` (undefined), etc., masking the original error and leaving server1 and testServer running.\n\nFix pattern: declare context, cleanupDir as `let` variables before the try block, assign them inside try, and use `context?.close()` and conditional `if (cleanupDir) fs.rmSync(...)` in finally. The server and testServer kills should also use optional chaining. Model after the pattern already used in helpers.ts setupIsolatedIifeTest (lines 437-484) which tracks resources incrementally."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix partial-setup resource leaks in side-panel-data-flow.e2e.ts",
+      "description": "As a platform contributor, I want all three manually-managed tests in side-panel-data-flow.e2e.ts to handle partial setup failures gracefully so that orphaned processes and temp dirs are cleaned up.",
+      "acceptanceCriteria": [
+        "The connection status test (line ~31) handles undefined context/cleanupDir in its finally block",
+        "The tab state dot test (line ~95) handles undefined context/cleanupDir in its finally block",
+        "The tool invocation animation test (line ~329) handles undefined context/cleanupDir in its finally block",
+        "All three tests still pass when setup succeeds (no behavioral regression)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/side-panel-data-flow.e2e.ts. Three tests at lines ~31, ~95, ~329 all have the same pattern: they destructure { context, cleanupDir, extensionDir } from launchExtensionContext, and the finally blocks assume these variables are defined. If launchExtensionContext throws, the finally blocks crash.\n\nFix: Declare context, cleanupDir, extensionDir as let variables before the try block (initialized to undefined). Assign them inside try via: `const ext = await launchExtensionContext(...); context = ext.context; cleanupDir = ext.cleanupDir; extensionDir = ext.extensionDir;`. In finally, use `await context?.close()` and `if (cleanupDir) fs.rmSync(cleanupDir, ...)`. Same pattern in all three tests."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix tmpDir leak in strict-csp.e2e.ts multi-plugin and file-watcher tests",
+      "description": "As a platform contributor, I want temporary directories created in strict-csp tests to be cleaned up in try/finally blocks so they don't leak when assertions fail.",
+      "acceptanceCriteria": [
+        "The multi-plugin CSP tests (lines ~586, ~653, ~712) wrap their tmpDir cleanup in try/finally",
+        "tmpDir is cleaned up even when assertions or awaits throw before the cleanup line",
+        "All strict-csp tests still pass (no behavioral regression)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/strict-csp.e2e.ts. Three fixtureTest blocks create tmpDir via fs.mkdtempSync but place the fs.rmSync cleanup at the END of the test body (lines ~643, ~702, ~795) WITHOUT a try/finally. If any assertion or await before the cleanup line throws, tmpDir leaks.\n\nFix: For each affected test, wrap the body after tmpDir creation in try/finally:\n```\nconst tmpDir = fs.mkdtempSync(...);\ntry {\n  // ... test body ...\n} finally {\n  fs.rmSync(tmpDir, { recursive: true, force: true });\n}\n```\nThe page.close() call can remain inside the try block since the fixture handles context cleanup."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix analyze-site.e2e.ts silent failure cascade when beforeAll fails",
+      "description": "As a platform contributor, I want the analyze-site tests to fail with a clear error message when the shared test server fails to start, instead of producing 12 misleading test failures with empty URLs.",
+      "acceptanceCriteria": [
+        "If startAnalyzeSiteServer() in beforeAll throws, subsequent tests fail with a clear message like 'Analyze-site test server failed to start' instead of obscure tool errors",
+        "The analyzeSiteServer?.url ?? '' fallback pattern is replaced with an explicit guard that throws early",
+        "All analyze-site tests still pass when the server starts successfully",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: e2e/analyze-site.e2e.ts, lines 104-125. The shared server is started in beforeAll (line 107-109) and used via `analyzeSiteServer?.url ?? ''` (line 125 and 11 other locations). If beforeAll fails, analyzeSiteServer stays undefined, and all 12 tests silently construct URLs like '/cookie-session/' (just the path) which produce misleading tool errors.\n\nFix: Add a guard function that throws a clear error:\n```typescript\nconst getServerUrl = (): string => {\n  if (!analyzeSiteServer) {\n    throw new Error('Analyze-site test server not started — check beforeAll for errors');\n  }\n  return analyzeSiteServer.url;\n};\n```\nThen replace all `analyzeSiteServer?.url ?? ''` with `getServerUrl()`. This gives immediate, clear errors instead of 12 cascading tool failures."
+    }
+  ]
+}
