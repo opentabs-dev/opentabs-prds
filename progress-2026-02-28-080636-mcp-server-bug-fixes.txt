@@ -1,0 +1,42 @@
+## Codebase Patterns
+- sanitize-error.ts: URL regex must run before path regexes. The Windows path regex `[a-z]:[/\\]` matches the `s:/` in `https://` and `p:/` in `http://`, consuming the trailing part of the protocol and producing `htt[PATH]` instead of `[URL]`.
+- Vitest runs TypeScript source directly (no build step needed for tests).
+- The pre-commit hook (lint-staged) runs prettier and eslint --fix automatically on staged files.
+- detectPrimaryApiBaseUrl: prefix counts must be based on distinct endpoint count (+1 per endpoint, not +callCount), and minCount threshold uses endpoints.length (not sum of callCounts), so that the threshold genuinely requires multiple distinct endpoints to share a prefix.
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-080636-mcp-server-bug-fixes~running.json
+Started: Sat Feb 28 16:07:50 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Fixed regex ordering in platform/mcp-server/src/sanitize-error.ts: moved the URL regex (`https?://...`) to run first, before both Windows and Unix path regexes.
+- The PRD notes suggested swapping only the Unix path and URL lines, but the Windows path regex (`[a-z]:[/\\]`) also matches the `s:/` in `https://`, so the URL regex must precede ALL path regexes.
+- Updated tests in platform/mcp-server/src/sanitize-error.test.ts: replaced `not.toContain` checks with exact `toBe` assertions that verify `[URL]` output; added regression test for `https://internal.corp/api/v2 → [URL]`.
+- Files changed: platform/mcp-server/src/sanitize-error.ts, platform/mcp-server/src/sanitize-error.test.ts
+- **Learnings for future iterations:**
+  - The Windows path regex `[a-z]:[/\\]` is broader than it looks — it matches any single letter followed by `:/` or `:\`, which includes `s:/` from `https://` and `p:/` from `http://`. Always put the URL regex before ALL path regexes.
+  - The original URL tests used only `not.toContain` assertions which passed even with partial sanitization (e.g., `htt[PATH]`). When writing tests for sanitization, prefer exact `toBe` assertions.
+---
+
+## 2026-02-28 - US-002
+- Fixed WebSocket frame URL matching in platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts line 450.
+- The bug: endpoint URLs are normalized (origin+pathname, no query params) during grouping at lines 417-424, but frame URLs were compared with strict equality (`frame.url !== ep.url`). Frames with query params (e.g., `wss://example.com/ws?token=abc`) never matched normalized endpoints (`wss://example.com/ws`).
+- Fix: normalize `frame.url` the same way (try/catch URL parse, use origin+pathname) before comparison.
+- Added test: 'matches frames to endpoints when frame URL has query params' — verifies a frame with `?token=abc` in the URL matches the normalized endpoint.
+- Files changed: platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts, platform/mcp-server/src/browser-tools/analyze-site/detect-apis.test.ts
+- **Learnings for future iterations:**
+  - Single-element arrays trigger prettier's "collapse to one line" rule. Write `[frame({...})]` not a multi-line array literal when there is only one element.
+  - The pre-commit hook runs prettier --write automatically, so minor formatting issues are auto-fixed on commit.
+---
+
+## 2026-02-28 - US-003
+- Fixed detectPrimaryApiBaseUrl in platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts.
+- The bug: prefix counts used `+ endpoint.callCount` (lines 342, 345) and `totalEndpoints` summed all callCounts (line 355). A single URL called N times contributed N to every prefix it belongs to, allowing it to satisfy minCount=2 on its own. This produced a deep, biased prefix instead of requiring genuinely shared prefixes.
+- Fix: change `+ endpoint.callCount` to `+ 1` on both count accumulation lines. Remove the `totalEndpoints` variable and derive `minCount` directly from `endpoints.length`. Now prefix counts reflect distinct endpoint counts, and minCount=2 truly requires two different URLs to share a prefix.
+- Added two tests: (1) a single URL requested 10 times + one unrelated URL on same origin → origin returned (not the deep path); (2) two endpoints sharing a prefix → that prefix returned.
+- Files changed: platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts, platform/mcp-server/src/browser-tools/analyze-site/detect-apis.test.ts
+- **Learnings for future iterations:**
+  - The acceptance criterion "produces at most the origin" for a single heavily-called endpoint refers to a scenario with 2 distinct endpoints: one with many calls (contributing +1 to its deep prefix) and one elsewhere on the same origin. After the fix, only the shared origin (count=2) satisfies minCount=2 — the deeply-called endpoint's sub-paths have count=1.
+  - When accumulating per-endpoint metrics for threshold logic, always count distinct endpoints (not event counts) to avoid cardinality confusion.
+---
