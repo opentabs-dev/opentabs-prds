@@ -1,0 +1,50 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix scaffolded plugin code that fails its own lint/format checks out of the box, and make localPlugins.add reject nonexistent paths. A new plugin developer runs `opentabs plugin create`, `npm install`, `npm run lint` and gets 7 errors before writing a single line of code. The scaffold template generates double-quoted strings but .prettierrc enforces singleQuote:true, and wraps arrow function params in unnecessary parens. Additionally, `opentabs config set localPlugins.add /nonexistent/path` silently adds the path with only a dim warning, making it easy to misconfigure.\n\nKnown LOW issues (not worth stories): The `ResourceDefinition.read(uri)` callback triggers `no-unused-vars` lint if the `uri` param is unused — this is a minor ergonomic issue with the SDK interface design, not a scaffold problem.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Scaffold template generates code that passes lint and format checks",
+      "description": "As a plugin developer, I want the scaffolded code to pass `npm run lint` and `npm run format:check` immediately after `npm install`, so that I don't have to fix formatting errors before I can start developing.",
+      "acceptanceCriteria": [
+        "All string literals in generatePluginIndex() and generateExampleTool() use single quotes (matching .prettierrc singleQuote:true)",
+        "Arrow function parameters in generateExampleTool() omit unnecessary parentheses for single-param arrows (e.g., `params =>` not `(params) =>`)",
+        "The ESLINT_CONFIG_CONTENT and PRETTIERRC_CONTENT templates remain unchanged (they already use single quotes)",
+        "A freshly scaffolded plugin (with `npm install`) passes `npm run lint` with zero errors",
+        "A freshly scaffolded plugin passes `npm run format:check` with zero warnings",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: `platform/cli/src/scaffold.ts`\n\nThe scaffold generates string literals using the `singleQuote()` helper (line 51) which correctly produces single-quoted strings. But there are other string literals in the templates that use double quotes directly.\n\nIn `generatePluginIndex()` (line 345-373): The generated code uses template literals that embed string values. The TS code output contains double-quoted strings for `name`, `description`, `displayName`, `urlPatterns`. The `singleQuote()` helper IS used for dynamic values, but the generated TypeScript source uses double-quote delimiters in some places where it should use single quotes to match the `.prettierrc` (singleQuote: true).\n\nActually, looking more carefully at the scaffold code: `singleQuote()` already wraps values in single quotes. The issue is that the GENERATED TypeScript file's import statements and other literals use the quote style from the template string.\n\nThe key observation: Looking at the generated `src/index.ts`, the imports like `import { OpenTabsPlugin } from '@opentabs-dev/plugin-sdk'` use single quotes (good), but value assignments like `readonly name = 'my-plugin'` are generated via `singleQuote()` which also produces single quotes (good). So the actual issue might be in the OTHER parts of the template.\n\nWait — the actual Docker test showed errors like `Replace '\"my-plugin\"' with '\\'my-plugin\\''`. This means some strings ARE double-quoted in the output. Check the `generatePluginIndex` return value — the template literal embeds `${singleQuote(args.name)}` which produces `'my-plugin'` (with single quotes). But the PUBLISHED VERSION (v0.0.35) may have had double quotes. Check the CURRENT source carefully — if the current source already uses `singleQuote()` everywhere, the fix may already be in the current codebase but not published. If so, verify by running the scaffold locally.\n\nAlso in `generateExampleTool()` (line 376-399): the `handle: async params => {` should NOT wrap params in parens. Check if the template produces `async (params) =>` or `async params =>`. The prettier rule `arrowParens: 'avoid'` means single params should not have parens.\n\nTo verify: after making changes, you can test by running the scaffold and checking the output files against prettier/eslint. The acceptance criteria require a clean `npm run lint` on the generated code."
+    },
+    {
+      "id": "US-002",
+      "title": "localPlugins.add rejects nonexistent paths with an error",
+      "description": "As a plugin developer, I want `opentabs config set localPlugins.add /bad/path` to fail with a clear error instead of silently adding a broken path, so that I catch typos immediately instead of debugging mysterious plugin-not-found issues later.",
+      "acceptanceCriteria": [
+        "Running `opentabs config set localPlugins.add /nonexistent/path` exits with code 1 and prints an error message like 'Error: Path does not exist: /nonexistent/path'",
+        "The path is NOT written to config.json when it doesn't exist",
+        "Running `opentabs config set localPlugins.add /nonexistent/path --force` (or `-f`) succeeds and adds the path with a warning, for cases where the developer intends to create the plugin directory later",
+        "Running `opentabs config set localPlugins.add /existing/path` (where the path exists but has no package.json) still warns about missing package.json but adds the path",
+        "Existing paths that pass all checks are added without any warning",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: `platform/cli/src/commands/config.ts`, function `handleSetLocalPluginsAdd` around line 401-429.\n\nCurrent behavior (line 418-426): The path is unconditionally added to config first (line 418-419), then a warning is printed if it doesn't exist (line 422-423). The fix should check existence BEFORE writing to config, and exit with an error if the path doesn't exist (unless --force is passed).\n\nThe `--force` flag needs to be threaded from the commander option through to this handler. Check how other flags are passed in the `config set` command definition. The commander action for `config set` is defined around line 645-680 in the same file.\n\nAlso update the test file `platform/cli/src/commands/config.test.ts` if there are existing tests for this handler. Check for tests around the `localPlugins.add` functionality.\n\nThe missing-package.json warning (line 424-425) should remain as-is — it's a valid warning for directories that exist but aren't set up yet."
+    }
+  ]
+}
