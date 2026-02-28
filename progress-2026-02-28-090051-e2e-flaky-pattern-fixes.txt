@@ -1,0 +1,56 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-090051-e2e-flaky-pattern-fixes~running.json
+Started: Sat Feb 28 17:01:18 UTC 2026
+---
+
+## Codebase Patterns
+- E2E test fixtures: `startMcpServer`, `startTestServer`, `launchExtensionContext` in `e2e/fixtures.ts`; helpers like `waitForExtensionConnected`, `waitForLog`, `setupToolTest` in `e2e/helpers.ts`
+- `waitForExtensionConnected(server, timeout)` already polls with a configurable timeout (default 45s) — prefer using it over fixed sleeps for connection detection
+- `startMcpServer(configDir, enableLogging, port?)` accepts an optional port parameter to restart on a known port
+- `expect.poll()` is the standard Playwright pattern for polling assertions in E2E tests
+- `replaceIifeClosing(iife, injection)` in `e2e/helpers.ts` replaces `})();` at end of IIFE and throws immediately if the pattern is not found — use this instead of raw `.replace()` for IIFE modifications
+- All inline `fetch('/health', ...)` calls inside `expect.poll()` callbacks must include `signal: AbortSignal.timeout(3_000)` AND be wrapped in try/catch (returning `undefined` on error so the poll retries instead of crashing)
+
+## 2026-02-28 - US-001
+- Replaced the fixed 8-second `setTimeout` in the server-restart reconnect test with immediate server2 startup
+- Removed the sleep between `server1.kill()` and `startMcpServer(configDir, true, serverPort)` — the extension's offscreen reconnect logic detects the broken connection and reconnects once server2 is up
+- `waitForExtensionConnected(server2, 45_000)` already handles the timing with a 45s polling timeout
+- Renumbered subsequent step comments (3-8 → 3-6)
+- Files changed: `e2e/tab-state-sync.e2e.ts`
+- **Learnings for future iterations:**
+  - The extension's offscreen document has built-in reconnect logic with exponential backoff — no need to wait for it to "exhaust reconnect attempts" before starting a new server
+  - When removing a fixed sleep, check if existing polling helpers (like `waitForExtensionConnected`) already cover the needed wait
+  - The 8s sleep was both wasteful (under no load) and flaky (under load) — polling-based approaches are always preferred
+---
+
+## 2026-02-28 - US-002
+- Added `replaceIifeClosing(iife, injection)` helper to `e2e/helpers.ts` that wraps the regex replace and throws immediately if the pattern wasn't found
+- Updated `e2e/iife-injection.e2e.ts` to import and use `replaceIifeClosing` at all 3 call sites (lines ~78, 623, 712)
+- PRD noted 6 sites at lines 77, 530, 622, 711, 893, 957 — but lines 893 and 957 use string concatenation (`+`), not `.replace()`, so they don't silently fail and needed no guard; line 530 is in `strict-csp.e2e.ts` (covered by US-003)
+- Files changed: `e2e/helpers.ts`, `e2e/iife-injection.e2e.ts`
+- **Learnings for future iterations:**
+  - When a `.replace()` with a regex can silently fail (returning unchanged string), always assert `modified !== original` after the call
+  - The `replaceIifeClosing` helper is ready for US-003 to reuse in `strict-csp.e2e.ts` — just import and call with the same `(originalIife, markerCode)` signature
+  - String concatenation (`iife + extra`) cannot silently fail, so those patterns don't need assertion guards
+---
+
+## 2026-02-28 - US-004
+- Added `signal: AbortSignal.timeout(3_000)` to all inline `fetch('/health', ...)` calls inside `expect.poll()` callbacks across 4 E2E test files
+- Wrapped each fetch call in try/catch returning `undefined` on error so an AbortError triggers poll retry instead of crashing the test
+- Files changed: `e2e/tab-state-sync.e2e.ts` (9 fetch calls: 7 fixture-based + server1 + server2 patterns), `e2e/side-panel-data-flow.e2e.ts` (6 fetch calls), `e2e/side-panel-plugin-toggle.e2e.ts` (1 fetch call), `e2e/side-panel-icons.e2e.ts` (1 fetch call using pre-built `authHeaders` object)
+- All 373 E2E tests passed (Phase 2 required by e2eCheckpoint: true)
+- **Learnings for future iterations:**
+  - `expect.poll()` propagates thrown errors immediately — it does NOT retry on throw. Always wrap async operations that can fail (fetch, file reads) in try/catch inside poll callbacks, returning `undefined` to signal "not ready yet"
+  - The `fixtures.ts` `fetchHealth` helper is the reference implementation: it wraps in try/catch and includes `AbortSignal.timeout(2_000)` — inline fetch calls should follow the same pattern
+  - The `authHeaders` pre-built variable pattern (as in `side-panel-icons.e2e.ts`) still needed expanding from single-line `{ headers: authHeaders }` to multi-line to accommodate the `signal` field
+  - 3 different header construction patterns existed across files: `pollHeaders` dict with conditional auth (tab-state-sync fixtures), direct `{ Authorization: \`Bearer ${server.secret ?? ''}\` }` (side-panel tests), and pre-built `authHeaders` object (icons test)
+---
+
+## 2026-02-28 - US-003
+- Added `replaceIifeClosing` to the `./helpers.js` import in `e2e/strict-csp.e2e.ts`
+- Replaced raw `originalIife.replace(/}\)\(\);[\s]*$/, ...)` call at line ~530 with `replaceIifeClosing(originalIife, markerCode)`
+- Files changed: `e2e/strict-csp.e2e.ts`
+- **Learnings for future iterations:**
+  - The `replaceIifeClosing` helper created in US-002 was a perfect drop-in — just add it to the import list and call `replaceIifeClosing(original, injection)` instead of `.replace()`
+  - Both `iife-injection.e2e.ts` and `strict-csp.e2e.ts` now use the same helper; any future files with IIFE modifications should do the same
+---
