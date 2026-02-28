@@ -1,0 +1,19 @@
+## Codebase Patterns
+- `platform/plugin-sdk/src/dom.ts` exports DOM utilities (waitForSelector, waitForSelectorRemoval, querySelectorAll, getTextContent, observeDOM) used by plugin authors
+- MutationObserver callbacks fire asynchronously — TypeScript control flow analysis knows boolean flags (like `settled`) set before `observer.observe()` are still at their original value in code immediately following it
+- `@typescript-eslint/no-unnecessary-condition` will flag `if (!settled)` after `observer.observe()` because settled is statically always false there; remove the outer guard and rely on the settled flag in the observer callback to prevent double-resolves
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-140655-sdk-dom-race-condition~running.json
+Started: Sat Feb 28 22:07:24 UTC 2026
+---
+
+## 2026-02-28 22:11 - US-001
+- Fixed TOCTOU race condition in `waitForSelector` and `waitForSelectorRemoval`
+- After `observer.observe()`, added a synchronous re-check of `document.querySelector` to catch elements that appear/disappear between the initial check and observer setup
+- Files changed: `platform/plugin-sdk/src/dom.ts`, `platform/plugin-sdk/src/dom.test.ts`
+- **Learnings for future iterations:**
+  - The `@typescript-eslint/no-unnecessary-condition` lint rule will flag `if (!settled)` immediately after `observer.observe()` because TypeScript knows `settled` is always `false` at that point (MutationObserver callbacks are async). The correct fix is to omit the outer `!settled` guard — the observer callback itself already guards with `if (settled) return;` to prevent double-resolves.
+  - The re-check pattern (try/catch around querySelector, swallowing errors) is correct because the observer callback already handles errors from subsequent querySelector calls. The re-check only needs to handle the success path.
+  - Test mocking approach: `vi.spyOn(document, 'querySelector')` with a mock that returns null on call 1 (initial check) and an element on call 2 (re-check) proves the TOCTOU fix without needing any DOM mutations to fire.
+---
