@@ -1,0 +1,57 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix CLI UX friction found during fresh-user testing: (1) every error message and some normal outputs print twice due to Commander.js async action handling, (2) inconsistent browser-tool naming in config set help examples. LOW issues noted but not addressed: plugin search shows blank description for slack (npm metadata, not a CLI bug); plugin list when server is down says 'No plugins installed' without noting server is offline.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix duplicated CLI output on all error and some success paths",
+      "description": "As a user, I want every CLI message to print exactly once so that I can clearly read and act on the output without confusion.",
+      "acceptanceCriteria": [
+        "opentabs (no args, server not running) prints 'Server not running' message exactly once",
+        "opentabs strat (unknown command) prints error and help output exactly once",
+        "opentabs status (server not running) prints error message exactly once",
+        "opentabs logs (no log file) prints error message exactly once",
+        "opentabs config set invalidkey foo prints error message exactly once",
+        "opentabs config set prot 9515 prints 'Did you mean port?' error exactly once",
+        "opentabs config set port notanumber prints validation error exactly once",
+        "opentabs config reset (without --confirm) prints confirmation prompt exactly once",
+        "opentabs config rotate-secret (without --confirm) prints confirmation prompt exactly once",
+        "opentabs plugin remove slack (without --confirm) prints confirmation prompt exactly once",
+        "opentabs plugin install nonexistent-plugin prints error exactly once",
+        "opentabs start (port already in use) prints port conflict error exactly once",
+        "opentabs audit (server not running) prints error message exactly once",
+        "All error commands still exit with code 1",
+        "All success commands still produce correct output",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Root cause: In platform/cli/src/cli.ts, all .action() handlers return async promises (the handler functions like handleStatus, handleStart, etc. are async). When a handler calls console.error() + process.exit(1), the promise rejects. Commander.js catches the rejected promise and re-prints the error/output because .showHelpAfterError() and .showSuggestionAfterError() are configured on line 28-29.\n\nThe fix should be in platform/cli/src/cli.ts. The approach: wrap the action callbacks so that rejected promises are caught and handled without Commander.js re-printing them. One approach is to use Commander's .exitOverride() so that when a command handler calls process.exit(), Commander throws a CommanderError instead of exiting — then catch that in a wrapper. Another approach: wrap each .action() callback in a helper that catches errors and calls process.exit(1) in a way that doesn't leave a rejected promise for Commander to catch (e.g., catch the promise rejection and exit cleanly).\n\nThe simplest correct fix: add a wrapper function like `function wrapAction(fn) { return (...args) => fn(...args).catch(() => {}) }` that swallows the rejection since the handler already called process.exit(1). Apply this wrapper to the .action() callback on line 37-44 of cli.ts. Then update each registerXxxCommand function to wrap its .action() callback similarly.\n\nAffected files:\n- platform/cli/src/cli.ts (line 37-44: default action, line 56: parseAsync)\n- platform/cli/src/commands/status.ts (line 236: .action())\n- platform/cli/src/commands/start.ts (look for .action())\n- platform/cli/src/commands/stop.ts (look for .action())\n- platform/cli/src/commands/config.ts (multiple .action() calls for set, show, reset, rotate-secret)\n- platform/cli/src/commands/logs.ts (look for .action())\n- platform/cli/src/commands/doctor.ts (look for .action())\n- platform/cli/src/commands/plugin.ts (multiple .action() calls for search, list, install, remove, create)\n- platform/cli/src/commands/audit.ts (look for .action())\n- platform/cli/src/commands/update.ts (look for .action())\n\nAlternative simpler approach: define a wrapAction helper in cli.ts and export it, then import in each command file. Or even simpler: just add .exitOverride() to the program in cli.ts and handle the CommanderError in a try-catch around program.parseAsync(). Test by running `opentabs status` with no server and verifying output appears only once."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix inconsistent browser-tool naming in config set help examples",
+      "description": "As a user, I want the config set help examples to use consistent naming so that I know which form of tool name to use.",
+      "acceptanceCriteria": [
+        "opentabs config set --help shows browser-tool examples using the same naming convention (both use browser_ prefixed canonical names)",
+        "The example on line 671 uses browser-tool.browser_execute_script (matching line 672 style) instead of browser-tool.execute_script",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Simple one-line fix in platform/cli/src/commands/config.ts line 671.\n\nChange:\n  $ opentabs config set browser-tool.execute_script disabled\nTo:\n  $ opentabs config set browser-tool.browser_execute_script disabled\n\nThis makes it consistent with line 672 which already uses browser-tool.browser_execute_script."
+    }
+  ]
+}
