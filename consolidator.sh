@@ -380,7 +380,8 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
         ) 2>"$5" | tee "$4"
       ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" \
         2>&1 | while IFS= read -r line; do
-          # Parse stream-json: extract text content and tool use, skip raw JSON noise
+          # Parse stream-json: extract text content, tool use, and results.
+          # Skip raw JSON noise — only show meaningful progress lines.
           local msg=""
           if echo "$line" | grep -q '"type":"tool_use"' 2>/dev/null; then
             msg=$(echo "$line" | python3 -c "
@@ -399,6 +400,18 @@ try:
         print(f'Tool: {name} → {inp.get(\"filePath\",inp.get(\"file_path\",\"\"))[:80]}')
       else:
         print(f'Tool: {name}')
+except: pass" 2>/dev/null)
+          elif echo "$line" | grep -q '"type":"text"' 2>/dev/null; then
+            msg=$(echo "$line" | python3 -c "
+import sys,json
+try:
+  d=json.load(sys.stdin)
+  for c in d.get('message',{}).get('content',[]):
+    if c.get('type')=='text':
+      text=c['text'].strip().replace('\n',' ')
+      # Show first meaningful line, truncated
+      if len(text)>120: text=text[:120]+'…'
+      if text: print(f'✦ {text}')
 except: pass" 2>/dev/null)
           elif echo "$line" | grep -q '"type":"result"' 2>/dev/null; then
             msg=$(echo "$line" | python3 -c "
