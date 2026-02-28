@@ -1,0 +1,116 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix the extension auth bootstrap fragility that causes 'Authentication Failed' errors when the extension cannot read auth.json, and add comprehensive E2E tests for the auth handshake lifecycle.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Allow /ws-info to serve secret to Chrome extension requests without Bearer token",
+      "description": "As a Chrome extension, I want to bootstrap the WebSocket secret from /ws-info even when I don't have a Bearer token, so that auth.json read failures don't cause permanent 'Authentication Failed' errors.",
+      "acceptanceCriteria": [
+        "GET /ws-info from Origin: chrome-extension://* without Authorization header returns 200 with { wsUrl, wsSecret }",
+        "GET /ws-info without Origin and without Authorization still returns 401 (non-extension callers are unchanged)",
+        "GET /ws-info with Origin: https://evil.com without Authorization returns 403 (existing CORS protection blocks it before reaching /ws-info)",
+        "GET /ws-info with valid Bearer token works the same as before regardless of Origin header",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in `platform/mcp-server/src/http-routes.ts` in `handleWsInfo()` (line 239). Currently it calls `checkBearerAuth()` and returns 401 on failure. The fix: when Bearer auth fails, check if the request has a `chrome-extension://` Origin header. If so, return the same 200 response with wsUrl and wsSecret. This is safe because the CORS check at lines 521-524 already blocks all non-chrome-extension origins before the router is reached, and DNS rebinding protection at lines 508-511 blocks non-localhost Host headers. So only Chrome extensions running on the same machine can reach this endpoint. The implementation should be: after `const authError = checkBearerAuth(...)`, if authError is not null, check `req.headers.get('Origin')?.startsWith('chrome-extension://')` — if true, proceed to return the wsInfo response; if false, return the authError. Note: the existing CORS check already handles the Origin validation, so the check in handleWsInfo is defense-in-depth."
+    },
+    {
+      "id": "US-002",
+      "title": "Use /ws-info as fallback when auth.json bootstrap fails in the extension",
+      "description": "As a Chrome extension offscreen document, I want to fetch the secret from /ws-info when chrome.runtime.getURL('auth.json') fails, so that transient Chrome file-serving issues don't cause permanent auth failures.",
+      "acceptanceCriteria": [
+        "When bootstrapFromAuthFile() fails (fetch error, non-ok response, or missing/invalid secret), the offscreen document logs a warning via console.warn",
+        "fetchWsInfo() on 401 retry path: instead of only re-reading auth.json, also attempts to parse the wsSecret from the /ws-info response body if the server returns 200 (now possible with US-001's extension-origin bypass)",
+        "wsSecret is updated from /ws-info response when auth.json is unavailable",
+        "The existing auth.json bootstrap remains the primary path (fast, no network round-trip when file is available)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in `platform/browser-extension/src/offscreen/index.ts`. Two changes:\n\n1. In `bootstrapFromAuthFile()` (line 509): add `console.warn('[opentabs:offscreen] Failed to read auth.json:', ...)` in both the `!res.ok` branch and the catch block. This gives visibility into bootstrap failures.\n\n2. In `fetchWsInfo()` (line 58): the current flow on initial 401 is: re-read auth.json via bootstrapFromAuthFile() → retry /ws-info. With US-001, /ws-info now returns 200 for chrome-extension:// origins even without a Bearer token. So the initial request (line 62) should actually succeed if the Origin header is sent. However, the `fetch()` calls in `fetchWsInfo()` may or may not include the Origin header automatically (offscreen documents should include it). The fix: when the first `/ws-info` call returns 200, check if the response body includes `wsSecret` and update the module-level `wsSecret` variable. This already happens indirectly — when /ws-info returns 200, `refreshWsUrl()` (line 240) processes the response, and then `connect()` uses the current `wsSecret`. But `wsSecret` must be set from the response. Add to `refreshWsUrl()` after line 247: if `wsInfo.wsSecret` is a non-empty string, set `wsSecret = wsInfo.wsSecret`. This makes the entire flow self-healing: even with no auth.json, the extension fetches /ws-info → gets secret from response → connects WebSocket with secret.\n\nKey file paths:\n- `platform/browser-extension/src/offscreen/index.ts:58` (fetchWsInfo)\n- `platform/browser-extension/src/offscreen/index.ts:240` (refreshWsUrl)\n- `platform/browser-extension/src/offscreen/index.ts:509` (bootstrapFromAuthFile)"
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: extension connects successfully when auth.json is missing",
+      "description": "As a platform maintainer, I want an E2E test that verifies the extension can connect to the server even when auth.json is absent from the extension directory, so that the self-healing auth bootstrap is verified.",
+      "acceptanceCriteria": [
+        "Test creates extension copy WITHOUT writing auth.json (skip the auth.json write in createExtensionCopy and the symlink in extensionContext)",
+        "Test starts MCP server with a known secret in <configDir>/extension/auth.json",
+        "Extension launches, offscreen document fails to read auth.json, falls back to /ws-info",
+        "Extension connects successfully (side panel or background page shows connected state)",
+        "Tool dispatch works after connection",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Create a new test file `e2e/auth-bootstrap.e2e.ts`. The test needs a custom fixture setup because the standard `extensionContext` fixture always symlinks auth.json. Options:\n\n1. Add a new fixture variant in `e2e/fixtures.ts` (e.g., `extensionContextNoAuth`) that skips the auth.json symlink in lines 1537-1540. Or add a parameter to control whether auth.json is symlinked.\n2. Or manually set up the extension context in the test using the lower-level helpers (`createExtensionCopy`, `launchExtensionContext`) without the auth.json symlink.\n\nThe cleanest approach is option 2: use the existing `createExtensionCopy(port, undefined)` (passing no secret) and `launchExtensionContext(port, undefined)` to create an extension without auth.json, then verify connection. Check `e2e/fixtures.ts:800` for `createExtensionCopy` and `e2e/fixtures.ts:1511` for the `extensionContext` fixture. The test should also remove any auth.json that might exist in the extension copy dir before launching Chrome.\n\nTo verify connection, use the pattern from existing E2E tests: poll `/health` for `extensionConnected: true`, or check the side panel's connection state via the backgroundPage fixture. Look at `e2e/lifecycle.e2e.ts` for examples of waiting for extension connection.\n\nIMPORTANT: The test must wait for the extension to actually connect (not just launch). The /ws-info fallback involves a network round-trip, so the connection may take slightly longer than the auth.json path. Use generous timeouts."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: extension recovers from auth.json with wrong secret",
+      "description": "As a platform maintainer, I want an E2E test that verifies the extension recovers when auth.json contains a stale/wrong secret, so that secret mismatches self-heal via the /ws-info fallback.",
+      "acceptanceCriteria": [
+        "Test creates extension copy with a WRONG secret in auth.json (different from the server's secret)",
+        "Extension launches, sends wrong Bearer token to /ws-info, gets 200 with correct secret (via US-001's extension-origin bypass)",
+        "Extension updates its in-memory secret from /ws-info response",
+        "Extension connects successfully via WebSocket with the correct secret",
+        "Tool dispatch works after connection",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Add this test to `e2e/auth-bootstrap.e2e.ts` (same file as US-003). Use `createExtensionCopy(port, 'wrong-secret-value')` to write a deliberately wrong secret to auth.json. The flow should be:\n\n1. Extension reads auth.json → gets wrong secret\n2. Extension calls GET /ws-info with `Authorization: Bearer wrong-secret-value` → server checks Bearer → fails → but request has chrome-extension:// Origin → returns 200 with correct wsSecret (per US-001)\n3. Extension's `refreshWsUrl()` parses wsSecret from response → updates module-level wsSecret (per US-002)\n4. Extension opens WebSocket with correct secret → success\n\nWait — actually, re-read the flow. With US-001, `/ws-info` will return 200 regardless of the Bearer token if the Origin is chrome-extension://. So the initial fetchWsInfo call at line 62 of offscreen/index.ts will get a 200 response with the correct wsSecret, even with the wrong Bearer. The `refreshWsUrl()` function (per US-002 changes) will then update wsSecret from the response. The WebSocket connect at line 276 will use the updated wsSecret.\n\nThe tricky part: `checkBearerAuth` returns 401 for wrong Bearer. But US-001 adds the extension-origin bypass AFTER the Bearer check. So the Bearer check fails → extension-origin check succeeds → return 200. The extension still sends the wrong Bearer, but it doesn't matter because the server returns 200 anyway. Then the extension picks up the correct secret from the response body.\n\nActually wait — re-check: the current fetchWsInfo() flow (line 58-84) sends Bearer, gets 401, re-reads auth.json, retries. With US-001, the first request would NOT get 401 if the Origin is chrome-extension://. It would get 200 directly. So the 401 retry path is never triggered. The extension gets 200 immediately, parses wsSecret from response, and connects. This is the clean path.\n\nTo verify: poll /health for extensionConnected: true, then dispatch a tool to confirm full connectivity."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: unauthenticated non-extension /ws-info requests are still rejected",
+      "description": "As a platform maintainer, I want an E2E test that verifies /ws-info still returns 401 for non-extension callers without a Bearer token, so that the extension-origin bypass doesn't weaken security for other callers.",
+      "acceptanceCriteria": [
+        "GET /ws-info without Authorization and without Origin returns 401",
+        "GET /ws-info without Authorization and with Origin: chrome-extension://fake returns 200 with wsSecret",
+        "GET /ws-info with wrong Bearer and without Origin returns 401",
+        "GET /ws-info with correct Bearer and without Origin returns 200 with wsSecret",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Add these tests to `e2e/lifecycle.e2e.ts` in the existing 'WebSocket authentication' describe block (line 364). These are simple HTTP request tests — no browser/extension needed, just `fetch()` calls against the running MCP server.\n\nUse the existing `mcpServer` fixture (which provides `mcpServer.port` and `mcpServer.secret`). Make fetch requests with different combinations of Authorization and Origin headers.\n\nKey detail: the CORS check at `platform/mcp-server/src/http-routes.ts:521-524` runs BEFORE the router. Requests with `Origin: https://evil.com` get 403, not 401. So do NOT test evil origins here — that's already covered by the CORS protection. Only test: no Origin (CLI/MCP client case), and `chrome-extension://` Origin (extension case).\n\nExisting test at line 383 (`/ws-info returns URL without leaking the secret in the URL`) already tests the authenticated path. Add new test cases for the unauthenticated paths.\n\nFile paths:\n- `e2e/lifecycle.e2e.ts:364` (WebSocket authentication describe block)"
+    }
+  ]
+}
