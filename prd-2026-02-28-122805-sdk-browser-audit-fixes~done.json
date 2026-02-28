@@ -20,7 +20,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/plugin-sdk/src/fetch.ts, lines 15-34 (httpStatusToToolError function).\n\nThe current catch-all at line 33 handles ALL remaining non-ok status codes as category='internal', retryable=false. This is wrong for:\n- 400 Bad Request → should be category='validation' (semantic match)\n- 408 Request Timeout → should be category='timeout', retryable=true (server says try again)\n- 422 Unprocessable Entity → should be category='validation' (semantic match)\n\nAdd these three cases before the catch-all return at line 33:\n```\nif (status === 400 || status === 422) {\n  return ToolError.validation(message);\n}\nif (status === 408) {\n  return ToolError.timeout(message);\n}\n```\n\nFor tests: add /error-400, /error-408, /error-422 endpoints to the test HTTP server in platform/plugin-sdk/src/fetch.test.ts (follow the pattern of existing /error-* endpoints around lines 46-86). Add test cases in the fetchFromPage describe block verifying the correct ToolError properties for each."
@@ -44,7 +44,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/plugin-sdk/src/timing.ts, line 30 (sleep function).\n\nCurrent implementation:\n```\nexport const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));\n```\n\nAdd an optional second parameter with the same abort pattern used by retry's internal abortableSleep (lines 51-68 in the same file). Export a SleepOptions interface:\n```\nexport interface SleepOptions {\n  signal?: AbortSignal;\n}\n```\n\nChange the signature to:\n```\nexport const sleep = (ms: number, opts?: SleepOptions): Promise<void> => {\n  const signal = opts?.signal;\n  if (!signal) return new Promise(resolve => setTimeout(resolve, ms));\n  if (signal.aborted) return Promise.reject(signal.reason instanceof Error ? signal.reason : new DOMException('sleep aborted', 'AbortError'));\n  return new Promise<void>((resolve, reject) => {\n    const timer = setTimeout(() => {\n      signal.removeEventListener('abort', onAbort);\n      resolve();\n    }, ms);\n    const onAbort = () => {\n      clearTimeout(timer);\n      reject(signal.reason instanceof Error ? signal.reason : new DOMException('sleep aborted', 'AbortError'));\n    };\n    signal.addEventListener('abort', onAbort, { once: true });\n  });\n};\n```\n\nUpdate the SleepOptions export in platform/plugin-sdk/src/index.ts alongside the existing RetryOptions and WaitUntilOptions exports.\n\nTests: platform/plugin-sdk/src/timing.test.ts — add tests in the sleep describe block."
@@ -69,7 +69,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/plugin-sdk/src/dom.ts, lines 11-14 (WaitForSelectorOptions), lines 30-87 (waitForSelector), lines 93-149 (waitForSelectorRemoval).\n\nAdd `signal?: AbortSignal` to the WaitForSelectorOptions interface.\n\nIn both waitForSelector and waitForSelectorRemoval, after checking for an existing element, add abort handling following the same pattern used in waitUntil (platform/plugin-sdk/src/timing.ts lines 96-152):\n\n1. Check `signal?.aborted` early and reject immediately if so\n2. Add an abort listener that sets `settled = true`, clears the timer, disconnects the observer, and rejects with the signal's reason\n3. Clean up the abort listener in both the timer handler and the observer success path (add `signal?.removeEventListener('abort', onAbort)` alongside the existing `clearTimeout(timer)` and `observer.disconnect()` calls)\n\nFor the abort reason, use the same pattern as timing.ts: `signal.reason instanceof Error ? signal.reason : new Error('waitForSelector: aborted')`.\n\nTests: platform/plugin-sdk/src/dom.test.ts. Note the tests use happy-dom. Create AbortController in the test, abort it, and verify the promise rejects. For mid-wait abort, start waitForSelector for a non-existent element with a long timeout, then abort after a short delay and verify prompt rejection."
@@ -93,7 +93,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/plugin-sdk/src/storage.ts.\n\nAdd `import { log } from './log.js';` at the top.\n\nIn each setter/remover function's catch block, replace the empty catch with a log.warn call:\n\n```typescript\n// setLocalStorage (line 22-27)\nexport const setLocalStorage = (key: string, value: string): void => {\n  try {\n    localStorage.setItem(key, value);\n  } catch (error) {\n    log.warn(`setLocalStorage failed for key \"${key}\"`, error);\n  }\n};\n```\n\nApply the same pattern to setSessionStorage (line 45-51), removeLocalStorage (line 57-63), and removeSessionStorage (line 69-75).\n\nDo NOT add logging to the getter functions (getLocalStorage, getSessionStorage, getCookie) — returning null is the expected behavior for blocked access and does not represent data loss.\n\nFor tests: import _setLogTransport from './log.js' and use it to capture log entries. Verify that when storage throws, a warning-level entry is emitted with the key name in the message. The existing tests already set up throwing storage mocks — add expectations for log.warn calls alongside the existing not-toThrow assertions."

@@ -1,0 +1,62 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-122805-sdk-browser-audit-fixes~running.json
+Started: Sat Feb 28 20:28:34 UTC 2026
+---
+
+## Codebase Patterns
+- platform/plugin-sdk/src/errors.ts: ToolError has static factory methods: .validation(), .timeout(), .auth(), .notFound(), .rateLimited()
+- platform/plugin-sdk/src/fetch.ts: httpStatusToToolError maps HTTP status codes to ToolErrors; cases are checked in order before the catch-all
+- platform/plugin-sdk/src/fetch.test.ts: Uses a real Node.js HTTP server (not mocks) with PORT=0 for all fetch tests; add new endpoints in the server handler block and new test cases in the fetchFromPage describe block
+- platform/plugin-sdk/src/timing.ts: AbortSignal abort reason pattern: `signal.reason instanceof Error ? signal.reason : new DOMException('...', 'AbortError')` — used consistently in sleep(), retry(), and waitUntil()
+- platform/plugin-sdk/src/index.ts: Timing exports use separate `export { ... }` and `export type { ... }` lines — add new types to the type line alongside RetryOptions/SleepOptions/WaitUntilOptions
+- AbortSignal abort reason in tests: `controller.abort()` (no reason) sets `signal.reason` to a `DOMException('This operation was aborted', 'AbortError')` which `instanceof Error` is TRUE — tests must use `expect(error).toBeInstanceOf(DOMException)` not `.toThrow('custom message')`
+- platform/plugin-sdk/src/log.ts: Use `_setLogTransport` to capture log entries in tests — returns a restore function; import `LogEntry` type from `./log.js` to type the entries array; `log.warn` maps to level `'warning'` (not `'warn'`) in the LogEntry
+- import-x/order: relative value imports come before package imports in this ESLint config; type imports come after all value imports; run `npm run lint:fix` to auto-fix import ordering issues
+
+## 2026-02-28 - US-001
+- Implemented: Added 400/422 → validation and 408 → retryable timeout mappings in httpStatusToToolError
+- Files changed:
+  - platform/plugin-sdk/src/fetch.ts: Added three new status code cases (400, 422, 408) before the catch-all return
+  - platform/plugin-sdk/src/fetch.test.ts: Added /error-400, /error-408, /error-422 server endpoints and three new test cases in the fetchFromPage describe block
+- **Learnings for future iterations:**
+  - ToolError.timeout() sets retryable=true automatically; ToolError.validation() sets retryable=false
+  - The test HTTP server is defined in beforeAll with a single switch-style if/else chain — add new endpoints in the same handler before the final 404 fallback
+  - All five fast checks (build, type-check, lint, knip, test) passed first time
+---
+
+## 2026-02-28 - US-002
+- Implemented: Added AbortSignal support to sleep() via optional SleepOptions parameter
+- Files changed:
+  - platform/plugin-sdk/src/timing.ts: Added SleepOptions interface; rewrote sleep() to accept opts?: SleepOptions with full abort handling (already-aborted check, abort listener, timer cleanup)
+  - platform/plugin-sdk/src/index.ts: Added SleepOptions to the `export type` line for timing.js
+  - platform/plugin-sdk/src/timing.test.ts: Added 4 new tests in the sleep describe block covering already-aborted signal, mid-sleep abort with prompt rejection, DOMException when aborted without custom reason, and backward compat with signal=undefined
+- **Learnings for future iterations:**
+  - Prettier lint:fix is needed when long ternary expressions exceed line length — run `npm run lint:fix` to auto-format rather than manually rewrapping
+  - The abort pattern for sleep matches retry's internal abortableSleep exactly: check `signal.aborted` early, add listener with `{ once: true }`, clean up timer/listener in both resolution paths
+  - All five fast checks passed (one lint fix needed via `npm run lint:fix`)
+---
+
+## 2026-02-28 - US-004
+- Implemented: Added log.warn on silent storage write failures in setLocalStorage, setSessionStorage, removeLocalStorage, removeSessionStorage
+- Files changed:
+  - platform/plugin-sdk/src/storage.ts: Added `import { log } from './log.js'`; updated catch blocks of the four mutating functions from empty catch to `catch (error) { log.warn(\`<fn> failed for key "${key}"\`, error); }`; updated JSDoc to say "Logs a warning" instead of "Silently fails"
+  - platform/plugin-sdk/src/storage.test.ts: Added `_setLogTransport` and `LogEntry` imports from `./log.js`; added 6 new test cases (2 for setLocalStorage, 1 for removeLocalStorage, 2 for setSessionStorage, 1 for removeSessionStorage) verifying `level === 'warning'` and message contains the key name; used try/finally to restore transport and localStorage/sessionStorage mock after each test
+- **Learnings for future iterations:**
+  - `log.warn` maps to `level === 'warning'` in `LogEntry` (not 'warn') — check against `'warning'` in tests
+  - The `_setLogTransport` pattern is the clean way to capture log entries in tests without mocking: call it with a capture function, get a restore callback back, always call restore in finally
+  - Existing "silently fails" tests still pass because the functions still don't throw — they now additionally emit a warning
+  - `import-x/order` in this project puts relative value imports BEFORE package imports (unusual); type imports come last; auto-fix with `npm run lint:fix`
+  - All five fast checks passed (one lint:fix needed for import order)
+---
+
+## 2026-02-28 - US-003
+- Implemented: Added AbortSignal support to waitForSelector and waitForSelectorRemoval
+- Files changed:
+  - platform/plugin-sdk/src/dom.ts: Added `signal?: AbortSignal` to WaitForSelectorOptions; added abort handling to both waitForSelector and waitForSelectorRemoval (early abort check, onAbort listener with cleanup in all resolution paths)
+  - platform/plugin-sdk/src/dom.test.ts: Added 3 new tests each in the waitForSelector and waitForSelectorRemoval describe blocks (pre-aborted signal, DOMException when aborted without reason, mid-wait abort)
+- **Learnings for future iterations:**
+  - `controller.abort()` (no reason) sets `signal.reason` to a DOMException which IS `instanceof Error`, so the fallback `new Error('...: aborted')` branch is only reached when abort is called with a non-Error reason; tests must use `expect(error).toBeInstanceOf(DOMException)` instead of `.toThrow('message')`
+  - The waitUntil abort pattern from timing.ts is the right template for MutationObserver-based waits: declare `onAbort` before the timer, register with `{ once: true }`, call `signal?.removeEventListener('abort', onAbort)` in all resolution paths (success, timeout, error)
+  - Prettier needs `npm run lint:fix` for long ternary expressions split across lines (same as US-002)
+  - All five fast checks passed (one lint fix needed via `npm run lint:fix`)
+---
