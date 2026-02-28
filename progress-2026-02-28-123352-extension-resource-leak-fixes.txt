@@ -1,0 +1,52 @@
+## Codebase Patterns
+- confirmation-badge.ts uses module-level Set (clearedConfirmationIds) and Map (confirmationTimeouts) for idempotency and background timeout tracking
+- clearConfirmationBadge is idempotent per id — returns early if id already in clearedConfirmationIds
+- The side panel ALWAYS pairs clearConfirmationBadge(id) + clearConfirmationBackgroundTimeout(id) in that order
+- clearConfirmationBackgroundTimeout cancels the background timeout; if this fires before the bg timeout, the background timeout never fires
+- handleBrowserExecuteScript uses Promise.race between an IIFE and a timeout; cancellation flag ({ value: false }) in closure lets the IIFE exit early when outer timeout wins
+- In extension-commands.test.ts, accessing mock.calls elements requires double-casting: `(calls[i] as unknown[])[0] as Record<string, unknown>` to avoid no-unsafe-assignment
+- expect.stringContaining()/expect.any() in object literals require `as string`/`as Type` cast to avoid no-unsafe-assignment in this codebase's strict ESLint config
+- Tests with fake timers need vi.useFakeTimers() in beforeEach and vi.useRealTimers() in afterEach; use vi.advanceTimersByTimeAsync(ms) for timer-driven async code
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-123352-extension-resource-leak-fixes~running.json
+Started: Sat Feb 28 20:34:16 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Implemented pruning of clearedConfirmationIds Set to prevent unbounded memory growth
+- Files changed:
+  - platform/browser-extension/src/confirmation-badge.ts
+  - platform/browser-extension/src/confirmation-badge.test.ts
+- Changes:
+  1. In background timeout callback: added `clearedConfirmationIds.delete(id)` after `clearConfirmationBadge(id)` fires
+  2. In `clearConfirmationBackgroundTimeout`: added `clearedConfirmationIds.delete(id)` after cancelling the background timeout
+  3. Updated test "when background timeout and side panel both clear same id" to reflect the new contract (idempotency only within confirmation lifetime)
+  4. Added test: "re-used id after background timeout fires can be cleared again without clearAll"
+  5. Added test: "prunes id from cleared set so re-used id in new confirmation can be decremented without clearAll" (in clearConfirmationBackgroundTimeout describe block)
+- **Learnings for future iterations:**
+  - The idempotency guarantee only holds while the background timeout is pending. After it fires OR is cancelled, the id is pruned.
+  - The side panel always pairs `clearConfirmationBadge(id)` + `clearConfirmationBackgroundTimeout(id)`. If bg fires, side panel hasn't done either yet. If clearConfirmationBackgroundTimeout was called, bg is cancelled.
+  - The test "when background timeout and side panel both clear same id" (original) tested an "impossible" real-world scenario and needed to be updated to test within-lifetime idempotency instead.
+  - All 5 quality checks (build, type-check, lint, knip, test) passed with 2590 tests.
+---
+
+## 2026-02-28 - US-002
+- Implemented cancellation flag in handleBrowserExecuteScript to stop polling after outer timeout
+- Files changed:
+  - platform/browser-extension/src/browser-commands/extension-commands.ts
+  - platform/browser-extension/src/browser-commands/extension-commands.test.ts
+- Changes:
+  1. Added `const cancelled = { value: false }` before the IIFE
+  2. Added `if (cancelled.value) return;` at top of polling while loop
+  3. Wrapped the cleanup script (after while loop exits) with `if (!cancelled.value)` guard
+  4. Added `cancelled.value = true` in the `finally` block after `Promise.race`
+  5. Added 3 new tests: sync result, outer timeout skips cleanup, inner timeout runs cleanup
+- **Learnings for future iterations:**
+  - SCRIPT_TIMEOUT_MS (outer) fires when file injection hangs; EXEC_MAX_ASYNC_WAIT_MS (inner) fires when async code doesn't resolve. Only the inner timeout means globals were set and need cleanup.
+  - `cancelled.value = true` in `finally` is always safe — when the IIFE wins the race, it has already returned and the flag is set harmlessly.
+  - The outer timeout scenario in practice is: file injection hangs, no globals were ever set, so cleanup would be incorrect. The inner timeout scenario is: injection succeeded but code takes too long, globals must be cleaned.
+  - Testing fake-timer-driven code: `vi.advanceTimersByTimeAsync(12000)` works well for tests where 200+ timer callbacks need to fire in sequence.
+  - The outer-timeout test can use `mockImplementation(() => new Promise(() => {}))` (never-resolving Promise) to simulate a hanging file injection.
+  - All 5 quality checks passed with 2593 tests.
+---
