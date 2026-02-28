@@ -1,0 +1,33 @@
+## Codebase Patterns
+- E2E file watcher tests in `e2e/hot-reload-dynamic.e2e.ts` require a 500ms delay after `waitForLog(server, 'File watcher: Watching', ...)` before any file writes, to guard against the macOS fs.watch()/FSEvents race condition.
+- The standard comment for this delay: "On macOS, fs.watch() returns before FSEvents is ready to deliver events. The explicit delay after the log is necessary — without it, the file write can race ahead of FSEvents registration and the change is silently missed."
+- `testServer.invocations()` returns `Array<{ ts, method, path, body }>` — use it with `waitFor` to poll for in-flight requests reaching the test server instead of fixed delays.
+- `replaceIifeClosing` in `e2e/helpers.ts` matches the first `})();` in the IIFE file — the adapter build appends a freeze block after the main IIFE, so the regex must not anchor to EOF.
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-101808-e2e-hot-reload-fixes~running.json
+Started: Sat Feb 28 18:18:41 UTC 2026
+---
+
+## [2026-02-28] - US-001
+- Added 500ms FSEvents readiness delay + comment to three locations in `e2e/hot-reload-dynamic.e2e.ts`:
+  1. Pre-reload phase of `file watcher still detects manifest changes after hot reload` (after line 1171)
+  2. Post-reload phase of the same test (after line 1204)
+  3. `rewriting tools.json preserves all tools` test (after line 1271)
+- Files changed: `e2e/hot-reload-dynamic.e2e.ts`
+- **Learnings for future iterations:**
+  - All three `waitForLog(server, 'File watcher: Watching', ...)` calls in the file now have the matching 500ms delay — the pattern is consistent throughout the file
+  - Phase 1 (build, type-check, lint, knip, test) all passed; no E2E needed (e2eCheckpoint: false)
+---
+
+## [2026-02-28] - US-002
+- Replaced fixed 500ms delay at line 805 with `waitFor` polling `testServer.invocations()` to confirm in-flight request reached the test server before triggering hot reload
+- Fixed catch block (lines 813-822) to only swallow expected network errors (502, Bad Gateway, ECONNRESET, socket hang up) and re-throw everything else including assertion errors
+- Fixed pre-existing `replaceIifeClosing` regex in `e2e/helpers.ts` — adapter IIFE now has a freeze block + sourcemap after the main `})();`, so the regex must not anchor to EOF
+- Files changed: `e2e/hot-reload-dynamic.e2e.ts`, `e2e/helpers.ts`
+- **Learnings for future iterations:**
+  - The adapter IIFE build (via `opentabs-plugin build`) appends a freeze/hash block after the main IIFE closure, so any regex matching `})();` at EOF will fail
+  - `testServer.invocations()` is the idiomatic way to confirm requests have reached the test server; avoid fixed delays
+  - When catch blocks swallow all errors, use a whitelist approach (only catch known expected errors) rather than a blacklist (detect specific error types to re-throw)
+  - Phase 1 + Phase 2 (including E2E) all passed; 385 E2E tests green
+---
