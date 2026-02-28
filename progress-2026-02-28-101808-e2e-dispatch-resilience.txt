@@ -1,0 +1,45 @@
+## Codebase Patterns
+- E2E test file: `e2e/dispatch-resilience.e2e.ts`; helpers: `e2e/helpers.ts`
+- WebSocket cleanup pattern: wrap post-connect code in `try { ... } finally { try { ws.close(); } catch { /* ignore if already closed */ } }`
+- Prettier enforces multi-line `try/catch` — inline form is auto-fixed by `npm run lint:fix`
+- Workspace node_modules may be empty after worktree creation; run `npm ci --prefer-offline` to install from cache
+- Zod error format (v4+): `"Invalid arguments:\n  - fieldName: Invalid input: expected X, received Y"` — NOT "Expected X, received Y" (Zod v3 style)
+- `replaceIifeClosing` in e2e/helpers.ts: regex must handle optional sourcemap comment (`//# sourceMappingURL=...`) at end of IIFE file
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-101808-e2e-dispatch-resilience~running.json
+Started: Sat Feb 28 18:18:29 UTC 2026
+---
+
+## 2026-02-28T18:30 UTC - US-001
+- Wrapped `fakeWs` WebSocket at 3 locations in try/finally blocks (tests: "tool call when disconnected", "browser_list_tabs during reconnect", "DISPATCH_TIMEOUT_MS fires")
+- Wrapped `rawWs` WebSocket in "Malformed WebSocket messages" test in try/finally block
+- Each finally block uses `try { ws.close(); } catch { /* ignore if already closed */ }` for graceful handling
+- Also fixed pre-existing timing-sensitive test failure in `platform/browser-extension/src/log-collector.test.ts` (the `since` timestamp test used `Date.now() - 1` which was already past entry timestamps; fixed by capturing a fresh entry inside the test after recording the cutoff)
+- **Learnings for future iterations:**
+  - Prettier auto-reformats inline `try { } catch { }` to multi-line — run `npm run lint:fix` after adding these patterns
+  - After git worktree setup, `node_modules/.bin` may be missing (only `lucide-react` present); run `npm ci --prefer-offline` to install from npm cache before running any build/check commands
+  - The `since` filter in LogCollector returns entries with `timestamp >= since`; test the filter correctly by capturing entries after the cutoff timestamp, not before
+---
+
+## 2026-02-28T18:33 UTC - US-002
+- Wrapped `timeoutClient` lifecycle in try/finally block in the "DISPATCH_TIMEOUT_MS fires" test so the MCP session is always cleaned up even if assertions fail
+- The finally block uses `try { await timeoutClient.close(); } catch { /* ignore */ }` for graceful handling
+- Replaced the fixed 2-second `setTimeout` in the "tab closed mid-execution" test with `waitFor` polling on `testServer.invocations()` — confirms the echo request has arrived at the test server before closing the tab
+- The polling pattern matches the existing pattern used in the DISPATCH_TIMEOUT_MS test (waitFor with 10s timeout, 200ms interval)
+- **Learnings for future iterations:**
+  - `waitFor` is already imported in dispatch-resilience.e2e.ts — no additional imports needed
+  - The `testServer.invocations()` API returns all recorded invocations; filter by `i.path` to find specific tool calls
+  - Nesting try/finally blocks (outer for timeoutClient, inner for fakeWs) is the correct pattern when multiple resources need cleanup in different scopes
+---
+
+## 2026-02-28T18:46 UTC - US-003
+- Replaced loose `toContain('invalid')` assertions in 2 browser-tool validation tests with specific Zod error checks: `'Invalid arguments:'` + field-specific message (`'tabId: Invalid input: expected number, received string'`, `'url: Invalid input: expected string, received undefined'`)
+- Replaced loose `toContain('url')` assertion in URL scheme test with `'url: URL scheme must be http: or https:'` (matches the explicit refinement message in url-validation.ts)
+- Fixed pre-existing `replaceIifeClosing` failure in `e2e/helpers.ts`: regex `/}\)\(\);[\s]*$/` didn't match because adapter.iife.js now ends with `})();\n//# sourceMappingURL=...` — updated to `/}\)\(\);\s*(\/\/[^\n]*)?\s*$/` to skip optional trailing comment
+- **Learnings for future iterations:**
+  - Zod v4+ error messages use "Invalid input: expected X, received Y" format, NOT "Expected X, received Y" (Zod v3 style) — always run tests first to see actual error strings
+  - Zod error for missing required string field is "Invalid input: expected string, received undefined" (not "Required")
+  - `adapter.iife.js` ends with `//# sourceMappingURL=adapter.iife.js.map\n` — any regex matching `})();` at end of file must account for this trailing comment
+  - The hash-setter IIFE is appended on the same line as the main IIFE close: `})();(function(){...})();`
+---
