@@ -1,0 +1,31 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-123112-fix-devproxy-leak-rgb-parse~running.json
+Started: Sat Feb 28 20:31:52 UTC 2026
+---
+
+## Codebase Patterns
+- dev-proxy.ts uses a module-level `pending: Array<() => void>` to buffer callbacks until the worker is ready; `drainPending` splices and calls all entries, `whenReady` pushes entries with a settled-flag guard
+- TypeScript closures in setTimeout callbacks can safely reference `const` variables declared later in the same scope (no TDZ at runtime since timers are async)
+
+---
+
+## 2026-02-28 - US-001
+- Extracted the anonymous callback in `pending.push(...)` into a named `entry` variable
+- In the timeout handler, added `pending.splice(pending.indexOf(entry), 1)` before calling `onTimeout()` to eagerly free dead req/res/socket references
+- **Learnings for future iterations:**
+  - The mutual-reference pattern (timer callback referencing `entry`, entry closure referencing `timer`) works cleanly in TypeScript because closures capture bindings and timers are async
+  - `drainPending` already handles settled entries via the `if (!settled)` guard, but removing timed-out entries eagerly means fewer items to iterate and references are freed sooner
+  - This is dev-only code (no user-facing behavior change)
+---
+
+## 2026-02-28 - US-002
+- Added a second regex branch in `parseColor` (platform/plugin-tools/src/validate-icon.ts) to match modern CSS Color Level 4 space-separated rgb() syntax: `rgb(R G B)`, `rgb(R G B / A)`, `rgba(R G B / A)`, with integer or percentage components
+- Added a matching branch in `convertColorToGray` for modern syntax, outputting `#rrggbb` for opaque colors and `rgba(g, g, g, A)` for colors with alpha
+- `isAchromaticColor` automatically benefits from the `parseColor` fix (delegates to it)
+- Added 7 tests to `validateInactiveIconColors` describe block and 7 tests to `generateInactiveIcon` describe block covering all modern syntax variants
+- **Learnings for future iterations:**
+  - JavaScript floating-point: `50 * 2.55` = `127.499...` (not 127.5), so `Math.round(50 * 2.55)` = 127, not 128. Percentage-to-255 conversions using `*2.55` have fp precision gotchas — always verify expected values against actual runtime output
+  - `parseFloat("50%")` returns 50 in JavaScript (stops at `%`), so the `%` detection with `s.endsWith('%')` is correct
+  - The legacy comma-separated and modern space-separated regex patterns are mutually exclusive; insertion order between them doesn't matter
+  - `convertColorToGray` has its own regex matching (not delegating to `parseColor`), so both functions need independent updates for new color syntax
+---
