@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix validated bugs found during systematic backend code audit: unsafe type casts in browser tools that crash on unexpected extension responses, and stale network capture state that persists across extension disconnects and tab closes.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Validate dispatchToExtension response shape in export-har before accessing .requests and .frames",
+      "description": "As a developer using browser_export_har, I want the tool to handle unexpected extension responses gracefully so that I get a clear error message instead of a cryptic 'Cannot read properties of undefined' crash.",
+      "acceptanceCriteria": [
+        "export-har handler validates that requestsResult has a 'requests' array before calling .map() — uses Array.isArray() check with ?? [] fallback, matching the pattern used in analyze-site/index.ts lines 954-956",
+        "export-har handler validates that framesResult has a 'frames' array before calling .map() — same defensive pattern",
+        "If the response shape is unexpected (e.g., null, error object, missing field), the handler falls back to an empty array instead of crashing",
+        "Existing export-har tests continue to pass with valid responses",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/export-har.ts, lines 199-214.\n\nThe handler casts dispatchToExtension results with `as { requests: CapturedRequest[] }` and immediately calls `.requests.map(...)`. If the extension returns an unexpected shape (null, error object, or object without a .requests field), this crashes with 'Cannot read properties of undefined (reading map)'.\n\nThe fix is to add the same defensive validation that analyze-site/index.ts uses at lines 954-956:\n```typescript\nconst requestsResult = await dispatchToExtension(...);\nconst requests = Array.isArray(requestsResult)\n  ? requestsResult\n  : ((requestsResult as { requests?: CapturedRequest[] }).requests ?? []);\n```\n\nApply the same pattern to the framesResult at line 210-212."
+    },
+    {
+      "id": "US-002",
+      "title": "Clear activeNetworkCaptures on extension disconnect and tab close",
+      "description": "As a developer using network capture tools, I want the activeNetworkCaptures set to be cleaned up when the extension disconnects or tabs are closed so that export_har doesn't pass its guard check for stale capture sessions that no longer exist.",
+      "acceptanceCriteria": [
+        "state.activeNetworkCaptures is cleared in the WebSocket close handler (createHandleWsClose in http-routes.ts) when the extension disconnects — all capture sessions are lost when the extension disconnects since they are extension-side state",
+        "When browser_close_tab is called, the closed tab's ID is removed from state.activeNetworkCaptures if present",
+        "After extension disconnect + reconnect, browser_export_har correctly rejects with 'Network capture is not active' instead of dispatching to the extension and getting a debugger error",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The activeNetworkCaptures Set<number> on ServerState tracks which tabs have active network capture. It is only modified in two places:\n- enable-network-capture.ts:52 (.add)\n- disable-network-capture.ts:18 (.delete)\n\nBut capture sessions are extension-side state that is lost when:\n1. The extension disconnects (WebSocket close) — ALL captures are lost\n2. A tab is closed — that tab's capture is lost\n\nFix in two places:\n\n1. platform/mcp-server/src/http-routes.ts, createHandleWsClose function (~line 584): add `state.activeNetworkCaptures.clear()` alongside the existing pendingDispatches/pendingConfirmations cleanup.\n\n2. platform/mcp-server/src/browser-tools/close-tab.ts: after the dispatchToExtension call succeeds, add `state.activeNetworkCaptures.delete(args.tabId)` to clean up any capture session for the closed tab. Read close-tab.ts first to see the exact handler structure."
+    }
+  ]
+}
