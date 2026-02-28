@@ -1,0 +1,157 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add comprehensive E2E tests for IIFE build, injection, and runtime integrity to ensure the Bun-to-Node migration did not introduce regressions and to cover previously untested edge cases in the adapter IIFE pipeline.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "E2E test: node:* import stripping produces valid browser IIFE",
+      "description": "As a platform developer, I want an E2E test that verifies plugins importing node:* modules produce valid browser IIFEs so that the stripNodeBuiltins esbuild plugin is verified end-to-end.",
+      "acceptanceCriteria": [
+        "A test creates a minimal plugin that imports from node:fs and node:crypto in its tool handler",
+        "The plugin builds successfully via the build pipeline",
+        "The adapter IIFE does not contain require('node:fs') or require('node:crypto') in its output",
+        "The adapter injects into a matching tab without runtime errors",
+        "Tool dispatch through the adapter returns the correct result (the tool handler uses a fallback for the node imports)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Create a new E2E test file e2e/iife-node-imports.e2e.ts. The test should:\n1. Create a temporary plugin directory with a src/index.ts that imports from node:fs and node:crypto\n2. The tool handler should use typeof checks (e.g., `typeof readFileSync === 'function'`) and return a fallback value when the node APIs are unavailable in browser context\n3. Build the plugin using the build pipeline (spawn `npx tsx platform/plugin-tools/src/commands/build.ts` or use the existing build helpers)\n4. Read the generated dist/adapter.iife.js and assert it does NOT contain 'node:fs' or 'node:crypto' strings (the stripNodeBuiltins plugin in platform/plugin-tools/src/commands/build.ts:672-681 marks them as external + sideEffects:false)\n5. Register the plugin, start the MCP server, inject into a tab, and call the tool\n\nKey files:\n- platform/plugin-tools/src/commands/build.ts:672-681 — stripNodeBuiltins esbuild plugin\n- e2e/fixtures.ts — createMinimalPlugin() helper (may need extending for custom source)\n- e2e/helpers.ts — setupIsolatedIifeTest() for standalone IIFE test setup\n\nIMPORTANT: The e2e-test plugin in plugins/e2e-test/ is a real plugin built with the SDK. For this test, you likely need to create a temporary plugin with custom source code that actually imports node:* modules. Look at how hot-reload-dynamic.e2e.ts and iife-injection.e2e.ts create minimal plugins for inspiration.\n\nAlternatively, if creating a full build pipeline in the test is too complex, you can verify the IIFE content statically by building a test plugin in global-setup.ts or a test-level beforeAll, then asserting on the file content AND injecting it into a tab to verify no runtime errors."
+    },
+    {
+      "id": "US-002",
+      "title": "E2E test: adapter hash integrity chain from build to injection verification",
+      "description": "As a platform developer, I want an E2E test that verifies the full adapter hash integrity chain (build → server load → extension injection → post-injection verification) so that hash mismatches are detected and the retry mechanism works.",
+      "acceptanceCriteria": [
+        "A test verifies that the adapter hash computed at build time matches the hash extracted by the server loader",
+        "The test verifies the hash sent to the extension in sync.full matches the hash in the injected adapter's __adapterHash property",
+        "A test verifies that when the IIFE file on disk is corrupted after server load but before injection, the hash verification detects the mismatch",
+        "The retry mechanism (200ms delay, single retry) is exercised when hash verification fails on the first attempt",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Add tests to e2e/iife-injection.e2e.ts (or a new file e2e/iife-hash-integrity.e2e.ts).\n\nThe hash chain is:\n1. build.ts:1076 computes SHA-256 of IIFE content, appends hashAndFreeze snippet with __adapterHash\n2. loader.ts extractEmbeddedAdapterHash() reads it from the IIFE via regex\n3. adapter-files.ts writeAdapterFile() writes the IIFE with content-hashed filename ({name}-{hash8}.js)\n4. MCP server sends adapterHash in sync.full/plugin.update to extension\n5. iife-injection.ts:38-94 verifyAdapterHash() reads __adapterHash from MAIN world and compares\n6. On mismatch, retries once after INJECTION_RETRY_DELAY_MS (200ms)\n\nExisting test 'injected adapter __adapterHash matches the manifest adapterHash' in tool-dispatch.e2e.ts:689 verifies the happy path (hash matches). The gap is the mismatch/retry path.\n\nTo test the mismatch path:\n- After the server loads the plugin and writes the adapter file, modify the adapter file on disk (e.g., append a comment) to change its content but not the embedded __adapterHash\n- The extension will inject this modified file; verifyAdapterHash will detect the mismatch\n- After the retry (which reads the same modified file), the test should verify the extension logs a warning about hash mismatch\n- Alternatively, the test can verify the adapter is still functional despite the mismatch (since hash mismatch is a warning, not a hard failure — see iife-injection.ts)\n\nKey files:\n- platform/browser-extension/src/iife-injection.ts:38-94 — hash verification + retry\n- e2e/tool-dispatch.e2e.ts:689 — existing happy-path hash test\n- platform/plugin-tools/src/commands/build.ts:1065-1093 — hashAndFreeze"
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: browser_execute_script exec file lifecycle and namespace isolation",
+      "description": "As a platform developer, I want E2E tests verifying that browser_execute_script exec files are properly created, executed, cleaned up, and isolated from adapter IIFE namespaces.",
+      "acceptanceCriteria": [
+        "A test calls browser_execute_script and verifies the result is correct",
+        "After execution, the __exec-*.js file is deleted from the adapters directory",
+        "The exec file's __lastExecResult does not interfere with any adapter's __openTabs namespace",
+        "Calling browser_execute_script while an adapter is active does not corrupt adapter state",
+        "A subsequent plugin tool call after browser_execute_script returns the correct result",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Add a new describe block in e2e/browser-tools.e2e.ts or create e2e/exec-file-lifecycle.e2e.ts.\n\nThe exec file lifecycle is:\n1. adapter-files.ts writeExecFile() writes __exec-{id}.js to adapters directory\n2. Extension injects it via chrome.scripting.executeScript({ files, world: 'MAIN' })\n3. It sets globalThis.__openTabs.__lastExecResult\n4. adapter-files.ts deleteExecFile() removes the file after reading the result\n\nTest scenarios:\n1. Call browser_execute_script with simple JS (e.g., `document.title`), verify correct result returned\n2. After the call, list files in the adapters directory and verify no __exec-*.js files remain\n3. Check that globalThis.__openTabs.adapters['e2e-test'] is still intact (not corrupted by __lastExecResult)\n4. Call a plugin tool (e2e-test_echo) and verify it works correctly after browser_execute_script\n\nThe browser_execute_script tool already exists and is tested in browser-tools.e2e.ts for basic functionality, but the cleanup and namespace isolation aspects are not verified. Check browser-tools.e2e.ts first to avoid duplicating existing tests — only add the missing scenarios.\n\nKey files:\n- platform/mcp-server/src/adapter-files.ts:156-190 — writeExecFile\n- platform/mcp-server/src/adapter-files.ts — deleteExecFile\n- e2e/browser-tools.e2e.ts — existing browser_execute_script tests"
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: frozen adapter integrity check rejects tampered adapter",
+      "description": "As a platform developer, I want an E2E test that verifies the Object.isFrozen(adapter) integrity check in tool dispatch rejects a non-frozen adapter, so that page-script tampering is detected.",
+      "acceptanceCriteria": [
+        "A test injects a legitimate adapter, then uses chrome.scripting.executeScript to replace it with a non-frozen fake adapter in the page",
+        "A subsequent tool dispatch returns an error with 'integrity' in the message (code -32002)",
+        "The test verifies the extension does not execute the tool handler on the tampered adapter",
+        "After re-injection of the legitimate adapter (e.g., via page reload), tool dispatch works again",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Add to e2e/iife-injection.e2e.ts or e2e/tool-dispatch.e2e.ts.\n\nThe integrity check is in platform/browser-extension/src/tool-dispatch.ts:183:\n```typescript\nif (!Object.isFrozen(adapter)) {\n  return { type: 'error', code: -32002, message: `${plugin} adapter failed integrity check` };\n}\n```\n\nThe hashAndFreeze snippet in the IIFE freezes the adapter. To test tamper rejection:\n1. Setup: inject legitimate adapter, verify tool works\n2. Tamper: use extensionContext's page.evaluate or chrome.scripting.executeScript to run JS in MAIN world that replaces the adapter with an unfrozen copy:\n   ```js\n   const adapters = globalThis.__openTabs.adapters;\n   // The adapters container itself may be frozen by hashAndFreeze, so we may need\n   // to first call prepareForReinjection to get a mutable container, then set a\n   // non-frozen adapter. Alternatively, rebuild __openTabs entirely.\n   ```\n3. Call tool: verify error response contains 'integrity' and code is -32002\n4. Recover: reload the page (triggers re-injection of legitimate frozen adapter)\n5. Call tool: verify it works again\n\nThis is tricky because hashAndFreeze also makes the adapters container non-writable. The test may need to reconstruct globalThis.__openTabs with a mutable container first. Look at how prepareForReinjection() works in iife-injection.ts for guidance on how to make the container writable.\n\nKey files:\n- platform/browser-extension/src/tool-dispatch.ts:183 — frozen check\n- platform/browser-extension/src/iife-injection.ts — prepareForReinjection()\n- platform/plugin-tools/src/commands/build.ts — hashAndFreeze snippet"
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: rapid successive IIFE re-injections maintain consistent state",
+      "description": "As a platform developer, I want an E2E test that verifies rapid successive IIFE changes (simulating fast iterative development) do not corrupt adapter state or leave stale adapters.",
+      "acceptanceCriteria": [
+        "A test modifies the IIFE file 3-5 times in rapid succession (< 500ms apart)",
+        "After all changes settle, only the final adapter version is present in the tab",
+        "Tool dispatch returns the correct result using the final adapter",
+        "No stale adapter files remain in the adapters directory",
+        "The extension and server remain healthy throughout",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Add to e2e/iife-injection.e2e.ts.\n\nThe file watcher in the MCP server uses debouncing to handle rapid changes. The generation counter (mentioned in the existing test 'concurrent file watcher change during hot reload does not corrupt tool state') prevents stale callbacks from executing. But that test only does ONE concurrent change — this test should do 3-5 rapid changes to stress the debounce and generation logic.\n\nTest approach:\n1. Setup: inject adapter, verify baseline tool works\n2. Rapid changes: write to the IIFE file 3-5 times with <500ms gaps, each adding a unique marker (e.g., `globalThis.__rapid_test_N = true` for N=1,2,3,4,5)\n3. Wait for changes to settle (e.g., wait for the file watcher to process, wait for 'IIFE updated for' log)\n4. Verify: only the final marker is set in the page (or all markers from all versions are set, since each injection runs the full IIFE which sets the latest marker)\n5. Actually, since each re-injection replaces the adapter, the adapter should be the last version. Verify adapter.tools or a custom marker identifies the final version.\n6. Call tool: verify dispatch works correctly\n7. Check adapters directory: only one adapter file for this plugin should exist (content-hashed to the final version)\n\nKey context:\n- The file watcher debounce time is likely around 500ms (check platform/mcp-server/src/file-watcher.ts or similar)\n- The generation counter logic is in the server's file watcher handler\n- iife-injection.e2e.ts already has 'concurrent file watcher change during hot reload' test — this new test is specifically about rapid successive changes (not concurrent with hot reload)"
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: navigation interceptor survives plugin removal when other plugins remain",
+      "description": "As a platform developer, I want an E2E test that verifies the shared history.pushState/replaceState navigation interceptor still works for remaining plugins after one plugin is removed.",
+      "acceptanceCriteria": [
+        "A test installs two plugins that both inject into the same tab",
+        "Both plugins receive onNavigate events from pushState calls",
+        "One plugin is removed via config change + hot reload",
+        "The remaining plugin still receives onNavigate events from pushState calls",
+        "history.pushState and replaceState still function correctly for the page after one plugin is removed",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Add to e2e/lifecycle-hooks.e2e.ts or create e2e/navigation-interceptor.e2e.ts.\n\nThe navigation interceptor sharing logic is in the IIFE wrapper generated by bundleIIFE() in platform/plugin-tools/src/commands/build.ts. The pattern:\n1. First plugin that installs the interceptor monkey-patches history.pushState/replaceState\n2. A shared Map on __openTabs._navigationInterceptor stores per-plugin callbacks\n3. When a plugin is torn down, its callback is removed from the Map\n4. If the Map becomes empty, the original pushState/replaceState are restored\n5. If other plugins remain, the interceptor stays active for them\n\nTest approach:\n1. Install two plugins: e2e-test (which has onNavigate) and a minimal second plugin with onNavigate\n2. The second plugin's onNavigate should set a global marker (e.g., globalThis.__plugin2_onNavigate_urls = [...urls])\n3. Trigger pushState in the page; verify both plugins' onNavigate markers are updated\n4. Remove one plugin via config + hot reload\n5. Trigger pushState again; verify the remaining plugin's onNavigate marker is updated\n6. Verify history.pushState still works for the page (the URL actually changes)\n\nThe e2e-test plugin already has onNavigate that sets __opentabs_onNavigate_urls. For the second plugin, create a minimal plugin with a custom IIFE that sets a different global marker.\n\nKey files:\n- platform/plugin-tools/src/commands/build.ts — bundleIIFE() navigation interceptor logic (search for 'pushState' or '_navigationInterceptor')\n- e2e/lifecycle-hooks.e2e.ts — existing onNavigate test\n- plugins/e2e-test/src/index.ts — e2e-test plugin's onNavigate implementation"
+    },
+    {
+      "id": "US-007",
+      "title": "E2E test: log relay nonce validation rejects spoofed messages from page scripts",
+      "description": "As a platform developer, I want an E2E test that verifies the log relay's cryptographic nonce validation rejects postMessage from page scripts that don't have the correct nonce.",
+      "acceptanceCriteria": [
+        "A test verifies that legitimate adapter log messages (with correct nonce) are relayed to the server",
+        "A test injects a page script that sends a postMessage with the correct structure but wrong/missing nonce",
+        "The spoofed message is NOT relayed to the server (verify by checking server logs)",
+        "Legitimate adapter tool invocations continue to work after the spoofing attempt",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Add to e2e/iife-injection.e2e.ts or create e2e/log-relay-security.e2e.ts.\n\nThe log relay mechanism:\n1. injectLogRelay() in iife-injection.ts injects an ISOLATED world listener that validates postMessage nonce\n2. The nonce is stored on globalThis.__openTabs._logNonce in MAIN world (accessible to page scripts)\n3. Adapter batches logs and flushes via window.postMessage({ type: 'opentabs-log', nonce, batch })\n4. The ISOLATED world listener validates nonce === storedNonce before relaying to background\n\nWait — the nonce IS accessible to page scripts via __openTabs._logNonce. This means a page script CAN read the nonce. The actual security relies on the ISOLATED world listener only being set up by the extension. So the nonce prevents cross-origin postMessage spoofing, not same-origin spoofing.\n\nRevise test approach:\n1. Verify legitimate logs are relayed: call a tool that produces logs, check server receives them\n2. Inject a page script that sends postMessage with type 'opentabs-log' but an INCORRECT nonce (random UUID)\n3. Verify the server does NOT receive these spoofed log entries\n4. Verify legitimate tool dispatch still works\n\nTo verify server receives/doesn't receive logs, use the MCP server's audit log or plugin log endpoint. Check if there's a log viewing API in the health endpoint or if logs appear in server stdout.\n\nKey files:\n- platform/browser-extension/src/iife-injection.ts:107-167 — injectLogRelay()\n- platform/plugin-tools/src/commands/build.ts — log transport in bundleIIFE() wrapper\n- e2e/plugin-logging.e2e.ts — existing plugin logging test (check how it verifies log delivery)"
+    }
+  ]
+}
