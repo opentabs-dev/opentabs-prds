@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix genuine quality issues in the E2E test suite found during audit: extract duplicated helper, clear dangling timeouts in WebSocket connect patterns, and replace a fixed sleep with polling in lifecycle.e2e.ts.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Extract duplicated parseErrorJson helper to helpers.ts",
+      "description": "As a platform developer, I want a single source of truth for the parseErrorJson test helper so that changes to the error response format only need updating in one place.",
+      "acceptanceCriteria": [
+        "parseErrorJson is defined in e2e/helpers.ts and exported",
+        "e2e/structured-errors.e2e.ts imports parseErrorJson from ./helpers.js instead of defining it locally",
+        "e2e/sdk-fetch-errors.e2e.ts imports parseErrorJson from ./helpers.js instead of defining it locally",
+        "No duplicate parseErrorJson definitions remain in any e2e/*.ts file",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The identical helper is defined at:\n- e2e/structured-errors.e2e.ts:20-26\n- e2e/sdk-fetch-errors.e2e.ts:19-25\n\nBoth have the same signature: `const parseErrorJson = (content: string): Record<string, unknown>`. Move to e2e/helpers.ts and add to the export list. Update both importing files. The helper extracts JSON from markdown code blocks in tool error responses using a regex: /```json\\n([\\s\\S]*?)\\n```/."
+    },
+    {
+      "id": "US-002",
+      "title": "Clear dangling setTimeout in WebSocket connect patterns across E2E tests",
+      "description": "As a platform developer, I want WebSocket connect patterns to clean up their timeout timers on success so that test infrastructure doesn't accumulate dangling timers.",
+      "acceptanceCriteria": [
+        "All WebSocket connect patterns in e2e/ that use setTimeout with reject() also clearTimeout on success (onopen)",
+        "Each pattern stores the timeout handle in a variable and calls clearTimeout in the onopen callback",
+        "No setTimeout-with-reject patterns remain that do not clear the timeout on success",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "There are 8 instances of this pattern across 3 files:\n\n1. e2e/lifecycle.e2e.ts lines 248-252, 280-284, 412-416\n2. e2e/dispatch-resilience.e2e.ts lines 301-305, 346-350, 542-546, 748-752\n3. e2e/plugin-management.e2e.ts lines 74-78\n\nThe current pattern is:\n```typescript\nawait new Promise<void>((resolve, reject) => {\n  ws.onopen = () => resolve();\n  ws.onerror = () => reject(new Error('WebSocket connect failed'));\n  setTimeout(() => reject(new Error('WebSocket connect timeout')), 5_000);\n});\n```\n\nFix each to:\n```typescript\nawait new Promise<void>((resolve, reject) => {\n  const timer = setTimeout(() => reject(new Error('WebSocket connect timeout')), 5_000);\n  ws.onopen = () => { clearTimeout(timer); resolve(); };\n  ws.onerror = () => { clearTimeout(timer); reject(new Error('WebSocket connect failed')); };\n});\n```\n\nThis prevents dangling timers from accumulating during test runs. While calling reject() after resolve() is a no-op in Promise semantics, clearing the timer is good practice and prevents unnecessary work on the event loop."
+    }
+  ]
+}
