@@ -1,0 +1,64 @@
+## Codebase Patterns
+- E2E test import order: regular imports (relative, then node:), then type-only imports (relative from ./fixtures.js, then external like @playwright/test)
+- For manual-setup E2E tests that create resources sequentially, use `let resource: Type | undefined` before the try block, assign inside try, and use optional chaining (`resource?.close()`) or conditionals (`if (cleanupDir) fs.rmSync(...)`) in the finally block
+- Capture `let` variable values as `const` before async callbacks/closures to avoid TypeScript narrowing issues (e.g., `const serverPort = server.port; const serverSecret = server.secret;` before `expect.poll` callbacks that use those values)
+- The helpers.ts `setupIsolatedIifeTest` pattern (lines 436-485) is the canonical reference for incremental resource tracking in E2E setup
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-090051-e2e-resource-leak-fixes~running.json
+Started: Sat Feb 28 17:01:25 UTC 2026
+---
+
+## 2026-02-28 - US-002
+- Fixed partial-setup resource leaks in all 4 tests in `e2e/side-panel-data-flow.e2e.ts`
+- Changed `const { context, cleanupDir, extensionDir }` to `let context`, `let cleanupDir`, `let extensionDir` declarations before try blocks
+- Changed `const server` and `const testServer` to `let server`, `let testServer` declarations before try blocks
+- Moved ALL setup code (`startMcpServer`, `startTestServer`, `launchExtensionContext`, `setupAdapterSymlink`) inside try blocks
+- Captured `const serverPort = server.port` and `const serverSecret = server.secret` after server assignment (before async callbacks) to avoid TypeScript narrowing failures in `expect.poll` callbacks
+- Used `context?.close()`, `server?.kill()`, `testServer?.kill()`, `mcpClient?.close()`, and `if (cleanupDir) fs.rmSync(...)` in finally blocks
+- Added type imports: `import type { McpServer, TestServer, McpClient } from './fixtures.js'` and `import type { BrowserContext } from '@playwright/test'`
+- The PRD noted 3 tests but the file actually has 4 — fixed all 4 (the 4th test at line ~198 "tab state dot shows unavailable" had the same pattern)
+- Files changed: `e2e/side-panel-data-flow.e2e.ts`
+- **Learnings for future iterations:**
+  - Always count tests in the file rather than trusting the PRD line numbers — PRDs may miss tests
+  - The `const serverPort = server.port; const serverSecret = server.secret;` capture pattern is needed before ANY async callback (like `expect.poll`) that accesses `let` variables
+  - `mcpClient` created by `createMcpClient` is synchronous but should still be declared as `let` and moved into try for consistent cleanup
+---
+
+## 2026-02-28 - US-001
+- Fixed partial-setup resource leak in `e2e/tab-state-sync.e2e.ts` reconnect test
+- Changed `const server1`, `testServer`, `context`, `cleanupDir` to `let` variables declared before the try block
+- Moved setup code (startMcpServer, startTestServer, launchExtensionContext) inside the try block
+- Added `const server1Secret = server1.secret` capture to avoid TypeScript narrowing failure inside async poll callback
+- Used `context?.close()`, `server1?.kill()`, `testServer?.kill()`, and `if (cleanupDir) fs.rmSync(...)` in the finally block
+- Added `import type { McpServer, TestServer } from './fixtures.js'` and `import type { BrowserContext } from '@playwright/test'` at end of imports (after all regular imports) per project convention
+- Files changed: `e2e/tab-state-sync.e2e.ts`
+- **Learnings for future iterations:**
+  - TypeScript does NOT narrow `let` variables inside async callbacks/closures — capture as `const` after assignment before the closure
+  - Type imports must be separated from regular imports and placed after them; relative type imports before external type imports
+  - The existing `helpers.ts` `setupIsolatedIifeTest` at lines 436-485 is the exact pattern to follow for these fixes
+---
+
+## 2026-02-28 - US-004
+- Fixed analyze-site.e2e.ts silent failure cascade when `beforeAll` fails to start the server
+- Added `getServerUrl()` guard function (lines 107-112) that throws `'Analyze-site test server not started — check beforeAll for errors'` if `analyzeSiteServer` is undefined
+- Replaced all 13 occurrences of `${analyzeSiteServer?.url ?? ''}` with `${getServerUrl()}` across the test file
+- All 373 E2E tests pass (including the 13 analyze-site tests)
+- Files changed: `e2e/analyze-site.e2e.ts`
+- **Learnings for future iterations:**
+  - For `beforeAll`-managed shared resources, a dedicated guard function is cleaner than optional chaining in every test
+  - The `let resource: Type | undefined` + guard function pattern is the right choice for shared resources (vs. the `let` in try pattern for per-test resources)
+  - When multiple tests share one resource, replacing `resource?.prop ?? fallback` with a throwing guard gives much better failure diagnostics
+---
+
+## 2026-02-28 - US-003
+- Fixed tmpDir leaks in 3 fixtureTest blocks in `e2e/strict-csp.e2e.ts` ('Strict CSP — multiple plugins on same page' describe block)
+- For each affected test, added `try {` immediately after `const tmpDir = fs.mkdtempSync(...)` and moved the final `fs.rmSync(tmpDir, ...)` into a `finally` block
+- The pre-commit hook (prettier) reformatted the indentation of code moved inside try blocks — this is expected and correct
+- The file-watcher test (line ~475) already had a proper try/finally and was not changed
+- Files changed: `e2e/strict-csp.e2e.ts`
+- **Learnings for future iterations:**
+  - For fixtureTest blocks (using Playwright fixtures), only the tmpDir needs protection — fixture teardown handles the browser context
+  - For manual `test()` blocks (no fixtures), full resource tracking with `let` variables before try is needed (as in US-001/US-002)
+  - The try/finally pattern here is simpler than the US-001/US-002 pattern: `const tmpDir = ...` then `try { ... } finally { fs.rmSync(tmpDir) }` — no `let` needed since tmpDir is always defined after mkdtempSync
+---
