@@ -1,0 +1,34 @@
+## Codebase Patterns
+- `writeAndWaitForWatcher(server, writeFile: (attempt: number) => void, expectedLog, outerTimeoutMs?, innerTimeoutMs?)` in `e2e/helpers.ts` — wraps a file write and polls server logs for the watcher to detect it; retries on FSEvents miss. Callback receives `attempt` (0-indexed) so callers can produce slightly different content on retry.
+- `writeAndWaitForWatcher` internally calls `waitForLog(server, 'File watcher: Watching', 10_000)` at the start — do NOT clear `server.logs` immediately before calling it or that wait will timeout. Clear logs before any hot-reload trigger phase, not right before a write.
+- For `writeToolsToManifest` retries, append `' '.repeat(attempt)` to a description field to guarantee FSEvents sees a content change on retry.
+- Prefer `mcpClient.listTools()` over `fs.readFileSync(configPath)` for verifying config persistence in E2E tests — avoids JSON.parse failures from partial writes, and `listTools()` confirming the state is functionally equivalent since the MCP server only reflects config after writing to disk.
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-123101-e2e-fix-flaky-file-io~running.json
+Started: Sat Feb 28 20:31:48 UTC 2026
+---
+
+## 2026-02-28 - US-001
+- Wrapped two bare `writeToolsToManifest()` calls in `writeAndWaitForWatcher()` in `e2e/hot-reload-dynamic.e2e.ts`
+- First fix (~line 1155): multi-session test's first write — moved `echoTool.description` assignment inside the callback, appending `' '.repeat(attempt)` on retry
+- Second fix (~line 1200): post-hot-reload write — extracted `postReloadTool` object before the push so the callback can vary `description` on retry; removed the `server.logs.length = 0` that preceded the write (it would have broken `writeAndWaitForWatcher`'s internal `waitForLog('File watcher: Watching')`)
+- Files changed: `e2e/hot-reload-dynamic.e2e.ts`
+- **Learnings for future iterations:**
+  - `writeAndWaitForWatcher` calls `waitForLog(server, 'File watcher: Watching', 10_000)` internally — any `server.logs.length = 0` before it will break that wait unless the server emits the message again
+  - The hot-reload block at line 1176 already clears logs and waits for 'File watcher: Watching' to confirm watchers are up; there's no need to clear logs again before the subsequent write
+  - Using `attempt` to slightly vary description content ensures FSEvents delivers a new notification even if it coalesces identical writes
+---
+
+## 2026-02-28 - US-002
+- Replaced three `fs.readFileSync(configPath)` `expect.poll()` blocks in `e2e/side-panel-plugin-toggle.e2e.ts` with `mcpClient.listTools()` based checks
+- Block 1 (~line 177): disabled echo tool — replaced fs poll with `listTools().some(t => t.name === 'e2e-test_echo')` returning `.toBe(false)`; merged with the immediately-following duplicate `listTools()` check to avoid redundancy
+- Block 2 (~line 208): re-enabled echo tool — replaced fs poll + duplicate `listTools()` block with a single `listTools().some(t => t.name === 'e2e-test_echo')` returning `.toBe(true)` with 30s timeout
+- Block 3 (~line 419): master toggle disabled all — replaced fs poll with `listTools()` checking `prefixedToolNames.every(name => !toolNames.includes(name))` returning `.toBe(true)`
+- `fs`, `os`, `path` imports all remain needed (used for `mkdtempSync`, `rmSync`, `resolve`, `join`)
+- Files changed: `e2e/side-panel-plugin-toggle.e2e.ts`
+- **Learnings for future iterations:**
+  - When `fs.readFileSync` on config.json is followed immediately by an equivalent `mcpClient.listTools()` check, the two are redundant — collapse into a single `listTools()` poll
+  - The MCP server's in-memory state is updated only after persisting to disk, so `listTools()` confirming a state change is safe evidence of persistence
+  - `expect.poll()` with `async () => { ... }` works fine; return `false` to indicate condition not yet met
+---
