@@ -344,6 +344,7 @@ IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and
           --dangerously-skip-permissions \
           --print \
           --model "$3" \
+          --verbose \
           --output-format stream-json \
         ) 2>"$5" > "$4"
       ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" || ai_exit=$?
