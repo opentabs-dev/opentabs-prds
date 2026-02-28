@@ -1,0 +1,68 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource-leak patterns, audit gaps, and a logic error found during backend code audit of the MCP server package.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix removeLocalPlugin configWriteMutex pattern to match config.ts",
+      "description": "As a developer, I want the configWriteMutex pattern in removeLocalPlugin to be consistent with saveConfig/saveToolConfig so that concurrent config writes don't see a rejected mutex promise on error.",
+      "acceptanceCriteria": [
+        "removeLocalPlugin uses the same mutex pattern as saveConfig: `state.configWriteMutex = writePromise.catch(() => {})` followed by `await writePromise`",
+        "The .catch() handler no longer re-throws, preventing the mutex from being temporarily assigned a rejected promise",
+        "Error logging is preserved (failures are still logged via log.warn)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/plugin-management.ts, lines 366-441.\n\nThe current pattern is:\n```\nstate.configWriteMutex = (async () => { ... })().catch((err) => {\n  state.configWriteMutex = Promise.resolve();\n  log.warn(...);\n  throw err;  // <-- re-throws, making .catch() return a rejected promise\n});\nawait state.configWriteMutex;\n```\n\nThe correct pattern (used in config.ts lines 306-314 and 333-357) is:\n```\nconst prev = state.configWriteMutex;\nconst writePromise = (async () => {\n  await prev;\n  // ... do work ...\n})();\nstate.configWriteMutex = writePromise.catch(() => {});\nawait writePromise;\n```\n\nThis ensures the mutex chain always fulfills so subsequent writes proceed even after a failure. The `await writePromise` still throws to the caller, but `state.configWriteMutex` is the `.catch()` version that always resolves.\n\nAlso fix the path splitting bug on line 405: replace `resolvedPath.split('/').pop()` with `path.basename(resolvedPath)`. Import `basename` from `node:path` (the file already imports `resolve` and `join` from `node:path`). The current code breaks on Windows where path.resolve returns backslash-separated paths."
+    },
+    {
+      "id": "US-002",
+      "title": "Add audit entries for denied and disabled browser tool calls",
+      "description": "As an operator monitoring the OpenTabs server, I want all browser tool call attempts (including denied and disabled ones) to appear in the audit log so that I have complete visibility into tool usage patterns.",
+      "acceptanceCriteria": [
+        "When a browser tool call is blocked because the tool is disabled, an audit entry is appended with success=false and error.code='DISABLED'",
+        "When a browser tool call is denied by permission policy, an audit entry is appended with success=false and error.code='PERMISSION_DENIED'",
+        "When a browser tool confirmation times out, an audit entry is appended with success=false and error.code='CONFIRMATION_TIMEOUT'",
+        "When a user denies a browser tool confirmation, an audit entry is appended with success=false and error.code='USER_DENIED'",
+        "Existing audit entries for successful/failed browser tool executions are unchanged",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/mcp-tool-dispatch.ts, function handleBrowserToolCall (lines 159-294).\n\nCurrently, audit entries are only appended in the `finally` block of the actual execution path (lines 284-293). Four early-return paths skip audit logging:\n\n1. Tool disabled check (line 166-171): return before audit\n2. Permission denied (line 192-201): return before audit\n3. User denied confirmation (line 234-244): return before audit\n4. Confirmation timeout (line 249-258): return before audit\n\nFor each early return, add an `appendAuditEntry(state, { ... })` call with appropriate error codes. Use `Date.now()` for the timestamp and `0` for durationMs (since no execution happened). The `plugin` field should be `'browser'` (consistent with line 288).\n\nImport `appendAuditEntry` from `./state.js` — it is already imported on line 19."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix detectPrimaryApiBaseUrl to count distinct endpoints instead of call counts",
+      "description": "As a user of the plugin_analyze_site tool, I want the primary API base URL detection to correctly identify prefixes shared by multiple distinct endpoints, not just prefixes with high call counts from a single endpoint.",
+      "acceptanceCriteria": [
+        "prefixCounts accumulates the number of distinct endpoints per prefix, not the sum of callCount values",
+        "totalEndpoints is set to endpoints.length (distinct endpoint count), not the sum of callCount",
+        "A single endpoint called many times does not inflate the prefix count beyond 1",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts, function detectPrimaryApiBaseUrl (lines 320-364).\n\nTwo changes needed:\n\n1. Line 332 and 335: Change `+ endpoint.callCount` to `+ 1`. Each endpoint should contribute 1 to each prefix it matches, regardless of how many times it was called. Currently:\n```ts\nprefixCounts.set(parsed.origin, (prefixCounts.get(parsed.origin) ?? 0) + endpoint.callCount);\n```\nShould be:\n```ts\nprefixCounts.set(parsed.origin, (prefixCounts.get(parsed.origin) ?? 0) + 1);\n```\nSame change for the inner loop on line 335.\n\n2. Line 345: Change from summing callCount to using endpoints.length:\n```ts\nconst totalEndpoints = endpoints.reduce((sum, e) => sum + e.callCount, 0);\n```\nShould be:\n```ts\nconst totalEndpoints = endpoints.length;\n```\n\nThe comment on line 344 says 'shared by at least 2 endpoints' which confirms the intent is distinct endpoints, not call counts."
+    }
+  ]
+}
