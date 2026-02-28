@@ -107,6 +107,8 @@ CODE_DIR="$CONSUMER_BASE/code"
 WORKTREE_BASE="$CONSUMER_BASE/worktrees"
 LOG_DIR="$CONSUMER_BASE/logs"
 
+CONFIG_FILE="$CONSUMER_BASE/config"
+
 mkdir -p "$CONSUMER_BASE" "$WORKTREE_BASE" "$LOG_DIR"
 
 # --- Date-Rotated Logging ---
@@ -287,6 +289,67 @@ for (( s=0; s<MAX_WORKERS; s++ )); do
   WORKER_TAGS[$s]=""
 done
 
+# Highest slot index ever initialized. reap_workers and cleanup iterate
+# 0..SLOT_HIGH_WATER so that scale-down doesn't orphan active workers.
+SLOT_HIGH_WATER=$((MAX_WORKERS - 1))
+
+# --- Config File & Hot Reload ---
+# Write current config so it can be edited and reloaded via SIGHUP.
+
+_write_config() {
+  cat > "$CONFIG_FILE" <<EOF
+# Ralph consumer config — edit and send SIGHUP to reload.
+#   kill -HUP \$(cat ~/.ralph-consumer/.consumer.pid)
+workers=$MAX_WORKERS
+EOF
+}
+
+_write_config
+
+# SIGHUP handler — re-read MAX_WORKERS from config file.
+# Scale-up: initialize new empty slots immediately.
+# Scale-down: lower the cap; active workers in higher slots drain naturally.
+_reload_config() {
+  if [ ! -f "$CONFIG_FILE" ]; then
+    echo -e "$(ts) ${YELLOW}[SIGHUP] Config file not found: $CONFIG_FILE${RESET}"
+    return
+  fi
+
+  local new_workers
+  new_workers=$(grep -E '^workers=' "$CONFIG_FILE" 2>/dev/null | head -1 | cut -d= -f2 | tr -d ' ')
+
+  if [ -z "$new_workers" ] || ! [[ "$new_workers" =~ ^[0-9]+$ ]] || [ "$new_workers" -lt 1 ]; then
+    echo -e "$(ts) ${YELLOW}[SIGHUP] Invalid workers value in $CONFIG_FILE. Ignoring.${RESET}"
+    return
+  fi
+
+  local old_workers=$MAX_WORKERS
+  MAX_WORKERS=$new_workers
+
+  if [ "$MAX_WORKERS" -gt "$old_workers" ]; then
+    # Scale up: initialize new empty slots
+    for (( s=old_workers; s<MAX_WORKERS; s++ )); do
+      WORKER_PIDS[$s]=""
+      WORKER_CONTAINERS[$s]=""
+      WORKER_PRDS[$s]=""
+      WORKER_WORKTREES[$s]=""
+      WORKER_BRANCHES[$s]=""
+      WORKER_SLUGS[$s]=""
+      WORKER_TAGS[$s]=""
+    done
+    SLOT_HIGH_WATER=$(( MAX_WORKERS - 1 ))
+    echo -e "$(ts) ${GREEN}[SIGHUP] Scaled UP: $old_workers → $MAX_WORKERS workers${RESET}"
+  elif [ "$MAX_WORKERS" -lt "$old_workers" ]; then
+    # Scale down: just lower the cap. Active workers in slots >= MAX_WORKERS
+    # continue running and are reaped normally. No new work is dispatched to them.
+    echo -e "$(ts) ${GREEN}[SIGHUP] Scaled DOWN: $old_workers → $MAX_WORKERS workers (active workers will drain)${RESET}"
+  else
+    echo -e "$(ts) ${DIM}[SIGHUP] Workers unchanged: $MAX_WORKERS${RESET}"
+  fi
+}
+
+trap _reload_config HUP
+
 # --- Helper Functions ---
 
 find_free_slot() {
@@ -301,7 +364,7 @@ find_free_slot() {
 
 count_active_workers() {
   local count=0
-  for (( s=0; s<MAX_WORKERS; s++ )); do
+  for (( s=0; s<=SLOT_HIGH_WATER; s++ )); do
     [ -n "${WORKER_PIDS[$s]}" ] && count=$((count + 1))
   done
   echo "$count"
@@ -801,7 +864,7 @@ cleanup() {
   _stop_resource_monitor
 
   # Phase 1: Kill all workers and containers
-  for (( s=0; s<MAX_WORKERS; s++ )); do
+  for (( s=0; s<=SLOT_HIGH_WATER; s++ )); do
     local pid="${WORKER_PIDS[$s]}"
     local container="${WORKER_CONTAINERS[$s]}"
 
@@ -816,7 +879,7 @@ cleanup() {
   done
 
   # Wait for all workers to exit after kill signals sent
-  for (( s=0; s<MAX_WORKERS; s++ )); do
+  for (( s=0; s<=SLOT_HIGH_WATER; s++ )); do
     local pid="${WORKER_PIDS[$s]}"
     if [ -n "$pid" ]; then
       wait "$pid" 2>/dev/null || true
@@ -825,7 +888,7 @@ cleanup() {
 
   # Phase 2: Save uncommitted work in each worktree before cleanup.
   # Commit any dirty changes to the branch and push to remote so work is never lost.
-  for (( s=0; s<MAX_WORKERS; s++ )); do
+  for (( s=0; s<=SLOT_HIGH_WATER; s++ )); do
     local wt="${WORKER_WORKTREES[$s]}"
     local br="${WORKER_BRANCHES[$s]}"
     local tag="${WORKER_TAGS[$s]}"
@@ -853,7 +916,7 @@ cleanup() {
   done
 
   # Phase 3: Clean up worktrees and branches
-  for (( s=0; s<MAX_WORKERS; s++ )); do
+  for (( s=0; s<=SLOT_HIGH_WATER; s++ )); do
     local wt="${WORKER_WORKTREES[$s]}"
     local br="${WORKER_BRANCHES[$s]}"
 
@@ -871,7 +934,7 @@ cleanup() {
   git -C "$QUEUE_DIR" fetch origin main --quiet 2>/dev/null || true
   git -C "$QUEUE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
 
-  for (( s=0; s<MAX_WORKERS; s++ )); do
+  for (( s=0; s<=SLOT_HIGH_WATER; s++ )); do
     local prd="${WORKER_PRDS[$s]}"
     if [ -n "$prd" ]; then
       local ready_basename="${prd/~running.json/.json}"
@@ -897,7 +960,7 @@ cleanup() {
         git -C "$QUEUE_DIR" rebase --abort 2>/dev/null || true
         git -C "$QUEUE_DIR" reset --hard origin/main --quiet 2>/dev/null || break
         local re_applied=false
-        for (( r=0; r<MAX_WORKERS; r++ )); do
+        for (( r=0; r<=SLOT_HIGH_WATER; r++ )); do
           local rprd="${WORKER_PRDS[$r]}"
           if [ -n "$rprd" ]; then
             local rready="${rprd/~running.json/.json}"
@@ -929,7 +992,7 @@ trap cleanup EXIT
 # are serialized — no concurrent git index corruption.
 
 reap_workers() {
-  for (( s=0; s<MAX_WORKERS; s++ )); do
+  for (( s=0; s<=SLOT_HIGH_WATER; s++ )); do
     local pid="${WORKER_PIDS[$s]}"
     [ -z "$pid" ] && continue
 
@@ -1128,8 +1191,8 @@ while true; do
     fi
   fi
 
-  # Dispatch new PRDs to free slots
-  if [ "$ACTIVE" -lt "$MAX_WORKERS" ]; then
+  # Dispatch new PRDs to free slots (check if any slot 0..MAX_WORKERS-1 is free)
+  if [ -n "$(find_free_slot)" ]; then
     # Fetch latest queue state before looking for PRDs
     git -C "$QUEUE_DIR" fetch origin main --quiet 2>/dev/null || true
     git -C "$QUEUE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
