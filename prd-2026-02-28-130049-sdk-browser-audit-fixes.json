@@ -1,0 +1,74 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix browser-context issues and test coverage gaps discovered during Plugin SDK audit. Addresses misleading error categories in fetch utilities, incomplete serialization of exotic JS types in the logger, and missing test coverage for critical edge cases in timing, page-state, fetch, and log modules.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix misleading error category for unhandled 4xx status codes in fetch.ts",
+      "description": "As a plugin developer, I want unhandled 4xx HTTP status codes (409, 413, 415, etc.) to produce ToolErrors with a descriptive category so that AI agents can distinguish client errors from internal server errors.",
+      "acceptanceCriteria": [
+        "httpStatusToToolError returns a ToolError with code 'http_error' and retryable: false for 4xx codes not explicitly handled (e.g., 409, 413, 415)",
+        "The fallback for unhandled 4xx (status >= 400 && status < 500) does NOT use category 'internal' — it should omit the category (undefined) or use a more accurate value",
+        "Existing behavior for explicitly handled codes (400, 401, 403, 404, 408, 422, 429) is unchanged",
+        "Existing behavior for 5xx codes is unchanged",
+        "Unit tests verify the new 4xx fallback category for at least 409 and 413",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/fetch.ts, line 39. The current fallback is:\n\n  return new ToolError(message, 'http_error', { category: 'internal' });\n\nThis fires for any non-ok status not matched by earlier if-blocks. For 4xx codes, 'internal' is semantically wrong — these are client errors, not server errors. The fix: split the fallback into two branches — one for 4xx (category undefined, retryable false) and one for other unmatched codes (keep current behavior). Add two test cases to platform/plugin-sdk/src/fetch.test.ts using the existing test HTTP server (add /error-409 and /error-413 endpoints). The test server is defined in the beforeAll block starting at line 28."
+    },
+    {
+      "id": "US-002",
+      "title": "Handle exotic JS types in log.ts safe serialization",
+      "description": "As a plugin developer, I want WeakRef, WeakMap, WeakSet, and SharedArrayBuffer instances to serialize as descriptive placeholder strings in log output so that debug logs show meaningful type information instead of empty objects.",
+      "acceptanceCriteria": [
+        "safeSerializeArg returns '[WeakRef]' for WeakRef instances",
+        "safeSerializeArg returns '[WeakMap]' for WeakMap instances",
+        "safeSerializeArg returns '[WeakSet]' for WeakSet instances",
+        "safeSerializeArg returns '[SharedArrayBuffer]' for SharedArrayBuffer instances (guarded by typeof check since SharedArrayBuffer may not exist in all contexts)",
+        "safeSerializeArg returns '[ArrayBuffer]' for ArrayBuffer instances",
+        "These types are also handled when nested inside objects (via the JSON.stringify replacer)",
+        "Unit tests verify each exotic type serializes to its placeholder string",
+        "Unit tests verify nested exotic types inside objects also serialize correctly",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/log.ts, safeSerializeArg function (line 31). Add type checks after the Error check (line 71) and before the JSON fallback (line 76). Use instanceof checks:\n\n  if (value instanceof WeakRef) return '[WeakRef]';\n  if (value instanceof WeakMap) return '[WeakMap]';\n  if (value instanceof WeakSet) return '[WeakSet]';\n  if (value instanceof ArrayBuffer) return '[ArrayBuffer]';\n  if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) return '[SharedArrayBuffer]';\n\nAlso update the JSON.stringify replacer (line 78-87) to handle these same types when they appear as nested properties. The replacer already handles functions, bigints, and symbols — add the exotic types in the same pattern.\n\nTests go in platform/plugin-sdk/src/log.test.ts in the 'safe serialization' describe block (line 137). Follow the existing pattern of collect() + log.info() + assert entries[0]?.data."
+    },
+    {
+      "id": "US-003",
+      "title": "Add missing test coverage for timing, page-state, and fetch edge cases",
+      "description": "As a platform maintainer, I want critical browser-context edge cases to have test coverage so that regressions in abort handling, Proxy traversal, and error paths are caught by CI.",
+      "acceptanceCriteria": [
+        "timing.test.ts has a test for retry where the signal is aborted while fn() is executing (mid-attempt, not during inter-retry sleep) — verifies that retry completes the current attempt and then throws the abort reason instead of continuing to the next attempt",
+        "page-state.test.ts has a test for getPageGlobal with a Proxy object that throws on get-trap access — verifies it returns undefined",
+        "fetch.test.ts has a test for fetchFromPage with an HTTP 409 response — verifies the ToolError has the correct category and retryable fields from US-001",
+        "All new tests follow the existing patterns in their respective test files",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Three test files to modify:\n\n1. platform/plugin-sdk/src/timing.test.ts — Add to the 'retry' describe block. Test: create an AbortController, start retry with a fn that returns a promise resolving after 100ms, abort the controller after 30ms (while fn is running), verify that the fn's attempt completes but retry does not proceed to the next attempt. The key behavior to verify: after fn() resolves (or rejects), the code at line 109-110 checks signal?.aborted before sleeping, and throws the abort reason. So if fn succeeds and signal is aborted, retry should return the fn's result (not throw). If fn rejects and signal is aborted, retry should throw the abort reason (not retry).\n\n2. platform/plugin-sdk/src/page-state.test.ts — Add to the 'getPageGlobal' describe block. Test: create a Proxy with a get trap that throws, assign it to globalThis.__testProxy, call getPageGlobal('__testProxy.anything'), verify it returns undefined. Clean up in afterEach. The existing 'getter throws' test uses Object.defineProperty which is similar but not identical — a Proxy is a distinct mechanism.\n\n3. platform/plugin-sdk/src/fetch.test.ts — Add to the 'fetchFromPage' describe block. Add a /error-409 endpoint to the test server (same pattern as /error-404 at line 46). Test: call fetchFromPage with the /error-409 URL, verify the ToolError has the correct category from US-001's changes."
+    }
+  ]
+}
