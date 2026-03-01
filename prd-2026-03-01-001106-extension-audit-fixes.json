@@ -1,0 +1,107 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs, resource leaks, and missing error handling found during a thorough audit of the Chrome extension (platform/browser-extension/). Covers log merge distortion, global variable leaks in executeScript, structured error field loss in resource/prompt dispatch, React hook instability causing listener churn, missing timer cleanup, and incorrect keyboard simulation for punctuation keys.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix handleExtensionGetLogs double-limiting that distorts merged results",
+      "description": "As a developer using extension.getLogs, I want the N most-recent log entries from all sources combined so that I get an accurate picture of recent activity regardless of which context generated the logs.",
+      "acceptanceCriteria": [
+        "bgLogCollector.getEntries() is called WITHOUT the limit filter — it returns all matching entries (level, source, since filters still applied)",
+        "The limit is applied ONLY to the merged+sorted array, ensuring the final result contains the N most-recent entries across both background and offscreen sources",
+        "If limit=10, bg has 8 recent entries and offscreen has 8 recent entries, the result contains the 10 most-recent by timestamp from both combined (not 8 bg + 2 offscreen)",
+        "Existing unit tests still pass for getEntries filtering behavior",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/browser-commands/extension-commands.ts, lines 101-163.\n\nThe bug: `bgLogCollector.getEntries(filterOptions)` at line 118 receives the full `filterOptions` including `limit`. This pre-limits bg entries before merging with offscreen entries. Then at line 149-150, `merged.slice(0, limit)` applies the limit again to the combined array.\n\nFix: Create a copy of `filterOptions` without the `limit` field for the `bgLogCollector.getEntries()` call AND for the offscreen `getLogs` message options. Apply limit only at line 150 on the merged result. Something like:\n```\nconst { limit: _limit, ...filterWithoutLimit } = filterOptions;\nconst bgEntries = bgLogCollector.getEntries(filterWithoutLimit);\n```\nAnd pass `filterWithoutLimit` to the offscreen getLogs message as well (line 132)."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix handleBrowserExecuteScript global leak when both timeouts fire",
+      "description": "As a developer using browser_execute_script, I want namespaced globals to be cleaned up even when the async poll timeout and the outer script timeout fire in close succession so that globalThis.__openTabs does not accumulate stale keys.",
+      "acceptanceCriteria": [
+        "When the outer SCRIPT_TIMEOUT_MS timeout fires and the injectPromise async loop has also exceeded EXEC_MAX_ASYNC_WAIT_MS, the cleanup script to delete __execResult_<uuid> and __execAsync_<uuid> still executes",
+        "The cancelled flag is only set to true in the timeout/error path, not unconditionally in the finally block — OR the cleanup logic does not rely on cancelled.value being false",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/browser-commands/extension-commands.ts, lines 370-500.\n\nThe bug: At line 493, `cancelled.value = true` is set unconditionally in the `finally` block of the outer `Promise.race`. This means that when the async poll at line 462 checks `if (!cancelled.value)` to decide whether to run the cleanup script, it always sees `true` — even in the race where the async timeout at line 479 fires just before the outer timeout. The cleanup script at lines 463-476 is then skipped, leaving `__execResult_<uuid>` and `__execAsync_<uuid>` on `globalThis.__openTabs`.\n\nFix approach: Move the cleanup logic out of the conditional. Instead of checking `!cancelled.value` to decide whether to clean up, always attempt the cleanup when the async loop exits (whether by timeout or cancellation). The cleanup is idempotent (deletes keys if they exist) so it's safe to run regardless. Alternatively, only set `cancelled.value = true` in the timeout rejection path (not in the success path), but the first approach is simpler.\n\nThe simplest fix: remove the `if (!cancelled.value)` guard at line 462, so the cleanup always runs when the async poll times out."
+    },
+    {
+      "id": "US-003",
+      "title": "Preserve structured error fields in resource and prompt dispatch",
+      "description": "As a plugin author, I want structured error fields (code, retryable, retryAfterMs, category) from OpenTabsError thrown in resource.read and prompt.render handlers to be preserved in the error response so that MCP clients can make informed retry decisions.",
+      "acceptanceCriteria": [
+        "The catch block in executeResourceReadOnTab extracts and forwards code, retryable, retryAfterMs, and category fields from thrown errors (same pattern as tool-dispatch.ts lines 246-274)",
+        "The catch block in executePromptGetOnTab extracts and forwards code, retryable, retryAfterMs, and category fields from thrown errors",
+        "The DispatchResult type already supports the data field — the change is only in the injected script catch blocks",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/resource-prompt-dispatch.ts\n\nResource read catch block: lines 84-91. Prompt render catch block: lines 175-181.\n\nBoth currently do:\n```ts\ncatch (err: unknown) {\n  const caughtError = err as { message?: string };\n  return { type: 'error' as const, code: -32603, message: caughtError.message ?? '...' };\n}\n```\n\nThe tool dispatch path at platform/browser-extension/src/tool-dispatch.ts lines 245-274 has the correct pattern:\n```ts\ncatch (err: unknown) {\n  const caughtError = err as { message?: string; code?: string; retryable?: boolean; retryAfterMs?: number; category?: string };\n  if (typeof caughtError.code !== 'string') {\n    return { type: 'error' as const, code: -32603, message: caughtError.message ?? 'Tool execution failed' };\n  }\n  const data: { code: string; retryable?: boolean; retryAfterMs?: number; category?: string } = { code: caughtError.code };\n  if (typeof caughtError.retryable === 'boolean') data.retryable = caughtError.retryable;\n  if (typeof caughtError.retryAfterMs === 'number') data.retryAfterMs = caughtError.retryAfterMs;\n  if (typeof caughtError.category === 'string') data.category = caughtError.category;\n  return { type: 'error' as const, code: -32603, message: caughtError.message ?? '...', data };\n}\n```\n\nApply the same pattern to both catch blocks. Update the error message fallback to match ('Resource read failed' and 'Prompt render failed' respectively)."
+    },
+    {
+      "id": "US-004",
+      "title": "Stabilize App.tsx useEffect deps and clean up npm search timer",
+      "description": "As a user of the side panel, I want the chrome.runtime.onMessage listener to be stable across renders and search timers to be cleaned up on unmount so that messages are never missed during re-registration and no setState fires after unmount.",
+      "acceptanceCriteria": [
+        "loadPlugins is wrapped in useCallback (deps: lastFetchRef, pendingTabStates, setPlugins, setFailedPlugins, setBrowserTools, setServerVersion, setActiveTools, setPluginsLoaded — refs and setters are stable)",
+        "handleSearchChange is wrapped in useCallback (deps: searchPlugins or empty since it uses refs)",
+        "The useEffect at line 176 has stable dependencies that do not change on every render — the effect does NOT re-run unless the actual identity of the callbacks changes",
+        "npmSearchTimer.current is cleared in a cleanup useEffect on unmount (return () => clearTimeout(npmSearchTimer.current))",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/browser-extension/src/side-panel/App.tsx\n\nIssue 1 — Unstable useEffect deps (line 265): The useEffect at line 176 depends on `[loadPlugins, handleNotification, handleSearchChange]`. All three are plain function declarations re-created every render, so the effect tears down and re-registers the chrome.runtime.onMessage listener on every state update. Fix by wrapping `loadPlugins` and `handleSearchChange` in useCallback. `handleNotification` comes from `useServerNotifications` — check if it's already stable (it's a plain function returned from the hook, not wrapped in useCallback either; it should be stabilized in the hook).\n\nFor loadPlugins (line 61): it reads `lastFetchRef` (ref, stable), calls `fetchConfigState` (module-level, stable), reads `pendingTabStates.current` (ref, stable), and calls state setters (stable). Wrap in useCallback with empty deps since all accessed values are refs or stable setters.\n\nFor handleSearchChange (line 102): it calls `clearTimeout(npmSearchTimer.current)` (ref, stable), `setSearchQuery` (stable), `setNpmResults` (stable), `setNpmSearching` (stable), `searchPlugins` (module-level, stable). Wrap in useCallback with empty deps.\n\nFor handleNotification: it comes from useServerNotifications hook (platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts line 148). The hook returns a plain object with handleNotification as a function. Wrap handleNotification in useCallback within the hook. Its deps are the state setters (stable) and refs (stable), so it should have empty deps.\n\nIssue 2 — Missing npm search timer cleanup: Add a useEffect with empty deps that returns `() => clearTimeout(npmSearchTimer.current)` to clean up any pending search timer on unmount.\n\nThis is an opus story because it requires understanding React hook stability rules across multiple files and coordinating changes between App.tsx and useServerNotifications.ts."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix keyboard simulation for punctuation keys and control characters",
+      "description": "As a developer using browser_press_key, I want punctuation keys to produce correct KeyboardEvent.code values and control characters to not fire keypress events so that keyboard simulation matches real browser behavior.",
+      "acceptanceCriteria": [
+        "deriveCode maps common punctuation characters to their correct KeyboardEvent.code values: '.' → 'Period', ',' → 'Comma', '-' → 'Minus', '=' → 'Equal', '[' → 'BracketLeft', ']' → 'BracketRight', '\\\\' → 'Backslash', ';' → 'Semicolon', '\\'' → 'Quote', '`' → 'Backquote', '/' → 'Slash'",
+        "isPrintable check excludes control characters (code points below 0x20) — only characters with charCodeAt(0) >= 32 are treated as printable",
+        "keypress event is NOT dispatched for control characters like Tab (\\t) or newline (\\n) when passed as single characters",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: platform/browser-extension/src/browser-commands/key-press-command.ts\n\nIssue 1 — deriveCode returns raw chars for punctuation (lines 40-49): The function handles digits (Digit0-9), letters (KeyA-KeyZ), and Space, but falls through with `return k` for punctuation. Add a mapping object for common punctuation:\n```ts\nconst PUNCTUATION_CODES: Record<string, string> = {\n  '.': 'Period', ',': 'Comma', '-': 'Minus', '=': 'Equal',\n  '[': 'BracketLeft', ']': 'BracketRight', '\\\\': 'Backslash',\n  ';': 'Semicolon', '\\'': 'Quote', '`': 'Backquote', '/': 'Slash',\n};\n```\nLook up `k` in this map before the final `return k` fallback.\n\nIssue 2 — isPrintable includes control characters (line ~88): Currently `const isPrintable = k.length === 1`. Change to `const isPrintable = k.length === 1 && k.charCodeAt(0) >= 32` to exclude ASCII control characters.\n\nThis is the last story and touches browser-observable behavior (keyboard events dispatched in tabs), so it gets e2eCheckpoint: true."
+    }
+  ]
+}
