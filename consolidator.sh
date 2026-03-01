@@ -377,10 +377,10 @@ merge_branch() {
       return 1
     fi
 
-    # AI fixed the build — amend the merge commit and push (skip hook; AI already built)
+    # AI fixed the build — amend the merge commit and push
     git -C "$CODE_DIR" add -A 2>/dev/null || true
     git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
-    if git -C "$CODE_DIR" push origin main --no-verify --quiet 2>/dev/null; then
+    if git -C "$CODE_DIR" push origin main --quiet 2>/dev/null; then
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI build fix).${RESET}"
       git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
@@ -634,7 +634,7 @@ except: pass" 2>/dev/null)
       if _ai_fix_build "$tag"; then
         git -C "$CODE_DIR" add -A 2>/dev/null || true
         git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
-        if git -C "$CODE_DIR" push origin main --no-verify --quiet 2>/dev/null; then
+        if git -C "$CODE_DIR" push origin main --quiet 2>/dev/null; then
           echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI conflict + build fix).${RESET}"
           git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
           echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
