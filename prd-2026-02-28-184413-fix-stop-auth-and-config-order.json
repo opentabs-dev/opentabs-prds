@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two issues found during fresh-user CLI testing of v0.0.38: (1) HIGH: `opentabs stop` says 'No OpenTabs server found' even when the server IS running — a regression from the health validation fix. The stop command doesn't send the auth header, so the health endpoint returns minimal `{\"status\":\"ok\"}` without the `version` field, and the new validation rejects it. (2) LOW: `config show` displays `browserToolPolicy` in a different position when offline (appended at end) vs online (between `tools` and `permissions`), because the normalization adds missing keys at the end of the object.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix `opentabs stop` to send auth header when checking health endpoint",
+      "description": "As a user trying to stop a running OpenTabs server, I want `opentabs stop` to correctly detect the running server instead of saying 'No OpenTabs server found', so that the command works as expected.",
+      "acceptanceCriteria": [
+        "`opentabs stop` sends the Authorization header (read from auth.json) when fetching the /health endpoint, matching the behavior of `opentabs status`",
+        "When the server is running (started without --background), `opentabs stop` prints a message acknowledging the server is running and advising how to stop it — NOT 'No OpenTabs server found'",
+        "When no server is running, `opentabs stop` still correctly reports 'Server is not running'",
+        "When a non-OpenTabs server is on the port, `opentabs stop` correctly reports 'No OpenTabs server found' (the validation still works for its intended purpose)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: `platform/cli/src/commands/stop.ts`\n\nRoot cause: The health validation fix in v0.0.38 added a check at line ~93: `typeof data.status === 'string' && typeof data.version === 'string'`. But the unauthenticated /health endpoint returns only `{\"status\":\"ok\"}` without the `version` field. The `stop` command at line ~90 calls `fetch(url, { signal: ... })` WITHOUT an Authorization header.\n\nFix: Import `readAuthSecret` from `../config.js` (like `status.ts` does at line 5). Before the fetch call at line ~90, read the auth secret and add it as an Authorization header:\n```typescript\nconst secret = await readAuthSecret();\nconst headers: Record<string, string> = {};\nif (secret) headers['Authorization'] = `Bearer ${secret}`;\nconst res = await fetch(url, { headers, signal: AbortSignal.timeout(3_000) });\n```\n\nThis matches the pattern used in `status.ts` at lines 75-81. With the auth header, the /health endpoint returns the full response including `version`, and the validation passes correctly.\n\nCompare `status.ts` lines 75-81 for the reference pattern."
+    },
+    {
+      "id": "US-002",
+      "title": "Normalize config show key ordering for consistent output",
+      "description": "As a user running `opentabs config show`, I want the sections to appear in the same order whether the server is running or stopped, so that the output is predictable.",
+      "acceptanceCriteria": [
+        "`opentabs config show` displays config sections in a consistent order: localPlugins, tools, browserToolPolicy, permissions — regardless of whether the key existed in the config file or was added by normalization",
+        "The order matches between server-running and server-stopped states",
+        "The JSON output (`--json`) also uses consistent key ordering",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: `platform/cli/src/commands/config.ts`\n\nThe issue is in `handleConfigShow` (line ~38). When normalizing the config, missing keys are spread after the original config:\n```typescript\nconst normalized = { localPlugins: [], tools: {}, browserToolPolicy: {}, ...config };\n```\nThis puts `browserToolPolicy` BEFORE `config`'s keys, but JavaScript spread preserves the order of the first occurrence — so if `config` already has `localPlugins` and `tools`, those come first from `config`, then `browserToolPolicy` comes from the defaults.\n\nThe fix: Put the defaults FIRST in the spread, so they define the key order, then spread `config` to override values:\n```typescript\nconst normalized = { localPlugins: [], tools: {}, browserToolPolicy: {}, permissions: {}, ...config };\n```\nWait — this won't work because `...config` will add keys in config's order after the defaults.\n\nBetter fix: Define the explicit key order and iterate in that order instead of using `Object.entries(normalized)`. Create a `CONFIG_DISPLAY_ORDER` array and iterate through it:\n```typescript\nconst displayOrder = ['localPlugins', 'tools', 'browserToolPolicy', 'permissions'] as const;\nfor (const key of displayOrder) {\n  const value = normalized[key];\n  // ... render\n}\n```\nThis ensures consistent ordering regardless of which keys were in the original file. Check the existing rendering logic at line ~76 which uses `for (const [key, value] of Object.entries(config))` — replace this with the ordered iteration."
+    }
+  ]
+}
