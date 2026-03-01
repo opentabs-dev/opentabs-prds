@@ -1,0 +1,32 @@
+{
+  "project": "OpenTabs Docs",
+  "description": "Fix language-less code blocks receiving inline code styling (background, border, padding) from the MDX code component override. The code override in MDX.tsx applies inline-code styles to ALL code elements, including code inside pre (language-less code blocks). This causes visual misalignment and incorrect styling in output example blocks.",
+  "workingDirectory": "docs",
+  "qualityChecks": "cd docs && npm run build && npm run type-check && npm run lint && npm run knip && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Skip inline code styling for code elements inside language-less code blocks",
+      "description": "As a docs reader, I want language-less code blocks to render with consistent code-block styling (not inline-code styling) so that output examples like log lines are properly aligned without extra padding, borders, or mismatched backgrounds.",
+      "acceptanceCriteria": [
+        "The code component override in docs/components/MDX.tsx detects when it is rendering a code block (not inline code) and skips inline-code styling in that case",
+        "Detection uses two signals: (1) presence of data-language or data-theme attributes means rehype-pretty-code processed it as a block — skip inline styling, and (2) if children is a string containing a newline character, it is a language-less code block — skip inline styling",
+        "When the code override detects block context, it renders a plain code element with only the className passed through (no bg-inline-code-bg, no text-inline-code-fg, no border, no px-1.5 py-0.5)",
+        "Inline code (backtick text in prose) continues to receive the full inline-code styling: bg-inline-code-bg, text-inline-code-fg, border, px-1.5, py-0.5, font-mono, text-sm",
+        "The language-less code block in docs/content/docs/guides/logging-debugging.mdx (lines 188-191, the [plugin:slack] log example) renders without a visible border, without inline-code background, and with both lines left-aligned at the same position",
+        "The language-less code block in docs/content/docs/guides/error-handling.mdx (line 13, Tool dispatch error) renders without inline-code styling",
+        "Code blocks with a language (```bash, ```typescript, etc.) are unaffected — rehype-pretty-code overrides their styling via inline style attributes regardless",
+        "cd docs && npm run build passes",
+        "cd docs && npm run type-check passes",
+        "cd docs && npm run lint passes",
+        "cd docs && npm run knip passes",
+        "cd docs && npm run format:check passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in docs/components/MDX.tsx, the code component override (currently lines 82-90).\n\nCurrent code:\n  code: ({ className, children, ...props }: React.HTMLAttributes<HTMLElement>) => (\n    <code\n      className={cn(\n        'bg-inline-code-bg text-inline-code-fg border-border/30 relative rounded-(--radius) border px-1.5 py-0.5 font-mono text-sm',\n        className,\n      )}\n      {...props}>\n      {children}\n    </code>\n  ),\n\nThe problem: this applies inline-code styling to ALL <code> elements, including <code> inside <pre> for language-less blocks. For language-less code blocks, the MDX render pipeline is:\n  1. <pre> → CodeBlock component (applies bg-code-bg text-code-fg p-4)\n  2. <code> inside <pre> → this code override (applies bg-inline-code-bg border px-1.5 py-0.5)\nThe inner <code> gets conflicting styling — different background, a border, and padding that pushes content inward.\n\nFor rehype-pretty-code-processed blocks (with a language), the <code> gets data-language, data-theme, and inline style attributes from Shiki that override the Tailwind classes. So those blocks look fine despite the override.\n\nFor language-less blocks, there's no Shiki override, so the inline-code styles are fully visible and cause the visual bug.\n\nFix approach — detect block context and skip inline styling:\n\n  code: ({ className, children, ...props }: React.HTMLAttributes<HTMLElement>) => {\n    // Skip inline-code styling for code elements inside code blocks.\n    // Block code is identified by: (1) data-language/data-theme from rehype-pretty-code,\n    // or (2) children containing newlines (language-less code blocks).\n    const isBlock =\n      'data-language' in props ||\n      'data-theme' in props ||\n      (typeof children === 'string' && children.includes('\\n'));\n\n    if (isBlock) {\n      return (\n        <code className={className} {...props}>\n          {children}\n        </code>\n      );\n    }\n\n    return (\n      <code\n        className={cn(\n          'bg-inline-code-bg text-inline-code-fg border-border/30 relative rounded-(--radius) border px-1.5 py-0.5 font-mono text-sm',\n          className,\n        )}\n        {...props}>\n        {children}\n      </code>\n    );\n  },\n\nThe 'in props' check works because the ...props rest object contains all HTML attributes not destructured. data-language and data-theme are set by rehype-pretty-code on block code elements.\n\nThe typeof children === 'string' && children.includes('\\n') check works because language-less block <code> children are template literal strings with newlines (verified via build output), while inline <code> children are plain strings without newlines.\n\nIMPORTANT: The component currently uses an arrow function with implicit return (parenthesized JSX). The fix requires conditional logic, so it must be converted to a block body with explicit returns. Make sure the TypeScript types are correct — the component signature stays the same."
+    }
+  ]
+}
