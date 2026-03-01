@@ -1,0 +1,130 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix E2E test reliability issues in plugin-logging, analyze-site, secret-rotation, and config-watcher test files: weak assertions, misleading failure messages, tab leaks, and a race condition in log truncation. Also add missing E2E coverage for stale MCP session error path.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Strengthen plugin-logging.e2e.ts log buffer count assertion",
+      "description": "As a platform contributor, I want the 'increments log buffer size by exactly the number of entries emitted' test to detect overcounting bugs so that duplicate log entry emission is caught by tests.",
+      "acceptanceCriteria": [
+        "The assertion at line ~121 uses toBe(bufferBefore + 4) instead of toBeGreaterThanOrEqual(bufferBefore + 4)",
+        "If flaky due to parallel test pollution (other tests emitting logs to the same plugin's buffer), add an upper bound check: expect(bufferAfter - bufferBefore).toBeLessThanOrEqual(5) to allow at most 1 extra entry from concurrent activity",
+        "The test title accurately reflects what it verifies",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/plugin-logging.e2e.ts, lines 96-124\n\nThe test claims to verify 'exactly the number of entries emitted' but uses `toBeGreaterThanOrEqual(bufferBefore + 4)` which can never detect overcounting. The waitForHealth predicate at line 114 also uses `buf >= bufferBefore + 4`.\n\nChange the final assertion at line 121 from:\n  expect(bufferAfter).toBeGreaterThanOrEqual(bufferBefore + 4);\nto:\n  expect(bufferAfter).toBe(bufferBefore + 4);\n\nSince the test uses the shared fixture mcpServer, other parallel tests could contribute log entries to the same plugin's buffer. If this causes flakiness, use a small tolerance:\n  expect(bufferAfter - bufferBefore).toBeGreaterThanOrEqual(4);\n  expect(bufferAfter - bufferBefore).toBeLessThanOrEqual(6);\n\nThis still catches gross overcounting (like double-emission of all 4 entries = 8) while allowing a small margin for parallel test activity."
+    },
+    {
+      "id": "US-002",
+      "title": "Add assertion guard for undefined analyzeSiteServer in analyze-site.e2e.ts",
+      "description": "As a platform contributor, I want analyze-site tests to fail immediately with a clear error message when the shared test server fails to start so that debugging is not obscured by misleading connection errors.",
+      "acceptanceCriteria": [
+        "The analyzeSite helper function at line ~96 asserts that analyzeSiteServer is defined at the top of the function (before using its URL), throwing a clear error like 'analyzeSiteServer not initialized — beforeAll may have failed'",
+        "The `analyzeSiteServer?.url ?? ''` fallback at line ~143 in the test body is also replaced with an assertion or non-null access",
+        "If beforeAll fails to start the server, subsequent tests fail immediately with the assertion error rather than with misleading 'connection refused to empty URL' errors",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/analyze-site.e2e.ts\n\nThe module-level `let analyzeSiteServer: TestServer | undefined` is set in beforeAll (line 125-127). If startAnalyzeSiteServer() throws, it stays undefined. Each test uses `analyzeSiteServer?.url ?? ''` (line 143) which silently produces an empty string URL.\n\nFix in two places:\n1. In the analyzeSite helper (line 96), add at the top:\n   if (!analyzeSiteServer) throw new Error('analyzeSiteServer not initialized — beforeAll may have failed');\n2. In each test body, replace `analyzeSiteServer?.url ?? ''` with `analyzeSiteServer!.url` (safe because the helper already guards it), or better yet, extract the URL inside the helper from the parameter.\n\nActually, the cleanest fix: add the guard in the analyzeSite helper and change the test bodies to pass the URL directly. But looking at the code, the analyzeSite helper already receives `url` as a parameter — the `analyzeSiteServer?.url ?? ''` is in the test body constructing the URL. So fix in the test body: replace `analyzeSiteServer?.url ?? ''` with a local `const baseUrl = analyzeSiteServer?.url; if (!baseUrl) throw new Error(...);` or just assert and use `analyzeSiteServer!.url`."
+    },
+    {
+      "id": "US-003",
+      "title": "Add try/finally for tab cleanup in analyze-site.e2e.ts analyzeSite helper",
+      "description": "As a platform contributor, I want the analyzeSite helper to clean up analysis tabs even when the tool call throws so that browser tabs don't accumulate across the 11+ analyze-site tests.",
+      "acceptanceCriteria": [
+        "The analyzeSite helper at lines 96-116 wraps the callTool and tab cleanup in try/finally so that tab cleanup runs even when the tool call throws",
+        "The tab snapshot (browser_list_tabs before) is taken before the try block",
+        "The tab cleanup (closing new tabs) is in the finally block",
+        "The tool result is still returned correctly on success",
+        "On failure, the original error is re-thrown after cleanup",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/analyze-site.e2e.ts, lines 96-116\n\nCurrent flow:\n1. Snapshot tabs before (line 98-99)\n2. Call plugin_analyze_site (line 101) — if this THROWS, lines 107-113 are skipped\n3. Check for isError (line 102-103) — if this throws, same problem\n4. Close new tabs (lines 107-113)\n5. Return result (line 115)\n\nFix: Wrap steps 2-5 in try/finally. The finally block should do the tab cleanup (step 4). The result needs to be stored in a variable inside try and returned after finally.\n\nRough structure:\n```\nconst analyzeSite = async (...) => {\n  const beforeResult = await mcpClient.callTool('browser_list_tabs');\n  const tabsBefore = new Set(...);\n  let result;\n  try {\n    result = await mcpClient.callTool('plugin_analyze_site', ...);\n    if (result.isError) throw new Error(...);\n  } finally {\n    // Close leaked tabs (best-effort)\n    try {\n      const afterResult = await mcpClient.callTool('browser_list_tabs');\n      const tabsAfter = JSON.parse(afterResult.content) as Array<{ id: number }>;\n      for (const tab of tabsAfter) {\n        if (!tabsBefore.has(tab.id)) {\n          await mcpClient.callTool('browser_close_tab', { tabId: tab.id }).catch(() => {});\n        }\n      }\n    } catch { /* best-effort cleanup */ }\n  }\n  return parseToolResult(result.content) as unknown as SiteAnalysis;\n};\n```"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix confusing error pattern in secret-rotation.e2e.ts old-secret rejection test",
+      "description": "As a platform contributor, I want the secret rotation test to clearly report when the old secret is incorrectly accepted so that genuine bugs produce clear failure messages instead of confusing assertion errors.",
+      "acceptanceCriteria": [
+        "The 'old secret is rejected' test at lines 163-174 no longer throws into its own catch block",
+        "If initialize() succeeds with the old secret (a genuine bug), the test fails with a clear message like 'Old secret should have been rejected but initialize() succeeded'",
+        "If initialize() fails with the expected 401/Unauthorized error, the test passes",
+        "If initialize() fails with an unexpected error (not 401), the test fails with the actual error message",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/secret-rotation.e2e.ts, lines 163-174\n\nCurrent code:\n```typescript\nconst oldClient = createMcpClient(server.port, oldSecret);\ntry {\n  await oldClient.initialize();\n  throw new Error('Expected old-secret client to be rejected during initialize');\n} catch (err: unknown) {\n  const message = err instanceof Error ? err.message : String(err);\n  expect(message).toMatch(/401|Unauthorized/i);\n} finally {\n  await oldClient.close();\n}\n```\n\nProblem: If initialize() succeeds, the manual throw is caught by the same catch block. The thrown message 'Expected old-secret client to be rejected...' does NOT match /401|Unauthorized/i, so the test fails — but the assertion error message is confusing (it shows the wrong string doesn't match the regex, rather than clearly stating 'old secret was accepted').\n\nFix with a flag-based pattern:\n```typescript\nconst oldClient = createMcpClient(server.port, oldSecret);\nlet succeeded = false;\ntry {\n  await oldClient.initialize();\n  succeeded = true;\n} catch (err: unknown) {\n  const message = err instanceof Error ? err.message : String(err);\n  expect(message).toMatch(/401|Unauthorized/i);\n} finally {\n  await oldClient.close();\n}\nexpect(succeeded).toBe(false);\n```\n\nOr even cleaner with expect().rejects."
+    },
+    {
+      "id": "US-005",
+      "title": "Fix race in log truncation before waitForLog in config-watcher.e2e.ts",
+      "description": "As a platform contributor, I want the config-watcher hot reload test to track new log occurrences instead of truncating logs so that log lines emitted during the truncation window are not lost.",
+      "acceptanceCriteria": [
+        "The 'config watcher still works after hot reload' test at line ~223 no longer uses server.logs.length = 0 to truncate logs before waitForLog",
+        "Instead, it captures the current log count before the action and uses a helper or inline logic to wait for a NEW occurrence of the expected log substring (similar to the writeAndWaitForWatcher pattern in helpers.ts which counts occurrences before/after)",
+        "The test correctly detects 'Hot reload complete' and 'Config watcher: Watching' after the hot reload",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/config-watcher.e2e.ts, line ~223\n\nCurrent pattern:\n```typescript\nserver.logs.length = 0;\nserver.triggerHotReload();\nawait waitForLog(server, 'Hot reload complete', 20_000);\nawait waitForLog(server, 'Config watcher: Watching', 10_000);\n```\n\nRace condition: If the hot reload completes between `server.logs.length = 0` and the first `waitForLog` call, the 'Hot reload complete' line is already in logs, gets truncated, and waitForLog never finds it.\n\nFix: Use the same pattern as writeAndWaitForWatcher in helpers.ts (line 530-533) — count occurrences before the action, then wait for the count to increase:\n\n```typescript\nconst hotReloadCountBefore = server.logs.filter(l => l.includes('Hot reload complete')).length;\nserver.triggerHotReload();\n// Wait for a NEW 'Hot reload complete' log line\nawait waitFor(\n  () => server.logs.filter(l => l.includes('Hot reload complete')).length > hotReloadCountBefore,\n  20_000, 200, 'Hot reload complete'\n);\nconst watcherCountBefore = server.logs.filter(l => l.includes('Config watcher: Watching')).length;\nawait waitFor(\n  () => server.logs.filter(l => l.includes('Config watcher: Watching')).length > watcherCountBefore,\n  10_000, 200, 'Config watcher: Watching'\n);\n```\n\nNote: this same pattern (logs.length = 0 before waitForLog) appears in other test files too. This story only fixes config-watcher.e2e.ts. The pattern in other files is a similar risk but lower severity since they haven't been reported as flaky."
+    },
+    {
+      "id": "US-006",
+      "title": "Add E2E test for stale MCP session ID error response",
+      "description": "As a platform contributor, I want an E2E test that verifies the MCP server returns a 400 'missing session' error when a client sends a request with a stale or fabricated session ID so that session lifecycle error handling is validated end-to-end.",
+      "acceptanceCriteria": [
+        "A new test is added to e2e/dispatch-resilience.e2e.ts (or a relevant existing E2E file) that verifies the stale session error path",
+        "The test creates an MCP client, initializes a session, then manually sends a request with a fabricated or invalidated mcp-session-id header",
+        "The server responds with HTTP 400 and the response body contains 'missing session' or equivalent error message",
+        "The test verifies the error response status code and message",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: e2e/dispatch-resilience.e2e.ts (add to the existing test.describe block, or create a new describe for session management)\n\nThe MCP server validates mcp-session-id headers and returns 400 'missing session' when the session doesn't exist. This path is handled in fixtures.ts (line ~1109) as a retry condition, but no test deliberately triggers it.\n\nTest approach:\n1. Use the fixture-provided mcpServer (port and secret)\n2. Initialize an MCP client normally to establish a valid session\n3. Send a raw HTTP POST to /mcp with a fabricated mcp-session-id header (e.g., 'nonexistent-session-id-12345') and a tools/list request body\n4. Assert the response status is 400\n5. Assert the response body contains 'missing session' (case-insensitive)\n\nUse raw fetch() rather than the MCP client wrapper since the client auto-retries on missing session errors.\n\nExample:\n```typescript\ntest('stale session ID returns 400 missing session', async ({ mcpServer }) => {\n  const res = await fetch(`http://localhost:${mcpServer.port}/mcp`, {\n    method: 'POST',\n    headers: {\n      'Content-Type': 'application/json',\n      Accept: 'application/json',\n      'mcp-session-id': 'nonexistent-session-id',\n      ...(mcpServer.secret ? { Authorization: `Bearer ${mcpServer.secret}` } : {}),\n    },\n    body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', params: {}, id: 1 }),\n    signal: AbortSignal.timeout(5_000),\n  });\n  expect(res.status).toBe(400);\n  const text = await res.text();\n  expect(text.toLowerCase()).toContain('missing session');\n});\n```\n\nThis is a simple test that doesn't require browser interaction — it only needs the mcpServer fixture."
+    }
+  ]
+}
