@@ -13,6 +13,18 @@ confirmation. This includes but is not limited to:
 
 Always ask first. Do not assume intent from context.
 
+### Never delete remote branches without asking
+
+Do not delete remote git branches unless the user explicitly says to. This
+applies everywhere: CLI, scripts, consolidator, consumer. Even if a branch
+has been merged, ask before deleting.
+
+### Never use --no-verify
+
+Never use `git push --no-verify` or `git commit --no-verify`. Git hooks
+exist for a reason. If the hook fails, fix the problem — do not skip the
+hook.
+
 ---
 
 ## Pulling Latest Changes
