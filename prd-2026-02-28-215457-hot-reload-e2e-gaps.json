@@ -1,0 +1,70 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fill the remaining E2E test gaps for dev proxy hot reload: multi-client end-to-end tool dispatch after reload, rapid successive reloads during SSE streams, and side panel UI state after hot reload (process restart).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "E2E test: multiple concurrent MCP clients dispatch tools end-to-end after hot reload",
+      "description": "As a developer, I want an E2E test that verifies multiple concurrent MCP clients can all successfully dispatch tools through the extension after a dev proxy hot reload, so that I can be confident multi-client setups survive hot reloads without silent failures.",
+      "acceptanceCriteria": [
+        "A new test in e2e/dev-proxy.e2e.ts (or hot-reload-dynamic.e2e.ts) creates 2 MCP clients and 1 extension context",
+        "Both MCP clients call a plugin tool (e.g., e2e-test_echo) through the extension before the hot reload and verify the result",
+        "A hot reload is triggered via triggerHotReload()",
+        "After the hot reload completes and the extension reconnects, both MCP clients call e2e-test_echo again and verify correct results",
+        "The test asserts both clients get correct tool output (not just listTools()) post-reload",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The existing tests 'all MCP sessions see updated tools after hot reload' and 'all sessions see config changes after hot reload' in e2e/hot-reload-dynamic.e2e.ts (lines 437 and 467) only call listTools() after hot reload — they never actually dispatch a tool through the extension for both clients. The gap is that listTools() is a server-side operation that doesn't exercise the extension WebSocket relay at all.\n\nAdd the test to e2e/dev-proxy.e2e.ts in a new describe block like 'Dev proxy multi-client tool dispatch after hot reload'. Use the full fixture set (mcpServer, testServer, extensionContext, mcpClient) plus create a second MCP client manually using createMcpClient(). Follow the pattern in e2e/hot-reload-dynamic.e2e.ts:499 ('plugin added via config is callable from pre-existing MCP session after hot reload') which already tests single-client end-to-end dispatch after reload.\n\nKey steps:\n1. Use the standard fixtures for one client; create a second client with createMcpClient()\n2. Set up tool test page, wait for adapter injection\n3. Both clients call e2e-test_echo (baseline)\n4. triggerHotReload()\n5. Wait for 'Hot reload complete' log and extension reconnect (waitForLog + waitForExtensionConnected)\n6. Both clients call e2e-test_echo again and assert correct output\n\nThe second MCP client needs re-initialization after hot reload (the worker process is replaced). Use the same retry-on-502/503 pattern that the fixture mcpClient uses — see e2e/fixtures.ts createMcpClient() and the MCP client's initialize() method which handles 502/503 responses."
+    },
+    {
+      "id": "US-002",
+      "title": "E2E test: rapid successive hot reloads during active SSE stream",
+      "description": "As a developer, I want an E2E test that fires 2-3 rapid hot reloads while an MCP client has an active SSE tool call in progress, so that I can verify the proxy handles overlapping restart+SSE scenarios without deadlocks or orphaned connections.",
+      "acceptanceCriteria": [
+        "A new test in e2e/dev-proxy.e2e.ts fires a slow tool call (e.g., slow_with_progress) that produces SSE progress events",
+        "While the SSE stream is active, 2-3 triggerHotReload() calls are fired in rapid succession (not awaited between them)",
+        "The slow tool call either completes, errors cleanly, or times out — but never hangs indefinitely",
+        "After all hot reloads settle, the MCP client can re-initialize and successfully call a tool (e.g., e2e-test_echo) end-to-end through the extension",
+        "No deadlock, state corruption, or uncaught exception appears in server logs",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The existing test 'SSE tool call gets clean error or completes when worker restarts mid-stream' in e2e/dev-proxy.e2e.ts (line 467) fires only ONE hot reload during the SSE stream. The gap is testing what happens with 2-3 rapid reloads overlapping the SSE stream — the proxy must handle multiple worker restarts while the upstream SSE connection is being torn down and rebuilt.\n\nAdd this test in the existing 'Dev proxy SSE mid-stream worker restart' describe block in e2e/dev-proxy.e2e.ts. Follow the same setup pattern as the existing test (lines 467-542):\n1. Full fixture set (mcpServer, testServer, extensionContext, mcpClient)\n2. Set up tool test page, wait for adapter injection\n3. Baseline tool call to confirm everything works\n4. Start a slow_with_progress call (5s duration, produces progress events)\n5. Wait ~500ms for the SSE stream to start flowing\n6. Fire 3 triggerHotReload() calls in rapid succession (no await between them)\n7. Await the slow call promise — success or error both acceptable\n8. Wait for 'Hot reload complete' log\n9. Wait for extension reconnect (waitForExtensionConnected)\n10. Call e2e-test_echo and verify correct output\n11. Assert no ECONNREFUSED/deadlock/state corruption/uncaughtException in logs\n\nThe e2e-test plugin's slow_with_progress tool is in plugins/e2e-test — it takes a duration param and emits progress notifications via SSE. The MCP client in fixtures.ts supports SSE streams via the callTool() method."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: side panel UI shows connected state after dev proxy hot reload",
+      "description": "As a developer, I want an E2E test that opens the side panel, triggers a dev proxy hot reload (process restart), and verifies the side panel DOM shows the correct connected state and plugin list after the reload completes, so that I can be confident the side panel recovers from process-level restarts.",
+      "acceptanceCriteria": [
+        "A new test in e2e/side-panel-reload.e2e.ts (or a new file) opens the side panel, verifies it shows the plugin list, triggers a hot reload via triggerHotReload(), and verifies the side panel still shows the plugin list after reload",
+        "The test verifies the side panel shows the e2e-test plugin name ('E2E Test') before AND after the hot reload",
+        "The test waits for 'Hot reload complete' and extension reconnect before checking the post-reload state",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Existing side panel tests in e2e/side-panel-reload.e2e.ts test POST /reload (in-process config rediscovery) but never test dev proxy hot reload (process restart via triggerHotReload). The side-panel-live-update.e2e.ts tests config.json changes with the config watcher. Neither exercises the full worker-kill-and-restart path that the dev proxy performs.\n\nAdd this test to e2e/side-panel-reload.e2e.ts in a new describe block like 'Side panel recovery after dev proxy hot reload'. Use a manual setup (not the standard fixture, since side panel tests need custom setup):\n\n1. Create a config dir with writeTestConfig() including the e2e-test plugin\n2. Start MCP server with hot=true via startMcpServer()\n3. Launch extension context via launchExtensionContext()\n4. Set up adapter symlink via setupAdapterSymlink()\n5. Wait for extension connected via waitForExtensionConnected()\n6. Open side panel via openSidePanel() helper from e2e/helpers.ts\n7. Assert side panel shows 'E2E Test' plugin (locator 'text=E2E Test')\n8. server.triggerHotReload()\n9. Wait for 'Hot reload complete' log\n10. Wait for extension reconnect via waitForExtensionConnected()\n11. Assert side panel still shows 'E2E Test' plugin — may need to wait for the sync.full → side panel re-render pipeline to complete (use Playwright's toBeVisible with timeout)\n12. Clean up: close context, kill server, rm temp dirs\n\nThe side panel re-render is driven by: worker restart → new sync.full to extension → chrome.storage update → offscreen broadcasts ws:message → side panel App.tsx detects sync.full and re-renders. This pipeline takes a few seconds, so use a generous timeout (30s) for the post-reload assertion.\n\nFollow the exact cleanup pattern from the existing tests in e2e/side-panel-reload.e2e.ts (the try/finally with context.close(), server.kill(), fs.rmSync, cleanupTestConfigDir)."
+    }
+  ]
+}
