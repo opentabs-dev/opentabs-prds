@@ -1,0 +1,38 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-001659-cli-port-resolution~running.json
+Started: Sun Mar  1 08:17:22 UTC 2026
+---
+
+## Codebase Patterns
+- Import order in CLI package: local (`./`) → third-party (`@opentabs-dev/*`, `commander`, etc.) → `node:` builtins, all in one block with no blank lines
+- `getConfigPath()` from `@opentabs-dev/shared` reads `OPENTABS_CONFIG_DIR` env var (defaulting to `~/.opentabs`) — tests override this to isolate from real config
+- `resolvePort()` is synchronous and called from ~20 sites in the CLI — keep it synchronous
+- Knip config has `ignoreExportsUsedInFile: true` — exports used within the same file are not flagged as unused
+- CLI tests mock fetch with `vi.stubGlobal('fetch', vi.fn<typeof fetch>())` and restore with `vi.unstubAllGlobals()` in `afterEach`
+- `notifyServer` tests mock `./config.js` and `./parse-port.js` with `vi.mock` at module level
+- The `/health` endpoint returns `x-opentabs-version` header on ALL responses (authenticated and unauthenticated) for OpenTabs identity verification
+
+## 2026-03-01 08:25 UTC - US-001
+- Implemented config.json port reading in `resolvePort()` with priority: (1) --port flag, (2) OPENTABS_PORT env, (3) config.json port, (4) DEFAULT_PORT 9515
+- Added `readConfigPort()` — synchronous config file reader with process-lifetime cache
+- Added `resetConfigPortCache()` export for test isolation
+- Files changed: `platform/cli/src/parse-port.ts`, `platform/cli/src/parse-port.test.ts`
+- **Learnings for future iterations:**
+  - Uses `fs.readFileSync` to keep `resolvePort()` synchronous — async would require updating all ~20 call sites
+  - Module-level cache (`cachedConfigPort`) avoids repeated file I/O within a single CLI process
+  - Tests use `OPENTABS_CONFIG_DIR` pointed at a temp directory + real file writes — matches the established pattern in `config.test.ts` and `doctor.test.ts`
+  - Existing `resolvePort` tests needed `OPENTABS_CONFIG_DIR` isolation added to prevent interference from real config files
+---
+
+## 2026-03-01 08:33 UTC - US-002
+- Added `x-opentabs-version` response header to all `/health` responses in `platform/mcp-server/src/http-routes.ts` (both the unauthenticated minimal path and the authenticated full path)
+- Updated `platform/cli/src/notify-server.ts`: after a successful health check, verifies `x-opentabs-version` header is present; if missing, treats the port as "server not running" without calling /reload
+- Added 3 tests to `platform/mcp-server/src/http-routes.test.ts` verifying the header appears on unauthenticated, authenticated, and no-secret responses
+- Created `platform/cli/src/notify-server.test.ts` with 11 tests covering: non-OpenTabs identity rejection, silent vs warned return, health failure cases, and /reload outcome logging
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`, `platform/cli/src/notify-server.ts`, `platform/cli/src/notify-server.test.ts`
+- **Learnings for future iterations:**
+  - The `/health` unauthenticated path returns only `{ status: 'ok' }` by design ("prevent fingerprinting") — use a response header for identity, not the JSON body
+  - `Response.json(body, { headers: { ... } })` is the correct way to add headers to a JSON response in this codebase
+  - The `handleStatus` test in `commands/status.test.ts` is a good reference for `fetch` mock patterns in CLI tests
+  - The `fetchMock.mock.calls[n]?.[1]?.method` pattern accesses the request init without needing a type assertion
+---
