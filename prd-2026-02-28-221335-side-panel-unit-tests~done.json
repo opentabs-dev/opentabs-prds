@@ -21,7 +21,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "The hook is in platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts. It returns { handleNotification, clearConfirmationTimeout }.\n\nTesting approach: Since the project uses pure-function testing (no jsdom, no React rendering), test the hook by calling it through a lightweight harness. Create mock setter functions (vi.fn()) for setPlugins, setActiveTools, setPendingConfirmations, and a mock pendingTabStates ref. Then invoke the hook's returned handleNotification directly with test payloads.\n\nThe hook uses useCallback, useEffect, and useRef internally. To test without React rendering, extract the core notification-handling logic into a separate pure function (e.g., processNotification) that takes the setters and refs as arguments and returns the handler. The hook then becomes a thin wrapper. This matches the established pattern in the codebase (ConfirmationDialog exports resolveDisplayIndex, PluginIcon exports hashString/getAvatarVar/getAvatarLetter).\n\nAlternatively, since the hook's handleNotification callback is essentially a pure function over its closure variables (the setters), you can test it by:\n1. Creating a test helper that mimics the hook's closure: creates the timeout maps, wraps handleNotification in a function that takes the same params\n2. Using vi.useFakeTimers() for timeout tests\n3. Asserting on the mock setters' calls\n\nKey test data:\n- VALID_PLUGIN_NAME regex is imported from '../../constants.js' — use valid names like 'slack', 'my-plugin' and invalid ones like '' or names with spaces\n- Valid tab states: 'closed', 'unavailable', 'ready'\n- TOOL_INVOCATION_TIMEOUT_MS is 300000 (5 min)\n\nMock chrome.runtime.sendMessage for the confirmationTimeout case (line 85: chrome.runtime.sendMessage({ type: 'sp:confirmationTimeout', id }).catch(() => {})).\n\nImportant: The test file must be .test.ts (not .test.tsx). All imports use .js extensions. Import vi, describe, test, expect, beforeEach, afterEach from 'vitest'."
@@ -45,7 +45,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "The current crash happens because App.tsx line 66 does `result.plugins` without guarding for undefined, and line 77 does `result.browserTools` without guarding.\n\nThe fix approach: Extract a normalizeConfigState function from the loadPlugins callback and export it from bridge.ts. This function takes the raw result from sendRequest and returns a safe ConfigStateResult with all arrays guaranteed to be present. Then test this function thoroughly.\n\nAdd to platform/browser-extension/src/side-panel/bridge.ts:\n```typescript\n/** Normalize a raw config.getState response, guarding against missing or malformed fields. */\nconst normalizeConfigState = (raw: unknown): ConfigStateResult => {\n  const obj = (typeof raw === 'object' && raw !== null ? raw : {}) as Record<string, unknown>;\n  const plugins = (Array.isArray(obj.plugins) ? obj.plugins : []) as ConfigStatePlugin[];\n  return {\n    plugins: plugins.map(p => ({ ...p, tools: Array.isArray(p.tools) ? p.tools : [] })),\n    failedPlugins: (Array.isArray(obj.failedPlugins) ? obj.failedPlugins : []) as ConfigStateFailedPlugin[],\n    browserTools: (Array.isArray(obj.browserTools) ? obj.browserTools : []) as ConfigStateBrowserTool[],\n  };\n};\n```\n\nThen update fetchConfigState:\n```typescript\nconst fetchConfigState = () => sendRequest('config.getState').then(normalizeConfigState);\n```\n\nAnd in App.tsx loadPlugins, no changes needed — the result is already safe.\n\nTest cases in bridge.test.ts:\n1. normalizeConfigState with a valid ConfigStateResult — passes through correctly\n2. normalizeConfigState with undefined/null — returns all empty arrays\n3. normalizeConfigState with missing plugins — plugins defaults to []\n4. normalizeConfigState with missing browserTools — browserTools defaults to []\n5. normalizeConfigState with missing failedPlugins — failedPlugins defaults to []\n6. normalizeConfigState with a plugin that has tools: undefined — tools normalized to []\n7. normalizeConfigState with a plugin that has tools: null — tools normalized to []\n8. normalizeConfigState with a plugin that has valid tools — tools preserved\n9. normalizeConfigState with non-object input (string, number, array) — returns all empty arrays\n\nThis is the KEY story that prevents the original TypeError from ever happening again. The normalization function is the single defensive boundary."
@@ -67,7 +67,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "SearchResults.tsx is at platform/browser-extension/src/side-panel/components/SearchResults.tsx.\n\nThe matchesBrowserTool function (line 33) is currently defined inside the file but not exported. Export it so it can be tested. Also extract and export the deduplication logic.\n\nThere are several pure-logic paths to test:\n1. matchesBrowserTool(tool, filterLower) — tests the browser tool matching logic. Import toDisplayName from BrowserToolsCard.tsx (already exported).\n2. Installed-vs-available deduplication — uses extractShortName (already exported from bridge.ts). Test the filtering logic: `npmResults.filter(r => !installedShortNames.has(extractShortName(r.name)))`.\n3. showNoResults derivation — `toolFilter && !hasInstalledResults && !npmSearching && availableResults.length === 0`.\n\nTo make these testable, export matchesBrowserTool from SearchResults.tsx. The deduplication and showNoResults logic can be tested via factory helpers without React rendering.\n\nCreate test data factories following the pattern in bridge.test.ts:\n```typescript\nconst browserTool = (overrides: Partial<BrowserToolState> = {}): BrowserToolState => ({\n  name: 'browser_list_tabs',\n  description: 'List all open tabs',\n  enabled: true,\n  ...overrides,\n});\n```\n\nTest cases:\n- matchesBrowserTool: display name match ('List Tabs' matches 'list'), raw name match ('browser_list'), description match, case insensitive, no match\n- Deduplication: plugin '@opentabs-dev/opentabs-plugin-slack' (shortName 'slack') filters out npm result 'opentabs-plugin-slack'\n- showNoResults: various combinations of toolFilter, hasInstalledResults, npmSearching, availableResults.length"
@@ -88,7 +88,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "BrowserToolsCard.tsx is at platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx. toDisplayName is already exported (line 138).\n\nThe allEnabled logic at line 45 is inline: `tools.length > 0 && tools.every(t => t.enabled)`. Extract this into a named exported function for testability:\n```typescript\nconst allToolsEnabled = (tools: BrowserToolState[]): boolean => tools.length > 0 && tools.every(t => t.enabled);\n```\n\nThe visible tools filter at lines 74-81 is also inline. Extract and export:\n```typescript\nconst filterBrowserTools = (tools: BrowserToolState[], filterLower: string): BrowserToolState[] =>\n  filterLower\n    ? tools.filter(t =>\n        toDisplayName(t.name).toLowerCase().includes(filterLower) ||\n        t.name.toLowerCase().includes(filterLower) ||\n        t.description.toLowerCase().includes(filterLower)\n      )\n    : tools;\n```\n\nTest cases for toDisplayName:\n1. 'browser_list_tabs' → 'List Tabs'\n2. 'browser_screenshot_tab' → 'Screenshot Tab'\n3. 'browser_get_page_html' → 'Get Page Html'\n4. 'extension_get_state' → 'Extension Get State' (no browser_ prefix to strip)\n5. 'browser_' → '' (just prefix, no words after)\n6. '' → '' (empty string edge case)\n\nTest cases for allToolsEnabled:\n1. All enabled → true\n2. One disabled → false\n3. All disabled → false\n4. Empty array → false\n5. Single enabled tool → true\n\nTest cases for filterBrowserTools:\n1. Empty filter returns all tools\n2. Filter by display name ('screenshot' matches 'browser_screenshot_tab')\n3. Filter by raw name ('browser_list' matches)\n4. Filter by description\n5. No match returns empty array\n6. Case insensitive"
@@ -108,7 +108,7 @@
         "npm run test passes"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "PluginCard.tsx is at platform/browser-extension/src/side-panel/components/PluginCard.tsx.\n\nThe allEnabled logic at line 52: `plugin.tools.length > 0 && plugin.tools.every(t => t.enabled)`. Extract a testable function:\n```typescript\nconst allPluginToolsEnabled = (tools: PluginState['tools']): boolean => tools.length > 0 && tools.every(t => t.enabled);\n```\n\nExport it from PluginCard.tsx and test it in PluginCard.test.ts.\n\nAlso extract and export the visible tools filtering logic (line 80):\n```typescript\nconst filterPluginTools = (tools: PluginState['tools'], filterLower: string): PluginState['tools'] =>\n  filterLower ? tools.filter(t => matchesTool(t, filterLower)) : tools;\n```\n\nCreate a WireToolDef factory:\n```typescript\nconst tool = (overrides: Partial<WireToolDef> = {}): WireToolDef => ({\n  name: 'send_message',\n  displayName: 'Send Message',\n  description: 'Send a message',\n  icon: 'message-square',\n  enabled: true,\n  ...overrides,\n});\n```\n\nTest cases for allPluginToolsEnabled:\n1. All tools enabled → true\n2. One tool disabled → false\n3. All tools disabled → false\n4. Empty tools array → false\n5. Single enabled tool → true\n\nTest cases for filterPluginTools:\n1. Empty filter returns all tools\n2. Filter matches displayName\n3. Filter matches name\n4. Filter matches description\n5. No match returns empty"
@@ -127,7 +127,7 @@
         "npm run test passes"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "NpmPluginCard.tsx is at platform/browser-extension/src/side-panel/components/NpmPluginCard.tsx. The deriveDisplayName function (line 22) is currently NOT exported. Export it:\n```typescript\nexport { NpmPluginCard, deriveDisplayName };\n```\n\nTest cases:\n1. '@opentabs-dev/opentabs-plugin-slack' → 'slack'\n2. 'opentabs-plugin-datadog' → 'datadog'\n3. 'custom-tool' → 'custom-tool'\n4. '@scope/my-plugin' → 'my-plugin'\n5. '' → ''\n6. '@scope/opentabs-plugin-jira' → 'jira'\n\nThis is very similar to extractShortName in bridge.ts. The difference is that deriveDisplayName does NOT handle the case where the package name has no scope — it just uses split('/').pop() which handles both cases. Verify the behavior matches extractShortName for the common cases, and note any differences.\n\nThis is a small story — keep it focused. Follow the pattern in PluginIcon.test.ts (small, focused, pure function tests)."
@@ -149,7 +149,7 @@
         "npm run test passes"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "PluginList.tsx is at platform/browser-extension/src/side-panel/components/PluginList.tsx. The filtering logic at lines 27-32 is inline.\n\nExtract and export these as pure functions:\n```typescript\nconst filterVisiblePlugins = (plugins: PluginState[], filterLower: string): PluginState[] =>\n  filterLower ? plugins.filter(p => matchesPlugin(p, filterLower)) : plugins;\n\nconst filterVisibleFailed = (failedPlugins: FailedPluginState[], filterLower: string): FailedPluginState[] =>\n  filterLower ? [] : failedPlugins;\n```\n\nTest cases for filterVisiblePlugins:\n1. Empty filter returns all plugins\n2. Filter matches plugin name — returns matching plugin\n3. Filter matches plugin displayName — returns matching plugin\n4. Filter matches tool name within plugin — returns the plugin\n5. No plugins match — returns empty array\n6. Multiple plugins, some match — returns only matching ones\n7. Plugin with empty tools array — only matches on name/displayName\n\nTest cases for filterVisibleFailed:\n1. Empty filter returns all failed plugins\n2. Non-empty filter returns empty array (failed plugins hidden during search)\n\nCreate a plugin factory:\n```typescript\nconst plugin = (overrides: Partial<PluginState> = {}): PluginState => ({\n  name: 'slack',\n  displayName: 'Slack',\n  version: '1.0.0',\n  trustTier: 'official' as const,\n  source: 'npm' as const,\n  tabState: 'closed' as const,\n  urlPatterns: ['*://*.slack.com/*'],\n  tools: [],\n  ...overrides,\n});\n```"
@@ -168,7 +168,7 @@
         "npm run test passes"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "sonnet",
       "notes": "platform/browser-extension/tsconfig.test.json currently has:\n```json\n\"include\": [\"src/**/*.test.ts\"]\n```\n\nUpdate to:\n```json\n\"include\": [\"src/**/*.test.ts\", \"src/**/*.test.tsx\"]\n```\n\nAlso check platform/browser-extension/tsconfig.json exclude pattern — it currently has:\n```json\n\"exclude\": [\"src/**/*.test.ts\", \"src/**/*.stories.tsx\"]\n```\n\nUpdate to:\n```json\n\"exclude\": [\"src/**/*.test.ts\", \"src/**/*.test.tsx\", \"src/**/*.stories.tsx\"]\n```\n\nAlso check the root vitest.config.ts — it currently includes 'platform/**/*.test.ts'. If any new test files use .test.tsx extension, update the vitest include to: ['platform/**/*.test.{ts,tsx}']. However, since all the tests in this PRD are .test.ts (pure function tests, no JSX needed), this vitest change may not be needed yet. Only update vitest config if a .test.tsx file is actually created.\n\nThis is a small infrastructure story to unblock future React component tests. Keep it minimal."

@@ -1,0 +1,109 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-221335-side-panel-unit-tests~running.json
+Started: Sun Mar  1 06:14:24 UTC 2026
+---
+
+## Codebase Patterns
+- Side panel pure-function test pattern: extract core logic from hooks into exported pure functions (e.g., `processNotification` from `useServerNotifications`), test those functions directly with mock setters (vi.fn()) and vi.useFakeTimers() for timeout behavior
+- Test files are `.test.ts` (not `.test.tsx`) — no jsdom or React rendering needed for pure logic tests
+- All imports in test files use `.js` extensions
+- Mock `chrome.runtime.sendMessage` in beforeEach as a vi.fn() on globalThis.chrome
+- Use `as ReturnType<typeof vi.fn>` to access `.mock.calls` on mock setters
+- The `@typescript-eslint/no-non-null-assertion` rule is enforced — use `if (!x) throw` guards instead of `x!`
+- State updater mock pattern: create `resolveSetX(prev)` helpers that extract the updater function from the last mock call and invoke it with the given previous state
+- Array element access (`arr[0]`) requires a guard (`if (!first) throw`) — TS strict mode flags `arr[0].field` as possibly undefined
+- normalizeConfigState pattern: when normalizing unknown data, cast to `Record<string, unknown>` after null/type check, then use Array.isArray guards for each array field; spread plugin objects and override `tools` field
+- Use `matchesPlugin` (from bridge.ts) for plugin list filtering — it checks plugin name, displayName, AND tool names; the simpler inline `p.tools.some(t => matchesTool(...))` only checks tools
+
+## 2026-03-01 07:12 - US-008
+- Implemented: Updated tsconfig files to include .test.tsx in type-check coverage
+- Files changed:
+  - `platform/browser-extension/tsconfig.test.json` — added `src/**/*.test.tsx` to include array alongside `src/**/*.test.ts`
+  - `platform/browser-extension/tsconfig.json` — added `src/**/*.test.tsx` to exclude array (keeps test files out of production build)
+- **Learnings for future iterations:**
+  - `vitest.config.ts` was NOT updated — per PRD notes, only update if a .test.tsx file is actually created; all tests in this PRD were .test.ts (pure function tests, no JSX needed)
+  - The two tsconfig changes are symmetric: `tsconfig.test.json` adds .tsx to the include, `tsconfig.json` adds .tsx to the exclude — always keep these in sync when adding new test file patterns
+  - This was a minimal infrastructure story — 2 files, 2 lines changed; All 407 E2E tests passed
+---
+
+## 2026-03-01 07:05 - US-007
+- Implemented: Unit tests for PluginList filtering and visibility logic
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/PluginList.tsx` — replaced inline filter logic with extracted exported pure functions `filterVisiblePlugins` and `filterVisibleFailed`; switched from `matchesTool` to `matchesPlugin` (richer filter: now matches on plugin name/displayName in addition to tools); added both to exports
+  - `platform/browser-extension/src/side-panel/components/PluginList.test.ts` — new test file with 13 tests covering: `filterVisiblePlugins` (empty filter, plugin name match, displayName match, tool displayName match, tool name match, no match, multiple match, empty tools, defense in depth, case contract), `filterVisibleFailed` (empty filter, non-empty filter, empty array)
+- **Learnings for future iterations:**
+  - PluginList used `p.tools.some(t => matchesTool(t, filterLower))` inline — switching to `matchesPlugin` is more correct since it also checks plugin name/displayName
+  - `matchesPlugin` is already exported from bridge.ts; just needed to swap the import in PluginList
+  - Defense-in-depth test for "undefined tools" uses empty `tools: []` (TypeScript valid) since `normalizeConfigState` prevents runtime undefined; the concern is "no tools" not truly undefined
+  - `filterVisibleFailed` is a trivial ternary but worth testing to document the "hidden during search" contract explicitly
+---
+
+## 2026-03-01 06:47 - US-006
+- Implemented: Unit tests for NpmPluginCard deriveDisplayName
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/NpmPluginCard.tsx` — exported `deriveDisplayName` by adding it to the export list
+  - `platform/browser-extension/src/side-panel/components/NpmPluginCard.test.ts` — new test file with 6 tests covering: scoped package with opentabs-plugin- prefix, unscoped package with opentabs-plugin- prefix, bare name without prefix, scoped without opentabs-plugin- prefix, empty string, scoped with opentabs-plugin- prefix in package segment
+- **Learnings for future iterations:**
+  - `deriveDisplayName` is very similar to `extractShortName` in bridge.ts — both split on '/' and strip the `opentabs-plugin-` prefix, but `deriveDisplayName` is simpler (single expression)
+  - The minimal change to export: just add the function name to the existing `export { NpmPluginCard }` statement
+  - This was a small, focused story — one function, one test file, 6 test cases. Kept implementation minimal.
+---
+
+## 2026-03-01 06:42 - US-005
+- Implemented: Unit tests for PluginCard allEnabled derivation and tool filtering
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — extracted `allPluginToolsEnabled` and `filterPluginTools` as exported pure functions; updated component to use them; added both to exports
+  - `platform/browser-extension/src/side-panel/components/PluginCard.test.ts` — new test file with 13 tests covering: `allPluginToolsEnabled` (6 cases: all enabled, one disabled, all disabled, empty, single enabled, single disabled), `filterPluginTools` (7 cases: empty filter, displayName match, raw name match, description match, no match, case contract, empty tools array)
+- **Learnings for future iterations:**
+  - `filterPluginTools` delegates to `matchesTool` from bridge.ts — same matching logic as BrowserToolsCard's `filterBrowserTools` but for plugin tools (with displayName/name/description, no `toDisplayName` conversion needed)
+  - `allPluginToolsEnabled` is identical to `allToolsEnabled` in BrowserToolsCard — the same `length > 0 && every` pattern; both are exported pure functions now
+  - Import `WireToolDef` from `@opentabs-dev/shared` for the tool factory type (it has `name`, `displayName`, `description`, `icon`, `enabled`, optional `iconSvg`/`iconInactiveSvg`)
+---
+
+## 2026-03-01 06:37 - US-004
+- Implemented: Unit tests for BrowserToolsCard toggle and display logic
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx` — extracted `allToolsEnabled` and `filterBrowserTools` as exported pure functions; updated component to use them; added them to exports
+  - `platform/browser-extension/src/side-panel/components/BrowserToolsCard.test.ts` — new test file with 17 tests covering: `toDisplayName` (6 cases: browser_ prefix, non-browser_ prefix, just prefix, empty), `allToolsEnabled` (6 cases: all enabled, one disabled, all disabled, empty, single enabled, single disabled), `filterBrowserTools` (8 cases: empty filter, display name match, raw name match, description match, no match, case contract, partial substring, empty tools)
+- **Learnings for future iterations:**
+  - Prettier may auto-collapse single-line arrow functions: `(tools): boolean =>\n  condition` becomes `(tools): boolean => condition` — let `eslint --fix` handle it rather than trying to predict wrapping
+  - `filterBrowserTools` mirrors `matchesBrowserTool` from SearchResults but takes a full tools array and returns filtered results — the filtering logic is identical
+  - The `allToolsEnabled` pattern (length > 0 && every) is the same guard used in PluginCard — the extracted function can serve as a reference for US-005
+---
+
+## 2026-03-01 06:32 - US-003
+- Implemented: Unit tests for SearchResults filtering and deduplication logic
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/SearchResults.tsx` — exported `matchesBrowserTool`; extracted and exported `filterAvailableResults` (deduplication logic) and `deriveShowNoResults`; updated component to use extracted functions
+  - `platform/browser-extension/src/side-panel/components/SearchResults.test.ts` — new test file with 23 tests covering: matchesBrowserTool (display name, raw name, description, case sensitivity contract, partial match, no match), filterAvailableResults (unscoped/scoped npm deduplication, non-matching kept, empty inputs, multiple matches), deriveShowNoResults (all 4 conditions, various false cases)
+- **Learnings for future iterations:**
+  - SearchResults.tsx imports React components (BrowserToolsCard, NpmPluginCard, PluginList, etc.) but importing it in Node.js tests works fine — no browser API side effects at module load time
+  - The `filterLower` parameter contract (caller must pre-lowercase): `matchesBrowserTool` lowercases tool fields internally but expects `filterLower` as-is, same as `matchesTool` in bridge.ts
+  - `extractShortName('slack')` = 'slack' (bare name stays the same), so installed plugin with name 'slack' and npm result 'opentabs-plugin-slack' both resolve to 'slack' — deduplication works correctly
+  - `deriveShowNoResults` takes `availableResultsLength: number` (not the array) to keep it a pure function with primitive args only
+---
+
+## 2026-03-01 06:27 - US-002
+- Implemented: normalizeConfigState helper and tests for loadPlugins defensive data handling
+- Files changed:
+  - `platform/browser-extension/src/side-panel/bridge.ts` — added `normalizeConfigState` function that guards unknown input with `Array.isArray` checks for all three array fields and normalizes plugin `tools` field; updated `fetchConfigState` to call `normalizeConfigState`; exported `normalizeConfigState`
+  - `platform/browser-extension/src/side-panel/bridge.test.ts` — imported `normalizeConfigState`; fixed existing handleServerResponse test to use proper plugin fixture; added 13 new tests covering: valid passthrough, undefined/null/empty-object input, missing individual fields, plugin with tools: undefined/null, plugin with valid tools, null array fields, non-object inputs (string/number/array)
+- **Learnings for future iterations:**
+  - The existing test at line 79 used `['stub-plugin']` as plugins — this broke when `normalizeConfigState` was introduced because it maps over plugins. Always use proper plugin-shaped fixtures in `fetchConfigState` tests.
+  - `typeof [] === 'object'` so arrays pass the object check in normalizeConfigState; they just won't have `.plugins`, `.failedPlugins`, `.browserTools` properties so all return `[]`
+  - `ConfigStateResult` from `@opentabs-dev/shared` defines: `plugins: ConfigStatePlugin[]`, `failedPlugins: ConfigStateFailedPlugin[]`, `browserTools: ConfigStateBrowserTool[]`
+  - Array element access in strict TS requires guards: `const first = arr[0]; if (!first) throw new Error(...)`
+---
+
+## 2026-03-01 06:22 - US-001
+- Implemented: Comprehensive unit tests for useServerNotifications hook logic
+- Files changed:
+  - `platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts` — extracted `processNotification`, `clearConfirmationTimeoutById`, `clearAllTimeouts`, and `validTabStates` as exported pure functions; hook now delegates to them
+  - `platform/browser-extension/src/side-panel/hooks/useServerNotifications.test.ts` — new test file with ~40 tests covering confirmation.request, tab.stateChanged, tool.invocationStart, tool.invocationEnd, cleanup, unknown methods, and validTabStates
+- **Learnings for future iterations:**
+  - The existing hook uses `useCallback` wrapping closures over refs and setters — to test without React, extract the closure body as a pure function with explicit deps parameter
+  - `NotificationHandlerDeps` interface defines the contract between the pure logic and the React hook wrapper
+  - Use `vi.useFakeTimers()` in beforeEach and `vi.useRealTimers()` in afterEach for timeout tests
+  - `VALID_PLUGIN_NAME` regex rejects: empty string, uppercase, spaces. Accepts: lowercase alphanumeric with hyphens like 'slack', 'my-plugin'
+  - The confirmation auto-removal fires at `timeoutMs + 1000` and sends `sp:confirmationTimeout` via `chrome.runtime.sendMessage`
+---
