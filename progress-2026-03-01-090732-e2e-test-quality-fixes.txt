@@ -1,0 +1,59 @@
+## Codebase Patterns
+- execSync catch blocks: when a process is killed by signal or timeout, the error's `stdout`, `stderr`, and `status` properties are `null`. Always use optional chaining (`e.stdout?.toString() ?? ''`) and `e.status ?? 1` fallback.
+- E2E test files live in `e2e/` at the repo root; helpers/fixtures in `e2e/helpers.ts` and `e2e/fixtures.ts`
+- MCP server does NOT log auth failures (no log emitted when `/ws-info` returns 401). `waitForLog` cannot detect auth rejection. Instead, use the side panel "Authentication Failed" text as the polling wait — the side panel only shows this state after the extension has actually attempted and been rejected.
+- `waitForLog`, `waitForExtensionConnected`, `waitForExtensionDisconnected`, `waitFor`, `waitForToolResult`, `waitForToolList` are all available in `e2e/helpers.ts` for polling-based waits.
+- BrowserToolsCard label is "Browser" (with a CORE badge), NOT "Browser Tools". E2E tests should use `locator('text=Browser')` for this section. The label was renamed in commit 608c01c.
+- When adding outer try/finally around a resource, move recovery assertions (waitForExtensionConnected etc.) to AFTER the try/finally so cleanup runs first and recovery code only runs on success path.
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-090732-e2e-test-quality-fixes~running.json
+Started: Sun Mar  1 17:07:56 UTC 2026
+---
+
+## 2026-03-01 - US-002
+- Removed tautological assertion `expect(['open', 'closed', 'error']).toContain(midReloadResult)` — this always passes since `midReloadResult` is typed as `'open' | 'closed' | 'error'`
+- Restructured mid-reload await from `Promise<'open' | 'closed' | 'error'>` to `Promise<void>` since the result value is not used; the variable was eliminated to satisfy lint
+- Fixed the ping verification timeout branch to resolve `false` instead of `true`, so `expect(pingReceived).toBe(true)` now has teeth — it only passes if the server responded within 2 seconds
+- Updated comments to reflect the new behavior
+- Files changed: `e2e/dev-proxy.e2e.ts`
+- **Learnings for future iterations:**
+  - When removing an assertion that used a variable, the variable itself may become unused — ESLint `@typescript-eslint/no-unused-vars` will flag it. Restructure the code (not just rename with `_`) when the value is genuinely not needed
+  - Promises that only need to await completion (not capture a result) should use `Promise<void>` to make intent clear
+  - The mid-reload WebSocket test at lines ~680-710 is a "wait for settle" pattern — it just needs to know the connection settled, not what the outcome was
+---
+
+## 2026-03-01 - US-003
+- Replaced `await new Promise(r => setTimeout(r, 3_000))` fixed sleep with a polling-based wait
+- Restructured the test to open the side panel FIRST, then wait for "Authentication Failed" to appear (15s timeout) as the polling wait
+- Moved health check to run AFTER auth failure is confirmed via the side panel — now meaningful rather than potentially tautological
+- The side panel only shows "Authentication Failed" once the extension has actually called `/ws-info` and received a 401, making it the correct polling signal
+- Files changed: `e2e/side-panel-auth-failed.e2e.ts`
+- **Learnings for future iterations:**
+  - The MCP server does NOT log auth failures — `waitForLog(server, '401')` would never trigger. Use the UI/side panel state as the polling signal instead
+  - Re-ordering assertions (UI wait before server health check) is often cleaner than inventing a server-side signal when the UI already reflects the state
+  - Phase 1 (build, type-check, lint, knip, test) all passed cleanly; story had `e2eCheckpoint: false` so Phase 2 was skipped
+---
+
+## 2026-03-01 - US-001
+- Fixed null-safety crash in `runBuild()` in `e2e/build-icons.e2e.ts`
+- Updated both catch blocks (lines 53-60 and 66-73) to cast `err` as `{ status: number | null; stdout: Buffer | null; stderr: Buffer | null }`
+- Applied `e.status ?? 1`, `e.stdout?.toString() ?? ''`, `e.stderr?.toString() ?? ''` in both catch blocks
+- Files changed: `e2e/build-icons.e2e.ts`
+- **Learnings for future iterations:**
+  - Node.js `execSync` on signal-killed or OOM-killed processes sets `stdout`, `stderr`, and `status` to `null` on the thrown error object; all three need null-guarding
+  - Phase 1 (build, type-check, lint, knip, test) all passed cleanly; this story had `e2eCheckpoint: false` so Phase 2 was skipped
+---
+
+## 2026-03-01 - US-004
+- Wrapped `timeoutClient` lifecycle in outer try/finally in `e2e/dispatch-resilience.e2e.ts`
+- Moved `testServer.setSlow(0)` and `timeoutClient.close()` to the finally block so they always run even if assertions throw
+- Recovery assertions (`waitForExtensionConnected`, `waitForToolResult`) moved to AFTER the outer try/finally — they run only on success (exception propagation skips them) but benefit from cleanup having already run
+- The inner try/finally for `fakeWs.close()` stays nested inside the outer try block
+- Also fixed pre-existing E2E failures in 3 test files: `e2e/onboarding.e2e.ts`, `e2e/side-panel-live-update.e2e.ts`, `e2e/side-panel-reload.e2e.ts` — updated locator from `'text=Browser Tools'` to `'text=Browser'` after BrowserToolsCard was renamed in commit 608c01c
+- Files changed: `e2e/dispatch-resilience.e2e.ts`, `e2e/onboarding.e2e.ts`, `e2e/side-panel-live-update.e2e.ts`, `e2e/side-panel-reload.e2e.ts`
+- **Learnings for future iterations:**
+  - For resources that need guaranteed cleanup, put cleanup in finally and move post-success assertions AFTER the try/finally block (not inside it) — cleaner than calling cleanup twice
+  - Always run the full E2E suite for stories with `e2eCheckpoint: true`; this story's E2E run caught 8 pre-existing failures from an unrelated UI rename
+  - The BrowserToolsCard header text is "Browser" (not "Browser Tools") — commit 608c01c renamed it but didn't update E2E locators
+---
