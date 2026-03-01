@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two CLI commands that display wrong port numbers when the server runs on a non-default port via --port flag",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "config show --show-secret uses wrong port in MCP client config URLs",
+      "description": "As a user who started the server on a custom port, I want config show --show-secret to display correct MCP client config URLs so that I can copy-paste working configurations",
+      "acceptanceCriteria": [
+        "config show --show-secret generates MCP client config URLs using resolvePort() instead of reading config.port directly",
+        "When server started with --port 9700 (port not saved in config), config show --show-secret --port 9700 shows URLs with port 9700",
+        "When port is saved in config (e.g., 8888), config show --show-secret shows URLs with port 8888 even without --port flag",
+        "ConfigShowOptions interface is not needed for the port — resolvePort(options) from the parent command's --port flag is used",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/config.ts\n\nThe bug is on line 203:\n```\nconst port = typeof config.port === 'number' ? config.port : DEFAULT_PORT;\n```\n\nThis reads the port from config.json, falling back to DEFAULT_PORT (9515). When the user starts with `opentabs start --port 9700` without saving the port to config, this always shows 9515 in the generated URLs.\n\nFix: Replace the above line with `resolvePort(options)` — the same helper every other command uses. This considers (in order): --port CLI flag, OPENTABS_PORT env var, config.json port, DEFAULT_PORT.\n\nHowever, `handleConfigShow` currently takes `ConfigShowOptions` which only has `json` and `showSecret` fields — no `port`. The `config show` subcommand doesn't define a `--port` option either.\n\nThe fix has two parts:\n1. The `config show` subcommand doesn't need its own `--port` option — Commander.js propagates the parent command's `--port` option. The parent `opentabs` command already defines `--port <number>`. When the action handler calls `options`, Commander merges parent and local options. So `options.port` should already be available if the user passes `--port`.\n2. Change line 203 to use `resolvePort(options)` instead of reading from config directly. Import resolvePort is already imported (line 15).\n\nVerify: The parent command at the top of platform/cli/src/index.ts defines `--port <number>` which Commander propagates to all subcommands. Check that `config show` action handler receives the parent's port option. If not, you may need to use `.passThroughOptions()` or read `this.parent?.opts()` — but Commander typically merges parent options by default.\n\nDo NOT add a separate `--port` option to the `config show` subcommand — that would conflict with the parent's `--port`. Use Commander's built-in parent option inheritance."
+    },
+    {
+      "id": "US-002",
+      "title": "config set port shows wrong 'currently running on' port",
+      "description": "As a user who started the server on a custom port, I want config set port to show the correct currently-running port so that the restart message is not confusing",
+      "acceptanceCriteria": [
+        "config set port message uses the actual running server port detected via resolvePort(options), not the old config port",
+        "When server runs on port 9600 via --port flag, and user runs config set port 8080 --port 9600, message says 'Server running on port 9600' (not 9515)",
+        "When server is not running, the message still says 'Restart to apply port change' (existing behavior from notifyServer warnIfNotRunning)",
+        "The notify request is sent to the correct port (the actual running port, not the old config port)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/config.ts\n\nThe bug is on lines 475-482 in `handleSetPort`:\n```\nif (newPort !== oldPort) {\n  await notifyServer({\n    port: options.port ?? oldPort,\n    warnIfNotRunning: true,\n    successMessage: pc.yellow(`Server running on port ${oldPort}. Restart to apply port change.`),\n  });\n}\n```\n\n`oldPort` is derived from `config.port` (line 464), not from the actual running server. When the user started with `--port 9600` but never saved port to config, `oldPort` = DEFAULT_PORT (9515).\n\nFix: Use `resolvePort(options)` to determine the actual running port for the message:\n```\nconst runningPort = resolvePort(options);\n```\n\nThen use `runningPort` in the success message and as the port for notifyServer. Keep `oldPort` for the comparison with `newPort` (to decide if the port is actually changing) since that compares the old config value with the new value.\n\nNote: The `newPort !== oldPort` comparison on line 475 should also be reconsidered — if the config had no port set (oldPort=9515) and the user sets port 9515 explicitly, the else branch fires (line 483-486). This is fine and a style choice, not a bug. Focus on fixing the message and the notifyServer port.\n\nDo NOT change the fundamental logic of what constitutes a port change vs. same-port set. Only fix the displayed port in the message and the port used for server notification."
+    }
+  ]
+}
