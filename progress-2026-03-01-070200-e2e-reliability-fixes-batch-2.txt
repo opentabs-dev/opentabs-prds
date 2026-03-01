@@ -1,0 +1,86 @@
+## Codebase Patterns
+- E2E tests are in `e2e/` at the repo root (not in individual packages)
+- Shared test fixtures are in `e2e/fixtures.ts`; helpers like `waitForLog`, `callToolExpectSuccess`, `setupToolTest` are in `e2e/helpers.ts`
+- The `mcpServer` fixture exposes `.health()` and `.waitForHealth()` for polling plugin buffer state
+- Plugin log buffer sizes are accessible via `health.pluginDetails?.find(p => p.name === '...')?.logBufferSize`
+- For shared buffers under parallel test concurrency, use a range assertion `[n, n+k]` rather than exact equality
+- `@typescript-eslint/no-non-null-assertion` is ENFORCED — never use `!.` to access properties; instead redesign to use proper guards (e.g., take a path param instead of a URL so construction happens after the guard)
+- Never use `server.logs.length = 0` before `waitForLog` — this races with log lines arriving between truncation and the wait call. Instead, count occurrences before the action and use `waitFor(() => count > before)` to detect a NEW occurrence
+- When using occurrence-counting for multiple log lines triggered by the same action, capture ALL baseline counts BEFORE triggering the action — log lines may arrive in any order, so capturing a second baseline after waiting for the first log can miss occurrences emitted before the first log
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-070200-e2e-reliability-fixes-batch-2~running.json
+Started: Sun Mar  1 15:02:32 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Strengthened the log buffer count assertion in `e2e/plugin-logging.e2e.ts` lines 111-122
+- Changed from `toBeGreaterThanOrEqual(bufferBefore + 4)` to a two-sided check: `[4, 6]` range for `bufferAfter - bufferBefore`
+- The lower bound catches regressions (fewer than 4 entries), the upper bound (<=6) catches gross overcounting like double-emission (which would produce 8)
+- Added explanatory comment clarifying why a small tolerance exists (parallel test activity on shared buffer)
+- Files changed: `e2e/plugin-logging.e2e.ts`
+- **Learnings for future iterations:**
+  - The `waitForHealth` predicate still uses `buf >= bufferBefore + 4` — that's intentional (it just waits for enough entries, doesn't assert an upper bound)
+  - The tolerance of `[4, 6]` was chosen to allow 2 extra entries from concurrent tests while still catching double-emission (8 entries)
+---
+
+## 2026-03-01 - US-003
+- Wrapped the `callTool` and tab cleanup in `try/finally` in the `analyzeSite` helper in `e2e/analyze-site.e2e.ts`
+- Tab snapshot (`browser_list_tabs` before) is taken before the try block so it's available in cleanup
+- Tab cleanup is in the `finally` block wrapped in its own try/catch (best-effort, to avoid suppressing the original error)
+- Used `let resultContent = ''` declared before the try block, assigned inside try, to avoid TypeScript undefined narrowing issues without needing non-null assertions
+- Files changed: `e2e/analyze-site.e2e.ts`
+- **Learnings for future iterations:**
+  - When a `let` variable is declared before try/finally and assigned inside try, TypeScript sees it as possibly uninitialized after the finally. Using an initialized default value (`let resultContent = ''`) avoids needing a non-null assertion while still satisfying TypeScript's narrowing
+  - The inner try/catch in finally is important: if cleanup itself throws, without it the original exception would be suppressed, making debugging harder
+  - The `@typescript-eslint/no-non-null-assertion` rule means you can't use `resultContent!` — the initialized default pattern is the right workaround
+---
+
+## 2026-03-01 - US-002
+- Added assertion guard `if (!analyzeSiteServer) throw new Error('analyzeSiteServer not initialized — beforeAll may have failed')` at the top of the `analyzeSite` helper in `e2e/analyze-site.e2e.ts`
+- Changed the `analyzeSite` helper's `url` parameter to `path`, with URL construction (`${analyzeSiteServer.url}${path}`) happening inside the function after the guard
+- Removed all 13 occurrences of `analyzeSiteServer?.url ?? ''` from test bodies — tests now call `analyzeSite(mcpClient, '/path/')` directly
+- Files changed: `e2e/analyze-site.e2e.ts`
+- **Learnings for future iterations:**
+  - `@typescript-eslint/no-non-null-assertion` is enforced — `!.url` would have been rejected by lint. The fix was to redesign the helper to take a path parameter so URL construction happens after the guard, eliminating the need for non-null assertions entirely
+  - When a shared variable is used by both a helper and test bodies, centralizing access inside the helper (after a guard) is cleaner than adding assertions in every test body
+---
+
+## 2026-03-01 - US-004
+- Fixed confusing error pattern in `e2e/secret-rotation.e2e.ts` lines 163-174
+- Replaced the throw-inside-try pattern (where a successful `initialize()` throws an error caught by the same catch block, producing a confusing regex mismatch) with a flag-based pattern
+- Added `let oldClientSucceeded = false;` before the try block, set to `true` inside try after `initialize()` succeeds, then checked after the try/catch/finally with `if (oldClientSucceeded) throw new Error('Old secret should have been rejected but initialize() succeeded')`
+- Files changed: `e2e/secret-rotation.e2e.ts`
+- **Learnings for future iterations:**
+  - The throw-inside-try antipattern (throwing inside try with a catch that asserts on the error message) is dangerous: if the throw message doesn't match the catch's regex, you get a confusing failure about the regex not matching rather than a clear "operation succeeded when it shouldn't have"
+  - The flag-based pattern is the idiomatic fix: set a boolean inside try if the operation succeeds, assert `expect(flag).toBe(false)` after the try/catch/finally, or throw with a clear message
+  - ESLint's `no-throw-literal` and similar rules don't catch this specific antipattern, so it requires manual review
+---
+
+## 2026-03-01 - US-005
+- Fixed race condition in `e2e/config-watcher.e2e.ts` 'config watcher still works after hot reload' test
+- Replaced both `server.logs.length = 0` truncations with occurrence counting + `waitFor`
+- Before triggering hot reload, capture `hotReloadCountBefore = server.logs.filter(l => l.includes('Hot reload complete')).length`
+- Use `waitFor(() => server.logs.filter(...).length > hotReloadCountBefore, ...)` to detect a NEW occurrence
+- Same pattern for 'Config watcher: Watching' after the reload
+- Added `waitFor` to the imports from `./helpers.js`
+- Files changed: `e2e/config-watcher.e2e.ts`
+- **Learnings for future iterations:**
+  - The `server.logs.length = 0` truncation pattern is racy: if a log line arrives between the truncation and the subsequent `waitForLog`, it is lost forever and the test hangs until timeout
+  - The correct pattern is always occurrence-counting: capture count before the action, then wait for count to increase — mirrors the `writeAndWaitForWatcher` pattern in helpers.ts
+  - `waitFor` (from helpers.ts) accepts a predicate `() => boolean` and handles polling/timeout — it's the right primitive for count-based waiting
+  - `waitForLog` (also in helpers.ts) scans the entire log array each poll — it works for initial setup waits but is unsafe after truncation
+---
+
+## 2026-03-01 - US-006
+- Added new `test.describe('Stale MCP session ID')` block in `e2e/dispatch-resilience.e2e.ts`
+- Test sends a raw POST to `/mcp` with a fabricated `mcp-session-id: nonexistent-session-id-12345` header and verifies the server returns HTTP 400 with `missing session` in the body
+- Uses `fetch()` directly (not the MCP client wrapper) since the client auto-retries on session errors
+- Conditionally includes `Authorization: Bearer <secret>` header when `mcpServer.secret` is defined
+- Also fixed a second race condition in `e2e/config-watcher.e2e.ts`: `watcherCountBefore` was captured after `Hot reload complete`, but `Config watcher: Watching` can be emitted before that log line — moved both baselines to before `triggerHotReload()`
+- Files changed: `e2e/dispatch-resilience.e2e.ts`, `e2e/config-watcher.e2e.ts`
+- **Learnings for future iterations:**
+  - The MCP server error message for a missing/stale session is `'Bad Request: missing session or not an initialize request'` (in `platform/mcp-server/src/http-routes.ts:487`) — HTTP 400 response
+  - When two log lines can be emitted in any order during the same async operation, both baseline counts must be captured before triggering the operation, not sequentially between them
+  - The `mcpServer` fixture without `extensionContext` is sufficient for tests that only need the HTTP endpoint — no Chromium needed
+---
