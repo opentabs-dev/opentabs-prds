@@ -1,0 +1,54 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-065737-extension-side-panel-fixes~running.json
+Started: Sun Mar  1 14:58:04 UTC 2026
+---
+
+## Codebase Patterns
+- Side panel state management is in `platform/browser-extension/src/side-panel/App.tsx`; bridge functions are in `./bridge.js`
+- Race conditions in async search can be solved with a monotonically increasing counter ref (`useRef(0)`); capture the counter value in the closure and check equality before calling setState
+- The `ERROR_DISPLAY_DURATION_MS` constant lives in `platform/browser-extension/src/side-panel/constants.ts`
+- Existing error pattern for install failures: `installErrors` state (`Map<string, string>`) in App.tsx, passed down to SearchResults → NpmPluginCard
+- Shared types for extension-protocol messages live in `platform/shared/src/index.ts`; add new params types here first, then import into `extension-handlers.ts`
+- Adding a new server method requires 4 changes: (1) type in shared/src/index.ts, (2) handler in extension-handlers.ts, (3) route + import in extension-protocol.ts, (4) bridge function in bridge.ts
+- `handleConfigSetBrowserToolEnabled` sends `plugins.changed` notification before the result — follow this pattern for browser tool batch updates too
+- For per-plugin action errors (update/remove) in App.tsx: use a `pluginErrors` state Map + `pluginErrorTimers` ref Map; call `showPluginError(name, msg)` to set + auto-clear after ERROR_DISPLAY_DURATION_MS, and `clearPluginError(name)` to cancel on retry; pass down via PluginList → PluginCard as `actionError` prop
+- ESLint enforces import ordering (`import-x/order`): local constants imports must come before hook imports (alphabetically within relative group)
+
+## 2026-03-01 - US-001
+- Fixed npm search race condition in `handleSearchChange`: added `npmSearchCounter` ref (monotonically incrementing), captured `searchId` in each closure, and gated all setState calls on `npmSearchCounter.current === searchId`
+- Fixed missing cleanup: added `clearTimeout(npmSearchTimer.current)` to the useEffect cleanup function (was only removing the message listener, leaving the debounce timer live)
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - The `.finally()` in the search also needed the searchId guard to avoid setting `npmSearching = false` for a stale request that resolves after the latest one
+  - The useEffect at line 142 has a single cleanup `return () => { ... }` — the `npmSearchTimer` ref is declared outside the effect so it's accessible from both the effect body and the cleanup
+---
+
+## 2026-03-01 - US-002
+- Added `ConfigSetAllBrowserToolsEnabledParams` interface to `platform/shared/src/index.ts`
+- Added `handleConfigSetAllBrowserToolsEnabled` handler in `platform/mcp-server/src/extension-handlers.ts` (mirrors `handleConfigSetBrowserToolEnabled` but iterates all cached browser tools)
+- Added `config.setAllBrowserToolsEnabled` route in `platform/mcp-server/src/extension-protocol.ts`
+- Added `setAllBrowserToolsEnabled(enabled)` bridge function in `platform/browser-extension/src/side-panel/bridge.ts`
+- Updated `BrowserToolsCard.handleToggleAll` to call `setAllBrowserToolsEnabled` (single batch request) instead of `Promise.all(N individual setBrowserToolEnabled calls)`
+- Files changed: `platform/shared/src/index.ts`, `platform/mcp-server/src/extension-handlers.ts`, `platform/mcp-server/src/extension-protocol.ts`, `platform/browser-extension/src/side-panel/bridge.ts`, `platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx`
+- **Learnings for future iterations:**
+  - The server handler for `setAllBrowserToolsEnabled` must send the `plugins.changed` notification (same as `setBrowserToolEnabled`) so the extension side panel re-syncs the tool list after the batch toggle
+  - `state.cachedBrowserTools` holds all browser tool definitions; iterate it to set policy for all tools
+  - The existing toggle counter + preToggleRef pattern in BrowserToolsCard already handles optimistic revert correctly — only the server call needed to change
+---
+
+## 2026-03-01 - US-003
+- Added `pluginErrors` state (`Map<string, string>`) and `pluginErrorTimers` ref (`Map<string, ReturnType<typeof setTimeout>>`) to App.tsx for per-plugin action error tracking
+- Added `showPluginError(pluginName, message)` helper: sets error, schedules auto-clear after `ERROR_DISPLAY_DURATION_MS` (3s), cancels previous timer for same plugin
+- Added `clearPluginError(pluginName)` helper: cancels timer and clears error immediately (used when retrying an operation)
+- Added cleanup `useEffect` to cancel all pending error timers on component unmount
+- Updated `handleRemove`: clears error on start, sets error on `.catch()` with message from rejection reason
+- Updated `handleUpdate`: clears error on start, sets error on `.catch()` with message from rejection reason
+- Updated `PluginList.tsx`: accepts `pluginErrors?: Map<string, string>` prop, passes `actionError={pluginErrors?.get(plugin.name) ?? null}` to each `PluginCard`
+- Updated `SearchResults.tsx`: accepts `pluginErrors?: Map<string, string>` prop, forwards it to `PluginList`
+- Updated `PluginCard.tsx`: accepts `actionError?: string | null` prop, renders it as an `Alert` (error status) alongside the existing `toggleError` alert
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`, `platform/browser-extension/src/side-panel/components/PluginCard.tsx`, `platform/browser-extension/src/side-panel/components/PluginList.tsx`, `platform/browser-extension/src/side-panel/components/SearchResults.tsx`
+- **Learnings for future iterations:**
+  - ESLint `import-x/order` requires `./constants.js` before `./hooks/useServerNotifications.js` — local imports are sorted alphabetically within the relative group
+  - Managing per-key auto-dismiss timers in a `Map` ref is cleaner than trying to use `useEffect` on a state Map; each timer key is independent and can be cancelled individually
+  - `PluginCard` already has `updatingPlugin` and `removingPlugin` props for loading state — `actionError` is the natural companion for failure feedback
+---
