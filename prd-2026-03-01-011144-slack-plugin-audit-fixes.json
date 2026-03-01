@@ -1,0 +1,45 @@
+{
+  "project": "OpenTabs Plugin — slack",
+  "description": "Fix unguarded nested property access in Slack plugin tools that can crash with TypeError when the Slack API returns unexpected response shapes. The slackApi() function uses unchecked type casts on API responses, so tool handlers must defensively guard nested property access.",
+  "workingDirectory": "plugins/slack",
+  "qualityChecks": "cd plugins/slack && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Guard nested property access in set-channel-topic and set-channel-purpose handlers",
+      "description": "As a plugin user, I want set_channel_topic and set_channel_purpose tools to return a descriptive ToolError instead of crashing with TypeError when the Slack API response is missing expected nested fields (channel.topic or channel.purpose).",
+      "acceptanceCriteria": [
+        "set-channel-topic handle() guards access to data.channel and data.channel.topic — if either is nullish, values default safely (e.g., value falls back to params.topic, creator to '', last_set to 0) instead of throwing TypeError",
+        "set-channel-purpose handle() guards access to data.channel and data.channel.purpose — same defensive defaulting pattern",
+        "Both tools continue to return correct values when the API response is well-formed (no behavioral change for the happy path)",
+        "cd plugins/slack && npm run build passes",
+        "cd plugins/slack && npm run type-check passes",
+        "cd plugins/slack && npm run lint passes",
+        "cd plugins/slack && npm run format:check passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files: plugins/slack/src/tools/set-channel-topic.ts (lines 30-32) and plugins/slack/src/tools/set-channel-purpose.ts (lines 30-32).\n\nThe bug: Both handlers access `data.channel.topic.value` and `data.channel.purpose.value` without null checks. The `slackApi<T>()` function casts the API response to `T` without runtime validation, so if the Slack API ever returns a response without the nested `topic`/`purpose` object (e.g., an unexpected API change, a permission issue, or a partial response), accessing `.value` on undefined throws `TypeError: Cannot read properties of undefined`.\n\nFix: Use optional chaining with nullish coalescing for all nested accesses. For example:\n```typescript\nvalue: data.channel?.topic?.value ?? params.topic,\ncreator: data.channel?.topic?.creator ?? '',\nlast_set: data.channel?.topic?.last_set ?? 0,\n```\n\nSame pattern for set-channel-purpose. This matches the defensive coding style already used in other Slack tools (e.g., send-message.ts line 28: `data.channel ?? ''`)."
+    },
+    {
+      "id": "US-002",
+      "title": "Guard data.channel access in get-channel-info handler",
+      "description": "As a plugin user, I want get_channel_info to handle a missing channel object in the API response gracefully instead of crashing with TypeError.",
+      "acceptanceCriteria": [
+        "get-channel-info handle() guards access to data.channel before passing it to mapChannel() — if data.channel is nullish, it passes an empty object to mapChannel() so the tool returns safe defaults instead of crashing",
+        "Tool continues to return correct values when the API response is well-formed (no behavioral change for the happy path)",
+        "cd plugins/slack && npm run build passes",
+        "cd plugins/slack && npm run type-check passes",
+        "cd plugins/slack && npm run lint passes",
+        "cd plugins/slack && npm run format:check passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: plugins/slack/src/tools/get-channel-info.ts (line 22).\n\nThe bug: `mapChannel(data.channel)` passes `data.channel` directly. The `slackApi<T>()` return type says `data.channel` is `SlackChannel`, but this is an unchecked cast. If the Slack API response doesn't include a `channel` field, `data.channel` is `undefined`, and `mapChannel(undefined)` crashes when it accesses `c.id` (TypeError).\n\nFix: Use nullish coalescing to provide a safe fallback:\n```typescript\nreturn { channel: mapChannel(data.channel ?? {}) };\n```\n\nThe `mapChannel` function already accepts `Partial<SlackChannel>` and defaults all fields, so passing an empty object produces safe output. The type annotation on `data` may need a `?` on `channel` to make it explicit: `channel?: SlackChannel`."
+    }
+  ]
+}
