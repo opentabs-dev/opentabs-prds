@@ -1,0 +1,55 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-204719-side-panel-no-flicker-e2e~running.json
+Started: Sun Mar  1 04:47:48 UTC 2026
+---
+
+## Codebase Patterns
+- E2E tests for side panel use `openSidePanel(context)` which navigates to `chrome-extension://<id>/side-panel/side-panel.html` in a regular tab
+- The plugin list accordion uses `button[data-radix-collection-item]` as the selector for individual plugin items (not `button[aria-expanded]`)
+- Side panel receives plugin updates via two paths: `sp:serverMessage` with `plugins.changed` and `ws:message` with `sync.full`
+- `loadPlugins()` calls `fetchConfigState()` which sends `config.getState` to the MCP server via the background script bridge
+- The `writeTestConfig` → `waitForLog('Config reload complete')` → `postReload()` pattern ensures the MCP server has processed plugin changes before the side panel checks
+- To restart a server on the same port, use `startMcpServer(configDir, true, originalPort)` — the extension's WebSocket reconnect logic picks up the new server automatically
+- Side panel App.tsx uses a `pluginsLoaded` state gate to prevent NoPluginsState from rendering before the initial plugin fetch completes
+
+## 2026-03-01T04:55 - US-001
+- Verified that the 2 pre-existing E2E test failures were already fixed by a previous iteration (commit bcfa70b)
+- The fix changed `button[aria-expanded]` to `button[data-radix-collection-item]` in E2E test locators
+- Ran full Phase 1: build, type-check, lint, knip, test — all pass (88 test files, 2769 tests passed)
+- Ran full Phase 2: E2E tests — all 404 tests pass (59.9s)
+- No additional code changes needed
+- Files previously changed: e2e/onboarding.e2e.ts, e2e/side-panel-live-update.e2e.ts
+- **Learnings for future iterations:**
+  - Previous iterations may have already committed fixes — always check git log and run tests before assuming work is needed
+  - The Radix UI accordion component uses `data-radix-collection-item` attribute on buttons, not `aria-expanded` (which can match multiple elements)
+  - Lockfile drift (`package-lock.json` peer dependency markers) is cosmetic and does not need to be committed
+  - Use MutationObserver via `page.evaluate()` to detect transient DOM states (flashes) that Playwright assertions might miss
+  - `document.body.textContent` is non-nullable in DOM types — use `.includes()` directly, not optional chaining
+---
+
+## 2026-03-01T05:00 - US-002
+- Created new E2E test file `e2e/side-panel-no-flicker.e2e.ts` verifying no-flash behavior
+- Test starts MCP server WITH e2e-test plugin pre-configured, opens side panel, uses MutationObserver to watch for any appearance of "No Plugins Installed" text, waits for plugin list to appear, then asserts the no-plugins text was never rendered
+- Fixed 3 lint errors: unused `Page` import, unnecessary optional chain on `document.body.textContent`
+- Files changed: e2e/side-panel-no-flicker.e2e.ts (new)
+- Phase 1 all green: build, type-check, lint, knip, test (88 files, 2769 tests)
+- **Learnings for future iterations:**
+  - DOM typings for `document.body.textContent` are `string` (not nullable) — `?.` and `??` operators trigger eslint `@typescript-eslint/no-unnecessary-condition`
+  - MutationObserver approach works well for detecting transient flashes: install observer, wait for target state, check flag
+  - The no-flicker mechanism relies on `loading=true` persisting until `loadPlugins()` resolves — the side panel shows LoadingState spinner, then transitions directly to PluginList
+---
+
+## 2026-03-01T05:10 - US-003
+- Added `pluginsLoaded` state gate to `platform/browser-extension/src/side-panel/App.tsx` to prevent "No Plugins Installed" from flashing during initial load and server reconnection
+- The side panel render logic now shows `LoadingState` when `connected && !pluginsLoaded`, preventing the NoPluginsState flash in the gap between connection and plugin data arrival
+- `pluginsLoaded` is set to `true` when `loadPlugins()` resolves (success or failure), and reset to `false` on disconnect
+- Added `isReady` computed variable (`!loading && connected && pluginsLoaded`) to simplify the render conditionals
+- Added reconnection E2E test to `e2e/side-panel-no-flicker.e2e.ts`: starts server with plugins, verifies plugin list, kills server, verifies disconnect state, restarts server on same port, verifies plugins reappear without "No Plugins Installed" flash
+- Files changed: e2e/side-panel-no-flicker.e2e.ts, platform/browser-extension/src/side-panel/App.tsx
+- Phase 1 all green: build, type-check, lint, knip, test (88 files, 2769 tests)
+- Phase 2 all green: E2E tests — 406 tests pass (59.7s)
+- **Learnings for future iterations:**
+  - The original `loadPlugins()` was fire-and-forget — `setLoading(false)` ran before plugin data arrived, causing a flash of NoPluginsState. A `pluginsLoaded` state gate is the correct fix.
+  - `startMcpServer(configDir, true, originalPort)` reuses the same port for server restart tests; the extension's WebSocket reconnection logic handles reconnection automatically
+  - The disconnect handler in `sp:connectionState` clears plugins AND resets `pluginsLoaded` to false, so the reconnect path shows LoadingState (not NoPluginsState) until plugins arrive
+---
