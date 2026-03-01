@@ -1,0 +1,87 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix CLI UX friction points found during fresh-user experience testing: silent failure on background start, stop command suggesting unavailable tools, incorrect exit code on stop, and inconsistent MCP client config paths between start and doctor commands.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix opentabs start --background silent failure",
+      "description": "As a user, I want opentabs start --background to always produce visible output so that I know whether the server started successfully or failed.",
+      "acceptanceCriteria": [
+        "When the background server starts successfully, the CLI prints startup header, setup hints, PID, and log path (existing behavior preserved)",
+        "When the background server process crashes within the 2-second detection window, the CLI prints an error message that includes the actual log output (not just 'check logs')",
+        "When the child process PID is undefined (spawn failure), the CLI prints a visible error to stderr",
+        "All failure paths exit with code 1 AND produce at least one line of output to stderr",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/start.ts, lines 311-356. The --background code path spawns a detached child process and waits 2 seconds for early crashes. When the child crashes (line 338), it prints 'Warning: Background server exited unexpectedly. Check logs: <path>' and exits 1. The problem: in some environments (e.g., Docker containers, systems where detached spawn fails), the process may fail before spawn completes or the crash detection may not trigger, resulting in exit code 1 with zero output.\n\nFix approach: After detecting a crash at line 338, read the last ~10 lines of the log file and include them in the error output so the user sees the actual failure reason. Also add a catch around the entire spawn block to handle unexpected errors. Ensure that EVERY path through the background branch that calls process.exit(1) has a preceding console.error() call."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix opentabs stop suggesting unavailable system tools",
+      "description": "As a user, I want opentabs stop to provide reliable kill instructions so that I can actually stop a non-background server without hunting for tools that may not be installed.",
+      "acceptanceCriteria": [
+        "When the server is running but was not started with --background, the stop command attempts to stop the server via the POST /shutdown endpoint (or equivalent HTTP signal) before falling back to manual kill instructions",
+        "If HTTP shutdown is not available, the kill instructions use only standard POSIX tools: 'kill $(ss -tlnp | grep :PORT | awk ...)' or a simpler portable alternative like printing the actual PID discovered from the health endpoint",
+        "The fallback message no longer suggests lsof or fuser as primary options",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/cli/src/commands/stop.ts, lines 85-114. When no PID file exists but the server is reachable on the port, the code prints manual kill instructions referencing lsof (macOS) and fuser (Linux). Neither is guaranteed to be available.\n\nBetter approach: The MCP server already has a health endpoint. Check if there's a shutdown endpoint or POST /admin/shutdown. If not, the health response (line 96) may include the process PID — if so, we can print 'kill <PID>' directly. If the PID isn't in the health response, consider adding it to the server's health response (in platform/mcp-server/) and then using it here.\n\nAlternatively, the simplest portable fix: since we already know the server is reachable (we just fetched /health), send a POST to a shutdown endpoint. Check platform/mcp-server/src/ for existing shutdown routes. If none exists, the server already handles SIGTERM gracefully (see the log output 'Received SIGTERM — shutting down gracefully'), so we just need to find and kill the right PID.\n\nAlso: The exit code should be non-zero when the stop didn't succeed (see US-003)."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix opentabs stop exit code when server is not stopped",
+      "description": "As a scripter, I want opentabs stop to return a non-zero exit code when it fails to stop the server so that automated workflows can detect the failure.",
+      "acceptanceCriteria": [
+        "When opentabs stop detects a running server but cannot stop it (no PID file, not started with --background), it exits with code 1",
+        "When opentabs stop successfully stops the server, it exits with code 0",
+        "When no server is running, it exits with code 0 (current behavior preserved)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/stop.ts, line 101. After printing the 'Server is running but was not started with --background' message, the function returns without setting a non-zero exit code. Add process.exitCode = 1 before the return statement at line 101. If US-002 adds an HTTP shutdown attempt that succeeds, the exit code should remain 0 in that case. Only set exit code 1 when the stop command was unable to stop the server and had to show fallback instructions."
+    },
+    {
+      "id": "US-004",
+      "title": "Align MCP client config paths between start and doctor commands",
+      "description": "As a user, I want consistent MCP client config paths across all CLI commands so that I don't get confused about where to put my configuration.",
+      "acceptanceCriteria": [
+        "The Cursor config path shown in opentabs start matches what opentabs doctor recommends (both should show the project-root .cursor/mcp.json as the primary recommendation)",
+        "The OpenCode config path shown in opentabs start matches what opentabs doctor recommends",
+        "The doctor warning message, when no MCP client is configured, shows consistent paths with the start command output",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two files need alignment:\n\n1. platform/cli/src/commands/start.ts lines 161-197: getMcpClientConfigs() defines the config blocks shown during 'opentabs start' and 'opentabs config show --show-secret'. It uses:\n   - Cursor: '.cursor/mcp.json' (project root)\n   - OpenCode: 'opencode.json in project root'\n\n2. platform/cli/src/commands/doctor.ts lines 249-261: defaultMcpClientLocations() defines paths checked by doctor. It checks:\n   - Cursor: ~/.cursor/mcp.json (global) AND <cwd>/.cursor/mcp.json (project)\n   - OpenCode: ~/.config/opencode/opencode.json (global) AND <cwd>/opencode.json (project)\n\nThe checking in doctor.ts is correct — it should check both global and project locations. The issue is the WARNING message shown when no config is found (lines 290-301), which lists all checked paths. When no project-level paths are found and cwd is not a project directory, the output only shows the global paths (e.g., ~/.cursor/mcp.json), which contradicts the start command's recommendation of .cursor/mcp.json (project root).\n\nFix: In the doctor warning message (the 'Add an opentabs entry to one of:' hint), always show the same paths that 'opentabs start' recommends as the primary suggestion, with global paths as alternatives. This way users get consistent guidance regardless of which command they run."
+    }
+  ]
+}
