@@ -1,0 +1,74 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-200721-cli-ux-friction~running.json
+Started: Sun Mar  1 04:07:45 UTC 2026
+---
+
+## Codebase Patterns
+- `platform/cli/src/commands/start.ts` has the `--background` spawn block at ~line 311; uses `createWriteStream` for the log file before spawn
+- The `readFile` import needs to be added to `node:fs/promises` imports when reading log content
+- `toErrorMessage` from `@opentabs-dev/shared` is the standard way to convert errors to strings in CLI commands
+- Pre-commit hook runs prettier + eslint --fix on staged files automatically
+- MCP server routes are in `platform/mcp-server/src/http-routes.ts`; router is in `createHandleFetch`; new routes need to be added both as handler functions and in the router switch
+- `checkBearerAuth` and `checkEndpointRateLimit` are the standard guards for admin endpoints
+- The health endpoint returns a minimal `{ status: 'ok' }` for unauthenticated requests and full details for authenticated ones
+- `platform/mcp-server/src/shutdown.ts` installs SIGTERM/SIGINT handlers; POST /shutdown triggers the same path via `process.kill(process.pid, 'SIGTERM')`
+- Stop command (`platform/cli/src/commands/stop.ts`) now tries POST /shutdown first, then falls back to `kill <PID>` using PID from health response
+- CLI command handlers are exported (e.g., `handleStop`, `handleStatus`) for unit testing; internal functions like `isProcessAlive`, `waitForExit` are not exported but are covered indirectly via `process.kill` mock
+- Import order rule: `sibling → parent → internal → external → builtin → type` (e.g., local `./stop.js` before `vitest` before `node:fs/promises`)
+- For `waitForExit` timeout tests: use `vi.useFakeTimers()` + `vi.runAllTimersAsync()` with `process.kill` mock always returning true (never throwing) so the 5s timeout is reached
+
+## 2026-03-01 - US-001
+- Implemented fix for `opentabs start --background` silent failure on crash
+- When the background server crashes within the 2-second detection window, the last 10 lines of the log file are now read and included in the error output
+- Added outer try/catch around the entire background spawn block so unexpected spawn errors produce a visible stderr message before exit(1)
+- Changed crash message from pc.yellow warning to pc.red error for consistency with other failure paths
+- **Files changed:** `platform/cli/src/commands/start.ts`
+- **Learnings for future iterations:**
+  - The background spawn block uses `logStream` (a `WriteStream`) directly as stdio for the child process — the log file is being written before we try to read it, so `readFile` may return content from previous runs appended with current run output
+  - The `pid === undefined` check was already correct and had a console.error before exit(1)
+  - All existing exit(1) paths already had console.error except the crash path (which had a console.error but no log content)
+---
+
+## 2026-03-01 - US-002
+- Added `POST /shutdown` endpoint to MCP server (`platform/mcp-server/src/http-routes.ts`) that triggers graceful SIGTERM via `process.kill(process.pid, 'SIGTERM')` after a 100ms delay (allows HTTP response to be sent)
+- Added `pid: process.pid` to the authenticated health response so CLI can offer portable `kill <PID>` as fallback
+- Rewrote the no-PID-file path in `platform/cli/src/commands/stop.ts`:
+  1. First tries `POST /shutdown` and polls health endpoint to confirm exit
+  2. If shutdown endpoint fails (older server), shows `kill <PID>` from health response
+  3. Removed all `lsof`/`fuser` suggestions — only POSIX `kill` is used
+- Added `process.exitCode = 1` when stop cannot actually stop the server (fallback paths) — prepares for US-003
+- Added tests: shutdown endpoint auth check, shutdown response + scheduled SIGTERM via fake timers, pid field in health response
+- Updated `platform/mcp-server/src/index.ts` comment to list 7 endpoints
+- **Files changed:** `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`, `platform/mcp-server/src/index.ts`, `platform/cli/src/commands/stop.ts`
+- **Learnings for future iterations:**
+  - The shutdown endpoint uses a delayed `process.kill(process.pid, 'SIGTERM')` to trigger the existing graceful shutdown handler — this reuses the same cleanup path (reject dispatches, stop watchers, close WS)
+  - Tests for shutdown need `vi.useFakeTimers()` + `vi.spyOn(process, 'kill')` to prevent actually killing the test process
+  - The health endpoint distinguishes authenticated vs unauthenticated responses — `pid` is only included in the authenticated response (where `version`, `plugins`, etc. are also present)
+  - The CLI's `readAuthSecret()` reads from `~/.opentabs/extension/auth.json` and is used for Bearer auth to the server
+---
+
+## 2026-03-01 - US-003
+- Fixed `opentabs stop` exit code when the server is running but cannot be stopped
+- Added `process.exitCode = 1` in the PID-file path when SIGTERM was sent but the process did not exit within 5 seconds (was missing; only the no-PID-file fallback paths had it from US-002)
+- Exported `handleStop` from `stop.ts` to enable unit testing
+- Created `platform/cli/src/commands/stop.test.ts` with 10 tests covering all exit code paths:
+  - PID file: invalid → exits 0, stale → exits 0, SIGTERM succeeds → exits 0, SIGTERM times out → exits 1
+  - No PID file: ECONNREFUSED → exits 0, non-OpenTabs server → exits 0, /shutdown succeeds and server stops → exits 0, /shutdown succeeds but times out → exits 1, /shutdown unavailable with PID → exits 1, /shutdown unavailable without PID → exits 1
+- **Files changed:** `platform/cli/src/commands/stop.ts`, `platform/cli/src/commands/stop.test.ts`
+- **Learnings for future iterations:**
+  - US-002 had already added `process.exitCode = 1` for the no-PID-file fallback paths, so US-003's only code change was adding it to the PID-file timeout path
+  - For testing `waitForExit` timeout: mock `process.kill` to always return true (never throw), use `vi.useFakeTimers()` + `vi.runAllTimersAsync()` — fake timers advance `Date.now()` correctly through the polling loop
+  - For testing shutdown polling timeout: same fake timers approach works; mock fetch to always succeed for health polls
+  - `vi.mocked(readFile).mockResolvedValue('12345' as never)` handles the overloaded `readFile` typing cleanly
+---
+
+## 2026-03-01 - US-004
+- Fixed `opentabs doctor` warning hint to always show project-root paths matching `opentabs start` recommendations
+- Replaced `clients.map(...)` hint generation with a canonical fixed list that always includes `.cursor/mcp.json` and `opencode.json` as primary suggestions (project-root), plus global alternatives
+- Added test verifying project-root paths appear in hint regardless of whether cwd is a project directory
+- **Files changed:** `platform/cli/src/commands/doctor.ts`, `platform/cli/src/commands/doctor.test.ts`
+- **Learnings for future iterations:**
+  - The `clients` param to `checkMcpClientConfig` is for checking config existence; the hint message should be decoupled from it and always show canonical user-facing suggestions
+  - `defaultMcpClientLocations()` is correct for config detection (conditionally includes project paths only when in a project dir), but the hint should always show project-root paths as primary suggestions
+  - The start command's `getMcpClientConfigs()` in `start.ts` shows: Claude Code (global `~/.claude/settings/mcp.json`), OpenCode (`opencode.json` project-root), Cursor (`.cursor/mcp.json` project-root), Windsurf (global) — the doctor hint now matches this order and includes both project-root and global alternatives
+---
