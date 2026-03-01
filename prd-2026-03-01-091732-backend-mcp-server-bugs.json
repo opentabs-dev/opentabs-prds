@@ -1,0 +1,85 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs in the MCP server: misleading timeout error message, network capture state tracking race, redundant disableNetworkCapture dispatch in analyze-site, and detectPrimaryApiBaseUrl depth bias.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix misleading timeout error message in handleToolProgress",
+      "description": "As an MCP client, I want accurate timeout duration in error messages so that I can determine the correct retry strategy.",
+      "acceptanceCriteria": [
+        "When the progress-reset timer near the MAX_DISPATCH_TIMEOUT_MS ceiling fires, the error message reports the actual timeout duration (nextTimeout) instead of always reporting DISPATCH_TIMEOUT_MS",
+        "The error message distinguishes between a per-progress timeout and the absolute ceiling timeout",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/extension-handlers.ts, line 524.\n\nWhen a tool reports progress near the 5-minute absolute ceiling (MAX_DISPATCH_TIMEOUT_MS = 300000), the new timer duration is `Math.min(DISPATCH_TIMEOUT_MS, remainingMax)` (line 520). If `remainingMax` is 10 seconds, the timer fires after 10s. But the rejection message on line 524 always says `timed out after ${DISPATCH_TIMEOUT_MS}ms` (30000ms), regardless of the actual timeout.\n\nFix: Change line 524 from:\n```typescript\npending.reject(new Error(`Dispatch ${pending.label} timed out after ${DISPATCH_TIMEOUT_MS}ms`));\n```\nto:\n```typescript\npending.reject(new Error(`Dispatch ${pending.label} timed out after ${nextTimeout}ms`));\n```\n\nThe `nextTimeout` variable is already in scope (line 520). This requires capturing `nextTimeout` in the setTimeout closure, which it already is since it's in the enclosing function scope.\n\nNote: the immediate rejection at lines 514-516 when `remainingMax <= 0` already correctly uses `MAX_DISPATCH_TIMEOUT_MS` in its message — leave that one alone."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix network capture state tracking on dispatch timeout",
+      "description": "As a user of browser_enable_network_capture, I want the server's activeNetworkCaptures set to stay in sync with the extension's actual capture state so that export-har works correctly even after a timeout.",
+      "acceptanceCriteria": [
+        "state.activeNetworkCaptures.add(tabId) runs regardless of whether dispatchToExtension succeeds or fails (i.e., it is moved before the dispatch or into a finally block)",
+        "If the dispatch fails, the tabId is still added to activeNetworkCaptures so subsequent tools can attempt to interact with it",
+        "A comment explains that the extension may have started capture before the timeout, so we track optimistically",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/enable-network-capture.ts, lines 44-53.\n\nCurrently `state.activeNetworkCaptures.add(args.tabId)` runs on line 52, AFTER `await dispatchToExtension(...)`. If the dispatch times out (30s default) but the extension actually succeeded in enabling capture, `activeNetworkCaptures` won't include the tabId. This causes:\n1. `export-har.ts` rejects with 'Network capture is not active' (line 195 checks `state.activeNetworkCaptures.has(args.tabId)`)\n2. The CDP debugger session on that tab is orphaned — never cleaned up\n\nFix: Move `state.activeNetworkCaptures.add(args.tabId)` BEFORE the dispatch, or wrap in try/finally:\n```typescript\nhandler: async (args, state) => {\n  state.activeNetworkCaptures.add(args.tabId);\n  try {\n    const result = await dispatchToExtension(state, 'browser.enableNetworkCapture', {\n      tabId: args.tabId,\n      ...(args.maxRequests !== undefined ? { maxRequests: args.maxRequests } : {}),\n      ...(args.urlFilter !== undefined ? { urlFilter: args.urlFilter } : {}),\n      ...(args.maxConsoleLogs !== undefined ? { maxConsoleLogs: args.maxConsoleLogs } : {}),\n      ...(args.maxWsFrames !== undefined ? { maxWsFrames: args.maxWsFrames } : {}),\n    });\n    return result;\n  } catch (err) {\n    // If dispatch fails definitively (not timeout), clean up the optimistic add\n    state.activeNetworkCaptures.delete(args.tabId);\n    throw err;\n  }\n};\n```\n\nActually, the simpler correct approach: keep the add after the await (current position), but ALSO add in a catch-rethrow where we DON'T delete. The real issue is the timeout case — if it times out, the extension may have succeeded. The safest fix is to just always add to the set after the dispatch call, but in a finally block:\n```typescript\nhandler: async (args, state) => {\n  const result = await dispatchToExtension(state, 'browser.enableNetworkCapture', { ... });\n  state.activeNetworkCaptures.add(args.tabId);\n  return result;\n};\n```\nThis is actually the current code. The issue is that on timeout, the error propagates and the add never runs. The fix: wrap in try/finally and always add, then let the error propagate. disableNetworkCapture already handles the case where capture wasn't actually started (extension returns success even if debugger isn't attached)."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix double disableNetworkCapture dispatch in analyze-site",
+      "description": "As an operator of analyze-site, I want network capture cleanup to happen only once so that the analysis completes faster and without noisy error logs.",
+      "acceptanceCriteria": [
+        "When getNetworkRequests fails in analyze-site's Step 6, disableNetworkCapture is dispatched exactly once (not twice)",
+        "The finally block at lines 1032-1039 still runs disableNetworkCapture for the normal (non-error) path",
+        "A boolean flag tracks whether capture was already disabled in the catch block",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts, lines 954-961 (catch block) and 1032-1039 (finally block).\n\nWhen `browser.getNetworkRequests` fails (line 954 catch), the catch block dispatches `browser.disableNetworkCapture` (line 957) and deletes from `activeNetworkCaptures` (line 961). Then the finally block (line 1034-1035) also dispatches `browser.disableNetworkCapture` and deletes from `activeNetworkCaptures`. The second dispatch goes to the extension which will error (debugger already detached), wasting a dispatch round-trip.\n\nFix: Add a `let captureDisabled = false;` flag before the try block. In the Step 6 catch block, set `captureDisabled = true` after disabling. In the finally block, guard the disableNetworkCapture call:\n```typescript\nfinally {\n  if (!captureDisabled) {\n    try {\n      await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId });\n    } catch { /* ... */ }\n    state.activeNetworkCaptures.delete(tabId);\n  }\n  // closeTab still runs unconditionally\n  try {\n    await dispatchToExtension(state, 'browser.closeTab', { tabId });\n  } catch { /* ... */ }\n}\n```\n\nAlternatively, remove the disableNetworkCapture from the catch block entirely and let the finally block handle all cleanup. This is simpler and the finally block already handles errors gracefully."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix detectPrimaryApiBaseUrl depth bias over coverage",
+      "description": "As a plugin developer using analyze-site, I want the primary API base URL to reflect the broadest common prefix so that I get the actual API base URL rather than a narrow sub-path.",
+      "acceptanceCriteria": [
+        "detectPrimaryApiBaseUrl prefers prefixes with higher endpoint count (coverage) over deeper paths that match fewer endpoints",
+        "Given endpoints /api/v1/users, /api/v1/posts, /api/v1/comments, /api/v1/auth/login, /api/v1/auth/logout, the function returns https://example.com/api/v1 (covers 5) not https://example.com/api/v1/auth (covers 2)",
+        "The existing unit tests still pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts, lines 378-393.\n\nThe algorithm at line 386 selects based on `depth > bestDepth` first, only breaking ties by count. This means a prefix at depth 6 shared by 2 endpoints beats a prefix at depth 5 shared by 20 endpoints. The comment says 'Prefer deeper prefixes with sufficient coverage' but the code doesn't actually weight coverage.\n\nFix: Change the comparison to prefer count (coverage) first, using depth only as a tiebreaker:\n```typescript\nif (count > bestCount || (count === bestCount && depth > bestDepth)) {\n  bestDepth = depth;\n  bestCount = count;\n  bestPrefix = prefix;\n}\n```\n\nThis way, a prefix shared by 5 endpoints always beats one shared by 2, regardless of depth. When counts are equal, the deeper prefix wins (more specific).\n\nCheck existing tests in platform/mcp-server/src/browser-tools/analyze-site/detect-apis.test.ts — update any that test the old depth-first behavior. Add a new test case that verifies the coverage-first selection."
+    }
+  ]
+}

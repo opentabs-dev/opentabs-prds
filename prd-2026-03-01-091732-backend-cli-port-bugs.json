@@ -1,0 +1,64 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix port resolution bugs in CLI config set and plugin-tools build that cause server reload notifications to go to the wrong port, plus a missing FSWatcher error handler that crashes watch mode.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix handleSetPort sending reload notification to wrong port",
+      "description": "As a user changing the MCP server port, I want the reload notification sent to the currently running server so that the server is properly notified of the config change.",
+      "acceptanceCriteria": [
+        "After `opentabs config set port <new>`, the POST /reload is sent to the OLD port (where the server is actually running), not the new port",
+        "The `resolvePort(options)` call uses the old port value captured before the config write, not a freshly-read value from the just-written config.json",
+        "When `newPort === oldPort` (port unchanged), no 'Restart the MCP server' message is printed and no unnecessary notification is sent",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/config.ts, lines 475-487.\n\nBug 1 (HIGH): `handleSetPort` writes the new port to config.json (line 472), then calls `resolvePort(options)` (line 478) to determine where to send the notification. `resolvePort` falls through to `readConfigPort()` (in platform/cli/src/parse-port.ts), which reads config.json from disk. Since the config was JUST written with the new port, `readConfigPort()` returns the NEW port. The notification goes to the new port (where nothing is listening) instead of the old port (where the server runs).\n\nFix: Capture `oldPort` before the config write (already done on line 464) and use `oldPort` directly as the notification port when `newPort !== oldPort`, instead of calling `resolvePort(options)`. If the user passed `--port` explicitly, that should override (they know which port the server is on). So: `const runningPort = options.port ?? oldPort`.\n\nBug 2 (LOW): The else-branch (line 484-487) fires when `newPort === oldPort` (port unchanged). It prints 'Restart the MCP server for the port change to take effect' and sends a notification — but no change occurred. Fix: Remove the else-branch entirely, or only print a 'Port is already set to X' message without the restart prompt.\n\nAlso on line 616: `if (!value)` uses JavaScript falsiness which catches the string '0'. Change to `if (value === undefined || value === '')` so that `opentabs config set port 0` falls through to `handleSetPort` which gives the proper 'Invalid port: 0' validation error."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix plugin-tools notifyServer ignoring config.json port",
+      "description": "As a plugin developer using a custom config-based port, I want `opentabs-plugin build` to send the reload notification to the correct port so that the running MCP server discovers my plugin changes.",
+      "acceptanceCriteria": [
+        "The `notifyServer()` function in plugin-tools reads the port from config.json (via @opentabs-dev/shared's getConfigPath) as a fallback when OPENTABS_PORT is not set",
+        "Port resolution order matches the CLI: OPENTABS_PORT env var → config.json port field → DEFAULT_PORT",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, lines 257-259.\n\nThe `notifyServer()` function only reads `process.env['OPENTABS_PORT']` and falls back to `DEFAULT_PORT` (9515). It does NOT read ~/.opentabs/config.json. The CLI's `resolvePort()` checks OPENTABS_PORT, then config.json, then default. If a user set a custom port via `opentabs config set port 3000` without the env var, the build command's POST /reload goes to 9515.\n\nFix: Add config.json reading as a fallback between the env var check and the default. Use `readFileSync(getConfigPath(), 'utf-8')` wrapped in try-catch (config may not exist). Parse JSON, extract the `port` field, validate it's a valid integer in 1-65535 range. This mirrors what the CLI's `readConfigPort()` does in platform/cli/src/parse-port.ts.\n\nImport `getConfigPath` from `@opentabs-dev/shared`. The shared package is already a dependency of plugin-tools.\n\nDo NOT import from @opentabs-dev/cli — that would create a circular dependency. Implement the config reading inline."
+    },
+    {
+      "id": "US-003",
+      "title": "Add FSWatcher error handler in plugin-tools watch mode",
+      "description": "As a plugin developer using watch mode, I want the watcher to handle filesystem errors gracefully so that deleting the dist/ directory doesn't crash my process.",
+      "acceptanceCriteria": [
+        "The FSWatcher returned by `watch()` in the watch mode section has an 'error' event handler attached",
+        "If the watched directory is deleted or becomes unavailable, the process prints an error message and exits cleanly instead of crashing with an unhandled error",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts, lines 1211-1229.\n\nThe `watch()` call creates an FSWatcher, but no `.on('error', ...)` handler is attached. If the watched dist/ directory is deleted (e.g., `npm run clean` in another terminal), Node.js emits an 'error' event on the watcher. Without a handler, this throws an unhandled exception and crashes the process.\n\nFix: After the try/catch block that creates the watcher (after line 1225), add:\n```typescript\nwatcher.on('error', (err) => {\n  console.error(pc.red(`Watch error: ${toErrorMessage(err)}`));\n  console.error(pc.yellow('Watcher stopped. Restart with: opentabs-plugin build --watch'));\n  process.exit(1);\n});\n```\n\nFor reference, the CLI's logs command does this correctly: platform/cli/src/commands/logs.ts has `watcher.on('error', () => undefined)` as a safety net."
+    }
+  ]
+}
