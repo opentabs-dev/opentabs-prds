@@ -1,0 +1,38 @@
+## Codebase Patterns
+- E2E lifecycle hook tests use `setupToolTest` for page setup, `waitFor` for async polling (10s timeout, 200ms interval), and `expect.arrayContaining([expect.stringContaining(...)])` for URL assertions
+- When testing popstate/history events: pushState fires onNavigate synchronously (via monkey-patch), while history.back() fires popstate asynchronously — clear the URL array after pushState before checking popstate effects
+- Prettier enforces multi-line destructured args in test functions when line exceeds 120 chars — format like the fixture-consuming tests (mcpServer, testServer, extensionContext, mcpClient each on its own line)
+- Browser extension rate limits tool.dispatch to 30 requests/second (in `platform/browser-extension/src/rate-limiter.ts`). For tests needing many log entries, use a single tool call emitting bulk entries rather than many tool calls
+- Per-plugin concurrent dispatch limit is 5 (`MAX_CONCURRENT_DISPATCHES_PER_PLUGIN` in `platform/mcp-server/src/mcp-tool-dispatch.ts`). Batch sizes in tests must stay under this limit
+- Log buffer constant is `MAX_ENTRIES_PER_PLUGIN = 1000` in `platform/mcp-server/src/log-buffer.ts` (ring buffer with modulo arithmetic)
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-231922-e2e-missing-coverage~running.json
+Started: Sun Mar  1 07:19:52 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Added `onNavigate fires on popstate (browser back)` test to `e2e/lifecycle-hooks.e2e.ts` after the replaceState test
+- Test follows hashchange pattern: setupToolTest → clear URLs → pushState to /popstate-target → clear URLs again → history.back() → waitFor → assert original URL
+- Captures `originalUrl` via `window.location.href` before pushState, then asserts after back navigation that the URL array contains it
+- Fixed Prettier formatting: split `({ mcpServer, testServer, extensionContext, mcpClient })` across multiple lines
+- Files changed: `e2e/lifecycle-hooks.e2e.ts`
+- **Learnings for future iterations:**
+  - `history.back()` is async — popstate fires after the call returns, so `waitFor` polling is necessary
+  - pushState itself triggers onNavigate synchronously via monkey-patch, so the URL array must be cleared AFTER the pushState call and BEFORE the history.back() call
+  - The original URL (to assert after going back) is captured via `window.location.href` before any navigation
+---
+
+## 2026-03-01 - US-002
+- Added `log buffer enforces 1000-entry circular limit` test to `e2e/plugin-logging.e2e.ts`
+- Created new `log_bulk` tool in `plugins/e2e-test/src/tools/log-bulk.ts` that emits a configurable number of log entries in a single tool call
+- Registered `log_bulk` in `plugins/e2e-test/src/index.ts` (27 tools total, was 26)
+- Test strategy: single `log_bulk` call with count=1100 to overflow buffer, then assert logBufferSize=1000, then emit 10 more to verify buffer wraps
+- Files changed: `e2e/plugin-logging.e2e.ts`, `plugins/e2e-test/src/tools/log-bulk.ts`, `plugins/e2e-test/src/index.ts`
+- **Learnings for future iterations:**
+  - Cannot use many parallel tool calls to fill the log buffer — browser extension rate limits `tool.dispatch` to 30/sec and per-plugin concurrent dispatch limit is 5
+  - The correct approach is to emit bulk entries from a single tool call (plugin-side loop) rather than many small dispatches
+  - `MAX_ENTRIES_PER_PLUGIN = 1000` in `platform/mcp-server/src/log-buffer.ts` — ring buffer with modulo arithmetic (`writeIndex`, `size` fields)
+  - `/health` exposes `logBufferSize` in `pluginDetails[].logBufferSize` — use `mcpServer.waitForHealth()` to poll until buffer stabilizes
+  - `npm run test:e2e` runs `npm ci` on the e2e-test plugin before building, so source changes survive but `node_modules` is reinstalled; manual `npx playwright test` uses whatever was last built
+---
