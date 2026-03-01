@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix `opentabs status` and `opentabs doctor` being fooled by non-OpenTabs HTTP servers on port 9515. Port 9515 is ChromeDriver's default port, making this a realistic collision. When a non-OpenTabs server responds with `{\"status\":\"ok\"}`, the CLI shows fake 'running' state with Version: undefined, Tools: 0, Plugin reloads: undefined. Both commands should validate that the /health response contains OpenTabs-specific fields before declaring the server as running. LOW issues not addressed: `config show` doesn't display browserToolPolicy section when server is stopped (minor inconsistency — field is only in config file when explicitly set).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Validate health response in `opentabs status` to detect non-OpenTabs servers",
+      "description": "As a user who has ChromeDriver or another service running on port 9515, I want `opentabs status` to correctly report 'Server not running' instead of showing a fake running status with undefined values, so that I am not confused by misleading output.",
+      "acceptanceCriteria": [
+        "When the /health response is missing the `version` field (or it is not a string), `opentabs status` treats the server as not running and shows the standard 'Server not running' message",
+        "When the /health response has `version` as a string, the existing behavior is preserved (show full status)",
+        "The `--json` output also validates the response — if the response is from a non-OpenTabs server, it outputs a JSON error object or the standard 'not running' JSON, not a JSON blob with undefined values",
+        "Exit code is 1 when a non-OpenTabs server is detected on the port (same as 'server not running')",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: `platform/cli/src/commands/status.ts`\n\nThe health response is fetched at line ~81 and parsed at line ~116. The only validation at lines 117-125 checks `typeof data.status !== 'string'` — but `{\"status\":\"ok\"}` passes this check.\n\nFix: After parsing the JSON response (line ~116), add a validation check for OpenTabs-specific fields. The simplest approach: check that `data.version` is a string AND `data.toolCount` is a number. If either is missing, this is not an OpenTabs server. In that case, fall through to the 'server not running' path (print 'Server not running' and exit 1).\n\nThe existing `isNonOpenTabsHttpError` helper at lines 62-69 only catches non-2xx responses. The new validation handles the 200 OK case where the JSON passes basic structure checks but isn't from OpenTabs.\n\nAlso fix lines ~141 and ~173 where `String(data.version)` and `String(data.reloadCount)` are used without type guards, which render as literal 'undefined'. Even if the validation above catches most cases, these should have type guards as defense-in-depth (e.g., `typeof data.version === 'string' ? data.version : 'unknown'`)."
+    },
+    {
+      "id": "US-002",
+      "title": "Validate health response in `opentabs doctor` to detect non-OpenTabs servers",
+      "description": "As a user running `opentabs doctor` while ChromeDriver is on port 9515, I want the MCP server check to correctly report 'not reachable' instead of 'running (vunknown)', so that the diagnostic output is accurate.",
+      "acceptanceCriteria": [
+        "When the /health response is missing the `version` field (or it is not a string), `opentabs doctor` reports the MCP server check as a warning: 'not reachable' or 'not an OpenTabs server'",
+        "When the /health response has `version` as a string, the existing behavior is preserved (show version and pass)",
+        "Downstream checks that depend on health data (extension connection, npm plugins) handle the case where health data is null/empty gracefully",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: `platform/cli/src/commands/doctor.ts`\n\nThe `checkServerHealth` function at lines 77-103 fetches /health and parses the response. At lines 92-94, it extracts the version with a fallback to 'unknown' but does NOT validate that the response is from an OpenTabs server.\n\nFix: After parsing the JSON response (line ~92), validate that the response contains OpenTabs-specific fields (e.g., check `typeof data.version === 'string'` AND `typeof data.toolCount === 'number'`). If these are missing, return a warning result like 'another service is running on port {port} (not OpenTabs)' and return `null` for the `data` so downstream checks (checkExtensionConnected at lines 105-117, checkNpmPlugins at lines 191-224) correctly skip.\n\nThe downstream functions already handle null/missing data fields gracefully (they use Array.isArray checks), so the main change is in `checkServerHealth`."
+    }
+  ]
+}
