@@ -1,0 +1,63 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-011953-cli-ux-friction-fixes~running.json
+Started: Sun Mar  1 09:20:24 UTC 2026
+---
+
+## Codebase Patterns
+- `handleSetPort` in `platform/cli/src/commands/config.ts` uses `resolvePort(options)` to determine the server port; `resolvePort` caches the config port once per process via `readConfigPort()` in `parse-port.ts`
+- `notifyServer` in `platform/cli/src/notify-server.ts` is a generic helper used by all `config set` handlers to notify the running server via POST /reload; it checks health first via the x-opentabs-version header
+- The `DEFAULT_HOST` and `DEFAULT_PORT` constants come from `@opentabs-dev/shared`
+- `ensureAuthSecret()` in `config.ts` is idempotent: creates `~/.opentabs/extension/` recursively and generates `auth.json` if missing. `readAuthSecret()` is read-only with no side effects.
+- `resetConfigPortCache()` in `parse-port.ts` resets the per-process port cache; call it in beforeEach/afterEach when tests modify OPENTABS_CONFIG_DIR or the config file
+- To mock `fetch` in Vitest tests: `vi.stubGlobal('fetch', vi.fn().mockResolvedValue(...))` and `vi.unstubAllGlobals()` in afterEach. The mock response needs `ok`, `headers.get()`, and `json()` fields to satisfy fetch helpers in config.ts
+- `notifyServer` is globally mocked in config.test.ts via `vi.mock('../notify-server.js', ...)` — tests only need to stub `fetch` for the `fetchToolNames`/`fetchBrowserToolNames` calls
+
+## 2026-03-01 09:25 UTC - US-001
+- Implemented: Fixed misleading "Server not running" message after `opentabs config set port <new>` when the server is still running on the old port
+- Added `tryNotifyServerOnPort` helper that checks server health on a specific port and calls /reload if running
+- Modified `handleSetPort` to capture the old effective port via `resolvePort(options)` BEFORE writing the new port to config, then use `tryNotifyServerOnPort` on the old port
+- When server is running on old port: prints "Server running on port <old>. Restart to apply new port." (yellow)
+- When server is not running: prints "Server not running — changes will apply on next start." (dim)
+- Files changed: `platform/cli/src/commands/config.ts`
+- **Learnings for future iterations:**
+  - `resolvePort` has a per-process cache (`cachedConfigPort`) that only reads config.json once. This means calling it before or after a config write gives the same result within the same process — useful for capturing the "old" port before overwriting
+  - The `notifyServer` function is tightly coupled to its generic messages; for port-change-specific messaging, inline the health check + /reload logic instead of trying to parameterize `notifyServer`
+  - `handleSetPort` is not directly unit-tested (tested through CLI integration); the `tryNotifyServerOnPort` helper follows the same fetch pattern as `notifyServer` (health check with x-opentabs-version header, then /reload)
+---
+
+## 2026-03-01 09:30 UTC - US-002
+- Implemented: Fixed `opentabs start --show-config` to auto-generate auth secret before first `opentabs start`
+- Instead of `readAuthSecret()` + error if null, now uses `ensureAuthSecret()` which creates `~/.opentabs/extension/` and generates `auth.json` if missing
+- Removed `readAuthSecret` from start.ts imports (no longer needed there)
+- Files changed: `platform/cli/src/commands/start.ts`
+- **Learnings for future iterations:**
+  - `ensureAuthSecret()` in `config.ts` is the idempotent "get or create" function — it creates the extensionDir recursively, so calling it is sufficient to ensure `~/.opentabs/` exists too
+  - `readAuthSecret()` is the "read only, no side effects" variant — use it only when you explicitly don't want to create anything
+  - No `start.test.ts` exists; start command is tested via the CLI integration / E2E tests
+---
+
+## 2026-03-01 09:35 UTC - US-003
+- Implemented: Updated stale browser tool count from 39 to 40 in README.md (two occurrences)
+- Line 31: "**39 built-in browser tools**" → "**40 built-in browser tools**"
+- Line 84: "the 39 built-in browser tools" → "the 40 built-in browser tools"
+- Files changed: `README.md`
+- **Learnings for future iterations:**
+  - The docs site (docs/content/docs/) already had 40; only README.md was stale
+  - Prettier auto-formatted README.md via lint-staged during commit (no manual formatting needed)
+---
+
+## 2026-03-01 09:45 UTC - US-004
+- Implemented: `opentabs config set browser-tool.<nonexistent> disabled` now exits non-zero when server is running and tool name is unrecognized; same fix applied to `config set tool.<nonexistent> disabled`
+- Moved `fetchBrowserToolNames`/`fetchToolNames` call BEFORE writing config to disk in both `handleSetBrowserTool` and `handleSetTool`
+- When server is running but name is not in registered list: print yellow warning to stderr, call `process.exit(1)`, config NOT written
+- When server is not running: write config, print dim validation note (preserved existing behavior)
+- When server is running and name is valid: write config, notify server (unchanged behavior)
+- Exported `handleSetBrowserTool` and `handleSetTool` for direct unit testing
+- Added 3 tests each for `handleSetBrowserTool` and `handleSetTool`: invalid name (server up), valid name (server up), server down
+- Files changed: `platform/cli/src/commands/config.ts`, `platform/cli/src/commands/config.test.ts`
+- **Learnings for future iterations:**
+  - Use `vi.stubGlobal('fetch', ...)` + `vi.unstubAllGlobals()` in afterEach to mock fetch in Vitest; the mock response object needs `ok`, `headers: { get: fn }`, and `json: async fn` fields
+  - Call `resetConfigPortCache()` (from `parse-port.ts`) in beforeEach/afterEach when tests use a temp `OPENTABS_CONFIG_DIR` to prevent the per-process port cache from bleeding between tests
+  - `notifyServer` is globally mocked via `vi.mock('../notify-server.js', ...)` in config.test.ts — stub only `fetch` for the direct `fetchToolNames`/`fetchBrowserToolNames` calls
+  - The pattern "validate against server BEFORE writing to disk" prevents saving bogus config entries and is cleaner than "write then validate then maybe undo"
+---
