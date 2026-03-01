@@ -1,0 +1,128 @@
+## Codebase Patterns
+- platform/shared/src/index.ts is the single file for all shared types — no separate files per domain
+- ConfigStateResult is the wire type for config.getState response; add new fields here to extend the protocol
+- ConfigStateBrowserTool/ConfigSetBrowserToolEnabledParams follow the same naming convention as ConfigStatePlugin/ConfigSetToolEnabledParams
+- handleConfigGetState is in platform/mcp-server/src/extension-handlers.ts; uses state.cachedBrowserTools (CachedBrowserTool[]) and isBrowserToolEnabled from state.js
+- To test handlers that call sendToExtension, mock state.extensionWs = { send: msg => messages.push(msg), close: () => {} }
+- CachedBrowserTool has a tool: BrowserToolDefinition field; in tests use `null as never` to avoid importing BrowserToolDefinition
+- McpCallbacks interface in extension-handlers.ts is used across 3 test files (extension-handlers.test.ts, extension-protocol.test.ts, mcp-setup-dispatch.test.ts) — adding a new field requires updating noopCallbacks in all of them
+- saveBrowserToolPolicy follows the same read-modify-write pattern as saveToolConfig in config.ts — both use configWriteMutex serialization
+- config.setBrowserToolEnabled handler sends a plugins.changed notification after toggling, so the side panel re-fetches state
+- BrowserToolsCard follows PluginCard pattern: AccordionPrimitive for custom header, optimistic toggle with rollback, error alert auto-dismiss
+- Browser tool active tool key format is `browser:${toolName}` (e.g., `browser:browser_list_tabs`) — MCP server sends plugin='browser'
+- BrowserToolState is a type alias for ConfigStateBrowserTool in bridge.ts; no displayName/icon fields on the wire type, so they are derived
+- toDisplayName strips 'browser_' prefix and title-cases the remaining words
+- ToolRow's icon prop accepts lucide icon names as strings; 'globe' works for all browser tools
+- knip tracks `src/**/*.stories.tsx` as entry points — a new component needs a stories file to avoid being flagged as unused
+- When adding new required props to a component, update ALL stories files that use it (both the component's own stories and SidePanel.stories.tsx / SearchResults.stories.tsx)
+- ConfigStateResult.browserTools is non-optional (`ConfigStateBrowserTool[]`), so `?? []` triggers @typescript-eslint/no-unnecessary-condition
+- Active tool keys for browser tools use `browser:` prefix; loadPlugins must preserve these in the activeTools cleanup filter
+- BrowserToolsCard renders inside its own `<Accordion type="multiple">` wrapper, separate from the PluginList Accordion
+- SearchResults matches browser tools via toDisplayName, tool.name, and tool.description — also matches 'browser tools' header text
+- E2E tests that checked for 'No Plugins Installed' must check for 'Browser Tools' instead (browser tools are always shown when connected)
+- E2E tests using `.locator('button[aria-expanded]').first()` or `.locator('.border-border').first()` break when BrowserToolsCard is added — use `.filter({ hasText: 'E2E Test' })` to scope to the plugin card
+- `button[data-radix-collection-item]` locator in strict mode fails when multiple accordion buttons exist — use a specific filter or remove redundant assertions
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-211119-browser-tools-side-panel~running.json
+Started: Sun Mar  1 05:11:39 UTC 2026
+---
+
+## 2026-03-01 - US-003
+- Added `handleConfigSetBrowserToolEnabled` in `extension-handlers.ts` — validates tool/enabled params, checks tool exists in `state.cachedBrowserTools`, updates `state.browserToolPolicy`, calls `onToolConfigChanged` + `onBrowserToolPolicyPersist`, sends `plugins.changed` notification, returns `{ ok: true }`
+- Added `onBrowserToolPolicyPersist` callback to `McpCallbacks` interface
+- Added `saveBrowserToolPolicy` in `config.ts` — read-modify-write pattern (same as `saveToolConfig`), updates only `browserToolPolicy` field
+- Added routing for `config.setBrowserToolEnabled` in `extension-protocol.ts`
+- Wired `onBrowserToolPolicyPersist` in `http-routes.ts` `createMcpCallbacks` to call `saveBrowserToolPolicy`
+- Added 6 tests in `extension-handlers.test.ts`: valid toggle, callback invocation, invalid tool name, missing params, invalid param types, re-enabling
+- Updated `noopCallbacks` in 3 test files to include `onBrowserToolPolicyPersist`
+- Files changed: platform/mcp-server/src/extension-handlers.ts, platform/mcp-server/src/extension-handlers.test.ts, platform/mcp-server/src/extension-protocol.ts, platform/mcp-server/src/extension-protocol.test.ts, platform/mcp-server/src/config.ts, platform/mcp-server/src/http-routes.ts, platform/mcp-server/src/mcp-setup-dispatch.test.ts
+- **Learnings for future iterations:**
+  - Adding a field to `McpCallbacks` requires updating noopCallbacks in 3 test files
+  - Use `replace_all` for repeated inline callback patterns that need the same change
+  - `saveBrowserToolPolicy` is structurally identical to `saveToolConfig` — just updates a different field
+  - The handler sends `plugins.changed` notification so the side panel refreshes automatically
+---
+
+## 2026-03-01 - US-002
+- Extended `handleConfigGetState` in `extension-handlers.ts` to include a `browserTools` array
+- Added `isBrowserToolEnabled` import from `./state.js` (added to multi-line import block for prettier)
+- Builds the `browserTools` array by mapping `state.cachedBrowserTools`, calling `isBrowserToolEnabled` for each, sorting alphabetically by name
+- Added 4 tests in `extension-handlers.test.ts`: presence of browserTools, alphabetical sort, policy-disabled tool, empty array
+- Files changed: platform/mcp-server/src/extension-handlers.ts, platform/mcp-server/src/extension-handlers.test.ts
+- **Learnings for future iterations:**
+  - Use `.slice()` before `.sort()` on state arrays to avoid mutating state in place
+  - Mock `state.extensionWs` with `{ send, close }` to capture JSON-RPC responses in handler tests
+  - The handler sends the full result in one `sendToExtension` call — parse `messages[0]` to assert the full result shape
+---
+
+## 2026-03-01 - US-001
+- Added `ConfigStateBrowserTool` interface (name, description, enabled) after `ConfigStateFailedPlugin`
+- Added `browserTools: ConfigStateBrowserTool[]` field to `ConfigStateResult`
+- Added `ConfigSetBrowserToolEnabledParams` interface (tool, enabled) after `ConfigSetAllToolsEnabledParams`
+- Files changed: platform/shared/src/index.ts
+- **Learnings for future iterations:**
+  - All shared wire types live in the single file `platform/shared/src/index.ts`
+  - Browser tools are simpler than plugin tools — just name, description, enabled (no icons, displayName, tabState, etc.)
+  - Interfaces are exported inline; no barrel re-export needed since the file is the barrel
+---
+
+## 2026-03-01 - US-004
+- Created `BrowserToolsCard` component in `platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx`
+- Follows PluginCard pattern: AccordionPrimitive for custom header layout, optimistic toggle with rollback via version counter, error alert with auto-dismiss
+- Header has Globe icon (8x8 box with border), "Browser Tools" title, BUILT-IN badge, ChevronDown, toggle-all Switch
+- Expanded content shows ToolRow per tool with per-tool toggle
+- `toDisplayName` strips `browser_` prefix and title-cases remaining words
+- All browser tools use `'globe'` as the icon for ToolRow
+- Active tool tracking uses key format `browser:${toolName}`
+- Added `BrowserToolState` type alias and `setBrowserToolEnabled` bridge function in `bridge.ts`
+- Created `BrowserToolsCard.stories.tsx` with 5 stories: Default, SomeDisabled, AllDisabled, WithActiveTool, WithToolFilter
+- Files changed: platform/browser-extension/src/side-panel/bridge.ts, platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx, platform/browser-extension/src/side-panel/components/BrowserToolsCard.stories.tsx
+- **Learnings for future iterations:**
+  - knip uses `src/**/*.stories.tsx` as entry points — new components need a stories file to be reachable
+  - BrowserToolState has no displayName or icon on the wire type; derive them in the component
+  - ToolRow's icon prop accepts lucide icon name strings (e.g., 'globe', 'wrench')
+  - handleToggleAll sends individual setBrowserToolEnabled calls per tool (no batch endpoint)
+  - The toggle-all only sends requests for tools whose state actually differs from the target
+---
+
+## 2026-03-01 - US-005
+- Added `browserTools` state to `App.tsx` via `useState<BrowserToolState[]>([])`
+- Updated `loadPlugins` to extract `browserTools` from `fetchConfigState()` result and call `setBrowserTools`
+- Updated `loadPlugins` active tools cleanup to preserve `browser:` prefixed keys (not just plugin keys)
+- Added `setBrowserTools([])` to disconnect handler for clean state on disconnect
+- Updated `hasContent` to include `browserTools.length > 0` (prevents NoPluginsState when only browser tools exist)
+- Rendered `BrowserToolsCard` above `PluginList` in main view, wrapped in its own `<Accordion type="multiple">`
+- Updated `SearchResults` to accept `browserTools` and `setBrowserTools` props
+- Added `matchesBrowserTool` filter function and `hasBrowserToolMatches` logic in SearchResults
+- Browser tools appear in the "Installed" section during search, above plugin results
+- Updated `SearchResults.stories.tsx` and `SidePanel.stories.tsx` to pass new required props
+- Files changed: platform/browser-extension/src/side-panel/App.tsx, platform/browser-extension/src/side-panel/components/SearchResults.tsx, platform/browser-extension/src/side-panel/components/SearchResults.stories.tsx, platform/browser-extension/src/side-panel/components/SidePanel.stories.tsx
+- **Learnings for future iterations:**
+  - ConfigStateResult.browserTools is non-optional — using `?? []` triggers lint error
+  - When adding required props to a shared component, check ALL story files (component's own + SidePanel stories + SearchResults stories)
+  - useServerNotifications hook already handles `browser` as plugin name for tool invocation events (VALID_PLUGIN_NAME regex matches it)
+  - Active tool cleanup in loadPlugins must preserve browser: keys separately since no plugin has name "browser"
+  - BrowserToolsCard uses its own Accordion wrapper, separate from PluginList's Accordion
+---
+
+## 2026-03-01 - US-006
+- Added `Interactive` story to `BrowserToolsCard.stories.tsx` (6th story alongside Default, SomeDisabled, AllDisabled, WithActiveTool, WithToolFilter) — uses `extension_get_state` tool for variety
+- Added `mockBrowserTools` constant to `SidePanel.stories.tsx` and imported `BrowserToolsCard` + `BrowserToolState`
+- Added `WithBrowserTools` story — BrowserToolsCard above PluginList with mockPlugin() + githubPlugin() + browser tools
+- Added `BrowserToolsOnly` story — BrowserToolsCard alone with no plugins (demonstrates no NoPluginsState shown)
+- Fixed 12 failing E2E tests caused by browser tools always being present in the side panel:
+  - `onboarding.e2e.ts` (4 tests): replaced `'text=No Plugins Installed'` visible assertions with `'text=Browser Tools'`; removed `'text=opentabs plugin'` check (NoPluginsState no longer shown); replaced "no-plugins card appears" assertion with "E2E Test hidden + Browser Tools visible"
+  - `side-panel-reload.e2e.ts` (2 tests): same pattern — "Browser Tools" visible + "E2E Test" hidden when no plugins
+  - `side-panel-live-update.e2e.ts` (2 tests): same pattern; also removed `button[data-radix-collection-item]` strict-mode assertion (now matches 2 elements)
+  - `side-panel-plugin-toggle.e2e.ts` (2 tests): changed `.locator('button[aria-expanded]').first()` to `.filter({ hasText: 'E2E Test' })` to find the plugin card specifically
+  - `side-panel-data-flow.e2e.ts` (1 test): same `.filter({ hasText: 'E2E Test' })` fix
+  - `side-panel-icons.e2e.ts` (1 test): scoped `.locator('.border-border').first()` to within `button[aria-expanded]` filtered by 'E2E Test'
+- All 404 E2E tests pass; all Phase 1 checks pass
+- Files changed: platform/browser-extension/src/side-panel/components/BrowserToolsCard.stories.tsx, platform/browser-extension/src/side-panel/components/SidePanel.stories.tsx, e2e/onboarding.e2e.ts, e2e/side-panel-reload.e2e.ts, e2e/side-panel-live-update.e2e.ts, e2e/side-panel-plugin-toggle.e2e.ts, e2e/side-panel-data-flow.e2e.ts, e2e/side-panel-icons.e2e.ts
+- **Learnings for future iterations:**
+  - Adding BrowserToolsCard to the side panel makes browser tools always visible when connected — any E2E test expecting "No Plugins Installed" (the NoPluginsState) will break because HasContent is always true
+  - `.locator('button[aria-expanded]').first()` and `.locator('.border-border').first()` in E2E tests must be scoped with `.filter({ hasText: 'PluginName' })` when browser tools card is also present
+  - Playwright strict mode fails when `toBeVisible()` is called on a locator matching 2+ elements — either filter to 1 element or remove the assertion if another check covers the same intent
+  - The `Interactive` story adds 1 more mock tool (`extension_get_state`) for variety — it's a full interactive playground story
+---
