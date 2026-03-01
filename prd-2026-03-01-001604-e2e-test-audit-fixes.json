@@ -1,0 +1,120 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix genuine E2E test quality issues found during a comprehensive audit: resource leaks on test failure, missing assertions that create false negatives/positives, race conditions in timing-dependent assertions, and inconsistent use of the writeAndWaitForWatcher helper.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix MCP client leak in strict-csp.e2e.ts manual cleanup test",
+      "description": "As a platform contributor, I want the strict-CSP file watcher IIFE re-injection test to clean up its MCP client connection on failure so that leaked connections do not cause server teardown hangs or cascading test timeouts.",
+      "acceptanceCriteria": [
+        "The MCP client created at line ~503 is closed in the finally block alongside the other resources (context, server, strictCspSrv, tmpDir, cleanupDir)",
+        "The client variable is declared alongside the other resource variables (server, strictCspSrv, context, cleanupDir) before the try block so the finally block can access it",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/strict-csp.e2e.ts, lines 475-572. The test creates an MCP client at line 503 (`const client = createMcpClient(...)`) inside the try block. `await client.close()` is at line 562, which is only reached on success. The finally block (lines 563-570) cleans up context, server, strictCspSrv, tmpDir, and cleanupDir but NOT the client.\n\nFix: Declare `let client: McpClient | undefined;` before the try (alongside lines 489-492), assign inside the try, and add `if (client) await client.close().catch(() => {});` to the finally block. Follow the same pattern as the other resources. See e2e/helpers.ts:setupIsolatedIifeTest (lines 446-493) for the correct pattern — it tracks all resources including the client."
+    },
+    {
+      "id": "US-002",
+      "title": "Add missing retryable assertion in sdk-fetch-errors.e2e.ts 500 test",
+      "description": "As a platform contributor, I want the HTTP 500 error test to assert the retryable field so that a regression where 500 errors become retryable is caught by E2E tests.",
+      "acceptanceCriteria": [
+        "The '500 produces category=internal' test asserts retryable=false in both the human-readable prefix (toContain) and the JSON block (parseErrorJson)",
+        "The assertion pattern matches the other tests in the same file (e.g., the 404 test at lines 24-36 or the timeout test at lines 94-112)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/sdk-fetch-errors.e2e.ts, lines 115-129. The '500 produces category=internal' test is the only test in this file that does NOT assert the `retryable` field. Every other test asserts it (lines 33, 56-57, 79, 106).\n\nFix: Add `expect(result.content).toContain('retryable=false');` after line 123, and add `expect(json.retryable).toBe(false);` after line 126. This matches the pattern used in all other tests in the file."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix race condition in plugin-logging.e2e.ts buffer count assertion",
+      "description": "As a platform contributor, I want the log buffer count assertion to be robust against concurrent log entries so that the test does not flake when other log entries arrive between the waitForHealth poll and the subsequent health() call.",
+      "acceptanceCriteria": [
+        "The buffer count assertion uses >= (greater-than-or-equal) instead of exact equality, matching the polling predicate",
+        "The overly broad log level tag assertions (lines 58-61: 'DEBUG', 'INFO', 'WARNING', 'ERROR') are tightened to include the plugin-specific prefix so they can only match plugin log entries, not server infrastructure logs",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/plugin-logging.e2e.ts.\n\nIssue 1 (lines 120-127): The waitForHealth predicate uses `buf >= bufferBefore + 4` but the subsequent assertion on line 127 uses exact equality: `expect(bufferAfter).toBe(bufferBefore + 4)`. Between the two health() calls, additional log entries could arrive (from lifecycle hooks, internal operations), causing the exact count to be higher. Fix: Change line 127 to `expect(bufferAfter).toBeGreaterThanOrEqual(bufferBefore + 4);`.\n\nIssue 2 (lines 58-61): The assertions `expect(allLogs).toContain('DEBUG')` etc. are overly broad — they match any server log containing these common strings, not just plugin log entries. The test has a unique `prefix` variable (line 30: `const prefix = ...`). The specific assertions on lines 52-55 already check `${prefix} debug-message` etc. Fix: Either remove lines 58-61 entirely (they add no value beyond lines 52-55) or tighten them to e.g. `expect(allLogs).toContain('[plugin:e2e-test] DEBUG')`. Removal is cleaner since lines 52-55 already provide the real coverage."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix vacuous achromatic assertion in build-icons.e2e.ts",
+      "description": "As a platform contributor, I want the achromatic color assertion to fail if no hex colors are found so that the test does not pass vacuously when the SVG generation changes color format.",
+      "acceptanceCriteria": [
+        "The 'valid icon.svg (no icon-inactive.svg)' test asserts that extractHexColors returns a non-empty array before iterating to check achromatic colors",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/build-icons.e2e.ts, lines 131-140. The test extracts hex colors from the auto-generated inactive SVG and checks each is achromatic (R=G=B). However, if `extractHexColors()` returns an empty array, the for-loop executes zero iterations and the test passes without verifying anything.\n\nFix: Add `expect(inactiveColors.length).toBeGreaterThan(0);` after line 133 and before the for-loop on line 134. Note: the last test in the file ('auto-generated inactive icon preserves visual structure', line ~293) already has `expect(grayColors.length).toBe(3)` so only the first test needs this fix."
+    },
+    {
+      "id": "US-005",
+      "title": "Add missing page.close() calls in audit-logging and sdk-version tests",
+      "description": "As a platform contributor, I want all tests that call setupToolTest to close the returned page so that resource usage is consistent and tabs do not accumulate during test execution.",
+      "acceptanceCriteria": [
+        "The 'GET /audit without Bearer auth returns 401' test in audit-logging.e2e.ts captures the page from setupToolTest and calls page.close() at the end",
+        "The 'plugin with matching SDK version loads and tools are callable' test in sdk-version.e2e.ts captures the page from setupToolTest and calls page.close() at the end",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two files have the same issue — setupToolTest returns a Page but the return value is discarded.\n\nFile 1: e2e/audit-logging.e2e.ts, lines 294-302. The test calls `await setupToolTest(mcpServer, testServer, extensionContext, mcpClient)` but does not capture the return value. Every other test in this file (lines ~77, ~115, ~176, ~221, ~260) captures the page and calls `await page.close()`. Fix: Change line 295 to `const page = await setupToolTest(...)` and add `await page.close();` after line 301 (before the closing brace).\n\nFile 2: e2e/sdk-version.e2e.ts, lines 63-81. The test calls `await setupToolTest(...)` on line 71 but discards the return value. Fix: Change line 71 to `const page = await setupToolTest(...)` and add `await page.close();` before the closing brace of the test (after line 80)."
+    },
+    {
+      "id": "US-006",
+      "title": "Use writeAndWaitForWatcher in hot-reload-dynamic.e2e.ts tools.json rewrite test",
+      "description": "As a platform contributor, I want the tools.json rewrite test to use writeAndWaitForWatcher so that it retries on FSEvents race conditions like all other file watcher tests, preventing flaky failures on macOS.",
+      "acceptanceCriteria": [
+        "The 'rewriting tools.json preserves all tools' test uses writeAndWaitForWatcher instead of raw fs.writeFileSync + waitForLog",
+        "The writeAndWaitForWatcher call waits for 'File watcher: Watching' first and retries writes on FSEvents miss, matching the pattern used by other file watcher tests in the same file",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: e2e/hot-reload-dynamic.e2e.ts, lines 1258-1267. The 'rewriting tools.json preserves all tools' test writes tools.json directly with `fs.writeFileSync` (line 1264) and then waits with `waitForLog(server, 'tools.json updated for', 10_000)` (line 1267). Other file watcher tests in the same file use `writeAndWaitForWatcher` (from e2e/helpers.ts, line 517) which retries the write if FSEvents misses the notification — a known macOS race documented in the helper's JSDoc.\n\nFix: Replace lines 1258-1267 with a single `writeAndWaitForWatcher` call. The helper already handles waiting for 'File watcher: Watching' internally (line 525 of helpers.ts). The callback should read the current tools.json content and write it back (same content, just to trigger the watcher). On retries (attempt > 0), append a trailing newline or comment to guarantee a different file hash.\n\nExample pattern (from other tests in the same file):\n```\nconst toolsJsonPath = path.join(pluginDir, 'dist', 'tools.json');\nconst toolsContent = fs.readFileSync(toolsJsonPath, 'utf-8');\nawait writeAndWaitForWatcher(\n  server,\n  (attempt) => fs.writeFileSync(toolsJsonPath, attempt === 0 ? toolsContent : toolsContent + '\\n', 'utf-8'),\n  'tools.json updated for',\n);\n```\n\nImport writeAndWaitForWatcher from './helpers.js' — check if it's already imported at the top of the file. The file already imports several helpers."
+    }
+  ]
+}
