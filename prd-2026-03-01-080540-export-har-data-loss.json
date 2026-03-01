@@ -1,0 +1,27 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix silent data loss in export-har buffer clearing — merge entries from clearing fetches instead of discarding them",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Merge entries from clearing dispatches in export-har to prevent data loss",
+      "description": "As a developer using network capture, I want HAR exports to include all captured requests so that requests arriving between the initial fetch and the clear are not silently dropped",
+      "acceptanceCriteria": [
+        "When args.clear is true, the response data from the clearing getNetworkRequests dispatch is merged into the entries array (not discarded)",
+        "When args.clear is true and includeWebSocketFrames is true, the response data from the clearing getWebSocketFrames dispatch is also merged into the entries array",
+        "Duplicate entries (same request appearing in both the initial fetch and the clear fetch) are deduplicated before merging",
+        "When args.clear is false, behavior is unchanged — only the initial fetch is performed",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/export-har.ts, lines 194-249\n\nCurrent flow:\n1. Fetch network requests WITHOUT clearing (line 202-207)\n2. Optionally fetch WebSocket frames WITHOUT clearing (line 212-217)\n3. If args.clear, re-dispatch getNetworkRequests with clear:true (line 225) — response DISCARDED\n4. If args.clear and includeWebSocketFrames, re-dispatch getWebSocketFrames with clear:true (line 227) — response DISCARDED\n\nThe problem: Between step 1 and step 3, new network requests may have arrived. The clear dispatch returns those new requests but the code discards the response. Those requests are silently lost.\n\nFix approach:\n- On the clearing dispatches (lines 225-228), capture the response data\n- Parse the response the same way as the initial fetch (requestsRaw handling pattern)\n- Convert new entries using requestToHarEntry / wsFrameToHarEntry\n- Merge into the entries array\n- To deduplicate, use a Set of request identifiers. The CapturedRequest type has startTime and url fields which together form a unique key. Alternatively, use the requestId field if present.\n- If deduplication is complex, a simpler approach: since the initial fetch did NOT clear, the clearing fetch's response will contain ALL entries (old + new). Just replace the initial entries with the clearing fetch's entries instead of merging. This is simpler and avoids dedup entirely.\n\nIMPORTANT: The sort at lines 232-236 using localeCompare on ISO 8601 strings is fine — do not change it.\n\nWARNING: Do NOT change the two-phase fetch design (fetch-without-clear then clear-separately). This design prevents data loss when the second fetch (WebSocket frames) fails. The fix is only about using the clearing fetch's response instead of discarding it."
+    }
+  ]
+}
