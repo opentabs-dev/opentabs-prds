@@ -17,7 +17,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/browser-commands/extension-commands.ts\n\nBug: When SCRIPT_TIMEOUT_MS fires (line 482-486), Promise.race rejects and the finally block (line 491-494) sets cancelled.value = true. The injectPromise async function continues running in the background. When it reaches the cleanup code at lines 460-477, the guard `if (!cancelled.value)` evaluates to false, so cleanup is skipped. The namespaced globals (__execResult_<uuid>, __execAsync_<uuid>) persist permanently on globalThis.__openTabs in the target tab.\n\nFix approach: Move the globals cleanup out of the `if (!cancelled.value)` guard. The cleanup should run unconditionally when the polling loop exits (whether via inner timeout, outer timeout cancellation, or normal completion with result). One clean approach: always attempt cleanup in a finally block after the while loop, regardless of cancelled.value. The cleanup is already best-effort (uses .catch(() => {})), so running it even when cancelled is safe — the tab may have navigated away, and the catch handles that.\n\nAlternatively, perform cleanup after the Promise.race in the outer scope (lines 491-494), in the finally block, using a fire-and-forget chrome.scripting.executeScript call. This ensures cleanup happens even if the inner injectPromise is still stuck in a poll iteration.\n\nKey constraints:\n- The cleanup chrome.scripting.executeScript call must be fire-and-forget (don't await it, or use .catch(() => {}))\n- Don't break the existing flow where successful executions clean up globals inline (lines 433-435)\n- Keep the cancelled.value = true assignment for the early-exit check in the polling loop (line 407)"
@@ -40,7 +40,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/browser-extension/src/sanitize-error.ts\n\nThe existing sanitizeErrorMessage function (lines 9-27) has regex patterns for IPv4 (line 20: /\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}/g), Windows paths, Unix paths, URLs, and localhost:port. IPv6 is missing.\n\nAdd IPv6 sanitization regex(es) AFTER the existing IPv4 pattern. IPv6 matching is complex but a pragmatic approach covers the common forms:\n\n1. Bracketed IPv6 (often in URLs/error messages): \\[[:0-9a-fA-F]+\\](?::\\d+)? — matches [::1], [::1]:9515, [2001:db8::1]\n2. Bare IPv6 with at least two colons (to avoid matching non-IPv6 strings): [0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]* — matches ::1, 2001:db8::1, ::ffff:127.0.0.1, fe80::1%eth0\n\nIMPORTANT: The IPv6 patterns must run BEFORE the localhost pattern (line 18) to avoid partial matches where localhost:port inside [::1]:9515 gets replaced first.\n\nAlso add the bracketed pattern before the bare pattern to prevent partial matches.\n\nExisting test file: platform/browser-extension/src/__tests__/sanitize-error.test.ts — add test cases for IPv6 patterns there. If the test file doesn't exist, create it."

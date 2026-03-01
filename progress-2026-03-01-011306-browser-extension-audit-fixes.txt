@@ -1,0 +1,33 @@
+## Codebase Patterns
+- `handleBrowserExecuteScript` in `platform/browser-extension/src/browser-commands/extension-commands.ts` uses a namespaced IIFE (`injectPromise`) with an outer `Promise.race` against `timeoutPromise`.
+- When testing async operations that run in the background after a handler settles, use `resolveManually()` + `await Promise.resolve()` to flush microtasks without depending on timer ordering.
+- The polling while loop's `if (cancelled.value) return;` check fires between poll iterations (during the 50ms wait), not while a poll executeScript is in-flight.
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-011306-browser-extension-audit-fixes~running.json
+Started: Sun Mar  1 09:13:29 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Fixed globals leak in `handleBrowserExecuteScript` when `SCRIPT_TIMEOUT_MS` fires while injection is pending and injection later completes. The `if (cancelled.value) return;` guard in the polling loop caused cleanup to be skipped.
+- Files changed:
+  - `platform/browser-extension/src/browser-commands/extension-commands.ts`: Wrapped the polling `while` loop in a `try/finally`. The `finally` fires `chrome.scripting.executeScript` cleanup unconditionally (fire-and-forget) — whether the loop exits normally, hits the inner `EXEC_MAX_ASYNC_WAIT_MS` timeout, or is cancelled by the outer `SCRIPT_TIMEOUT_MS`. Removed the old `if (!cancelled.value)` conditional cleanup block.
+  - `platform/browser-extension/src/browser-commands/extension-commands.test.ts`: Updated success test count (2→3 calls: injection + poll + finally cleanup). Added new test "runs cleanup when outer SCRIPT_TIMEOUT_MS fires during injection and injection later completes".
+- **Learnings for future iterations:**
+  - `EXEC_MAX_ASYNC_WAIT_MS` (10s) < `SCRIPT_TIMEOUT_MS` (30s in mock, 25s in prod), so the inner timeout always fires before the outer in normal operation. The outer timeout path is triggered by slow injection (tab stops responding mid-injection) followed by late injection completion.
+  - Testing background async operations after a handler settles: `resolveManually()` + `await Promise.resolve()` flushes the microtask queue sufficiently since the subsequent code path is synchronous (no more awaits after the if-check).
+  - `try/finally` inside an async function catches `return` statements — the finally block runs before the return takes effect, enabling unconditional cleanup regardless of exit path.
+  - The inline cleanup inside the poll `executeScript` (lines 433-435) still runs on success; the `finally` cleanup is a harmless no-op double-delete on that path.
+---
+
+## 2026-03-01 - US-002
+- Added IPv6 address sanitization to `sanitizeErrorMessage` in `platform/browser-extension/src/sanitize-error.ts`.
+- Files changed:
+  - `platform/browser-extension/src/sanitize-error.ts`: Added two regex patterns before the localhost pattern — (1) bracketed IPv6 `\[[:0-9a-fA-F]+\](?::\d+)?` for `[::1]`, `[::1]:9515`, `[2001:db8::1]`; (2) bare IPv6 `[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:.]*(?:%\w+)?` for `::1`, `2001:db8::1`, `::ffff:127.0.0.1`, `fe80::1%eth0`. Both replace with `[IP]`.
+  - `platform/browser-extension/src/sanitize-error.test.ts`: Added `describe('IPv6 addresses', ...)` block with six tests covering all acceptance-criteria forms.
+- **Learnings for future iterations:**
+  - Bracketed IPv6 pattern must run before bare IPv6 to prevent partial replacement leaving dangling brackets (e.g., `[::1]` would become `[[IP]]` if bare ran first).
+  - The bare IPv6 pattern requires exactly two colons minimum; single-colon strings like `key: value` and `localhost:9515` don't match.
+  - The `(?:%\w+)?` suffix handles zone IDs (e.g., `%eth0`) — important for link-local addresses.
+  - IPv6 patterns placed before localhost to avoid any order-dependent partial match in messages that contain both forms.
+---
