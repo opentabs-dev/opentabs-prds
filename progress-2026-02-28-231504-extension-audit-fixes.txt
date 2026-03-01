@@ -1,0 +1,32 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-231504-extension-audit-fixes~running.json
+Started: Sun Mar  1 07:15:37 UTC 2026
+---
+
+## Codebase Patterns
+- BrowserToolsCard and PluginCard both use a `toggleCounter` ref + version matching to guard optimistic toggle revert — the catch handler only fires if its version equals the current counter
+- Optimistic toggle pattern: `onToolsChange(prev => { ref.current = prev; return updatedState; })` — capture pre-toggle via `prev` inside the updater, not via a stale closure over the outer variable
+- `updatePluginTools` in PluginCard wraps `setPlugins(prev => ...)` and passes `p.tools ?? []` as `prev` to the inner updater, so the inner updater's `prev` is the current plugin's tools array
+- Vitest module mocks in `.test.ts` files: put `vi.mock('path')` AFTER all imports (Vitest hoists it automatically); imports must still be at the top in the correct group order (sibling → parent → external, no blank lines between groups per `newlines-between: 'never'`)
+- When spying on `console.warn` in a test with type safety: declare `warnSpy` locally within the test (not at describe scope) so TypeScript infers the concrete return type of `vi.spyOn` rather than `any`; use `vi.restoreAllMocks()` in `afterEach` for cleanup
+
+## [2026-03-01 07:18] - US-001
+- Fixed stale closure in optimistic toggle revert in both BrowserToolsCard and PluginCard
+- Files changed: `platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx`, `platform/browser-extension/src/side-panel/components/PluginCard.tsx`
+- In both files, `handleToggleAll` and `handleToggleTool` previously captured `originalTools` by closing over the outer `tools`/`pluginTools` variable at call time. Added `preToggleRef = useRef<...>([])` and changed the optimistic updater to `prev => { preToggleRef.current = prev; return updatedState; }`. The revert in the catch handler now uses `() => preToggleRef.current` instead of `() => originalTools`.
+- **Learnings for future iterations:**
+  - The `preToggleRef` is shared between `handleToggleAll` and `handleToggleTool` — safe because `toggleCounter` ensures only the latest toggle's catch handler fires, and `preToggleRef` is set atomically inside the updater for each toggle
+  - In `handleToggleAll`, `tools.filter(t => t.enabled !== checked)` to determine which API calls to make still correctly reads from the outer closure (we want the state at click time for determining which tools to toggle via API)
+  - React state updaters always run before Promise rejections (which are microtasks), so `preToggleRef.current` is guaranteed to be set before the catch handler fires
+---
+
+## [2026-03-01 07:30] - US-002
+- Guarded `sanitizeSvg` call in PluginIcon with a try-catch to prevent crashing the entire side panel on broken plugin icon SVGs
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginIcon.tsx`, `platform/browser-extension/src/side-panel/components/PluginIcon.test.ts`
+- Extracted `tryGetSanitizedSvg(rawSvg, pluginName)` helper that wraps `sanitizeSvg` in try-catch: logs `console.warn` with the plugin name and returns `undefined` on error. The existing `hasSvg && svgToRender` condition already falls through to the letter-avatar when `svgToRender` is `undefined`, so no conditional logic changes were needed.
+- Added 4 unit tests in `PluginIcon.test.ts`: undefined rawSvg returns undefined; success path returns sanitized string; throw path returns undefined and logs warning; throw path does not propagate the error.
+- **Learnings for future iterations:**
+  - Extracting fallible logic into a named exported helper (instead of inline try-catch in JSX) makes the component code cleaner and enables pure-function unit testing without React Testing Library
+  - `vi.mock` path in the test file must resolve to the same module as the production code's import — both `../../sanitize-svg.js` from the test file and from PluginIcon.tsx resolve to `src/sanitize-svg.ts`, confirming they mock the same module
+  - `import-x/exports-last` requires that exports be at the END of the file — adding `tryGetSanitizedSvg` to the existing export statement at the bottom is the correct pattern
+---
