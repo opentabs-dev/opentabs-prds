@@ -1,0 +1,62 @@
+## Codebase Patterns
+- `platform/plugin-tools/src/validate-icon.ts` contains all SVG icon validation: `parseColor`, `isAchromaticColor`, `convertColorToGray`, `generateInactiveIcon`
+- `parseColor` and `convertColorToGray` have separate code paths for: legacy comma-separated rgb(), modern space-separated rgb(), hsl/hsla, hex, named colors — each must be updated independently when adding new features
+- Prettier formats single-expression arrow functions onto a single line — don't write multi-line arrow functions if ESLint expects single line
+- `@typescript-eslint/no-non-null-assertion` is enforced — never use `!` on array accesses; use `?? fallback`
+- `platform/plugin-tools/src/commands/build.ts` handles watch mode, plugin registration in `~/.opentabs/config.json`
+- `platform/shared/src/index.ts` contains `validateUrlPattern`; tests in `platform/shared/src/validation.test.ts`
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-011735-plugin-tools-shared-audit-fixes~running.json
+Started: Sun Mar  1 09:18:16 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Fixed watch mode double-rebuild caused by lingering debounce timer
+- Files changed: `platform/plugin-tools/src/commands/build.ts`
+- Added 4 lines at start of `rebuild()` to clear and null `debounceTimer` before checking `building` flag
+- **Learnings for future iterations:**
+  - Watch mode logic in `build.ts` around lines 1172-1201 uses three state variables: `debounceTimer`, `building`, `pendingRebuild`
+  - The bug: when a timer fires and calls `rebuild()`, the `debounceTimer` variable is not nulled; a new file change during an active build schedules another timer that fires independently, causing a second rebuild even after `pendingRebuild` already triggered one
+  - Fix pattern: clear the debounce timer at the start of `rebuild()` so any pending timer is cancelled when the actual rebuild work begins
+  - All Phase 1 checks passed (build, type-check, lint, knip, test); `e2eCheckpoint: false` so no E2E needed
+---
+
+## 2026-03-01 - US-002
+- Guarded against non-string elements in `config.localPlugins` in `registerInConfig()`
+- Files changed: `platform/plugin-tools/src/commands/build.ts`
+- Changed the `if (!Array.isArray(...)) config.localPlugins = []` block to also filter non-string elements using a type guard: `(config.localPlugins as unknown[]).filter((p): p is string => typeof p === 'string')`
+- **Learnings for future iterations:**
+  - The `registerInConfig` function in `build.ts` around line 206 handles reading and updating `~/.opentabs/config.json`
+  - `config` is typed as `Record<string, unknown>`, so its fields must be cast carefully
+  - The fix filters `config.localPlugins` in-place (reassigns it) so that the same filtered array reference is used for both the duplicate check and the push
+  - All Phase 1 checks passed (build, type-check, lint, knip, test); `e2eCheckpoint: false` so no E2E needed
+---
+
+## 2026-03-01 - US-003
+- Added IPv4 octet validation in `validateUrlPattern` to reject addresses with octets > 255
+- Files changed: `platform/shared/src/index.ts`, `platform/shared/src/validation.test.ts`
+- After the existing host format check passes (which allows `\d{1,3}` for each octet), a separate check now tests the IP regex and validates each octet is 0-255
+- Used `host.replace(/:\d+$/, '')` to strip port before splitting on `.` — avoids non-null assertion that lint forbids
+- Added 10 new tests covering: valid IPs (192.168.1.1, 127.0.0.1, 10.0.0.1, 0.0.0.0, 255.255.255.255, with port), invalid IPs (256.0.0.1, 999.999.999.999, 192.168.1.256)
+- **Learnings for future iterations:**
+  - The `@typescript-eslint/no-non-null-assertion` rule is enforced — never use `!` suffix on array/regex capture group accesses; use `?? fallback` or restructure to avoid the assertion
+  - `validateUrlPattern` is in `platform/shared/src/index.ts` around lines 432-480; tests are in `platform/shared/src/validation.test.ts`
+  - The IP format regex `/^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/` only validates format (1-3 digits per octet), not range — octet range validation must be added separately
+  - All Phase 1 checks passed (build, type-check, lint, knip, test); `e2eCheckpoint: false` so no E2E needed
+---
+
+## 2026-03-01 - US-004
+- Added support for percentage-based rgb() in comma-separated (legacy) syntax in `validate-icon.ts`
+- Files changed: `platform/plugin-tools/src/validate-icon.ts`, `platform/plugin-tools/src/validate-icon.test.ts`
+- Root cause: `parseColor` legacy comma regex `(\d+)` matched integers only; modern space-separated `([\d.]+%?)` already handled percentages
+- Added module-level `parseRgbComponent` helper: `s.endsWith('%') ? Math.round(parseFloat(s) * 2.55) : parseInt(s, 10)` — consistent with existing modern syntax handler
+- Updated three regexes: legacy rgb in `parseColor` and legacy rgb/rgba in `convertColorToGray`, from `(\d+)` to `(\d+%?)`
+- Replaced two inline `parseComponent` closures in modern space-separated paths with the new shared `parseRgbComponent` helper
+- Added 6 new tests: `validateInactiveIconColors` (saturated fails, rgba with alpha fails, achromatic passes) and `generateInactiveIcon` (rgb 100% red → #363636, rgba 100% red with alpha preserved, roundtrip)
+- **Learnings for future iterations:**
+  - `parseColor` and `convertColorToGray` in `validate-icon.ts` have SEPARATE code paths for legacy comma-separated and modern space-separated rgb() — BOTH must be updated when extending rgb() support
+  - `50% * 2.55` in IEEE 754 floating point = 127.499... → Math.round gives 127, not 128 — tests for 50% use 127
+  - Prettier auto-formats single-expression arrow functions to one line; write them that way to avoid lint errors
+  - All Phase 1 checks passed (build, type-check, lint, knip, test); `e2eCheckpoint: false` so no E2E needed
+---
