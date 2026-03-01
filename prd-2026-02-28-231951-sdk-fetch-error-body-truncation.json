@@ -1,0 +1,27 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix unbounded error response body reading in the Plugin SDK fetchFromPage utility and add missing test coverage for the error body fallback path.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Truncate error response body in fetchFromPage and add test coverage",
+      "description": "As a plugin developer, I want fetchFromPage to truncate large HTTP error response bodies so that a proxy returning a multi-megabyte HTML error page does not cause memory pressure in the page context or unnecessary serialization overhead through the extension pipeline.",
+      "acceptanceCriteria": [
+        "fetchFromPage truncates the error response body to a maximum of 512 characters before including it in the ToolError message, appending '…' when truncated",
+        "A new test verifies that a large error response body (e.g., 10,000+ characters) is truncated to 512 characters plus the ellipsis in the resulting ToolError message",
+        "A new test verifies that when response.text() rejects (e.g., body stream error), the error message falls back to response.statusText instead of crashing",
+        "Existing error-handling tests continue to pass unchanged (all current HTTP status code mapping tests remain green)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-sdk/src/fetch.ts, line 91.\n\nCurrent code:\n```\nconst errorText = await response.text().catch(() => response.statusText);\nconst msg = `fetchFromPage: HTTP ${response.status} for ${url}: ${errorText}`;\nthrow httpStatusToToolError(response, msg);\n```\n\nThe fix is to truncate `rawText` before building the message string. Add a module-level constant (e.g., `const MAX_ERROR_BODY_LENGTH = 512;`) and truncate:\n```\nconst rawText = await response.text().catch(() => response.statusText);\nconst errorText = rawText.length > MAX_ERROR_BODY_LENGTH\n  ? rawText.slice(0, MAX_ERROR_BODY_LENGTH) + '…'\n  : rawText;\n```\n\nFor tests (platform/plugin-sdk/src/fetch.test.ts):\n\n1. Large error body test: Add a new endpoint to the test HTTP server (e.g., `/error-500-large`) that returns a 500 status with a 10,000-character body. Assert that the resulting ToolError.message contains at most ~512 chars of the body content (look for the '…' truncation marker).\n\n2. response.text() fallback test: Add a new endpoint (e.g., `/error-500-no-body`) that returns a 500 status. Then mock/intercept the response so that `.text()` rejects (or use a response where the body stream is already consumed). Assert the ToolError.message contains the statusText fallback ('Internal Server Error'). Alternatively, this can be tested by constructing a mock Response object with a body that throws on .text(), but since the test file uses a real HTTP server, a simpler approach is to verify the .catch path by testing with a response whose body stream is disturbed (call response.text() before passing to fetchFromPage won't work since fetchFromPage calls fetch internally). The cleanest approach: add a test that directly tests the truncation and fallback by calling the error path with a known large response from the test server.\n\nThe existing test server is defined inline in fetch.test.ts (beforeAll block). Add new route handlers there.\n\nDo NOT change the truncation constant name or value to anything other than MAX_ERROR_BODY_LENGTH = 512 — this was chosen to be less than the downstream sanitizeErrorMessage limit (500 chars) while providing enough context for debugging. The downstream sanitizer (in platform/browser-extension/src/sanitize-error.ts) also strips URLs and IPs, so the SDK-level truncation at 512 chars means the sanitizer receives a manageable input."
+    }
+  ]
+}
