@@ -1,0 +1,52 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add missing E2E test coverage for two side panel features: the 'Authentication Failed' empty state (shown when extension has wrong secret) and the port configuration editor in the footer (inline NumberStepper that triggers WebSocket reconnect).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "E2E test: side panel shows 'Authentication Failed' when extension has wrong secret",
+      "description": "As a platform developer, I want an E2E test verifying the side panel shows the 'Authentication Failed' card (not 'Cannot Reach MCP Server') when the extension's secret doesn't match the server's secret, so that the disconnect reason flow (offscreen → background → side panel) is covered by tests.",
+      "acceptanceCriteria": [
+        "New test file e2e/side-panel-auth-failed.e2e.ts exists",
+        "Test starts MCP server with a known secret, launches extension with a DIFFERENT (wrong) secret",
+        "Test opens the side panel and verifies text 'Authentication Failed' is visible (not 'Cannot Reach MCP Server' and not 'No Plugins Installed')",
+        "Test verifies the extension is NOT connected (extensionConnected === false in /health)",
+        "Test has proper cleanup in finally block (context.close, server.kill, fs.rmSync, cleanupTestConfigDir)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The 'Authentication Failed' state is rendered by AuthFailedState in platform/browser-extension/src/side-panel/components/EmptyStates.tsx (line 50). It is shown when DisconnectedState receives reason='auth_failed' (line 66). The disconnect reason flows: offscreen/index.ts returns { reason: 'auth_failed' } when /ws-info returns 401 (line 79) → background-message-handlers.ts stores lastDisconnectReason → side panel App.tsx sets disconnectReason state → renders DisconnectedState.\n\nThe test should NOT use the standard extensionContext fixture (which sets up matching secrets). Instead, follow the pattern in e2e/auth-bootstrap.e2e.ts which uses manual setup via launchExtensionContext(). Key steps:\n1. Create config dir with createTestConfigDir()\n2. Start MCP server: const server = await startMcpServer(configDir, true)\n3. Launch extension with WRONG secret: const { context, cleanupDir } = await launchExtensionContext(server.port, 'wrong-secret-value')\n4. Wait briefly for connection attempt to fail (the extension tries /ws-info with wrong secret → 401 → auth_failed)\n5. Open side panel: const sidePanelPage = await openSidePanel(context)\n6. Assert 'Authentication Failed' text is visible\n7. Assert 'Cannot Reach MCP Server' is NOT visible\n8. Assert 'No Plugins Installed' is NOT visible\n9. Verify /health shows extensionConnected === false\n\nImport openSidePanel from e2e/helpers.ts. The side panel is opened as a chrome-extension:// page via the openSidePanel helper.\n\nFile paths: e2e/side-panel-auth-failed.e2e.ts (new), e2e/fixtures.ts (imports), e2e/helpers.ts (imports)."
+    },
+    {
+      "id": "US-002",
+      "title": "E2E test: side panel port editor changes port and extension reconnects",
+      "description": "As a platform developer, I want an E2E test verifying the side panel footer's port editor works end-to-end: changing the port triggers a WebSocket reconnect to the new port, so that the port configuration flow (NumberStepper → chrome.storage.local → port-changed message → offscreen reconnect) is covered by tests.",
+      "acceptanceCriteria": [
+        "New test file e2e/side-panel-port-change.e2e.ts exists",
+        "Test starts MCP server A on port X, extension connects, side panel shows connected state (plugin card visible)",
+        "Test starts MCP server B on a different port Y (same config dir)",
+        "Test uses the side panel footer's port editor (NumberStepper with aria-label='Server port') to change the port from X to Y",
+        "Test verifies the extension disconnects from server A and reconnects to server B (plugin card becomes visible again)",
+        "Test has proper cleanup in finally block for both servers, context, and temp dirs",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "The PortEditor component is in platform/browser-extension/src/side-panel/components/Footer.tsx (line 9). It renders a NumberStepper with aria-label='Server port'. On change, it writes to chrome.storage.local and sends a 'port-changed' message via chrome.runtime.sendMessage. The offscreen document listens for this message and reconnects the WebSocket to the new port.\n\nThis test requires manual setup (not the standard extensionContext fixture) because it needs two MCP servers on different ports with the extension switching between them. Follow the pattern in e2e/side-panel-data-flow.e2e.ts (connection status test) which manually starts servers and launches extension context.\n\nKey steps:\n1. Create config dir with createTestConfigDir() or similar\n2. Start server A: const serverA = await startMcpServer(configDir, true)\n3. Launch extension connected to server A: const { context, cleanupDir, extensionDir } = await launchExtensionContext(serverA.port, serverA.secret)\n4. Set up adapter symlink: setupAdapterSymlink(configDir, extensionDir)\n5. Wait for extension connected: await waitForExtensionConnected(serverA)\n6. Open side panel and verify connected state (plugin card visible or 'Browser Tools' visible)\n7. Start server B on a different port: const serverB = await startMcpServer(configDir, true) — uses PORT=0 so gets new ephemeral port\n8. In the side panel, locate the NumberStepper input and change the value to serverB.port. The NumberStepper (platform/browser-extension/src/side-panel/components/retro/NumberStepper.tsx) uses an uncontrolled <input type='number'>. Find it by aria-label='Server port', clear the input, type the new port number, and trigger blur or press Enter to commit the change.\n9. Wait for extension to disconnect from server A and connect to server B. The port-changed message triggers offscreen to close old WebSocket and open new one. Use waitForExtensionConnected(serverB, 45_000) to verify.\n10. Verify server B /health shows extensionConnected === true\n\nIMPORTANT: Both servers must share the same auth secret (they use the same configDir, so auth.json is shared). The extension reads auth.json on each connection attempt.\n\nFile paths: e2e/side-panel-port-change.e2e.ts (new), e2e/fixtures.ts (imports), e2e/helpers.ts (imports), platform/browser-extension/src/side-panel/components/Footer.tsx (PortEditor source), platform/browser-extension/src/side-panel/components/retro/NumberStepper.tsx (NumberStepper component)."
+    }
+  ]
+}
