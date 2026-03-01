@@ -1,0 +1,161 @@
+## Codebase Patterns
+- bridge.ts uses `sendRequest(method, params) as Promise<T>` for all JSON-RPC bridge calls — cast return type, no async/await wrapper needed
+- bridge.ts exports both types and functions; types use `export type { ... }`, functions use `export { ... }`
+- New bridge types follow the interface pattern (not type aliases) for consistency
+- `matchesTool` checks displayName, name, description; `matchesPlugin` delegates to `matchesTool` for tools plus checks plugin displayName and name
+- Retro card container pattern: `border-border bg-card rounded border-2 p-3 shadow-md transition-all hover:shadow-sm` (note: Tailwind prettier plugin sorts classes alphabetically)
+- ESLint `import-x/order` groups: sibling (./) → parent (../) → external → builtin → type (import type, always last)
+- Stories follow: `Meta` with `title`, `decorators` wrapping in `w-80` div, named `StoryObj` exports — follow PluginCard.stories.tsx as the canonical pattern
+- ConfigStatePlugin.name is a short name like 'slack', NOT the full npm package name — npm search results use full names like '@opentabs-dev/opentabs-plugin-slack'; use `extractShortName` to normalize when deduplicating
+- PluginList filters by matchesTool (tool-only), not matchesPlugin (name+tools); SearchResults pre-filters with matchesPlugin and passes empty toolFilter to PluginList to show all matched plugins correctly
+- When a component includes a prop in its interface but doesn't use it in the implementation, TypeScript/knip don't complain — fine for API consistency
+- TrustTier is 'official' | 'community' | 'local' (NOT 'npm') — use 'community' for npm-sourced plugins in test/story mocks
+- PluginState.source is 'npm' | 'local'; PluginState.update is `{ latestVersion: string; updateCommand: string } | undefined`
+- Confirmation UX pattern: useState(false) for confirmPending + useRef for 3s timer — clear timer on unmount with useEffect cleanup
+- Retro Menu component has a `Menu.Separator` sub-component (added in US-008) — `React.forwardRef` wrapping `DropdownMenuPrimitive.Separator` with class `h-px bg-border -mx-1 my-1`
+- `Accordion.Item` accepts `className` merged via `cn()` — apply conditional classes directly (e.g., `pointer-events-none opacity-60`) without extra wrapper divs
+- ESLint `react-hooks/set-state-in-effect` forbids calling setState synchronously in useEffect body — use event handler callbacks instead of effects for debounced search patterns
+- `import-x/order` sorts `./retro/*` before `./SearchResults` — deeper paths come before shallower siblings alphabetically within the same group
+---
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-180637-sidepanel-plugin-lifecycle~running.json
+Started: Sun Mar  1 02:07:05 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Added `PluginSearchResult` and `PluginInstallResult` interfaces to bridge.ts
+- Added `matchesPlugin` helper that checks plugin displayName, name, and tools
+- Added `searchPlugins`, `installPlugin`, `removePlugin`, `updatePlugin` bridge functions using the existing `sendRequest` pattern
+- Exported all new types and functions
+- Files changed: `platform/browser-extension/src/side-panel/bridge.ts`
+- **Learnings for future iterations:**
+  - The four JSON-RPC methods (`plugin.search`, `plugin.install`, `plugin.remove`, `plugin.updateFromRegistry`) are already handled server-side in `extension-protocol.ts` — the bridge just needs to call them
+  - Server-side types in `platform/mcp-server/src/plugin-management.ts` match exactly what the PRD specifies for `PluginSearchResult` and `PluginInstallResult`
+  - All Phase 1 checks (build, type-check, lint, knip, test) pass with a clean run — 88 test files, 2720 tests
+---
+
+## 2026-03-01 - US-003
+- Created `SearchResults.tsx` at `platform/browser-extension/src/side-panel/components/SearchResults.tsx`
+- Created `SearchResults.stories.tsx` at `platform/browser-extension/src/side-panel/components/SearchResults.stories.tsx`
+- Component renders two sections: INSTALLED (filtered via matchesPlugin) and AVAILABLE (npm results, filtered by search query)
+- Pre-filters installed plugins with `matchesPlugin` (name+displayName+tools) then passes to PluginList with empty toolFilter to correctly show name-matched plugins
+- Deduplicates npm results against installed plugins using `extractShortName` normalization (handles short names like 'slack' vs full names like '@opentabs-dev/opentabs-plugin-slack')
+- Shows centered Loader when npmSearching instead of AVAILABLE section
+- Shows 'No results' message when both sections empty and search query is non-empty
+- Stories: InstalledOnly, NpmOnly, Both, NoResults, NpmLoading, InstallingPlugin, AllStates composite
+- Files changed: `platform/browser-extension/src/side-panel/components/SearchResults.tsx`, `platform/browser-extension/src/side-panel/components/SearchResults.stories.tsx`
+- **Learnings for future iterations:**
+  - ConfigStatePlugin.name is always a short name ('slack', 'datadog'), NOT the full npm package name — need `extractShortName` normalization to deduplicate against npm search results
+  - PluginList only filters by matchesTool (tools), not plugin name/displayName — SearchResults must pre-filter with matchesPlugin and pass empty toolFilter to PluginList to show plugins matching by name
+  - Tailwind Prettier plugin sorts by utility groups, not purely alphabetically — always run `npx prettier --write` after writing CSS classes to fix ordering
+  - All Phase 1 checks (build, type-check, lint, knip, test) pass — 88 test files, 2720 tests
+---
+
+## 2026-03-01 - US-002
+- Created `NpmPluginCard.tsx` at `platform/browser-extension/src/side-panel/components/NpmPluginCard.tsx`
+- Created `NpmPluginCard.stories.tsx` at `platform/browser-extension/src/side-panel/components/NpmPluginCard.stories.tsx`
+- Component renders: PluginIcon (tabState='closed', size=28), name+version Badge+optional OFFICIAL Badge, author in font-mono text-xs, description (line-clamp-2), Install Button (disabled+Loader when installing), Alert (status='error') when error
+- Uses `deriveDisplayName` helper to extract a clean display name from npm package names for the letter avatar
+- Stories: Default, Official, Installing, WithError, LongDescription, AllStates composite
+- Files changed: `platform/browser-extension/src/side-panel/components/NpmPluginCard.tsx`, `platform/browser-extension/src/side-panel/components/NpmPluginCard.stories.tsx`
+- **Learnings for future iterations:**
+  - Prettier sorts Tailwind classes alphabetically — don't fight it, just run `npm run format` after writing CSS classes
+  - `import-x/order` requires `./ComponentName` before `./retro/ComponentName` (parent-level before nested)
+  - PluginIcon's `getAvatarLetter` uses first char of `displayName`, so pass a clean string (not an npm package name like `@scope/package`) to get a meaningful letter avatar
+  - The `Alert` component accepts children directly (no required sub-components needed for simple error messages)
+---
+
+## 2026-03-01 - US-004
+- Created `PluginMenu.tsx` at `platform/browser-extension/src/side-panel/components/PluginMenu.tsx`
+- Created `PluginMenu.stories.tsx` at `platform/browser-extension/src/side-panel/components/PluginMenu.stories.tsx`
+- Component returns null for source='local' (local plugins cannot be uninstalled from UI)
+- Trigger: MoreHorizontal icon button (24x24, hover:bg-muted/50, no border) inside a div with stopPropagation to isolate from accordion
+- Update item only shown when plugin.update is truthy, shows "Update to v{latestVersion}"
+- Inline `<div>` separator between Update and Uninstall when both visible (Menu.Separator doesn't exist yet)
+- Confirmation UX: useState(false) for confirmPending + useRef<ReturnType<typeof setTimeout>> — clicking 'Uninstall' sets confirmPending=true for 3s, clicking 'Confirm?' calls onRemove()
+- Loader (size='sm') shown inline with Update and Uninstall text when updating/removing respectively
+- Stories: Default, WithUpdate, LocalPlugin, ConfirmState, AllStates composite
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginMenu.tsx`, `platform/browser-extension/src/side-panel/components/PluginMenu.stories.tsx`
+- **Learnings for future iterations:**
+  - TrustTier is 'official' | 'community' | 'local' (NOT 'npm') — caught by TypeScript, use 'community' for npm-sourced mocks
+  - import-x/order groups: sibling → parent → external → builtin → type (import type always last regardless of source)
+  - All Phase 1 checks (build, type-check, lint, knip, test) pass — 88 test files, 2720 tests
+---
+
+## 2026-03-01 - US-005
+- Added `className?: string` prop to `PluginMenu.tsx` outer div to allow flex layout control from parent
+- Modified `PluginCard.tsx` to import `PluginMenu`, add `onUpdate?`, `onRemove?`, `updatingPlugin?`, `removingPlugin?` optional props
+- Inserted `<PluginMenu>` between `AccordionPrimitive.Trigger` and the Switch div in the accordion header, with `className="flex shrink-0 items-center px-1"` for visual alignment
+- Added conditional `pointer-events-none opacity-60 transition-opacity` class to `Accordion.Item` when `removingPlugin` is true — uses `Accordion.Item`'s existing `className` passthrough (via `cn()` merge)
+- Added new stories to `PluginCard.stories.tsx`: `WithMenu` (npm plugin with menu), `WithMenuAndUpdate` (npm plugin with update option), `RemovingState` (opacity-60 visual)
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginMenu.tsx`, `platform/browser-extension/src/side-panel/components/PluginCard.tsx`, `platform/browser-extension/src/side-panel/components/PluginCard.stories.tsx`
+- **Learnings for future iterations:**
+  - `Accordion.Item` accepts `className` which is merged via `cn()` — safe to apply conditional layout classes directly rather than wrapping in an extra div
+  - PluginMenu returns null for `source === 'local'`, so it can be unconditionally rendered in PluginCard (no extra source check needed in PluginCard)
+  - Default no-op handlers `() => undefined` are required when optional callback props are passed to components with required prop types
+  - Prettier auto-collapses single-item arrays to one line — `useState([mockPlugin(...)])` not `useState([\n  mockPlugin(...),\n])`
+  - All Phase 1 checks (build, type-check, lint, knip, test) pass — 88 test files, 2720 tests
+---
+
+## 2026-03-01 - US-007
+- Changed `NoPluginsState` description text from "Manage plugins with:" to "Search for plugins above or install via CLI:"
+- Kept the existing `opentabs plugin` code block as fallback for CLI users
+- No changes needed to `EmptyStates.stories.tsx` — stories auto-reflect component text changes
+- Files changed: `platform/browser-extension/src/side-panel/components/EmptyStates.tsx`
+- **Learnings for future iterations:**
+  - EmptyStates.stories.tsx renders components directly without hardcoded text — story file needs no update for text-only component changes
+  - All Phase 1 checks (build, type-check, lint, knip, test) pass — 88 test files, 2720 tests
+---
+
+## 2026-03-01 - US-008
+- Added `MenuSeparator` component to `Menu.tsx` as a `React.forwardRef` wrapping `DropdownMenuPrimitive.Separator` with class `h-px bg-border -mx-1 my-1`
+- Added `Separator: MenuSeparator` to the `MenuObject` compound component assignment
+- Updated `Menu.stories.tsx` with a `WithSeparator` story showing Edit/Duplicate items separated from a destructive Delete item
+- Updated `PluginMenu.tsx` to replace the inline `<div className="bg-border mx-1 my-1 h-px" />` with `<Menu.Separator />`
+- Files changed: `platform/browser-extension/src/side-panel/components/retro/Menu.tsx`, `platform/browser-extension/src/side-panel/components/retro/Menu.stories.tsx`, `platform/browser-extension/src/side-panel/components/PluginMenu.tsx`
+- **Learnings for future iterations:**
+  - `MenuSeparator` follows the exact same `React.forwardRef` pattern as `MenuItem` — wrap `DropdownMenuPrimitive.Separator`, add to `MenuObject`, set `displayName`
+  - The class uses `-mx-1` (negative margin) to span the full menu width including padding — matches the ContextMenu.Separator pattern from RetroUI
+  - Pre-commit hook runs prettier and eslint --fix automatically on staged files; the commit lands with any auto-formatting applied
+  - All Phase 1 checks (build, type-check, lint, knip, test) pass — 88 test files, 2720 tests
+---
+
+## 2026-03-01 - US-006
+- Upgraded search bar to omnisearch: always visible when connected, placeholder changed to "Search plugins and tools..."
+- Renamed `toolFilter` state to `searchQuery` in App.tsx
+- Added debounced npm search via `handleSearchChange` callback (400ms debounce, calls `searchPlugins`)
+- Added new state: `npmResults`, `npmSearching`, `installingPlugins`, `removingPlugins`, `installErrors`
+- Added `handleInstall`, `handleRemove`, `handleUpdate` callbacks with optimistic UI state management
+- When `searchQuery` is non-empty, App.tsx renders `<SearchResults>` instead of `<PluginList>`
+- Updated `PluginList.tsx` to accept and pass through `onUpdate`, `onRemove`, `removingPlugins` props to `PluginCard`
+- Updated `SearchResults.tsx` to accept and pass through lifecycle props to `PluginList`
+- Updated `SidePanel.stories.tsx`: added `OmnisearchEmpty`, `OmnisearchWithResults`, `OmnisearchNpmLoading`, `OmnisearchInstalling` stories; updated search bar placeholder
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`, `platform/browser-extension/src/side-panel/components/PluginList.tsx`, `platform/browser-extension/src/side-panel/components/SearchResults.tsx`, `platform/browser-extension/src/side-panel/components/SidePanel.stories.tsx`
+- **Learnings for future iterations:**
+  - ESLint `react-hooks/set-state-in-effect` forbids calling setState synchronously in useEffect body — use event handler callbacks (like `handleSearchChange`) instead of effects for debounced search
+  - ESLint auto-fix (`--fix`) handles import-x/order and prettier formatting but not unused-vars — fix those manually
+  - `import-x/order` sorts `./retro/Input` before `./SearchResults` (deeper paths before siblings at same level, alphabetically within the group)
+  - When passing `setPlugins` to SearchResults in stories, use `() => undefined` as a no-op — don't destructure useState if you won't use the setter
+  - `showPlugins` must account for `searchQuery` being non-empty to avoid centering the SearchResults view
+  - All Phase 1 checks (build, type-check, lint, knip, test) pass — 88 test files, 2720 tests
+---
+
+## 2026-03-01 - US-009
+- Added 7 new stories to `SidePanel.stories.tsx`: OmnisearchInstalledResults, OmnisearchNpmResults, OmnisearchMixed, OmnisearchNoResults, PluginWithContextMenu, PluginRemoving, PluginUpdating
+- Added imports for `PluginCard` and `Accordion` to support the PluginUpdating story (renders PluginCard directly with updatingPlugin=true)
+- Added `pluginWithUpdate` helper returning a PluginState with `update: { latestVersion, updateCommand }`
+- OmnisearchInstalledResults: SearchResults with toolFilter="slack", no npm results → shows only matching installed plugin
+- OmnisearchNpmResults: SearchResults with empty installed plugins, toolFilter="notion", npmResults=full list
+- OmnisearchMixed: SearchResults with toolFilter="github" matching githubPlugin() + all 3 mockNpmResults shown
+- OmnisearchNoResults: SearchResults with toolFilter="xyzzy", no matches in either section → shows "No results"
+- PluginWithContextMenu: PluginList with datadogPlugin() (source='npm') → PluginMenu three-dot icon visible
+- PluginRemoving: PluginList with removingPlugins={new Set(['datadog'])} → datadog card shows opacity-60
+- PluginUpdating: PluginCard rendered directly in Accordion with updatingPlugin=true (PluginList has no per-plugin updating state)
+- Files changed: `platform/browser-extension/src/side-panel/components/SidePanel.stories.tsx`
+- **Learnings for future iterations:**
+  - PluginList has no per-plugin `updatingPlugin` state (unlike `removingPlugins` Set) — to show a specific card in updating state, render PluginCard directly inside an Accordion wrapper
+  - `() => undefined` is assignable to `Dispatch<SetStateAction<T>>` in TypeScript due to function arity compatibility — standard pattern for story no-op setters
+  - OmnisearchMixed requires a query matching an installed plugin by name/displayName (use "github" → matches githubPlugin) while npm results don't include any "github" package, so all npm results remain visible
+  - Phase 1 and Phase 2 (E2E) all pass — 88 unit test files + 404 E2E tests passed
+---
