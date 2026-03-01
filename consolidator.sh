@@ -203,6 +203,116 @@ find_ralph_branches() {
     | awk '{print $2}'
 }
 
+# Invoke AI to fix a build failure after a clean merge.
+# The merged code is on HEAD; the build (pre-push hook) failed.
+# AI reads the error, fixes the code, and runs the build again.
+# Returns 0 if the build passes after AI fix, 1 otherwise.
+_ai_fix_build() {
+  local tag="$1"
+
+  if [ -z "$CLAUDE_BIN" ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Skipping AI build fix: 'claude' CLI not found.${RESET}"
+    return 1
+  fi
+
+  # Capture the actual build error so AI has context
+  local build_output
+  build_output=$(git -C "$CODE_DIR" --no-pager diff --stat HEAD~1 2>/dev/null | head -40)
+  local build_error
+  build_error=$(cd "$CODE_DIR" && npm run build 2>&1 | tail -60)
+
+  local ai_prompt="You are fixing a build failure in a TypeScript monorepo after merging a branch into main.
+
+The merge itself succeeded (no conflicts), but the build fails. Your job:
+1. Read the build error below and identify the root cause
+2. Fix the source code so the build passes
+3. Run: npm run build
+4. If the build still fails, keep fixing until it passes
+5. Do NOT commit. Just leave the fixed files staged/unstaged — the consolidator will commit.
+
+## Files changed in this merge:
+$build_output
+
+## Build error output (last 60 lines):
+$build_error
+
+IMPORTANT: Focus only on fixing the build error. Do not refactor or change unrelated code."
+
+  local ai_result_file ai_stderr_file
+  ai_result_file=$(mktemp) && chmod 600 "$ai_result_file"
+  ai_stderr_file=$(mktemp) && chmod 600 "$ai_stderr_file"
+  local ai_exit=0
+
+  echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Running AI to fix build...${RESET}"
+
+  timeout 600 env PATH="$PATH" bash -c '
+    set -o pipefail
+    echo "$1" | (cd "$2" && claude \
+      --dangerously-skip-permissions \
+      --print \
+      --model "$3" \
+      --verbose \
+      --output-format stream-json \
+    ) 2>"$5" | tee "$4"
+  ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" \
+    2>&1 | while IFS= read -r line; do
+      local msg=""
+      if echo "$line" | grep -q '"type":"tool_use"' 2>/dev/null; then
+        msg=$(echo "$line" | python3 -c "
+import sys,json
+try:
+  d=json.load(sys.stdin)
+  for c in d.get('message',{}).get('content',[]):
+    if c.get('type')=='tool_use':
+      name=c.get('name','')
+      inp=c.get('input',{})
+      if name in ('Edit','Write'):
+        print(f'Tool: {name} → {inp.get(\"filePath\",inp.get(\"file_path\",\"\"))[:80]}')
+      elif name=='Bash':
+        print(f'Tool: {name} → {inp.get(\"command\",\"\")[:80]}')
+      elif name=='Read':
+        print(f'Tool: {name} → {inp.get(\"filePath\",inp.get(\"file_path\",\"\"))[:80]}')
+      else:
+        print(f'Tool: {name}')
+except: pass" 2>/dev/null)
+      elif echo "$line" | grep -q '"type":"result"' 2>/dev/null; then
+        msg=$(echo "$line" | python3 -c "
+import sys,json
+try:
+  d=json.load(sys.stdin)
+  cost=d.get('total_cost_usd',0)
+  dur=d.get('duration_ms',0)
+  turns=d.get('num_turns',0)
+  status=d.get('subtype','')
+  print(f'Result: {status} ({turns} turns, {dur/1000:.1f}s, \${cost:.2f})')
+except: pass" 2>/dev/null)
+      fi
+      if [ -n "$msg" ]; then
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}${msg}${RESET}"
+      fi
+    done
+  ai_exit=${PIPESTATUS[0]}
+
+  rm -f "$ai_result_file" "$ai_stderr_file"
+
+  if [ "$ai_exit" -eq 124 ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI build fix timed out.${RESET}"
+    return 1
+  elif [ "$ai_exit" -ne 0 ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI build fix failed (exit $ai_exit).${RESET}"
+    return 1
+  fi
+
+  # Verify the build passes now
+  if (cd "$CODE_DIR" && npm run build) &>/dev/null; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Build passes after AI fix.${RESET}"
+    return 0
+  else
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Build still fails after AI fix.${RESET}"
+    return 1
+  fi
+}
+
 # Attempt to merge a single branch into main and push.
 # Returns 0 on success, 1 on conflict.
 merge_branch() {
@@ -255,8 +365,28 @@ merge_branch() {
       git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
       return 0
+    fi
+
+    # Push failed (likely pre-push hook build failure) — invoke AI to fix the build.
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed after 3 attempts. Invoking AI to fix build...${RESET}"
+
+    if ! _ai_fix_build "$tag"; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI build fix failed. Resetting to remote.${RESET}"
+      git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
+      git -C "$CODE_DIR" reset --hard origin/main --quiet
+      return 1
+    fi
+
+    # AI fixed the build — amend the merge commit and push (skip hook; AI already built)
+    git -C "$CODE_DIR" add -A 2>/dev/null || true
+    git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
+    if git -C "$CODE_DIR" push origin main --no-verify --quiet 2>/dev/null; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI build fix).${RESET}"
+      git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
+      return 0
     else
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed after 3 attempts. Resetting to remote.${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push still failed after AI fix. Resetting to remote.${RESET}"
       git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
       git -C "$CODE_DIR" reset --hard origin/main --quiet
       return 1
@@ -497,12 +627,25 @@ except: pass" 2>/dev/null)
         git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
         echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
         return 0
-      else
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed. Resetting to remote.${RESET}"
-        git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
-        git -C "$CODE_DIR" reset --hard origin/main --quiet
-        return 1
       fi
+
+      # Push failed (likely pre-push hook build failure) — try AI build fix
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed after AI conflict resolution. Invoking AI to fix build...${RESET}"
+      if _ai_fix_build "$tag"; then
+        git -C "$CODE_DIR" add -A 2>/dev/null || true
+        git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
+        if git -C "$CODE_DIR" push origin main --no-verify --quiet 2>/dev/null; then
+          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI conflict + build fix).${RESET}"
+          git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
+          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
+          return 0
+        fi
+      fi
+
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push still failed. Resetting to remote.${RESET}"
+      git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
+      git -C "$CODE_DIR" reset --hard origin/main --quiet
+      return 1
     fi
 
     # AI failed to resolve — clean up and fall back to breadcrumb file
