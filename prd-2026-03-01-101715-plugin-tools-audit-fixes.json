@@ -1,0 +1,49 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two bugs in the plugin developer CLI (opentabs-plugin): stale ESM module cache in watch mode causing outdated tools.json, and incomplete rgba() color conversion in grayscale icon generation.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix stale ESM module cache in build watch mode",
+      "description": "As a plugin developer, I want `opentabs-plugin build --watch` to produce correct tools.json on every rebuild so that the MCP server always sees the latest tool definitions.",
+      "acceptanceCriteria": [
+        "pluginCacheKey is replaced with a monotonically increasing counter (not an alternating 0/1 toggle)",
+        "Each dynamic import of the plugin entry point uses a unique query string that has never been used before in the process lifetime",
+        "The comment about 'at most 2 entries' is updated to reflect the new unbounded-but-necessary cache growth behavior",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts\n\nBug: The module-level variable `pluginCacheKey` (line 48) alternates between 0 and 1 via `pluginCacheKey = 1 - pluginCacheKey` (line 1058). This produces only two distinct query strings (`?t=0` and `?t=1`). Node.js caches ESM modules permanently by their full URL. On the 3rd rebuild in watch mode, the URL `?t=1` was already cached from the 1st rebuild, so Node.js returns the stale module instead of re-reading the changed file from disk.\n\nThe IIFE bundle is unaffected (esbuild reads source files directly), but `tools.json` is generated from the dynamically imported module's tool definitions, schemas, resources, and prompts — so it reflects state from 2 builds ago on odd-numbered rebuilds.\n\nFix: Replace the alternating key with a monotonically increasing counter. The simplest approach is to use an incrementing integer:\n\n```typescript\nlet pluginCacheKey = 0;\n```\n\nThen at line 1058:\n```typescript\npluginCacheKey++;\nconst mod = (await import(`${entryPoint}?t=${String(pluginCacheKey)}`)) as { default?: OpenTabsPlugin };\n```\n\nThis ensures every import gets a unique URL. The ESM cache grows by one entry per rebuild, but this is acceptable for a dev tool (watch mode rebuilds are bounded by developer activity, not automated loops).\n\nWARNING: Do NOT try to clear or evict the Node.js ESM module cache — there is no documented API for this. The only correct approach is unique query strings per import.\n\nAlso update the comment block above `pluginCacheKey` (lines 45-47) — it currently says 'Alternates between 0 and 1 so the ESM module cache holds at most 2 entries'. The new comment should explain that a monotonically increasing counter is used to ensure cache-busting on every rebuild."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix rgba() grayscale conversion gaps in icon validation",
+      "description": "As a plugin developer, I want auto-generated grayscale inactive icons to correctly convert all valid CSS rgba() color formats so that no chromatic colors leak into the inactive icon variant.",
+      "acceptanceCriteria": [
+        "rgba(255, 0, 0) (without alpha) is converted to a grayscale value",
+        "rgba(255, 0, 0, 50%) (percentage alpha) is converted to grayscale with the alpha preserved",
+        "rgba(255, 0, 0, 0.5) (numeric alpha) continues to work correctly",
+        "rgb(255, 0, 0) continues to work correctly",
+        "Modern space-separated formats like rgb(255 0 0) and rgb(255 0 0 / 0.5) continue to work correctly",
+        "Unit tests are added for the newly handled rgba() formats",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/validate-icon.ts, function `convertColorToGray`, lines 449-468\n\nTwo gaps in the regex chain cause certain valid CSS rgba() values to fall through unconverted:\n\n**Gap 1: rgba() without alpha parameter**\nLine 450: `const rgbaMatch = lowerValue.match(/^rgba\\(\\s*(\\d+%?)\\s*,\\s*(\\d+%?)\\s*,\\s*(\\d+%?)\\s*,\\s*([\\d.]+)\\s*\\)/);`\nThis regex REQUIRES an alpha parameter (the 4th capture group with the preceding comma). So `rgba(255, 0, 0)` fails to match.\n\nLine 461: `const rgbMatch = lowerValue.match(/^rgb\\(\\s*(\\d+%?)\\s*,\\s*(\\d+%?)\\s*,\\s*(\\d+%?)\\s*\\)/);`\nThis regex requires the literal prefix `rgb(` — so `rgba(255, 0, 0)` (which starts with `rgba(`) also fails.\n\nThe value falls through to line 503 and is returned unchanged.\n\n**Gap 2: rgba() with percentage alpha**\nLine 450: The alpha capture group `([\\d.]+)` does not match the `%` character. So `rgba(255, 0, 0, 50%)` fails to match. It also fails the rgb regex (starts with `rgba`) and the modern space-separated regex (uses commas). Returned unchanged.\n\n**Recommended fix (simplest approach):**\n1. Change the rgbMatch regex at line 461 from `^rgb\\(` to `^rgba?\\(` so it accepts both `rgb(` and `rgba(` without alpha. This handles Gap 1.\n2. Change the alpha capture group in rgbaMatch at line 450 from `([\\d.]+)` to `([\\d.]+%?)` to accept percentage alpha values. This handles Gap 2.\n\n**IMPORTANT:** When fixing Gap 1 by broadening the rgbMatch regex, the output format is correct as-is — rgba without alpha is equivalent to full opacity, so outputting a hex gray (the existing rgb branch behavior) is correct.\n\nTest file: platform/plugin-tools/src/validate-icon.test.ts — add test cases for the new formats in the `convertColorToGray` describe block."
+    }
+  ]
+}
