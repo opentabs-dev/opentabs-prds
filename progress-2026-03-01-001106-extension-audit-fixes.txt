@@ -1,0 +1,77 @@
+## Codebase Patterns
+- LogFilterOptions is defined in platform/browser-extension/src/log-collector.ts — has level, source, since, limit fields
+- OffscreenGetLogsMessage is in extension-messages.ts — options field mirrors LogFilterOptions (limit optional)
+- _prefixed unused destructure variables satisfy ESLint no-unused-vars rules
+- React Compiler (babel-plugin-react-compiler) handles auto-memoization, but useCallback is still needed as an escape hatch for ensuring effect dependency stability
+- State setters from useState and refs from useRef are stable across renders — safe as empty useCallback deps
+- Module-level imports (e.g., fetchConfigState, searchPlugins from bridge.js) are stable — safe as empty useCallback deps
+- useServerNotifications hook params (setPlugins, setActiveTools, etc.) are state setters passed from App — stable identity, but listed in deps for correctness
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-001106-extension-audit-fixes~running.json
+Started: Sun Mar  1 08:11:44 UTC 2026
+---
+
+## 2026-03-01 08:14 - US-001
+- Fixed handleExtensionGetLogs double-limiting that distorted merged results
+- Destructured `limit` out of `filterOptions` before passing to bgLogCollector.getEntries() and the offscreen getLogs message
+- Both sources now return all matching entries (by level/source/since); the `limit` is applied once to the merged+sorted array
+- Files changed: platform/browser-extension/src/browser-commands/extension-commands.ts (lines 117-135)
+- **Learnings for future iterations:**
+  - The bug was pre-existing — `filterOptions.limit` was passed to both individual sources AND then applied again to the merged result
+  - The fix uses `const { limit: _limit, ...filterWithoutLimit } = filterOptions` — TypeScript allows Omit types where optional fields are present
+  - `OffscreenGetLogsMessage.options` type already includes `limit?: number` but passing without it is valid (structural subtyping)
+  - Pre-existing lint warnings in App.tsx (react-hooks/exhaustive-deps) exit 0 — they are warnings not errors, addressed by US-004
+---
+
+## 2026-03-01 08:17 - US-002
+- Fixed handleBrowserExecuteScript global leak when both timeouts fire
+- Removed the `if (!cancelled.value)` guard around the cleanup script in the async poll timeout path
+- The cleanup script (which deletes __execResult_<uuid> and __execAsync_<uuid> from globalThis.__openTabs) now always runs when the async poll times out, regardless of whether the outer SCRIPT_TIMEOUT_MS also fired
+- Files changed: platform/browser-extension/src/browser-commands/extension-commands.ts (lines 462-479)
+- **Learnings for future iterations:**
+  - The `cancelled` variable still serves a purpose — it short-circuits the while loop at line 409 when the outer timeout fires (avoiding unnecessary polling iterations)
+  - The fix was surgical: just remove the conditional guard; the cleanup being idempotent makes unconditional execution safe
+  - lint-staged pre-commit hook runs prettier + eslint fix on the file; no issues introduced
+---
+
+## 2026-03-01 08:21 - US-003
+- Preserved structured error fields in resource and prompt dispatch
+- Updated catch blocks in executeResourceReadOnTab and executePromptGetOnTab in resource-prompt-dispatch.ts
+- Both now apply the same pattern as tool-dispatch.ts: extract code/retryable/retryAfterMs/category fields from caught errors and include them in the DispatchResult's data field
+- Files changed: platform/browser-extension/src/resource-prompt-dispatch.ts (lines 81-101, 172-192)
+- **Learnings for future iterations:**
+  - DispatchResult type in dispatch-helpers.ts already had the `data` field with the correct shape — no type changes needed
+  - The pattern: if `caughtError.code` is not a string (generic JS Error), return a plain error without data; only attach `data` when OpenTabsError fields are present
+  - The injected func runs in MAIN world — structured fields from thrown objects survive the chrome.scripting serialization back to the extension
+  - Error message fallbacks use operation-specific strings ('Resource read failed', 'Prompt render failed') matching the original
+---
+
+## 2026-03-01 08:28 - US-004
+- Stabilized App.tsx useEffect deps and cleaned up npm search timer
+- Wrapped `loadPlugins` in `useCallback` with empty deps (all accessed values are refs or stable setters)
+- Wrapped `handleSearchChange` in `useCallback` with empty deps (uses refs, stable setters, and module-level imports)
+- Wrapped `handleNotification` and `clearConfirmationTimeout` in `useCallback` within `useServerNotifications` hook (deps: state setters and refs — all stable)
+- Added cleanup `useEffect` with empty deps that clears `npmSearchTimer.current` on unmount
+- The `useEffect` at line 176 in App.tsx now has stable dependencies — the chrome.runtime.onMessage listener is registered once and not re-registered on every render
+- Files changed: platform/browser-extension/src/side-panel/App.tsx, platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts
+- **Learnings for future iterations:**
+  - React Compiler auto-memoizes but useCallback is the correct escape hatch for ensuring effect dependency stability (per browser-extension CLAUDE.md)
+  - State setters (e.g., setPlugins), refs (e.g., lastFetchRef), and module-level imports (e.g., fetchConfigState) are all stable across renders — safe for empty useCallback deps
+  - The useServerNotifications hook's params are state setters passed from App, so they have stable identity — listed in useCallback deps for correctness but won't cause re-creation
+  - lint-staged auto-fixes formatting when useCallback body indentation changes (Prettier reformats the callback body)
+  - For timer cleanup useEffects, capture the ref in a local variable (`const timerRef = npmSearchTimer`) to satisfy the React Compiler's ref capture rules
+---
+
+## 2026-03-01 - US-005
+- Fixed keyboard simulation for punctuation keys and control characters
+- Added `PUNCTUATION_CODES` map inside `deriveCode()` to map common punctuation to correct `KeyboardEvent.code` values: `.`→`Period`, `,`→`Comma`, `-`→`Minus`, `=`→`Equal`, `[`→`BracketLeft`, `]`→`BracketRight`, `\`→`Backslash`, `;`→`Semicolon`, `'`→`Quote`, `` ` ``→`Backquote`, `/`→`Slash`
+- Changed `isPrintable` from `k.length === 1` to `k.length === 1 && k.charCodeAt(0) >= 32` to exclude ASCII control characters (Tab, newline, etc.) from keypress dispatch and text insertion
+- Files changed: platform/browser-extension/src/browser-commands/key-press-command.ts (lines 46-60, 91)
+- All 415 E2E tests passed (e2eCheckpoint: true)
+- **Learnings for future iterations:**
+  - The injected `func` is serialized and runs inside the tab's MAIN world — all helper functions/constants must be defined inline within the func closure
+  - `PUNCTUATION_CODES` is defined inside `deriveCode` rather than at module scope because the func is injected as a serialized function — no outer scope is available in the page
+  - The `isPrintable` guard controls both `keypress` event dispatch AND text insertion into editable elements — control chars (charCode < 32) should not trigger either
+  - lint-staged ran Prettier on the file without issues; no reformatting needed beyond the added lines
+---
