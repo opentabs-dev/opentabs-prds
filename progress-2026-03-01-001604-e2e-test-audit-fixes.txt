@@ -1,0 +1,79 @@
+## Codebase Patterns
+- E2E test resource cleanup pattern: declare resources as `let X: Type | undefined` before the try block, assign inside try, close/kill in finally with `if (X) await X.cleanup().catch(() => {})`. See e2e/helpers.ts:setupIsolatedIifeTest for the canonical reference.
+- McpClient is imported from `./fixtures.js` and has `initialize()` and `close()` methods.
+- lint-staged stash hazard: after every commit with unstaged changes, run `git diff --stat && git stash list` to verify unstaged changes survived.
+- Race condition pattern for health assertions: `waitForHealth` uses `>=` predicate, so the subsequent assertion must also use `toBeGreaterThanOrEqual` — never `toBe` (exact equality) — because more log entries can arrive between the two health() calls.
+- Overly broad assertions (e.g. `toContain('DEBUG')`) that match any log string should be removed if more specific assertions (e.g. `toContain('${prefix} debug-message')`) already cover the same behavior.
+- `setupToolTest` returns a `Page` that callers must close — capture it as `const page = await setupToolTest(...)` and call `await page.close()` at the end of the test. Tests that discard the return value leak browser tabs.
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-001604-e2e-test-audit-fixes~running.json
+Started: Sun Mar  1 08:16:33 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Implemented fix for MCP client leak in e2e/strict-csp.e2e.ts
+- Moved `client` variable declaration before the try block (alongside server, strictCspSrv, context, cleanupDir)
+- Changed `const client = createMcpClient(...)` to `client = createMcpClient(...)`
+- Removed explicit `await client.close()` from success path and added `if (client) await client.close().catch(() => {});` to the finally block
+- Files changed: e2e/strict-csp.e2e.ts
+- **Learnings for future iterations:**
+  - The canonical resource-tracking pattern for manual E2E tests (no fixture): declare `let resource: Type | undefined` before try, assign in try, clean up in finally. McpClient follows same pattern as McpServer, TestServer, BrowserContext.
+  - McpClient type is imported from `./fixtures.js` as a type import alongside other fixture types.
+  - Phase 1 checks (build, type-check, lint, knip, test) all passed. No E2E run needed (e2eCheckpoint: false).
+---
+
+## 2026-03-01 - US-002
+- Added missing `retryable=false` assertions to the '500 produces category=internal' test in e2e/sdk-fetch-errors.e2e.ts
+- Added `expect(result.content).toContain('retryable=false');` after the category assertion
+- Added `expect(json.retryable).toBe(false);` after the category JSON assertion
+- Files changed: e2e/sdk-fetch-errors.e2e.ts
+- **Learnings for future iterations:**
+  - All error category tests should assert both `category` and `retryable` in both the human-readable prefix (toContain) and parsed JSON (parseErrorJson). The 500 test was the only one missing the retryable check.
+  - Phase 1 checks (build, type-check, lint, knip, test) all passed. No E2E run needed (e2eCheckpoint: false).
+---
+
+## 2026-03-01 - US-003
+- Fixed race condition in 'log_levels tool increments log buffer size by exactly the number of entries emitted' test in e2e/plugin-logging.e2e.ts
+- Changed `expect(bufferAfter).toBe(bufferBefore + 4)` to `expect(bufferAfter).toBeGreaterThanOrEqual(bufferBefore + 4)` — the waitForHealth predicate already uses `>=`, and additional entries can arrive between health() calls
+- Removed 4 overly broad log level tag assertions (`toContain('DEBUG')`, `toContain('INFO')`, `toContain('WARNING')`, `toContain('ERROR')`) from the first test — lines 52-55 already assert prefix-specific log messages which provide real coverage
+- Files changed: e2e/plugin-logging.e2e.ts
+- **Learnings for future iterations:**
+  - When `waitForHealth` uses `>=`, the subsequent assertion must use `toBeGreaterThanOrEqual` not `toBe` to avoid race conditions from concurrent log entries.
+  - Broad string assertions like `toContain('DEBUG')` can match any log line and are redundant when more specific assertions exist. Remove them.
+  - Phase 1 checks (build, type-check, lint, knip, test) all passed. No E2E run needed (e2eCheckpoint: false).
+---
+
+## 2026-03-01 - US-004
+- Fixed vacuous achromatic assertion in e2e/build-icons.e2e.ts
+- Added `expect(inactiveColors.length).toBeGreaterThan(0);` after extracting hex colors from the auto-generated inactive SVG and before the for-loop checking achromatic values
+- This prevents the test from passing vacuously when `extractHexColors()` returns an empty array (e.g. if the SVG generation changes color format)
+- Files changed: e2e/build-icons.e2e.ts
+- **Learnings for future iterations:**
+  - For-loops over arrays that assert per-element properties can pass vacuously on empty arrays — always add a `length > 0` guard before the loop when the array's non-emptiness is an invariant.
+  - The last test in the file ('auto-generated inactive icon preserves visual structure') already has `expect(grayColors.length).toBe(3)`, so only the first test needed this fix.
+  - Phase 1 checks (build, type-check, lint, knip, test) all passed. No E2E run needed (e2eCheckpoint: false).
+---
+
+## 2026-03-01 - US-005
+- Added missing `page.close()` calls in two test files that discarded the return value of `setupToolTest`
+- e2e/audit-logging.e2e.ts: Changed `await setupToolTest(...)` to `const page = await setupToolTest(...)` and added `await page.close()` before the closing brace
+- e2e/sdk-version.e2e.ts: Same fix — captured page return value and closed it after assertions
+- Files changed: e2e/audit-logging.e2e.ts, e2e/sdk-version.e2e.ts
+- **Learnings for future iterations:**
+  - `setupToolTest` returns a `Page` that callers own and must close. Every other test in audit-logging.e2e.ts closes its page — these two were the only outliers.
+  - Lint-staged ran prettier on both files (formatting tweaks). The stash pop completed cleanly.
+  - Phase 1 checks (build, type-check, lint, knip, test) all passed. No E2E run needed (e2eCheckpoint: false).
+---
+
+## 2026-03-01 - US-006
+- Replaced manual `waitForLog + fs.writeFileSync + waitForLog` pattern with `writeAndWaitForWatcher` in the 'rewriting tools.json preserves all tools' test in e2e/hot-reload-dynamic.e2e.ts
+- `writeAndWaitForWatcher` is already imported at the top of the file — no import change needed
+- The callback writes the original content on attempt 0 and appends `\n` on retries to guarantee a different file hash, ensuring FSEvents fires on each retry
+- Removed the manual `await waitForLog(server, 'File watcher: Watching', 10_000)` — `writeAndWaitForWatcher` handles that internally
+- Files changed: e2e/hot-reload-dynamic.e2e.ts
+- **Learnings for future iterations:**
+  - `writeAndWaitForWatcher` already waits for 'File watcher: Watching' internally — callers must NOT add a redundant `waitForLog` before calling it.
+  - On retries (attempt > 0), the write callback must produce a different file hash to guarantee a new FSEvents notification. Appending `'\n'` to string content is the simplest approach.
+  - Phase 1 checks (build, type-check, lint, knip, test) all passed. Phase 2 (test:e2e) also passed — 415 tests, 0 failures (e2eCheckpoint: true).
+---
