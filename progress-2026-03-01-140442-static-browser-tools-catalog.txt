@@ -1,0 +1,72 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-140442-static-browser-tools-catalog~running.json
+Started: Sun Mar  1 22:05:11 UTC 2026
+---
+
+## Codebase Patterns
+- The shared package barrel is at platform/shared/src/index.ts; re-exports use `.js` extension (e.g., `'./generated/browser-tools-catalog.js'`)
+- The tsconfig for shared (`platform/shared/tsconfig.json`) uses `"include": ["src"]` which covers `src/generated/` automatically
+- Scripts in `scripts/` are type-checked by `tsconfig.scripts.json` which references `platform/shared`
+- The browser tools barrel at `platform/mcp-server/src/browser-tools/index.ts` exports 40 tools as `browserTools: BrowserToolDefinition[]`
+- `BrowserToolDefinition.icon` is optional (`icon?: string`); all current tools have explicit icons but the generator defaults to `'globe'`
+- Generated files should be run through prettier (via `execFileSync` with `--parser typescript` and stdin input) to match project formatting conventions
+- The root build script chains: `tsc --build && generate:browser-tools-catalog && build:bundle && build:side-panel && generate-icons && install-extension && npm rebuild`
+- To use `@opentabs-dev/shared` in `e2e/*.ts`, add `"@opentabs-dev/shared": "*"` to root `package.json` devDependencies and run `npm install`; the e2e tsconfig resolves it via moduleResolution `bundler` through node_modules without needing a project reference
+- Never put non-import code between import blocks — ESLint's import-x plugin will error with "Import in body of module; reorder to top"
+- ESLint import order groups: `['index', 'sibling', 'parent', 'internal', 'external', 'builtin', 'object', 'type']`; scoped packages (`@*/**`) are "internal" and come before external packages (react, lucide-react)
+
+## 2026-03-01 - US-001
+- Implemented build-time browser tools catalog generator
+- Files created:
+  - `scripts/generate-browser-tools-catalog.ts` — generator script that dynamically imports compiled barrel, extracts metadata, formats with prettier, writes to shared package
+  - `platform/shared/src/generated/browser-tools-catalog.ts` — generated catalog with 40 tools (BrowserToolMeta interface + BROWSER_TOOLS_CATALOG array)
+- Files modified:
+  - `platform/shared/src/index.ts` — added re-export of BROWSER_TOOLS_CATALOG and BrowserToolMeta
+  - `package.json` — added `generate:browser-tools-catalog` script, inserted into `build` and `build:force` pipelines after `tsc --build`
+- **Learnings for future iterations:**
+  - `JSON.stringify` produces double quotes which violates the project's prettier single-quote convention — pipe generated code through prettier instead of hand-formatting
+  - The generated file is committed to git (not gitignored) so `tsc --build` works on fresh clones without running the generator first
+  - `execFileSync` with `{ input: raw }` works for piping content through prettier; the async `execFile` with `promisify` hung for unknown reasons
+---
+
+## 2026-03-01 - US-002
+- Replaced BROWSER_TOOL_NAMES static list with BROWSER_TOOLS_CATALOG from @opentabs-dev/shared
+- Files deleted:
+  - `platform/mcp-server/src/browser-tool-names.ts` — manually maintained list, now redundant
+- Files modified:
+  - `platform/mcp-server/src/browser-tools/index.ts` — now imports BROWSER_TOOLS_CATALOG and validates name, description, and icon for every tool; errors mention which field differs
+  - `platform/mcp-server/src/loader.ts` — imports BROWSER_TOOLS_CATALOG and derives `browserToolNames` array at module level for prompt injection detection
+  - `e2e/helpers.ts` — replaced 40-entry hand-maintained array with `BROWSER_TOOLS_CATALOG.map(t => t.name)`; export name unchanged
+  - `package.json` — added `"@opentabs-dev/shared": "*"` to devDependencies so knip resolves the e2e import
+  - `package-lock.json` — updated by npm install
+- **Learnings for future iterations:**
+  - `e2e/tsconfig.json` does NOT need a project reference to `platform/shared` — TypeScript resolves `@opentabs-dev/shared` via `moduleResolution: "bundler"` through `node_modules` symlink
+  - Knip reports workspace packages used in `e2e/*.ts` as "unlisted" unless declared in root `package.json` devDependencies — fix by adding `"@opentabs-dev/shared": "*"` and running `npm install`
+  - When editing imports, place module-level consts AFTER all imports to avoid import-x/first lint errors
+---
+
+## 2026-03-01 - US-003
+- Initialized side panel browserTools state from BROWSER_TOOLS_CATALOG instead of empty array
+- Files modified:
+  - `platform/browser-extension/src/side-panel/App.tsx` — import BROWSER_TOOLS_CATALOG, use lazy initializer `useState(() => BROWSER_TOOLS_CATALOG.map(t => ({ ...t, enabled: true })))`, merge only `enabled` field from server response, reset to catalog defaults on disconnect
+- **Learnings for future iterations:**
+  - `ConfigStateBrowserTool` has `icon?: string` (optional) while `BrowserToolMeta` has `icon: string` (required) — spreading catalog entry and adding `enabled: true` satisfies both types
+  - The fetch merge pattern: `prev.map(t => { const serverTool = result.browserTools?.find(s => s.name === t.name); return serverTool ? { ...t, enabled: serverTool.enabled } : t; })` is the correct pattern for merging sparse server updates into fully-populated local state
+  - `@opentabs-dev/shared` (scoped package) is classified as "internal" by ESLint import-x, not "external" — it must appear before `lucide-react` and `react` in the import block
+---
+
+## 2026-03-01 - US-004
+- Removed NoPluginsState component and all associated loading gates
+- Files modified:
+  - `platform/browser-extension/src/side-panel/components/EmptyStates.tsx` — removed `NoPluginsState` component and its export
+  - `platform/browser-extension/src/side-panel/App.tsx` — removed `pluginsLoaded` state, `setPluginsLoaded` calls, `showNoPlugins` conditional, `NoPluginsState` import and render branch
+  - `platform/browser-extension/src/side-panel/components/EmptyStates.stories.tsx` — removed `NoPlugins` story
+  - `platform/browser-extension/src/side-panel/components/SidePanel.stories.tsx` — removed `NoPlugins` story and `NoPluginsState` import
+  - `e2e/onboarding.e2e.ts` — renamed tests to remove "no-plugins" references, removed stale "No Plugins Installed" assertion
+  - `e2e/side-panel-reload.e2e.ts` — removed stale "No Plugins Installed" assertion
+  - `e2e/side-panel-auth-failed.e2e.ts` — removed stale "No Plugins Installed" assertion
+- **Learnings for future iterations:**
+  - Side panel E2E tests in this worktree environment consistently fail due to headless Chromium not rendering the side panel — confirmed pre-existing by running tests on stashed (original) code. All 28 side-panel-rendering tests fail identically with and without code changes. Non-side-panel tests (395) pass fine.
+  - When removing a component, search for Storybook stories in both the component's own `.stories.tsx` AND the assembled `SidePanel.stories.tsx` file
+  - Removing stale negative assertions (asserting UI text doesn't exist when the component producing it is deleted) is cleaner than leaving them — `toBeHidden()`/`not.toBeVisible()` would pass either way, but the assertion becomes meaningless
+---
