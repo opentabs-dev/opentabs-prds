@@ -1,0 +1,70 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-192112-cli-ux-polish~running.json
+Started: Sun Mar  1 03:21:37 UTC 2026
+---
+
+## Codebase Patterns
+- Platform CLI source lives in `platform/cli/src/commands/` with one file per command (start.ts, stop.ts, config.ts, etc.)
+- `printMcpClientConfigs` is shared between `start --show-config`, `config show --show-secret`, and first-time setup — `primaryOnly=false` shows all 4 configs, `primaryOnly=true` shows only Claude Code + a "For other MCP clients" hint; after US-003, first-run uses `primaryOnly=false`
+- The CLI uses `picocolors` (imported as `pc`) for terminal coloring
+- `@opentabs-dev/shared` exports cross-platform helpers like `platformExec`, `isWindows`, `toErrorMessage`
+- The `handleStart` function in start.ts handles both foreground and `--background` modes
+- Background mode spawns a detached child process writing to a log file; foreground mode uses `teeStream` to pipe output to both terminal and log file
+
+## 2026-03-01 03:24 UTC - US-001
+- Implemented robust error handling for `opentabs start --background`
+- Files changed: `platform/cli/src/commands/start.ts`
+- Changes:
+  - Extracted `printStartupHeader()` and `printSetupHints()` closures from inline code so the header can be printed conditionally
+  - Moved header + hints printing to AFTER spawn + health check in the background branch (prevents showing success-like output before confirming server is alive)
+  - Added 2-second post-spawn health check: listens for `exit` event on the child process; if it exits within 2s, prints warning with log path
+  - Wrapped PID file `writeFile` in try-catch with user-friendly "Failed to write PID file: <reason>" message
+  - The foreground path still prints header/hints in the same position as before (just refactored into the closures)
+- **Learnings for future iterations:**
+  - `child.pid` is undefined when spawn itself fails (e.g., binary not found) — checking it immediately after spawn is the right guard
+  - `child.unref()` makes the child not keep the parent's event loop alive, but you can still listen on `child` events before the parent exits
+  - The `resolve` shadow in Promises using `node:path`'s `resolve` is a common pitfall — inner Promise `resolve` takes precedence
+---
+
+## 2026-03-01 - US-002
+- Removed self-referential "Run opentabs config show --show-secret" hint from `config show --show-secret` and `start --show-config` output
+- Files changed: `platform/cli/src/commands/start.ts`, `platform/cli/src/commands/config.ts`
+- Changes:
+  - Added `showHint = true` as a 4th parameter to `printMcpClientConfigs` in start.ts
+  - Changed the trailing hint condition from `!primaryOnly` to `!primaryOnly && showHint`
+  - Passed `false, false` (primaryOnly=false, showHint=false) from both self-referential call sites:
+    - `start --show-config` path in start.ts
+    - `config show --show-secret` path in config.ts
+  - First-run (`primaryOnly=true`) and subsequent-run (direct `console.log` in `printSetupHints`) flows are unaffected
+- **Learnings for future iterations:**
+  - The subsequent-run hint ("Run opentabs config show --show-secret to see MCP client configuration.") lives directly in `printSetupHints()` in start.ts, NOT in `printMcpClientConfigs` — it's separate from the trailing hint in the configs function
+  - The trailing hint in `printMcpClientConfigs` is the one printed after all config blocks when `primaryOnly=false`
+  - `printMcpClientConfigs` is exported and called from both start.ts and config.ts
+---
+
+## 2026-03-01 - US-003
+- Show all MCP client configs on first run of `opentabs start`
+- Files changed: `platform/cli/src/commands/start.ts`
+- Changes:
+  - Changed `printMcpClientConfigs(mcpUrl, secret, true)` to `printMcpClientConfigs(mcpUrl, secret, false)` in `printFirstTimeInstructions` (line ~152)
+  - This causes first-run to show all 4 client configs (Claude Code, OpenCode, Cursor, Windsurf) instead of just Claude Code + "For other MCP clients" hint
+  - The "For other MCP clients" hint is automatically suppressed (it only appears when `primaryOnly=true`)
+  - The trailing "Run opentabs config show --show-secret" hint still appears (not self-referential here since we're on `opentabs start`)
+  - Subsequent runs are unaffected — `printSetupHints()` still shows just the short hint
+- **Learnings for future iterations:**
+  - The fix was a 1-character change (`true` → `false`) — the whole `primaryOnly` parameter design cleanly encapsulates all the downstream behavior
+  - No test file exists for start.ts commands (onboarding.e2e.ts tests browser extension side panel state, not CLI output)
+---
+
+## 2026-03-01 - US-004
+- Replaced lsof-only suggestion in `opentabs stop` with cross-platform alternatives
+- Files changed: `platform/cli/src/commands/stop.ts`
+- Changes:
+  - Replaced `find the process with \`lsof -i :<port>\` and kill it` with:
+    - macOS suggestion: `kill $(lsof -ti :<port>)`
+    - Linux suggestion: `fuser -k <port>/tcp`
+    - Tip to use `opentabs start --background` next time
+- **Learnings for future iterations:**
+  - The no-PID-file branch in stop.ts (lines 85-113) handles the case where the server runs in foreground — it detects liveness via health check then prints the manual-stop instructions
+  - The message is a single `console.log` with `\n` embedded in the template literal
+---
