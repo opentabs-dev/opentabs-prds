@@ -1,0 +1,45 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix TypeError: Cannot read properties of undefined (reading 'length') in the side panel App component. The crash occurs because fetchConfigState() uses an unsafe cast and the loadPlugins callback does not defensively guard against undefined array fields in the server response. Additionally, child components access plugin.tools.length without null guards.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add defensive guards for fetchConfigState response in loadPlugins",
+      "description": "As a user, I want the side panel to handle malformed or partial config.getState responses gracefully so that the UI does not crash with a TypeError.",
+      "acceptanceCriteria": [
+        "loadPlugins in App.tsx guards result.plugins, result.failedPlugins, and result.browserTools with fallback to empty arrays (e.g., result.plugins ?? [], result.failedPlugins ?? [], result.browserTools ?? [])",
+        "If fetchConfigState resolves with a result where plugins/failedPlugins/browserTools is undefined or not an array, the side panel renders without crashing",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The bug is in platform/browser-extension/src/side-panel/App.tsx in the loadPlugins callback (line 60-91). The fetchConfigState() call at line 64 returns a Promise<ConfigStateResult> via an unsafe cast from Promise<unknown> (bridge.ts:180). The .then handler at line 65 destructures result.plugins (line 66), result.failedPlugins (line 76), and result.browserTools (line 77) without checking if they are defined. If the server returns a partial or malformed response, these fields are undefined, and the next render crashes at line 288 where plugins.length is accessed.\n\nFix: In the .then handler of loadPlugins, add nullish coalescing to ensure arrays default to []. For example:\n```\nconst updatedPlugins = (result.plugins ?? []).map(p => ({ ...p, tools: p.tools ?? [] }));\n```\nAlso guard result.failedPlugins and result.browserTools:\n```\nsetFailedPlugins(result.failedPlugins ?? []);\nsetBrowserTools(result.browserTools ?? []);\n```\n\nAlso ensure each plugin's tools array is guarded when mapping (line 68) — add `tools: p.tools ?? []` spread to handle plugins with no tools field on the wire."
+    },
+    {
+      "id": "US-002",
+      "title": "Add defensive guards for plugin.tools in child components",
+      "description": "As a user, I want the side panel to handle plugins with missing tools arrays gracefully so that individual plugin cards do not crash.",
+      "acceptanceCriteria": [
+        "PluginCard.tsx guards plugin.tools with a fallback to empty array before accessing .length or .every() or .map()",
+        "PluginList.tsx guards p.tools in the filter callback with a fallback to empty array before calling .some()",
+        "bridge.ts matchesPlugin function guards plugin.tools before calling .some()",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Multiple child components access plugin.tools without null guards:\n\n1. platform/browser-extension/src/side-panel/components/PluginCard.tsx:\n   - Line 52: `plugin.tools.length > 0 && plugin.tools.every(t => t.enabled)` — add `(plugin.tools ?? [])` or guard with early return\n   - Line 55: `plugin.tools` in handleToggleAll — same pattern\n   - Line 67: `plugin.tools` in handleToggleTool — same pattern\n   - Line 80: `plugin.tools.filter(...)` — same pattern\n   - Line 162: `plugin.tools.length` — same pattern\n\n2. platform/browser-extension/src/side-panel/components/PluginList.tsx:\n   - Line 29: `plugins.filter(p => p.tools.some(...))` — add `(p.tools ?? []).some(...)`\n\n3. platform/browser-extension/src/side-panel/bridge.ts:\n   - Line 62: `plugin.tools.some(...)` in matchesPlugin — add `(plugin.tools ?? []).some(...)`\n\nThe cleanest approach is to normalize plugin.tools to [] at the data ingestion boundary (US-001), but adding guards in these locations provides defense in depth. Use `(plugin.tools ?? [])` pattern consistently."
+    }
+  ]
+}
