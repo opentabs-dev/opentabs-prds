@@ -1,0 +1,47 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix opentabs start --background silently failing with exit code 1 and zero output on Node.js 24. Two root causes: (1) createWriteStream returns a WriteStream with fd=null before the open event, and Node 24 rejects this in spawn stdio; (2) the global .catch(() => {}) in cli.ts swallows all unexpected errors, producing silent exits.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Wait for WriteStream open before passing to spawn in background mode",
+      "description": "As a user running opentabs start --background, I want the server to start successfully so that I can run the server in the background without issues.",
+      "acceptanceCriteria": [
+        "createWriteStream for the log file is awaited until the 'open' event fires (fd is non-null) before being passed to spawn stdio",
+        "If the WriteStream fails to open (e.g., permission denied), a clear error message is printed and the process exits with code 1",
+        "The spawn call receives a WriteStream with a valid fd, preventing ERR_INVALID_ARG_VALUE on Node.js 24+",
+        "Existing foreground start behavior is unchanged (the foreground path uses spawnStreaming with 'pipe' stdio, not WriteStream)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/start.ts, lines 311-318.\n\nThe bug: On Node.js 24, `spawn()` rejects a WriteStream whose fd is null (stream hasn't opened yet). The current code creates the stream and immediately passes it to spawn:\n\n```\nconst logStream = createWriteStream(logFilePath, { flags: 'a', mode: 0o600 });\nconst child = spawn(platformExec('node'), [serverEntry], {\n  env: env as NodeJS.ProcessEnv,\n  stdio: ['ignore', logStream, logStream],\n  detached: true,\n});\n```\n\nFix: Wait for the stream's 'open' event before calling spawn. Add a helper like:\n\n```typescript\nconst waitForOpen = (stream: WriteStream): Promise<void> =>\n  new Promise((resolve, reject) => {\n    if (stream.fd !== null) { resolve(); return; }\n    stream.once('open', () => resolve());\n    stream.once('error', reject);\n  });\n```\n\nThen before the spawn call:\n```typescript\ntry {\n  await waitForOpen(logStream);\n} catch (err) {\n  console.error(pc.red(`Error: Failed to open log file ${logFilePath}: ${toErrorMessage(err)}`));\n  process.exit(1);\n}\n```\n\nIMPORTANT: Only the background path (lines 311-357) needs this fix. The foreground path (line 370) uses spawnStreaming which pipes stdout/stderr, not WriteStream objects.\n\nAlso note: the `WriteStream` type is already imported on line 26 as `import type { WriteStream } from 'node:fs';`."
+    },
+    {
+      "id": "US-002",
+      "title": "Log unexpected errors in CLI global catch handler instead of swallowing them",
+      "description": "As a user running any opentabs command, I want unexpected errors to be printed to stderr so that I can diagnose issues instead of seeing a silent exit with code 1.",
+      "acceptanceCriteria": [
+        "The .catch() handler in cli.ts prints the error message to stderr for unexpected errors",
+        "Expected errors (where the action handler already called process.exit or printed an error) do not produce duplicate output",
+        "The error message format is: 'Error: <message>' on stderr, matching the style of other CLI error messages",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/cli.ts, lines 56-59.\n\nThe current code:\n```typescript\nawait program.parseAsync().catch(() => {\n  // Action handlers print their own errors and call process.exit(1).\n  // Swallow the rejected promise so Commander does not re-print the output.\n  process.exitCode ??= 1;\n});\n```\n\nThis swallows ALL errors — including unexpected ones like ERR_INVALID_ARG_VALUE from Node 24. The intent is correct (don't double-print), but the implementation is too aggressive.\n\nThe fix: Check whether the error is an expected Commander/process.exit error or an unexpected one. When action handlers call `process.exit(1)`, Commander wraps the exit in a special error. There are two patterns to distinguish:\n\n1. Commander's own errors (like CommanderError) — these have already been printed by Commander\n2. process.exit() called from action handlers — the handler already printed its own error message\n\nThe simplest robust fix: Check if anything was already printed to stderr (hard to track) — OR simply log unexpected errors that are NOT CommanderError instances:\n\n```typescript\nimport { CommanderError } from 'commander';\n\nawait program.parseAsync().catch((err: unknown) => {\n  if (!(err instanceof CommanderError)) {\n    // Unexpected error — action handlers didn't get a chance to print.\n    const message = err instanceof Error ? err.message : String(err);\n    console.error(`Error: ${message}`);\n  }\n  process.exitCode ??= 1;\n});\n```\n\nNote: When action handlers call `process.exit(1)`, Commander catches the SystemExit and throws a CommanderError with exitCode. So the CommanderError check correctly covers the 'already printed' case.\n\nImport `CommanderError` from 'commander' — it's already a dependency. Check the Commander source/types to confirm CommanderError is exported."
+    }
+  ]
+}
