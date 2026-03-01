@@ -19,7 +19,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: e2e/strict-csp.e2e.ts\n\nThree tests in the 'Multi-plugin injection under strict CSP' describe block create temp directories via fs.mkdtempSync() for minimal plugins. The cleanup (fs.rmSync) is at the end of the test body but NOT inside try/finally. If any assertion or await between creation and cleanup throws, the temp directory leaks.\n\nPattern to fix (each test):\n1. Find the `const tmpDir = fs.mkdtempSync(...)` line\n2. Wrap everything from the next line through the `fs.rmSync(tmpDir, ...)` in try/finally\n3. Move `fs.rmSync(tmpDir, { recursive: true, force: true })` into the finally block\n\nNote: `page.close()` calls can stay outside the try/finally since the page is owned by the fixture and cleaned up automatically. The critical thing is the tmpDir.\n\nLook at how the third test (around line 718) handles the same pattern — it may or may not also need fixing."
@@ -40,7 +40,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: e2e/lifecycle.e2e.ts, line ~770\n\nThe test kills server A and then does `await new Promise(r => setTimeout(r, 5_000))` to wait for the extension to detect the disconnect and exhaust reconnect attempts. This fixed sleep is flaky under CI load (5s may not be enough) and wastes time on fast machines.\n\nThe helpers.ts file exports `waitForExtensionDisconnected(server, timeoutMs)` which polls /health until extensionConnected === false. However, the server is already dead here, so /health won't respond.\n\nBetter approach: After killing server A, poll the extension's service worker or health endpoint to verify the disconnect was detected. Since the server is dead, we can't use waitForExtensionDisconnected on server A. Instead, the point of the wait is to ensure the extension has given up its initial reconnect backoff. A practical replacement:\n1. Use `waitForExtensionDisconnected(mcpServer, 10_000)` — even though server A is dead, the health check for server A will always return null (which means extensionConnected is false by default). Actually, re-read how waitForExtensionDisconnected works — it calls server.waitForHealth which needs the server alive.\n2. Alternative: After killing server A, simply wait for a new server B to start, then use `waitForExtensionConnected(serverB)` after the port change. The 5-second wait is to let the extension exhaust retries before changing the port — but this may not be strictly necessary. Read the full test (lines 740-840) to understand the reconnection sequence and determine if the sleep can be replaced with polling on server B's health instead.\n\nThe key insight: the fixed sleep is between killing server A and starting server B. Its purpose is to ensure the extension is in a disconnected state before we change the port. Replace with: start server B immediately, change port, then let `waitForExtensionConnected(serverB)` handle the full wait. If the extension is still retrying server A, the port change will redirect it to B."
@@ -61,7 +61,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "sonnet",
       "notes": "File: e2e/browser-tools.e2e.ts, in the browser_get_websocket_frames describe block\n\nThe test:\n1. Opens /ws-test page which establishes a live WebSocket connection\n2. Captures frames via browser_get_websocket_frames\n3. Calls browser_get_websocket_frames with { clear: true } — returns current frames and clears the buffer\n4. Immediately calls browser_get_websocket_frames again and asserts frame count is 0\n\nThe race: The WebSocket connection is still alive at step 4. The echo server sends messages back, so new frames can arrive between step 3 (clear) and step 4 (verify). This causes an intermittent failure where the frame count is 1 or 2 instead of 0.\n\nFix approach: Navigate away from the /ws-test page (or close it) between steps 3 and 4 to sever the WebSocket connection and prevent new frames. Alternatively, disable network capture before the verification read, then re-enable it. The simplest fix is to navigate the tab to about:blank (which closes the WebSocket) before the verification read, then check the buffer is empty."

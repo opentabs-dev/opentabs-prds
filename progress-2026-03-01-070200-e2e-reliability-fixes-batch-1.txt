@@ -1,0 +1,50 @@
+## Codebase Patterns
+- E2E tests in e2e/ use try/finally to guarantee cleanup of temp dirs created via fs.mkdtempSync
+- page.close() goes inside the try block (before finally); fs.rmSync goes in the finally block
+- Phase 1 checks: npm run build && npm run type-check && npm run lint && npm run knip && npm run test
+- lint-staged runs prettier and eslint --fix on staged *.ts files; indentation changes may be auto-applied
+- Fixed sleeps in E2E tests should be replaced by using the existing polling helpers (waitForExtensionConnected, waitForExtensionDisconnected, waitFor). When server A is dead, waitForExtensionDisconnected won't work (fetchHealth returns null). Instead, start server B immediately and rely on waitForExtensionConnected(serverB, 45_000) to provide the necessary wait.
+- setServerPort calls chrome.storage.onChanged which triggers connect() immediately — no need to wait for extension reconnect exhaustion before calling it
+- To fix race conditions between a live WebSocket connection and a buffer-empty assertion, navigate the tab away (browser_navigate_tab to any non-WebSocket page) before the verification read — this severs the connection and stops new frames from arriving
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-070200-e2e-reliability-fixes-batch-1~running.json
+Started: Sun Mar  1 15:02:28 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Wrapped code after fs.mkdtempSync in try/finally in all three multi-plugin tests in the 'Multi-plugin injection under strict CSP' describe block
+- Files changed: e2e/strict-csp.e2e.ts
+- Tests affected: 'two plugins both inject adapters...', 'e2e-test tool dispatch works...', 'removing one plugin does not affect the other...'
+- **Learnings for future iterations:**
+  - All three tests follow the same pattern: create tmpDir, then do work, then cleanup at the end. The fix is mechanical: add try {} wrapping the body and move fs.rmSync into finally.
+  - page.close() is included inside the try block (not outside) since the fixture owns the page but we can still call close explicitly to release resources early.
+  - lint-staged auto-adjusted indentation inside the try blocks (prettier applied). The commit diff shows more lines changed than functionally modified due to re-indentation.
+  - Phase 1 (build + type-check + lint + knip + test) all passed cleanly with no pre-existing failures.
+---
+
+## 2026-03-01 - US-002
+- Removed the fixed 5-second sleep in the 'URL change reconnection' test after killing server A
+- The sleep was designed to let the extension exhaust reconnect attempts before changing the port, but it was both unreliable (too short under CI load) and wasteful (5s fixed wait)
+- The existing waitForExtensionConnected(serverB, 45_000) call already handles the timing — the extension will connect to server B once setServerPort triggers chrome.storage.onChanged
+- Files changed: e2e/lifecycle.e2e.ts
+- **Learnings for future iterations:**
+  - waitForExtensionDisconnected polls /health, which needs a live server — it won't work after killing a server (fetchHealth returns null and the predicate is never invoked)
+  - The chrome.storage.onChanged handler calls connect() unconditionally, so setServerPort triggers an immediate reconnect attempt to the new URL regardless of current extension state
+  - When replacing a sleep before waitForExtensionConnected(serverB, 45_000), simply removing the sleep is correct — the 45s polling budget is already the gate
+  - Phase 1 (build + type-check + lint + knip + test) all passed cleanly
+---
+
+## 2026-03-01 - US-003
+- Fixed race condition in WebSocket frame buffer clear verification (browser-tools.e2e.ts)
+- Added `browser_navigate_tab` to testServer.url between the clear=true call and the empty-buffer verification to sever the WebSocket connection
+- This prevents the echo server from delivering new frames into the buffer between the clear and the verification read
+- Files changed: e2e/browser-tools.e2e.ts (1 navigation call added, 5 lines total)
+- Phase 1 (build + type-check + lint + knip + test) passed cleanly
+- Phase 2 (full E2E suite) passed: 417 tests, 0 failures
+- **Learnings for future iterations:**
+  - When a test opens a page with a live WebSocket and asserts the buffer is empty after clearing, the connection must be severed before the verification read
+  - The simplest approach is browser_navigate_tab to any non-WebSocket URL (e.g. testServer.url) — this closes the WebSocket and stops frame delivery immediately
+  - Alternatively, browser_disable_network_capture could stop recording, but navigation is cleaner and doesn't require re-enabling capture
+  - The test still needs to disable network capture and close the tab in the cleanup phase — the navigation only severs the connection
+---
