@@ -1,0 +1,37 @@
+## Codebase Patterns
+- WebSocket cleanup pattern: create WS and await connect OUTSIDE try block; wrap post-connect assertions in try; call ws.close() in finally
+- For tests where cleanup (ws.close()) must happen before subsequent assertions, only the pre-close logic goes in try/finally — post-close assertions stay outside
+- Reference pattern (dispatch-resilience.e2e.ts malformed messages test): `const rawWs = new WebSocket(...); await connectPromise; try { /* assertions */ } finally { rawWs.close(); }`
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-231922-e2e-websocket-leak-fixes~running.json
+Started: Sun Mar  1 07:19:56 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Wrapped WebSocket cleanup in try/finally blocks in 4 tests in e2e/lifecycle.e2e.ts
+- Files changed: e2e/lifecycle.e2e.ts
+- Tests fixed:
+  1. 'old extension WS is closed when a new connection arrives': wrapped waitForLog + assertions in try, ws.close() in finally; waitForHealth remains after finally
+  2. 'ping/pong keepalive works': wrapped pongPromise setup through expect in try, ws.close() in finally
+  3. 'extension detects replaced connection and reconnects': wrapped waitForLog in try, ws.close() in finally; waitForExtensionDisconnected and subsequent assertions remain outside
+  4. 'authenticated WS connection via sec-websocket-protocol': wrapped pongPromise setup through expect in try, ws.close() in finally
+- **Learnings for future iterations:**
+  - The WebSocket connect await (new Promise) stays OUTSIDE the try block — only post-connect logic goes inside
+  - For test 3, the post-close assertions (waitForExtensionDisconnected, waitForExtensionConnected) MUST stay outside the finally because they verify the server state after the WS is closed
+  - All 5 Phase 1 checks passed (build, type-check, lint, knip, test); e2eCheckpoint=false so no Phase 2 needed
+---
+
+## 2026-03-01 - US-002
+- Wrapped fake WebSocket cleanup in try/finally blocks in 3 tests in e2e/dispatch-resilience.e2e.ts
+- Files changed: e2e/dispatch-resilience.e2e.ts
+- Tests fixed:
+  1. 'tool call when extension is disconnected returns clean error': wrapped waitForLog in try, fakeWs.close() in finally; waitForExtensionDisconnected and assertions remain outside
+  2. 'browser_list_tabs during reconnect returns Extension not connected': same pattern — waitForLog in try, fakeWs.close() in finally; waitForExtensionDisconnected stays outside
+  3. 'DISPATCH_TIMEOUT_MS fires when extension response never reaches server': wrapped waitForLog + timeout assertions in try, fakeWs.close() in finally; cleanup (setSlow(0), timeoutClient.close(), waitForExtensionConnected) stays after
+- **Learnings for future iterations:**
+  - For tests 1 and 2, only waitForLog goes inside try (it's the only assertion that can fail between WS open and close); the WS was already closed before other assertions ran in the original code
+  - For test 3, `const response = await toolCallPromise` and the timing assertions go inside try so they're protected; fakeWs.close() in finally
+  - Post-close assertions and cleanup (waitForExtensionDisconnected, setSlow, waitForExtensionConnected) MUST stay outside try/finally — they verify state after the WS is closed
+  - All Phase 1 checks passed (build, type-check, lint, knip, test); e2eCheckpoint=true so Phase 2 (test:e2e) also ran — all 413 tests passed
+---
