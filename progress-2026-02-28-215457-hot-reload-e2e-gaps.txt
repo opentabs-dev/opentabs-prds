@@ -1,0 +1,55 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-215457-hot-reload-e2e-gaps~running.json
+Started: Sun Mar  1 05:55:20 UTC 2026
+---
+
+## Codebase Patterns
+- `setupToolTest(mcpServer, testServer, extensionContext, mcpClient)` in e2e/helpers.ts handles: waitForExtensionConnected, waitForLog('tab.syncAll received'), open test tab, waitForToolResult until ready. Returns the page handle.
+- After hot reload, the correct wait sequence is: waitForLog('Hot reload complete') → waitForExtensionConnected → waitForLog('tab.syncAll received') → waitForToolResult(mcpClient, 'e2e-test_echo', ..., {isError: false}).
+- A second MCP client is created with `createMcpClient(mcpServer.port, mcpServer.secret)` then `await client2.initialize()`. After hot reload, `callTool` auto-reinitializes the session internally.
+- Tests using fixture-based setup that exercise the extension WebSocket relay need `test.describe.serial` to avoid browser context conflicts.
+- `waitForToolResult` must be imported from `./helpers.js` separately — it is not currently imported in dev-proxy.e2e.ts by default.
+- For rapid successive hot reloads, ECONNREFUSED is an expected log message (proxy forwarding to already-killed worker) — do not assert its absence in those tests. Only check for 'deadlock', 'state corruption', and 'uncaughtException'.
+- When firing multiple rapid triggerHotReload() calls, clear `mcpServer.logs` first; then only ONE 'Hot reload complete' log will appear (from the final worker that wins the race).
+- Side panel hot reload tests (dev proxy restart) do NOT need `waitForLog(server, 'Config watcher: Watching')` — that's only needed when testing the config watcher reload path. For dev proxy hot reload, use: waitForLog('Hot reload complete') → waitForExtensionConnected → then side panel toBeVisible with 30s timeout.
+- Side panel tests that use manual server setup (not fixture-based) should use `test.describe.serial` to avoid parallel context conflicts with other side panel tests in the same file.
+
+## [2026-03-01] - US-001
+- Implemented E2E test: "both MCP clients dispatch tools end-to-end after hot reload"
+- Added to e2e/dev-proxy.e2e.ts in a new `test.describe.serial` block at the end of the file
+- Added `waitForToolResult` to the imports from helpers.js
+- Test creates two MCP clients, establishes baseline echo calls through the extension, triggers hot reload, waits for reload + reconnect + resync, then verifies both clients can still dispatch e2e-test_echo end-to-end
+- Files changed: e2e/dev-proxy.e2e.ts
+- **Learnings for future iterations:**
+  - The `setupToolTest` helper already handles waitForExtensionConnected + waitForLog('tab.syncAll received') + adapter injection polling — no need to duplicate
+  - After hot reload, always wait for 'tab.syncAll received' before asserting tool results — the extension must resync plugin state with the new worker
+  - MCP clients auto-reinitialize sessions after worker restart; just call `callTool` directly after hot reload
+  - `waitForToolResult` in helpers.ts was not previously imported in dev-proxy.e2e.ts — needed to add it
+---
+
+## [2026-03-01] - US-002
+- Implemented E2E test: "rapid successive hot reloads during active SSE stream resolve without deadlock"
+- Added to the existing `test.describe.serial('Dev proxy SSE mid-stream worker restart', ...)` block in e2e/dev-proxy.e2e.ts
+- Test fires 3 rapid `triggerHotReload()` calls in succession (no await between them) while a 5s slow_with_progress SSE stream is active
+- Uses the same post-reload wait sequence: waitForLog('Hot reload complete') → waitForExtensionConnected → waitForLog('tab.syncAll received') → waitForToolResult poll → final callTool assertion
+- ECONNREFUSED intentionally excluded from error pattern checks (expected during rapid kills)
+- Files changed: e2e/dev-proxy.e2e.ts
+- **Learnings for future iterations:**
+  - Clearing `mcpServer.logs.length = 0` before rapid reloads ensures only the final 'Hot reload complete' appears; no need to count occurrences
+  - The slow SSE call (30s timeout) will likely resolve with an error (502/connection reset) rather than completing — always wrap it in try/catch
+  - The same post-reload wait sequence (HC → EC → syncAll → waitForToolResult) works even after 3 rapid reloads; the proxy eventually stabilizes
+  - New tests can be added inside an existing `test.describe.serial` block without needing a new describe wrapper
+---
+
+## [2026-03-01] - US-003
+- Implemented E2E test: "side panel shows plugin list before and after dev proxy hot reload"
+- Added to e2e/side-panel-reload.e2e.ts in a new `test.describe.serial('Side panel recovery after dev proxy hot reload')` block
+- Test manually starts MCP server (hot=true), launches extension context, sets up adapter symlink, opens side panel, asserts 'E2E Test' visible, triggers hot reload, waits for reload+reconnect, re-asserts 'E2E Test' visible (30s timeout)
+- All 407 E2E tests pass including the new test
+- Files changed: e2e/side-panel-reload.e2e.ts
+- **Learnings for future iterations:**
+  - Side panel tests don't need `waitForLog('Config watcher: Watching')` when testing dev proxy hot reload — that log is only emitted by the config watcher path, not by hot reload
+  - After dev proxy hot reload, waitForLog('Hot reload complete') + waitForExtensionConnected is sufficient; the side panel re-render pipeline completes within the 30s Playwright timeout
+  - `server.logs.length = 0` before triggerHotReload() cleanly isolates the 'Hot reload complete' log from pre-reload noise
+  - `test.describe.serial` is needed since side panel tests use launchExtensionContext which creates Chromium contexts that conflict when parallelized
+---
