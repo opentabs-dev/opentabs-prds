@@ -1,0 +1,89 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix genuine issues in E2E test suite: null-safety crash in build-icons test, tautological/weak assertions in dev-proxy test, fixed sleep instead of polling in side-panel-auth-failed test, and leaked MCP client in dispatch-resilience test.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Guard against null stdout/stderr in build-icons.e2e.ts execSync catch blocks",
+      "description": "As a platform contributor, I want the build-icons E2E test to handle signal-killed processes gracefully so that test failures produce clear error messages instead of unhandled TypeErrors.",
+      "acceptanceCriteria": [
+        "Both catch blocks in runBuild() (lines 53-60 and 66-73) use optional chaining or null checks before calling .toString() on stdout and stderr",
+        "If stdout or stderr is null (process killed by signal), the result uses a fallback string like '' or '(no output)' instead of crashing",
+        "The return type and structure of runBuild() is unchanged — callers are not affected",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/build-icons.e2e.ts, lines 53-73.\n\nThe `runBuild` function has two catch blocks that handle execSync errors. Both cast the error to `{ status: number; stdout: Buffer; stderr: Buffer }` and call `.toString()` on stdout and stderr. However, when execSync kills a process due to timeout (60s) or the process receives a signal (OOM), the thrown error's `stdout` and `stderr` properties can be `null` instead of Buffer. Calling `.toString()` on `null` throws `TypeError: Cannot read properties of null`.\n\nFix: use optional chaining: `e.stdout?.toString() ?? ''` and `e.stderr?.toString() ?? ''`. Also update the type cast to `{ status: number; stdout: Buffer | null; stderr: Buffer | null }`. The `e.status` can also be null when killed by signal — use `e.status ?? 1` as fallback."
+    },
+    {
+      "id": "US-002",
+      "title": "Remove tautological assertion and strengthen ping verification in dev-proxy.e2e.ts",
+      "description": "As a platform contributor, I want the dev-proxy hot reload WebSocket test to have meaningful assertions so that real regressions are caught instead of silently passing.",
+      "acceptanceCriteria": [
+        "The mid-reload assertion at line 704 is removed (it accepts all possible outcomes and verifies nothing)",
+        "The ping verification timeout branch (line 747) resolves with false instead of true, so the test distinguishes 'got response' from 'timed out with no response'",
+        "The assertion at line 768 checks that pingReceived is true (meaning a response was actually received, not just that the timeout elapsed)",
+        "The test still cleans up freshWs correctly via freshWs.close()",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/dev-proxy.e2e.ts\n\nTwo issues in the 'WebSocket connections survive hot reload' test:\n\n1. Line 704: `expect(['open', 'closed', 'error']).toContain(midReloadResult)` — midReloadResult is typed as `'open' | 'closed' | 'error'`, so this assertion always passes regardless of outcome. It is dead code that verifies nothing. Remove the assertion entirely. The test's value comes from the later assertion that a fresh WebSocket connects successfully.\n\n2. Lines 746-768: The ping verification promise resolves `true` both when a message is received (line 751) AND when the 2s timeout fires (line 747). This means the `expect(pingReceived).toBe(true)` at line 768 always passes. The real assertion is `expect(freshWs.readyState).toBe(WebSocket.OPEN)` at line 764, which is correct. Fix the timeout branch to resolve `false` so the ping assertion has teeth. The comment at lines 765-767 explains the current intent — update the comment to reflect the new behavior.\n\nDo NOT change the freshResult assertion at line 737 or the cleanup at line 772 — those are correct."
+    },
+    {
+      "id": "US-003",
+      "title": "Replace fixed sleep with polling in side-panel-auth-failed.e2e.ts",
+      "description": "As a platform contributor, I want the auth-failed side panel test to use polling instead of a fixed 3-second sleep so that it is reliable under varying CI load.",
+      "acceptanceCriteria": [
+        "The fixed `setTimeout(r, 3_000)` at line 38 is replaced with a polling-based wait",
+        "The polling waits for the MCP server logs to contain evidence of an auth failure attempt (e.g., a 401 or auth rejection log line), with a reasonable timeout (e.g., 15 seconds)",
+        "The subsequent health check (`extensionConnected === false`) only runs after the extension has actually attempted and failed authentication",
+        "The test still verifies extensionConnected is false and the side panel shows 'Authentication Failed'",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/side-panel-auth-failed.e2e.ts, line 38.\n\nThe test currently uses `await new Promise(r => setTimeout(r, 3_000))` to wait for the extension to attempt connection and fail auth. Under heavy CI load, the extension might not have attempted connection within 3 seconds, making the subsequent `health.extensionConnected === false` assertion a tautology (it was never connected *yet*, not because auth failed).\n\nReplace with `waitForLog(server, '401', 15_000)` or similar — check the server's log output for the specific string that indicates auth rejection. Import `waitForLog` from `./helpers.js` if not already imported. The server logs auth failures when /ws-info returns 401 or when the WebSocket upgrade is rejected.\n\nIf the server doesn't log a clear auth failure indicator, an alternative is to poll the server logs for the extension connection attempt. Check what the MCP server actually logs when an unauthenticated extension tries to connect — read `platform/mcp-server/src/` for the relevant log line.\n\nDo NOT change the side panel assertions (lines 47-60) — those are correct and have their own 15s timeout."
+    },
+    {
+      "id": "US-004",
+      "title": "Wrap timeoutClient lifecycle in try/finally in dispatch-resilience.e2e.ts",
+      "description": "As a platform contributor, I want the dispatch-resilience server-side timeout test to always close the MCP client so that test failures don't leak sessions.",
+      "acceptanceCriteria": [
+        "timeoutClient.close() is called in a finally block that runs regardless of whether the test assertions pass or fail",
+        "testServer.setSlow(0) is also in a finally block or guaranteed to run before fixture teardown",
+        "The test behavior is otherwise unchanged — same assertions, same tool call, same timing expectations",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File: e2e/dispatch-resilience.e2e.ts, lines 522-609.\n\nThe 'server-side dispatch timeout when extension WS is replaced' test creates a `timeoutClient` at line 522 and initializes it at line 523. If an exception is thrown inside the try block (lines 572-588) — for example if `toolCallPromise` at line 576 rejects with a transport error — the `finally` at line 587 only closes `fakeWs`. The `timeoutClient.close()` at line 594 is outside this try/finally, so it is skipped on exception.\n\nFix: restructure the cleanup so that `timeoutClient.close()` and `testServer.setSlow(0)` are in a `finally` block that encompasses all code after their creation. One approach:\n\n```typescript\nconst timeoutClient = createMcpClient(mcpServer.port, mcpServer.secret);\nawait timeoutClient.initialize();\ntry {\n  // ... existing code (fetchWsInfo, setSlow, toolCallPromise, fakeWs, etc.) ...\n  // Move the existing inner try/finally for fakeWs inside here\n} finally {\n  await testServer.setSlow(0);\n  await timeoutClient.close();\n}\n```\n\nDo NOT change the test assertions or timing expectations. The existing inner try/finally for fakeWs cleanup (lines 572-589) should remain — nest it inside the outer try/finally."
+    }
+  ]
+}
