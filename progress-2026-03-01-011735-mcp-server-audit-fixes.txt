@@ -1,0 +1,67 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-011735-mcp-server-audit-fixes~running.json
+Started: Sun Mar  1 09:18:13 UTC 2026
+---
+
+## Codebase Patterns
+- sanitize-error.ts uses chained .replace() calls; order matters — more specific patterns (bracket IPv6, bare IPv6) must precede IPv4 to avoid partial matches on IPv4-mapped IPv6 addresses.
+- Vitest uses positional pattern args (`npm run test -- sanitize-error`), not `--testPathPattern`.
+- lint-staged runs prettier+eslint on staged files automatically; run `npm run lint:fix` to pre-fix before committing.
+
+## 2026-03-01 - US-001
+- Added IPv6 address stripping to `sanitizeErrorMessage` in `platform/mcp-server/src/sanitize-error.ts`
+- Two new regexes inserted before the IPv4 regex:
+  1. Bracket-wrapped form: `/\[[\da-fA-F:]+(?:%[^\]]+)?\](?::\d+)?/g` — handles `[::1]:9515`, `[fe80::1%eth0]`
+  2. Bare form: `/(?:[\da-fA-F]{0,4}:){2,}[\da-fA-F]{0,4}(?:%\S+)?/g` — handles `::1`, `fe80::1`, full 8-group addresses, zone IDs
+- Added 7 new tests to `platform/mcp-server/src/sanitize-error.test.ts` covering all IPv6 forms in the acceptance criteria
+- **Learnings for future iterations:**
+  - The bare IPv6 regex requires at least 2 colons (`{2,}` on the colon-terminated group), which is the key distinguishing feature from other patterns
+  - Bracket form must run before bare form to capture `[addr]:port` as a single replacement
+  - IPv4-mapped IPv6 (`::ffff:127.0.0.1`) is partially handled — the IPv6 prefix is stripped, preventing `::ffff:` from leaking, though the decimal suffix `.0.0.1` may remain (not a listed requirement)
+  - `[\da-fA-F]{0,4}` allows 0 hex digits in each group, correctly handling compressed `::` notation
+---
+
+## 2026-03-01 - US-002
+- Fixed `handleConfirmationResponse` in `platform/mcp-server/src/extension-handlers.ts`: when `domain_all` scope is requested but `pending.domain` is null, now falls back to `tool_all` (not `tool_domain`). Also sets `rule.domain = null` explicitly for clarity.
+- Added null guard in `isSessionAllowed` in `platform/mcp-server/src/state.ts`: `domain_all` case now returns `rule.domain !== null && rule.domain === domain`, so a rule with `domain: null` never matches any call.
+- Updated `platform/mcp-server/src/state.test.ts`: merged two tests for `domain_all` null rule into one test verifying it never matches (both null and specific domain calls return false).
+- Updated `platform/mcp-server/src/extension-handlers.test.ts`: updated test description and expectation — fallback now expects `tool_all` scope instead of `tool_domain`.
+- **Learnings for future iterations:**
+  - The `isSessionAllowed` function in state.ts uses a switch on `rule.scope` — defense-in-depth guards belong directly in the relevant case branch.
+  - lint-staged (prettier + eslint) auto-formats staged files during commit — after editing a log.warn call, prettier may collapse a multiline template literal to a single line if it fits the print width.
+  - The existing tests in extension-handlers.test.ts use `createPendingConfirmation()` helper; check its signature before adding new tests to avoid boilerplate.
+---
+
+## 2026-03-01 - US-003
+- Fixed race condition in `platform/mcp-server/src/browser-tools/export-har.ts`: replaced the two-step fetch-then-clear approach with atomic read+clear by passing `clear: args.clear ?? false` directly in both `getNetworkRequests` and `getWebSocketFrames` dispatches.
+- Removed the separate clearing block (the `if (args.clear)` block at lines 224-229) that issued redundant dispatches after all fetches succeeded.
+- Removed the misleading comment that described the old non-atomic approach.
+- Updated `platform/mcp-server/src/browser-tools/export-har.test.ts`: replaced the 3-test `exportHar clear-after-fetch ordering` describe block with a 4-test `exportHar atomic read+clear` describe block reflecting the new single-dispatch behavior.
+- **Learnings for future iterations:**
+  - When tests describe ordering of multiple dispatches (e.g. "fetch then clear"), they need full rewrite when the approach changes from two-step to atomic — not just assertion updates.
+  - The old tests were testing the wrong invariant for the new design: test 1 asserted HTTP was NOT cleared when WS failed, but with atomic design it IS cleared (which is the desired behavior). Rename tests to describe new invariants precisely.
+  - `args.clear ?? false` is cleaner than `...(args.clear ? { clear: true } : {})` since the extension accepts an explicit `false` value fine, and it makes the parameter always present for easier mock assertion matching.
+---
+
+## 2026-03-01 - US-004
+- Removed duplicate `disableNetworkCapture` dispatch and `activeNetworkCaptures.delete` from the inner `catch` block around `getNetworkRequests` in `platform/mcp-server/src/browser-tools/analyze-site/index.ts`.
+- The inner catch now just falls through with `networkRequests = []` (the default); the outer `finally` block at the end of `analyzeSite` already handles all cleanup unconditionally.
+- No test changes needed — `index.test.ts` tests helper functions only (generateSuggestions, restEndpointSuggestion, etc.), not the analyzeSite dispatch flow.
+- **Learnings for future iterations:**
+  - The `analyzeSite` function uses a top-level `try/finally` that always runs cleanup (disableNetworkCapture + activeNetworkCaptures.delete + closeTab); inner catch blocks for partial failures should only reset local result variables, never re-do cleanup.
+  - `index.test.ts` in analyze-site only tests pure helper functions; the analyzeSite orchestration itself (dispatch mocking, cleanup sequencing) is not unit-tested — changes there are verified by build/type-check only.
+---
+
+## 2026-03-01 - US-005
+- Added `import { log } from '../logger.js'` to `platform/mcp-server/src/browser-tools/export-har.ts`
+- Added `import { log } from '../../logger.js'` to `platform/mcp-server/src/browser-tools/analyze-site/index.ts`
+- Added `log.warn(...)` after each `?? []` fallback in export-har.ts (getNetworkRequests and getWebSocketFrames) when the result is neither an array nor an object with the expected property key
+- Same pattern in analyze-site/index.ts for getNetworkRequests and getWebSocketFrames
+- Condition: `!Array.isArray(raw) && !(raw as { key?: T[] }).key` — fires only when result falls through to the fallback
+- Updated `platform/mcp-server/src/browser-tools/export-har.test.ts`: added logger mock via `vi.hoisted` + `vi.mock('../logger.js', ...)`, and a 5-test `exportHar unexpected result shape warnings` describe block
+- **Learnings for future iterations:**
+  - `@typescript-eslint/no-unnecessary-condition` flags `!= null` checks when TypeScript already proves the value is non-nullable from the cast type — remove the null check rather than suppressing the lint rule
+  - Prettier will either force a multi-line `if (...)` or collapse it to single line based on length; if the single-line form fits in 120 chars, prettier prefers it
+  - When adding a logger mock to a test file that uses `vi.hoisted`, add the mock object to the hoisted factory so it's available as a named export alongside other mocks
+  - The logger mock pattern: `vi.mock('./logger.js', () => ({ log: { debug: vi.fn(), warn: vi.fn(), info: vi.fn(), error: vi.fn() } }))` (adjust relative path as needed)
+---
