@@ -1,0 +1,84 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-090351-improve-update-command-ux~running.json
+Started: Sun Mar  1 17:04:16 UTC 2026
+---
+
+## Codebase Patterns
+- The unauthenticated `/health` endpoint at `platform/mcp-server/src/http-routes.ts` always returns `x-opentabs-version` header
+- The authenticated `/health` response body includes `mode: "dev" | "production"` — only returned when Bearer token is valid
+- The CLI uses `picocolors` (pc) for colored output; `eqeqeq` ESLint rule requires `!==` not `!=`
+- Main update command file: `platform/cli/src/commands/update.ts`
+- Stop command pattern (PID file + health check) is in `platform/cli/src/commands/stop.ts`
+- `getPidFilePath` and `readAuthSecret` are exported from `platform/cli/src/config.ts`
+- `isProcessAlive` and `waitForExit` are duplicated in update.ts (same pattern as stop.ts); both files use local copies rather than a shared module
+- `waitForServer` in update.ts polls GET /health every 500ms checking x-opentabs-version header matches expected version
+- `restartBackgroundServer` orchestrates: SIGTERM → waitForExit(5s) → unlink PID → spawnSync opentabs start --background --port → waitForServer(10s)
+- Server detection order: unauthenticated health → PID file check → authenticated dev mode check → foreground default
+- For ESM module mocking: use `vi.mock('module', async importOriginal => { const actual = await importOriginal<typeof Module>(); return { ...actual, fn: vi.fn() }; })` — `vi.spyOn` does not work on ESM namespace exports
+- CLI test files use `createTestServer` helper (same as doctor.test.ts) for real HTTP servers on random ports
+- E2E side panel locators: BrowserToolsCard shows "Browser" + "CORE" badge (use `text=CORE` as locator)
+
+## 2026-03-01 - US-001
+- Changed `isServerRunning` to `getServerStatus` returning `{ running: boolean; version: string | null }`
+- Reads `x-opentabs-version` response header from unauthenticated `GET /health`
+- Warning now shows: `MCP server v0.0.41 is running on port 9515` (or without version if header missing)
+- Files changed: `platform/cli/src/commands/update.ts`
+- **Learnings for future iterations:**
+  - ESLint `eqeqeq` rule requires `!==` (not `!=`) — use strict equality everywhere
+  - The unauthenticated `/health` always returns the version header, no auth token needed for US-001
+  - `serverStatus.running` replaces `serverRunning` boolean throughout the function — update all references
+---
+
+## 2026-03-01 - US-002
+- Replaced `ServerStatus` interface + `getServerStatus` function with `ServerType` type + `DetectedServer` interface + `isProcessAlive` helper + `detectServer` function
+- `detectServer` returns `DetectedServer | null` (null = no server running)
+- Detection logic follows stop.ts pattern: unauthenticated health → PID file + alive process + authenticated verify → dev mode check → foreground fallback
+- `handleUpdate` now uses `detectedServer !== null` instead of `serverStatus.running`
+- Files changed: `platform/cli/src/commands/update.ts`
+- **Learnings for future iterations:**
+  - `readAuthSecret()` may return null if `~/.opentabs/extension/auth.json` doesn't exist — dev mode detection silently skips in that case
+  - `isProcessAlive` is duplicated from stop.ts — US-003 should consider extracting to `platform/cli/src/process-utils.ts`
+  - The `DetectedServer` type (`{ type, version, pid }`) is the central data structure for US-003 and US-004 to use
+  - Background detection requires PID file + `isProcessAlive(pid)` + authenticated health check returning `x-opentabs-version` header
+---
+
+## 2026-03-01 - US-003
+- Added `waitForExit` helper (matches stop.ts pattern: polls every 200ms up to timeoutMs)
+- Added `waitForServer` helper (polls GET /health every 500ms, checks x-opentabs-version matches expected version)
+- Added `restartBackgroundServer` function: SIGTERM → waitForExit(5s) → unlink PID file → spawnSync opentabs start --background --port → waitForServer(10s) → success/failure messages
+- Updated `handleUpdate` post-update logic: background servers auto-restart, non-background servers still get generic restart instructions
+- Added `unlink` import from `node:fs/promises`
+- Files changed: `platform/cli/src/commands/update.ts`
+- **Learnings for future iterations:**
+  - `spawnSync('opentabs', ['start', '--background', '--port', String(port)], { stdio: 'inherit' })` uses the newly installed binary from PATH, not the currently running one
+  - `waitForExit` and `waitForServer` are kept as local functions in update.ts rather than extracted to a shared module — keeps the change minimal and avoids merge conflicts with stop.ts
+  - The `restartBackgroundServer` function returns boolean so the caller can branch on success/failure (used by US-004 to decide what message to show)
+  - PID file is always cleaned up after waitForExit, regardless of whether the process exited — matches stop.ts behavior
+---
+
+## 2026-03-01 - US-004
+- Updated pre-update warning section to be type-specific: background gets "will be restarted automatically", foreground gets "you will need to restart it", dev gets a dimmed note that dev servers run from source and won't be affected
+- Replaced generic post-update `else if (detectedServer !== null)` block with a switch on type: background calls `restartBackgroundServer` (US-003), foreground prints actionable Ctrl+C message with version label, dev prints hot-reload note
+- Files changed: `platform/cli/src/commands/update.ts`
+- **Learnings for future iterations:**
+  - Prettier auto-fix handles long template literals with multi-line wrapping — run `npx eslint --fix` to auto-correct
+  - The `versionLabel` pattern (`detectedServer.version !== null ? \`Server v${...}\` : 'Server'`) is used in both pre-update and post-update sections to gracefully omit version when unavailable
+  - Dev server pre-update message uses `pc.dim` (not `pc.yellow`) since it's informational rather than a warning — dev servers are unaffected by global CLI updates
+---
+
+## 2026-03-01 - US-005
+- Created `platform/cli/src/commands/update.test.ts` with 24 unit tests covering all new update command functionality
+- Exported internal functions from `update.ts` for testability: `detectServer`, `handleUpdate`, `isProcessAlive`, `restartBackgroundServer`, `waitForExit`, `waitForServer`, and types `DetectedServer`, `ServerType`
+- Tests use real HTTP test servers (via `createServer`) for `detectServer` and `waitForServer` tests — same pattern as `doctor.test.ts`
+- Tests use `vi.mock` at module level for `node:fs/promises` (unlink) and `node:child_process` (spawnSync) — ESM modules can't be spied on with `vi.spyOn`
+- Tests mock `../config.js` for `readAuthSecret` and `getPidFilePath`, and `../parse-port.js` for `resolvePort`
+- Fixed pre-existing E2E test failures: updated `text=Browser Tools` locators to `text=CORE` in onboarding, side-panel-live-update, and side-panel-reload E2E tests (the BrowserToolsCard component renders "Browser" + "CORE" badge, not "Browser Tools")
+- Files changed: `platform/cli/src/commands/update.ts`, `platform/cli/src/commands/update.test.ts`, `e2e/onboarding.e2e.ts`, `e2e/side-panel-live-update.e2e.ts`, `e2e/side-panel-reload.e2e.ts`
+- **Learnings for future iterations:**
+  - ESM modules (`node:fs/promises`, `node:child_process`) cannot be spied on with `vi.spyOn` — use `vi.mock` with `importOriginal` to mock specific exports while passing through the rest
+  - Use `import type * as ModuleName from 'module'` then `importOriginal<typeof ModuleName>()` for typed module mocks — `typeof import('...')` inline is forbidden by `@typescript-eslint/consistent-type-imports`
+  - Use `writeFileSync`/`unlinkSync` from `node:fs` (not mocked) for test fixture setup/cleanup when `node:fs/promises` is module-mocked
+  - The `restartBackgroundServer` test for "process does not exit within timeout" takes ~5s (real wait) — use `10_000` test timeout
+  - E2E test locators must match the actual rendered text; the BrowserToolsCard renders "Browser" + a `<Badge>CORE</Badge>`, not "Browser Tools"
+---
+
