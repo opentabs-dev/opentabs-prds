@@ -1,0 +1,93 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs in plugin-tools and shared packages discovered during backend audit: watch mode double-rebuild, non-string config elements crash, invalid IPv4 in URL patterns, and percentage-based rgb() in icon validation.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix watch mode double-rebuild due to lingering debounce timer",
+      "description": "As a plugin developer, I want watch mode to not trigger redundant double-rebuilds when file changes arrive during an active build.",
+      "acceptanceCriteria": [
+        "When rebuild() starts, the debounce timer (debounceTimer) is cleared before checking pendingRebuild",
+        "A file change during an active build results in exactly one follow-up rebuild (via pendingRebuild), not two",
+        "Normal debounce behavior for changes outside of an active build is preserved",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts around lines 1176-1217.\n\nThe problem: when a file change arrives during an active build, the watcher callback sets pendingRebuild=true (because building=true) AND starts a new debounceTimer. When the build finishes and sees pendingRebuild=true, it calls rebuild(). But the debounceTimer also fires independently, causing a second rebuild.\n\nFix: At the start of the rebuild() function (around line 1176), clear debounceTimer:\n```typescript\nconst rebuild = async () => {\n  if (debounceTimer) {\n    clearTimeout(debounceTimer);\n    debounceTimer = undefined;\n  }\n  building = true;\n  // ... rest of rebuild\n};\n```\n\nThis ensures that when rebuild() runs (whether from debounce or pendingRebuild), any lingering timer is cancelled."
+    },
+    {
+      "id": "US-002",
+      "title": "Guard against non-string elements in config.localPlugins during build",
+      "description": "As a plugin developer with a manually-edited config, I want the build command to gracefully handle non-string elements in localPlugins instead of crashing with an unhelpful TypeError.",
+      "acceptanceCriteria": [
+        "config.localPlugins is filtered to only include string elements before use in registerInConfig",
+        "Non-string elements (null, numbers, objects) are silently skipped",
+        "The build succeeds when config.localPlugins contains mixed types",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/commands/build.ts around lines 206-207.\n\nCurrent code in registerInConfig():\n```typescript\nconst localPlugins: string[] = Array.isArray(config.localPlugins) ? config.localPlugins : [];\n```\n\nFix: Add a filter:\n```typescript\nconst localPlugins: string[] = Array.isArray(config.localPlugins)\n  ? (config.localPlugins as unknown[]).filter((p): p is string => typeof p === 'string')\n  : [];\n```\n\nThis matches the defensive pattern used in the MCP server's config.ts parseConfigRecord function (line 180-181)."
+    },
+    {
+      "id": "US-003",
+      "title": "Validate IPv4 octets in URL pattern validation",
+      "description": "As a plugin developer, I want validateUrlPattern to reject invalid IPv4 addresses like 999.999.999.999 so that I get a build-time error instead of a silently non-functional plugin.",
+      "acceptanceCriteria": [
+        "validateUrlPattern rejects URL patterns with IPv4 addresses containing octets > 255",
+        "validateUrlPattern accepts valid IPv4 addresses like 192.168.1.1, 127.0.0.1, 10.0.0.1",
+        "Error message clearly states which octet is out of range",
+        "Non-IP hostnames are unaffected",
+        "Wildcard host (*) is unaffected",
+        "Tests cover: valid IPs, edge cases (0.0.0.0, 255.255.255.255), invalid IPs (256.0.0.1, 999.999.999.999)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/shared/src/index.ts around lines 460-480 (the validateUrlPattern function).\n\nThe IP detection regex is at line 466-467:\n```typescript\nconst ipMatch = host.match(/^\\d{1,3}(\\.\\d{1,3}){3}(:\\d+)?$/);\n```\n\nAfter this regex matches, add octet validation:\n```typescript\nif (ipMatch) {\n  const hostWithoutPort = host.replace(/:\\d+$/, '');\n  const octets = hostWithoutPort.split('.').map(Number);\n  if (octets.some(o => o > 255)) {\n    return { valid: false, error: `Invalid IPv4 address in URL pattern: octets must be 0-255, got '${hostWithoutPort}'` };\n  }\n}\n```\n\nTest file: look for existing validateUrlPattern tests — check platform/shared/src/manifest.test.ts or platform/shared/src/index.test.ts or similar. Add test cases for valid and invalid IPs."
+    },
+    {
+      "id": "US-004",
+      "title": "Handle percentage-based rgb() in SVG icon color validation",
+      "description": "As a plugin developer, I want the icon validator to correctly parse percentage-based rgb() colors so that saturated colors in inactive icons are properly detected and converted to grayscale.",
+      "acceptanceCriteria": [
+        "parseColor correctly parses rgb(100%, 50%, 0%) as {r: 255, g: 128, b: 0}",
+        "parseColor correctly parses rgba(100%, 0%, 0%, 0.5) as {r: 255, g: 0, b: 0, a: 0.5}",
+        "isAchromaticColor returns false for rgb(100%, 0%, 0%) (it's saturated red, not gray)",
+        "convertColorToGray converts percentage-based rgb colors to grayscale",
+        "generateInactiveIcon converts percentage-based rgb() colors to grayscale",
+        "Integer-based rgb() continues to work as before",
+        "Tests cover percentage-based rgb() in both comma-separated and modern space-separated syntax",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/plugin-tools/src/validate-icon.ts.\n\nThe parseColor function (around line 220) has regexes for various color formats. The legacy comma-separated rgb() regex at line 228:\n```typescript\nconst legacyRgbMatch = value.match(/^rgba?\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)/);\n```\nonly matches integer values. Extend it to also match percentage values:\n```typescript\nconst legacyRgbMatch = value.match(/^rgba?\\(\\s*(\\d+%?)\\s*,\\s*(\\d+%?)\\s*,\\s*(\\d+%?)/);\n```\nThen when extracting values, check for the % suffix and convert: if value ends with '%', parse as Number(value.slice(0, -1)) * 255 / 100, clamped to 0-255.\n\nAlso check convertColorToGray (around line 450) for the same issue — it has its own regex matching that may also need the percentage extension.\n\nSimilarly check the modern space-separated regex patterns in the same function.\n\nTest file: platform/plugin-tools/src/validate-icon.test.ts."
+    }
+  ]
+}

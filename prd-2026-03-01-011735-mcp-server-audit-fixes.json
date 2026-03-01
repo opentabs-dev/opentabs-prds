@@ -1,0 +1,115 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bugs and missing guards discovered during mcp-server backend audit: IPv6 address leak in error sanitization, domain_all permission scope with null domain, export-har race condition, double disableNetworkCapture dispatch, and silent empty results on unexpected dispatch shapes.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix IPv6 address leak in sanitize-error.ts",
+      "description": "As a platform operator, I want IPv6 addresses stripped from error messages so that internal network topology is not exposed to external MCP clients.",
+      "acceptanceCriteria": [
+        "sanitizeErrorMessage strips full IPv6 addresses (e.g., '2001:0db8:85a3:0000:0000:8a2e:0370:7334') replacing with [IP]",
+        "sanitizeErrorMessage strips compressed IPv6 (e.g., '::1', 'fe80::1') replacing with [IP]",
+        "sanitizeErrorMessage strips IPv6 with zone IDs (e.g., 'fe80::1%eth0') replacing with [IP]",
+        "sanitizeErrorMessage strips bracket-wrapped IPv6 (e.g., '[::1]:9515') replacing with [IP]",
+        "Existing IPv4 stripping behavior is unchanged",
+        "Existing URL and path stripping behavior is unchanged",
+        "Tests cover all IPv6 forms listed above",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/sanitize-error.ts line 26. Currently only has an IPv4 regex: /\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}/g. Add an IPv6 regex BEFORE the IPv4 regex (to avoid partial matches where IPv4-mapped IPv6 like ::ffff:127.0.0.1 gets partially stripped). IPv6 forms to handle: full (8 groups of 4 hex digits separated by colons), compressed (:: shorthand), with zone ID (%interface), bracket-wrapped ([::1]:port). A practical approach: match sequences of hex digits and colons that look like IPv6 (at least two colons), optionally followed by %zone_id, optionally wrapped in brackets with :port. Test file is at platform/mcp-server/src/sanitize-error.test.ts."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix domain_all scope with null domain creating unintentional wildcard permission",
+      "description": "As a user, I want 'Allow Always' on a domain_all confirmation to NOT create a session rule that matches all null-domain requests, so that my permission intent is preserved.",
+      "acceptanceCriteria": [
+        "When domain_all scope is requested but pending.domain is null, the code does NOT create a SessionPermissionRule with scope=tool_domain and domain=null",
+        "Instead, a domain_all request with null domain either falls back to tool_all scope or is rejected (no rule created)",
+        "isSessionAllowed with scope=domain_all never matches when rule.domain is null",
+        "Existing domain_all behavior is preserved when domain is a valid string",
+        "Tests verify: domain_all with null domain does not produce a rule that matches future null-domain requests",
+        "Tests verify: domain_all with a valid domain still works as before",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two files to change:\n\n1. platform/mcp-server/src/extension-handlers.ts around lines 563-570: the handleConfirmationResponse function handles the 'allow_always' decision. When scope is 'domain_all' but pending.domain is null, it currently falls back to tool_domain scope with domain=null. Fix: when scope is 'domain_all' and domain is null, fall back to 'tool_all' scope instead (which makes sense — if there's no domain context, 'allow this tool everywhere' is the only reasonable interpretation of 'allow always').\n\n2. platform/mcp-server/src/state.ts lines 232-244: the isSessionAllowed function. Add a guard in the domain_all case: if rule.domain is null, return false (a domain_all rule with no domain is meaningless and should never match). This is a defense-in-depth guard.\n\nTests: platform/mcp-server/src/extension-handlers.test.ts and platform/mcp-server/src/state.test.ts."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix export-har race condition and redundant clear fetch",
+      "description": "As a user exporting HAR data, I want the export to atomically read and clear captured requests so that no requests are silently lost between the read and clear operations.",
+      "acceptanceCriteria": [
+        "The initial dispatchToExtension for getNetworkRequests uses clear: true when args.clear is true, combining read and clear into one dispatch",
+        "The separate clearing dispatches at the end (lines 224-229) are removed when the initial fetch already cleared",
+        "Same pattern applied for getWebSocketFrames when includeWebSocketFrames and clear are both true",
+        "When args.clear is false, behavior is unchanged (read without clearing)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/export-har.ts lines 196-229.\n\nCurrent flow:\n1. Fetch requests (no clear) — line 202\n2. Fetch WS frames (no clear) — line 212\n3. If args.clear: fetch requests again with clear:true — line 225\n4. If args.clear: fetch WS frames again with clear:true — line 227\n\nFix: Pass clear: args.clear ?? false in the initial fetch calls (steps 1 and 2). Then remove the separate clearing block (steps 3 and 4) entirely. This makes the read+clear atomic per dispatch, eliminating the race window where new requests arrive between step 1 and step 3.\n\nTest file: platform/mcp-server/src/browser-tools/export-har.test.ts."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix double disableNetworkCapture dispatch in analyze-site",
+      "description": "As a developer, I want analyze-site to dispatch disableNetworkCapture exactly once so that extension logs are not polluted with redundant cleanup errors.",
+      "acceptanceCriteria": [
+        "When getNetworkRequests fails in the analyze-site flow, disableNetworkCapture is dispatched only once (in the finally block), not twice",
+        "The catch block around getNetworkRequests no longer calls disableNetworkCapture or deletes from activeNetworkCaptures — it only sets networkRequests to empty",
+        "The finally block still handles all cleanup (disableNetworkCapture + activeNetworkCaptures.delete)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/mcp-server/src/browser-tools/analyze-site/index.ts\n\nThe inner catch block (around lines 954-962) for the getNetworkRequests failure currently does:\n```\ncatch {\n  try {\n    await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId });\n  } catch { }\n  state.activeNetworkCaptures.delete(tabId);\n}\n```\n\nBut the outer finally block (around lines 1032-1044) ALSO does:\n```\nfinally {\n  try {\n    await dispatchToExtension(state, 'browser.disableNetworkCapture', { tabId });\n  } catch { }\n  state.activeNetworkCaptures.delete(tabId);\n}\n```\n\nFix: Remove the disableNetworkCapture call and activeNetworkCaptures.delete from the inner catch. The catch block should only set networkRequests = [] (or just let the empty default stand). The finally block handles all cleanup paths."
+    },
+    {
+      "id": "US-005",
+      "title": "Add warnings for unexpected dispatch result shapes in HAR export and analyze-site",
+      "description": "As a developer debugging protocol mismatches, I want warnings logged when the extension returns unexpected result shapes so that silent empty results are diagnosable.",
+      "acceptanceCriteria": [
+        "In export-har.ts, when the dispatch result falls through to the ?? [] fallback (neither array nor object with .requests), a log.warn is emitted with the actual result type/keys",
+        "In analyze-site/index.ts, same warning pattern for getNetworkRequests result shape",
+        "Warnings include enough context to diagnose the mismatch (expected shape, actual shape)",
+        "Normal operation (correct shapes) produces no warnings",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files: platform/mcp-server/src/browser-tools/export-har.ts and platform/mcp-server/src/browser-tools/analyze-site/index.ts.\n\nIn export-har.ts lines 202-207:\n```typescript\nconst requestsRaw = (await dispatchToExtension(...)) as { requests: CapturedRequest[] } | CapturedRequest[];\nconst requests = Array.isArray(requestsRaw)\n  ? requestsRaw\n  : ((requestsRaw as { requests?: CapturedRequest[] }).requests ?? []);\n```\n\nAdd after the fallback: if requests is empty AND requestsRaw is not null/undefined and not an empty array and not { requests: [] }, log a warning like:\n`log.warn('Unexpected getNetworkRequests result shape — expected array or {requests: [...]}, got:', typeof requestsRaw, requestsRaw && typeof requestsRaw === 'object' ? Object.keys(requestsRaw) : 'N/A')`\n\nSame pattern for the WebSocket frames result and for the similar code in analyze-site/index.ts lines 947-953.\n\nImport log from '../logger.js' in export-har.ts if not already imported."
+    }
+  ]
+}

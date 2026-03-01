@@ -1,0 +1,50 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix CLI bugs discovered during backend audit: isPortInUse false positive on EACCES errors, and PID recycling risk in the stop command.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix isPortInUse false positive on non-EADDRINUSE errors",
+      "description": "As a CLI user, I want accurate port-in-use detection so that permission errors on privileged ports are reported correctly instead of showing a misleading 'port in use' message.",
+      "acceptanceCriteria": [
+        "isPortInUse resolves true ONLY for EADDRINUSE errors",
+        "EACCES errors cause the start command to print a specific permission-denied error message mentioning the port number",
+        "Other net.Server errors are propagated/rejected (not silently mapped to 'port in use')",
+        "The server.close() is called in the error handler to clean up the server object",
+        "Existing EADDRINUSE behavior is preserved",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/start.ts lines 81-89.\n\nCurrent code:\n```typescript\nconst isPortInUse = (port: number): Promise<boolean> =>\n  new Promise(resolve => {\n    const server = net.createServer();\n    server.once('error', () => resolve(true));\n    server.once('listening', () => {\n      server.close(() => resolve(false));\n    });\n    server.listen(port, '127.0.0.1');\n  });\n```\n\nFix: Change the error handler to inspect the error code:\n```typescript\nserver.once('error', (err: NodeJS.ErrnoException) => {\n  server.close();\n  if (err.code === 'EADDRINUSE') {\n    resolve(true);\n  } else {\n    reject(err);\n  }\n});\n```\n\nThen in the caller (the start command), catch the rejection and handle EACCES specifically with a user-friendly message like 'Permission denied: port N requires elevated privileges'. Other errors can use a generic 'Failed to check port N: <error message>'.\n\nAlso update the Promise constructor from `new Promise(resolve => ...)` to `new Promise<boolean>((resolve, reject) => ...)` since we now need reject."
+    },
+    {
+      "id": "US-002",
+      "title": "Mitigate PID recycling risk in stop command",
+      "description": "As a CLI user, I want `opentabs stop` to verify the target process is actually an OpenTabs server before sending SIGTERM, so that PID recycling cannot accidentally kill an unrelated process.",
+      "acceptanceCriteria": [
+        "Before sending SIGTERM, the stop command attempts a health check GET request to http://127.0.0.1:<port>/health",
+        "If the health check succeeds and the response includes the x-opentabs-version header, SIGTERM is sent as before",
+        "If the health check fails (connection refused, timeout, no x-opentabs-version header), the PID file is treated as stale: deleted with a message indicating the server is not running",
+        "The health check has a short timeout (2-3 seconds) to avoid hanging the stop command",
+        "If the port is unknown (no way to determine it), the stop command falls back to the existing behavior (SIGTERM with a warning)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/cli/src/commands/stop.ts lines 58-83.\n\nThe current code reads the PID from ~/.opentabs/server.pid and sends SIGTERM without verification. To verify:\n\n1. Read the port from the config or use the default port (check platform/cli/src/commands/start.ts for how the port is determined — it uses DEFAULT_PORT from @opentabs-dev/shared, which can be overridden by OPENTABS_PORT env var or config).\n2. Read the auth secret from ~/.opentabs/extension/auth.json (same as loadSecret in mcp-server config.ts).\n3. Attempt: fetch(`http://127.0.0.1:${port}/health`, { headers: { Authorization: `Bearer ${secret}` }, signal: AbortSignal.timeout(2000) })\n4. Check: response.ok && response.headers.get('x-opentabs-version')\n5. If verified: proceed with SIGTERM as before\n6. If not verified: clean up stale PID file, print message\n\nThe port can be read from process.env['OPENTABS_PORT'] or from the config file, or default to DEFAULT_PORT (9515). Check how other CLI commands determine the port — look at platform/cli/src/commands/status.ts or platform/cli/src/notify-server.ts for patterns.\n\nUsing opus because this requires reading multiple files to understand port/secret resolution patterns and integrating a health check into the existing stop flow."
+    }
+  ]
+}
