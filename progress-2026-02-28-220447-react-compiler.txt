@@ -1,0 +1,78 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-220447-react-compiler~running.json
+Started: Sun Mar  1 06:05:15 UTC 2026
+---
+
+## Codebase Patterns
+- The esbuild side panel build is in `platform/browser-extension/build-side-panel.ts`. Build scripts are type-checked via `tsconfig.build-scripts.json` which includes `build-*.ts` files.
+- Knip config is in `knip.ts` at the repo root. Babel presets/plugins referenced as strings in config objects must be listed in `ignoreDependencies` since knip can't trace string-based references. However, dynamic `await import(...)` calls in `.storybook/main.ts` ARE traced by knip (the file is in the entry list via tsconfig.storybook.json), so those packages should NOT be in ignoreDependencies.
+- `storybook-static/` is Storybook build output. If it exists on disk, knip flags all its JS files as "unused files" (non-zero exit). It must be in both `.gitignore` and knip's `ignore` list (`**/storybook-static/**`). Knip may show a "configuration hint" suggesting the ignore can be removed — ignore this hint when the directory is present.
+- Declaration files (`.d.ts`) for untyped npm packages should be placed in the consuming package directory and added to both the relevant tsconfig and knip entry list.
+- The browser extension workspace (`platform/browser-extension`) has separate tsconfigs for: main source (`tsconfig.json`), build scripts (`tsconfig.build-scripts.json`), tests (`tsconfig.test.json`), and storybook (`tsconfig.storybook.json`).
+- `@storybook/react-vite` auto-adds `@vitejs/plugin-react` without babel options. To use React Compiler in Storybook, filter out the auto-added plugins by name (`vite:react-babel`, `vite:react-refresh`, `vite:react-virtual-preamble`) in `viteFinal` and replace with a configured instance.
+- React Compiler evidence in Vite/Rollup output: the compiler runtime is inlined as `.c(N)` calls (where N is memo slot count); the import path `react/compiler-runtime` disappears after bundling. Use `grep -o "[a-zA-Z_$]\.c([0-9]\+)"` to verify compiler ran.
+- When removing `useCallback` from functions used as `useEffect` dependencies, `react-hooks/exhaustive-deps` will warn that the function "changes on every render". These are false positives — React Compiler automatically memoizes the functions. The rule emits `warning` (not `error`), so `npm run lint` exits 0.
+
+## 2026-03-01 - US-001
+- Integrated babel-plugin-react-compiler into the esbuild side panel build
+- Files changed:
+  - `package.json` — added devDependencies: `@babel/core`, `@babel/preset-react`, `@babel/preset-typescript`, `babel-plugin-react-compiler`, `esbuild-plugin-babel`
+  - `package-lock.json` — lockfile update
+  - `platform/browser-extension/build-side-panel.ts` — added esbuild-plugin-babel plugin with React Compiler, TypeScript, and React JSX presets
+  - `platform/browser-extension/esbuild-plugin-babel.d.ts` — type declarations for the untyped `esbuild-plugin-babel` package
+  - `platform/browser-extension/tsconfig.build-scripts.json` — included the `.d.ts` file
+  - `knip.ts` — added Babel packages to `ignoreDependencies` (string-referenced), added `.d.ts` to browser-extension entry list
+- **Learnings for future iterations:**
+  - `esbuild-plugin-babel` uses `onLoad` which intercepts file loading before esbuild's built-in transforms. Babel must handle both TypeScript stripping and JSX transformation via presets.
+  - The Babel pipeline order is: plugins first (react-compiler), then presets (typescript, react).
+  - The built output contains `react/compiler-runtime` imports as evidence the compiler ran.
+  - Prettier may require single-line formatting for short arrays — watch for lint failures after adding multi-line arrays.
+---
+
+## 2026-03-01 - US-002
+- Integrated React Compiler into Storybook Vite config
+- Files changed:
+  - `platform/browser-extension/.storybook/main.ts` — in `viteFinal`, filter out auto-added `@vitejs/plugin-react` plugins by name, then re-add with `babel: { plugins: ['babel-plugin-react-compiler'] }` option
+  - `knip.ts` — removed `@vitejs/plugin-react` from `ignoreDependencies` in browser-extension workspace (knip now traces its dynamic import in main.ts)
+- **Learnings for future iterations:**
+  - `@storybook/react-vite` auto-includes `@vitejs/plugin-react` without babel options. Must filter and replace it in `viteFinal` to add React Compiler — simply appending another instance causes double-transformation.
+  - `@vitejs/plugin-react` returns 3 plugins: `vite:react-babel`, `vite:react-refresh`, `vite:react-virtual-preamble`. All three names stay the same whether or not babel options are passed.
+  - Evidence of React Compiler in Vite output: look for `.c(N)` patterns in bundled output (cache calls). The import path `react/compiler-runtime` gets inlined and disappears. Use `grep -o "[a-zA-Z_$]\.c([0-9]\+)"` to verify.
+  - Knip 2026: dynamic `await import(...)` in `.storybook/main.ts` IS traced by knip (because the file is included in tsconfig.storybook.json which knip picks up as an entry). Don't add such imports to `ignoreDependencies`.
+  - `babel-plugin-react-compiler` is in root `node_modules/` and is resolved correctly by Babel when Storybook runs from `platform/browser-extension/` — Node.js module resolution traverses up to root.
+---
+
+## 2026-03-01 - US-003
+- Upgraded ESLint react-hooks config from recommended to recommended-latest
+- Files changed:
+  - `eslint.config.ts` — changed `plugin:react-hooks/recommended` to `plugin:react-hooks/recommended-latest`
+  - `.gitignore` — added `storybook-static/` (Storybook build output was untracked and needed gitignoring)
+  - `knip.ts` — added `**/storybook-static/**` to `ignore` list to prevent knip from flagging storybook build output as "unused files"
+- **Learnings for future iterations:**
+  - `recommended-latest` in eslint-plugin-react-hooks@7 adds the `react-hooks/exhaustive-deps` extended rules for React Compiler — no new lint violations were introduced with this upgrade.
+  - The `storybook-static/` directory (left by US-002's Storybook build) was not gitignored, causing knip to flag 1758 "unused files". Fixed by adding to `.gitignore` and knip's `ignore` list.
+  - Knip "configuration hints" (yellow) are advisory and don't cause non-zero exit. The `**/storybook-static/**` ignore pattern triggers a hint when the directory is absent but is required when it's present.
+---
+
+## 2026-03-01 - US-004
+- Removed all manual `useCallback` calls from the side panel codebase (11 total across 4 files)
+- Files changed:
+  - `platform/browser-extension/src/side-panel/App.tsx` — removed `useCallback` import and unwrapped 7 functions: `loadPlugins`, `handleSearchChange`, `handleInstall`, `handleRemove`, `handleUpdate`, `handleConfirmationRespond`, `handleDenyAll`
+  - `platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts` — removed `useCallback` import and unwrapped `clearConfirmationTimeout` and `handleNotification`
+  - `platform/browser-extension/src/side-panel/components/Footer.tsx` — removed `useCallback` import and unwrapped `handleChange`
+  - `platform/browser-extension/src/side-panel/hooks/useTheme.ts` — removed `useCallback` import and unwrapped `toggleTheme`
+- All 404 E2E tests passed (e2eCheckpoint: true)
+- **Learnings for future iterations:**
+  - After unwrapping `useCallback(callback, deps)` where the callback is passed as a separate argument (multiline form), the inner body has an extra 2-space indent. Run `npm run lint:fix` to auto-fix via prettier.
+  - `react-hooks/exhaustive-deps` warns about plain functions used as useEffect deps ("changes on every render"). These are false positives with React Compiler. The warnings are severity `warning`, not `error` — lint exits 0.
+  - The `react-hooks/exhaustive-deps` rule does NOT recommend removing `useCallback` even in recommended-latest; it still suggests wrapping. These suggestions can be ignored when React Compiler is in use.
+---
+
+## 2026-03-01 - US-005
+- Updated `platform/browser-extension/CLAUDE.md` React Best Practices section to reflect React Compiler conventions
+- Files changed:
+  - `platform/browser-extension/CLAUDE.md` — added React Compiler mention to section opening paragraph; replaced "useMemo/useCallback only when justified" guidance with "do not use for optimization — React Compiler handles memoization automatically; these are escape hatches only"
+- **Learnings for future iterations:**
+  - CLAUDE.md updates are linted by prettier via lint-staged (`*.md` glob). No special handling needed — prettier auto-formats on commit.
+  - The update is minimal: two targeted sentence changes. No need to restructure the section or add new subsections.
+---
