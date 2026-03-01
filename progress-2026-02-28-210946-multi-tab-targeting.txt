@@ -1,0 +1,207 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-210946-multi-tab-targeting~running.json
+Started: Sun Mar  1 05:10:28 UTC 2026
+---
+
+## Codebase Patterns
+- Shared wire types live in `platform/shared/src/index.ts` and are imported by both mcp-server and browser-extension
+- `TabMapping` in `platform/mcp-server/src/state.ts` mirrors the wire format and must stay in sync with shared types
+- Wire parsing in `extension-handlers.ts` uses `WireTabMapping` / `WirePluginTabInfo` interfaces for defensive parsing (all fields optional, validated before use)
+- Test files that set `state.tabMapping` must use the `TabMapping` shape from state.ts — multiple test files reference it: `extension-protocol.test.ts`, `http-routes.test.ts`, `reload.test.ts`
+- The `/health` endpoint in `http-routes.ts` exposes per-plugin tab info from `state.tabMapping`
+- The `config.getState` handler in `extension-handlers.ts` also reads `state.tabMapping` for tabState
+- `PluginTabStateInfo` in `extension-messages.ts` has shape `{ state: TabState, tabs: PluginTabInfo[] }` — the old `{ state, tabId, url }` shape is gone
+- `lastKnownState` cache in `tab-state.ts` stores serialized JSON strings (not `TabState`) — use `getAggregateState()` to extract the aggregate state from a cache entry
+- `updateLastKnownState` takes `PluginTabStateInfo` (not `TabState`) — callers pass the full computed state
+- `findAllMatchingTabs` in `tab-matching.ts` returns `chrome.tabs.Tab[]` with `.title` — pass it through to `PluginTabInfo.title`
+- Extension test mocks for `tab-state.js` must include `getAggregateState` alongside `getLastKnownStates`
+- `dispatchToTargetedTab` in `dispatch-helpers.ts` handles targeted dispatch (tab exists + URL pattern check + no fallback). `dispatchWithTabFallback` handles auto-select dispatch. Callers choose based on `tabId` presence.
+- JSON-RPC error codes: -32001 = no usable tab, -32002 = adapter not ready, -32003 = tab URL not matched (security). All in `json-rpc-errors.ts`
+- `handleToolDispatch`, `handleResourceRead`, and `handlePromptGet` all extract optional `tabId` from params and route to targeted vs fallback dispatch
+- Browser tool registration requires 4 files: `browser-tools/<name>.ts` (definition), `browser-tools/index.ts` (barrel), `browser-tool-names.ts` (static list), `permissions.ts` (tier). Also update `e2e/helpers.ts` BROWSER_TOOL_NAMES.
+- `defineBrowserTool` handler returns `Promise<unknown>` — for sync handlers use `Promise.resolve()` (ESLint rejects async without await)
+
+## 2026-03-01T05:17 - US-001
+- Implemented multi-tab wire types in `platform/shared/src/index.ts`:
+  - Added `PluginTabInfo` interface: `{ tabId: number, url: string, title: string, ready: boolean }`
+  - Updated `TabStateChangedParams`: replaced `tabId`/`url` with `tabs: PluginTabInfo[]`
+  - Updated `TabSyncAllParams`: values changed to `{ state: TabState, tabs: PluginTabInfo[] }`
+  - Added optional `tabId?: number` to `ToolDispatchParams`
+- Updated `TabMapping` in `platform/mcp-server/src/state.ts` from `{ state, tabId, url }` to `{ state, tabs: PluginTabInfo[] }`
+- Rewrote parsing in `extension-handlers.ts`: `parseTabMapping` and new `parsePluginTabInfo` handle the new array-based wire format
+- Updated `/health` endpoint to expose `tabs` array per plugin
+- Updated all server-side test files to use new TabMapping shape
+- Files changed:
+  - `platform/shared/src/index.ts`
+  - `platform/mcp-server/src/state.ts`
+  - `platform/mcp-server/src/extension-handlers.ts`
+  - `platform/mcp-server/src/http-routes.ts`
+  - `platform/mcp-server/src/extension-protocol.test.ts`
+  - `platform/mcp-server/src/http-routes.test.ts`
+  - `platform/mcp-server/src/reload.test.ts`
+- **Learnings for future iterations:**
+  - The `WireTabMapping` interface's `tabs` field is typed as `WirePluginTabInfo[]` — when iterating, don't add redundant `as WirePluginTabInfo` type assertions or ESLint will flag `@typescript-eslint/no-unnecessary-type-assertion`
+  - The `handleTabSyncAll` casts params as `Partial<TabSyncAllParams>` then accesses `.tabs` which is `Record<string, ...>` — iteration via `Object.entries()` works but each entry value is then cast to `WireTabMapping` for defensive parsing
+  - Extension-side code (browser-extension) was NOT changed in this story — it will have compile errors that US-002 resolves
+---
+
+## 2026-03-01T05:30 - US-002
+- Updated extension tab state reporting to emit multi-tab payloads
+- `PluginTabStateInfo` changed from `{ state, tabId, url }` to `{ state, tabs: PluginTabInfo[] }`
+- `computePluginTabState` now probes ALL matching tabs (no short-circuit on first ready) and returns full tabs array with per-tab readiness
+- `sendTabSyncAll` emits new payload shape with `tabs` arrays per plugin
+- `sendTabStateNotification` sends `{ plugin, state, tabs }` instead of `{ plugin, state, tabId, url }`
+- `lastKnownState` cache stores serialized `{ state, tabs }` JSON strings for diff detection — tab list changes (new tabs, closed tabs, URL changes, title changes, readiness changes) trigger notifications even when aggregate state is unchanged
+- Added `getAggregateState()` helper to extract `TabState` from serialized cache entries
+- `handleExtensionGetState` now includes per-tab detail (`tabs` array) in the plugins response
+- Updated all extension unit tests for new shape
+- Files changed:
+  - `platform/browser-extension/src/extension-messages.ts`
+  - `platform/browser-extension/src/tab-state.ts`
+  - `platform/browser-extension/src/messaging.ts`
+  - `platform/browser-extension/src/message-router.ts`
+  - `platform/browser-extension/src/browser-commands/extension-commands.ts`
+  - `platform/browser-extension/src/tab-state.test.ts`
+  - `platform/browser-extension/src/message-router.test.ts`
+  - `platform/browser-extension/src/browser-commands/extension-commands.test.ts`
+- **Learnings for future iterations:**
+  - `chrome.tabs.Tab.title` is available from `findAllMatchingTabs` — no extra API call needed
+  - When changing `lastKnownState` from simple values to serialized strings, all consumers (checkTabChanged, notifyAffectedPlugins, sendTabSyncAll) must be updated to compare serialized strings instead of direct values
+  - `eslint no-non-null-assertion` rule is enforced — use `?? ''` fallback instead of `!` for Map.get() results in tests
+  - The side panel's `useServerNotifications` hook only reads `state` from `tab.stateChanged` params, so it works unchanged with the new payload shape
+---
+
+## 2026-03-01T05:38 - US-003
+- Added tabId-targeted dispatch path in extension tool dispatch
+- New `dispatchToTargetedTab` function in `dispatch-helpers.ts` handles targeted dispatch:
+  1. Validates tab exists via `chrome.tabs.get(tabId)`
+  2. Security check: validates tab URL matches plugin's URL patterns via `urlMatchesPatterns`
+  3. Executes on the targeted tab with no fallback to other tabs
+- New `JSONRPC_TAB_NOT_MATCHED` error code (-32003) for URL pattern mismatch
+- `handleToolDispatch` in `tool-dispatch.ts` extracts optional `tabId` from params, routes to either `dispatchToTargetedTab` or `dispatchWithTabFallback`
+- `handleResourceRead` and `handlePromptGet` in `resource-prompt-dispatch.ts` also support optional `tabId` with the same targeted-dispatch logic
+- Added 8 new tests in `dispatch-helpers.test.ts` covering:
+  - Targeted dispatch success (tab exists + URL matches)
+  - Tab-not-found error (-32001)
+  - URL-mismatch security error (-32003)
+  - Tab with no URL
+  - Adapter-not-ready with no fallback (-32002)
+  - Tab closed during execution
+  - Non-tab-gone execution failure
+  - Error data forwarding from dispatch result
+- Files changed:
+  - `platform/browser-extension/src/json-rpc-errors.ts`
+  - `platform/browser-extension/src/dispatch-helpers.ts`
+  - `platform/browser-extension/src/tool-dispatch.ts`
+  - `platform/browser-extension/src/resource-prompt-dispatch.ts`
+  - `platform/browser-extension/src/dispatch-helpers.test.ts`
+- **Learnings for future iterations:**
+  - The `dispatchToTargetedTab` function is intentionally separate from `dispatchWithTabFallback` — callers choose which to use based on whether `tabId` is present
+  - ESLint forbids `import()` type annotations in source code (`@typescript-eslint/consistent-type-imports`) — use regular `import type` at the top of the file instead
+  - Prettier requires multi-item destructured imports from `await import()` to break across lines
+  - The `sanitizeErrorMessage` function is already imported in `dispatch-helpers.ts` — reuse it in new error paths
+  - `JSONRPC_TAB_NOT_MATCHED` (-32003) is the new error code for the URL pattern security check — distinct from `JSONRPC_NO_USABLE_TAB` (-32001) which is for tab-not-found
+- `getEnabledToolsList` in `mcp-setup.ts` clones plugin tool schemas with `structuredClone` and injects `tabId` — the original `ManifestTool.input_schema` is never mutated
+- `handlePluginToolCall` in `mcp-tool-dispatch.ts` extracts and strips `tabId` from args before Ajv validation, then threads it as a top-level `ToolDispatchParams` field to the extension
+---
+
+## 2026-03-01T05:41 - US-004
+- Injected optional `tabId` property into plugin tool schemas exposed via MCP tools/list
+- `getEnabledToolsList` deep-clones each plugin tool's `input_schema` via `structuredClone`, then injects `tabId: { type: 'integer', description: '...' }` into the clone's `properties`
+- `handlePluginToolCall` extracts `tabId` from args before Ajv validation (`typeof args.tabId === 'number'`), deletes it from args, validates remaining args against the plugin's original schema, then threads `tabId` into `dispatchToExtension` as a top-level param
+- This ensures plugins with `additionalProperties: false` still validate correctly, and plugin tool handlers never see `tabId` in their input
+- Files changed:
+  - `platform/mcp-server/src/mcp-setup.ts`
+  - `platform/mcp-server/src/mcp-tool-dispatch.ts`
+- **Learnings for future iterations:**
+  - `structuredClone(toolDef.input_schema)` returns `Record<string, unknown>` since `input_schema` is typed that way — no `as` assertion needed (ESLint `no-unnecessary-type-assertion` catches it)
+  - The `delete args.tabId` on an object without `tabId` is a harmless no-op, so existing tests passing `{}` args continue to work unchanged
+  - The `...(tabId !== undefined && { tabId })` spread pattern conditionally includes `tabId` only when present, keeping the dispatch params clean for non-targeted calls
+---
+
+## 2026-03-01T05:47 - US-005
+- Added `plugin_list_tabs` browser tool — reads from `state.tabMapping` server-side (no extension dispatch needed)
+- Tool accepts optional `plugin` param: when provided, returns tabs for that plugin only; when omitted, returns tabs for all plugins
+- Response includes per-plugin entries with: plugin name, displayName, aggregate state, and tabs array (tabId, url, title, ready)
+- When plugin is specified but doesn't exist, returns error with list of available plugins
+- Classified as 'observe' permission tier (auto-allowed, no confirmation needed)
+- Files changed:
+  - `platform/mcp-server/src/browser-tools/plugin-list-tabs.ts` (new)
+  - `platform/mcp-server/src/browser-tools/index.ts` (import + array entry)
+  - `platform/mcp-server/src/browser-tool-names.ts` (added 'plugin_list_tabs')
+  - `platform/mcp-server/src/permissions.ts` (added observe tier classification)
+  - `e2e/helpers.ts` (added to BROWSER_TOOL_NAMES list)
+- **Learnings for future iterations:**
+  - The `defineBrowserTool` handler type is `(...) => Promise<unknown>` — for synchronous handlers (no extension dispatch), return `Promise.resolve(...)` instead of using `async` (ESLint `@typescript-eslint/require-await` rejects async without await)
+  - PRD suggested extension dispatch but server-side approach reading `state.tabMapping` is simpler and preferred (data is kept fresh by tab.syncAll and tab.stateChanged events)
+  - The E2E helpers file `e2e/helpers.ts` has its own `BROWSER_TOOL_NAMES` array that must stay in sync with `platform/mcp-server/src/browser-tool-names.ts`
+  - `permissions.ts` TOOL_TIERS map must include new tools — tools not in the map default to 'interact' tier which would require confirmation
+  - Import ordering in `browser-tools/index.ts` is strictly alphabetical — ESLint import-x/order enforces it
+- `browser_list_tabs` returns tabs with field `id` (from Chrome's `chrome.tabs.Tab.id`), while `plugin_list_tabs` uses `tabId` (from the multi-tab wire format)
+- `browser_execute_script` input param is `code` (not `script`); result is nested as `{ value: { value: <actual>, type: '...' } }`
+---
+
+## 2026-03-01T05:58 - US-006
+- Added comprehensive unit tests for multi-tab state and targeted dispatch
+- tab-matching.test.ts: 2 new tests verifying findAllMatchingTabs returns tab titles (present and absent)
+- tool-dispatch.test.ts: 3 new tests — tabId extraction routes to targeted dispatch (tab not found → -32001), omitting tabId preserves fallback dispatch, non-numeric tabId ignored
+- resource-prompt-dispatch.test.ts: 6 new tests — 3 for handleResourceRead + 3 for handlePromptGet covering tabId targeting success, tab not found, URL pattern mismatch
+- mcp-setup.test.ts: 6 new tests — tabId injected into inputSchema properties, description mentions list tools, original schema not mutated, tabId not in required, browser tools excluded, multiple plugin tools independently injected
+- mcp-tool-dispatch.test.ts: 5 new tests — tabId stripped before Ajv validation, tabId threaded to dispatchToExtension, tabId omitted from dispatch when absent, non-numeric tabId ignored
+- Extension-protocol.test.ts already had comprehensive coverage of the new multi-tab payload format (tab.syncAll and tab.stateChanged) from US-001 — no additional tests needed there
+- dispatch-helpers.test.ts already had 8 targeted dispatch tests from US-003 — no additional tests needed
+- tab-state.test.ts already covered computePluginTabState multi-tab behavior from US-002 — no additional tests needed
+- Files changed:
+  - platform/browser-extension/src/tab-matching.test.ts
+  - platform/browser-extension/src/tool-dispatch.test.ts
+  - platform/browser-extension/src/resource-prompt-dispatch.test.ts
+  - platform/mcp-server/src/mcp-setup.test.ts
+  - platform/mcp-server/src/mcp-tool-dispatch.test.ts
+- **Learnings for future iterations:**
+  - The plugin-storage module caches plugin metadata — tests that need fresh plugin data must call `invalidatePluginCache()` before setting new `storage.local.get` mock values
+  - `expect.stringContaining()` returns `any` in Vitest — using `as string` on it triggers `@typescript-eslint/no-unnecessary-type-assertion`; use separate `expect().toContain()` assertions instead
+  - The tool-dispatch.test.ts mock setup for chrome globals uses `(globalThis as Record<string, unknown>).chrome` casts to access mock functions — follow this pattern for new test setup
+  - `getEnabledToolsList` return shape: `inputSchema` is `Record<string, unknown>` with `properties` nested — assert intermediate types when traversing
+---
+
+## 2026-03-01T06:25 - US-008
+- Updated documentation for multi-tab targeting across all relevant files
+- Root CLAUDE.md: added multi-tab targeting and plugin_list_tabs to Key Concepts (updated "Tab state machine" bullet + new "Multi-tab targeting" bullet)
+- platform/mcp-server/CLAUDE.md: added tabId injection/stripping docs to Tool Dispatch section; added plugin_list_tabs description to Browser Tools section
+- platform/browser-extension/CLAUDE.md: rewrote Tab State Machine section to describe multi-tab reporting (tabs array, aggregate state derivation, JSON serialization for diff); added new Tool Dispatch section covering two-path dispatch (targeted vs auto-select)
+- platform/shared/src/index.ts: added field-level JSDoc to ToolDispatchParams, TabStateChangedParams, TabSyncAllParams, and updated PluginTabInfo comment
+- docs/content/docs/contributing/architecture.mdx: updated Dispatch Flow steps to show tabId threading and two-path dispatch; updated Tab State section to describe multi-tab reporting and mention plugin_list_tabs
+- Verified platform/plugin-sdk/CLAUDE.md needs no changes (plugin authors don't see tabId — confirmed)
+- Verified e2e/helpers.ts BROWSER_TOOL_NAMES already has 'plugin_list_tabs' from US-005
+- Files changed:
+  - CLAUDE.md
+  - platform/mcp-server/CLAUDE.md
+  - platform/browser-extension/CLAUDE.md
+  - platform/shared/src/index.ts
+  - docs/content/docs/contributing/architecture.mdx
+- **Learnings for future iterations:**
+  - The `e2e/helpers.ts` BROWSER_TOOL_NAMES was already updated in US-005 — no additional action needed in US-008
+  - platform/plugin-sdk/CLAUDE.md truly needs no changes — the plugin SDK is unaware of tabId (it's stripped before reaching plugin handlers)
+  - CLAUDE.md files (unlike source) go through prettier formatting during lint-staged — keep line lengths reasonable
+---
+
+## 2026-03-01T06:15 - US-007
+- Created `e2e/multi-tab-targeting.e2e.ts` with 6 E2E test scenarios covering the full multi-tab targeting pipeline
+- Test 1: plugin_list_tabs discovers two matching tabs with correct URLs, tab IDs, and distinct IDs
+- Test 2: Targeted dispatch via tabId — sets unique markers on two pages via Playwright's `page.evaluate`, identifies tabs via `browser_execute_script`, then verifies `sdk_get_page_global` with `tabId` returns the correct marker for each tab
+- Test 3: URL mismatch error — opens non-matching tab (127.0.0.1), gets its `id` from `browser_list_tabs`, calls plugin tool with that tabId, verifies error about URL patterns
+- Test 4: Non-existent tabId (999999) returns clean error
+- Test 5: Auto-select fallback — two tabs open, tool called without tabId, verifies success and single server invocation
+- Test 6: Readiness info — verifies `ready: true` in plugin_list_tabs response, tests both filtered (single plugin) and unfiltered (all plugins) responses
+- Helper `waitForTabCount` polls plugin_list_tabs until the e2e-test plugin reports the expected number of tabs
+- All tests use standard fixture infrastructure (mcpServer, testServer, extensionContext, mcpClient)
+- Files changed:
+  - e2e/multi-tab-targeting.e2e.ts (new)
+- **Learnings for future iterations:**
+  - `browser_list_tabs` returns tabs with field `id` (not `tabId`) — this is the Chrome tab ID from `chrome.tabs.Tab.id`
+  - `browser_execute_script` input param is `code` (not `script`), and result is nested as `{ value: { value: <actual>, type: '...' } }`
+  - `plugin_list_tabs` returns tabs with field `tabId` (from the multi-tab state wire format) — different from `browser_list_tabs` which uses `id`
+  - ESLint forbids non-null assertions (`!`) — use `if (!x) throw new Error(...)` guard pattern instead
+  - ESLint catches unused variables even in test code — avoid reading values into variables unless actually used
+  - The `callTool.bind(mcpClient)` pattern is needed when passing `mcpClient.callTool` as a callback to preserve `this` context
+---
