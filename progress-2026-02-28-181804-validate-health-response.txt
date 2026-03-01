@@ -1,0 +1,37 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-181804-validate-health-response~running.json
+Started: Sun Mar  1 02:18:31 UTC 2026
+---
+
+## Codebase Patterns
+- CLI commands live in `platform/cli/src/commands/`, each with a matching `.test.ts` file
+- `handleStatus` in `status.ts` uses `const data = (await res.json()) as Record<string, unknown>` — TypeScript narrows Record property types after `typeof` checks, so assertions/conversions on narrowed properties trigger `no-unnecessary-type-assertion` and `no-unnecessary-type-conversion` lint rules
+- The validation guard pattern: check all required fields in a single if-block and exit 1, so TypeScript narrows types for the rest of the function body
+- `isNonOpenTabsHttpError` handles non-2xx cases; the JSON validation guard handles 200 OK responses from non-OpenTabs services
+- Tests use `vi.stubGlobal('fetch', fetchMock)` and mock `process.exit` to throw so async functions can be tested with `rejects.toThrow`
+
+## 2026-03-01 - US-001
+- Implemented OpenTabs-specific health response validation in `opentabs status`
+- Files changed: `platform/cli/src/commands/status.ts`, `platform/cli/src/commands/status.test.ts`
+- Changed validation at line ~117 from `typeof data.status !== 'string'` to also require `typeof data.version === 'string' && typeof data.toolCount === 'number'` — this catches non-OpenTabs servers like ChromeDriver that return `{"status":"ok"}`
+- Fixed `String(data.version)` → `data.version` (TypeScript narrows to string after guard, making String() conversion a lint error)
+- Fixed `Number(data.toolCount)` → `data.toolCount` (TypeScript narrows to number after guard, making Number() conversion a lint error)
+- Fixed `String(data.reloadCount)` → `typeof data.reloadCount === 'number' ? String(data.reloadCount) : '0'` for defense-in-depth
+- Added 4 new tests covering: `{"status":"ok"}` (ChromeDriver case), missing version, missing toolCount, and the combined missing fields case
+- **Learnings for future iterations:**
+  - TypeScript DOES narrow `data.version`/`data.toolCount` (Record<string, unknown> property accesses) after `typeof` guards when `data` is `const` — so don't add redundant `as string` / `Number()` wrappers after validation
+  - The pre-commit hook (lint-staged) runs prettier and eslint --fix automatically on staged files
+---
+
+## 2026-03-01 - US-002
+- Implemented OpenTabs-specific health response validation in `opentabs doctor`
+- Files changed: `platform/cli/src/commands/doctor.ts`, `platform/cli/src/commands/doctor.test.ts`
+- Modified `checkServerHealth` at line ~92: after parsing JSON, added guard `if (typeof data.version !== 'string' || typeof data.toolCount !== 'number')` — if either field is missing, returns a `warn` result with message "another service is running on port {port} (not OpenTabs)" and `data: null`
+- When `data: null` is returned, downstream checks (`checkExtensionConnected`, `checkNpmPlugins`) already handle null gracefully — no additional changes needed
+- TypeScript narrows `data.version` to `string` after the guard, so `data.version` can be used directly in `pass()` result
+- Updated existing test fixtures to include `toolCount` in mock responses (the validation now requires it)
+- Added 3 new tests: non-OpenTabs JSON (only `status: ok`), missing `toolCount`, missing `version`
+- **Learnings for future iterations:**
+  - `doctor.ts` uses real HTTP servers in tests (via `createServer` + `listen(0)`) rather than mocking `fetch` — matches the pattern already established in the test file
+  - Downstream functions (`checkExtensionConnected`, `checkNpmPlugins`) check `if (!data)` before accessing health fields, so returning `data: null` from `checkServerHealth` is sufficient to skip them gracefully
+---
