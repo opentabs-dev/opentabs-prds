@@ -18,7 +18,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: `platform/cli/src/commands/stop.ts`\n\nRoot cause: The health validation fix in v0.0.38 added a check at line ~93: `typeof data.status === 'string' && typeof data.version === 'string'`. But the unauthenticated /health endpoint returns only `{\"status\":\"ok\"}` without the `version` field. The `stop` command at line ~90 calls `fetch(url, { signal: ... })` WITHOUT an Authorization header.\n\nFix: Import `readAuthSecret` from `../config.js` (like `status.ts` does at line 5). Before the fetch call at line ~90, read the auth secret and add it as an Authorization header:\n```typescript\nconst secret = await readAuthSecret();\nconst headers: Record<string, string> = {};\nif (secret) headers['Authorization'] = `Bearer ${secret}`;\nconst res = await fetch(url, { headers, signal: AbortSignal.timeout(3_000) });\n```\n\nThis matches the pattern used in `status.ts` at lines 75-81. With the auth header, the /health endpoint returns the full response including `version`, and the validation passes correctly.\n\nCompare `status.ts` lines 75-81 for the reference pattern."
@@ -38,7 +38,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: `platform/cli/src/commands/config.ts`\n\nThe issue is in `handleConfigShow` (line ~38). When normalizing the config, missing keys are spread after the original config:\n```typescript\nconst normalized = { localPlugins: [], tools: {}, browserToolPolicy: {}, ...config };\n```\nThis puts `browserToolPolicy` BEFORE `config`'s keys, but JavaScript spread preserves the order of the first occurrence — so if `config` already has `localPlugins` and `tools`, those come first from `config`, then `browserToolPolicy` comes from the defaults.\n\nThe fix: Put the defaults FIRST in the spread, so they define the key order, then spread `config` to override values:\n```typescript\nconst normalized = { localPlugins: [], tools: {}, browserToolPolicy: {}, permissions: {}, ...config };\n```\nWait — this won't work because `...config` will add keys in config's order after the defaults.\n\nBetter fix: Define the explicit key order and iterate in that order instead of using `Object.entries(normalized)`. Create a `CONFIG_DISPLAY_ORDER` array and iterate through it:\n```typescript\nconst displayOrder = ['localPlugins', 'tools', 'browserToolPolicy', 'permissions'] as const;\nfor (const key of displayOrder) {\n  const value = normalized[key];\n  // ... render\n}\n```\nThis ensures consistent ordering regardless of which keys were in the original file. Check the existing rendering logic at line ~76 which uses `for (const [key, value] of Object.entries(config))` — replace this with the ordered iteration."
