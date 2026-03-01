@@ -1,0 +1,32 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-210940-fix-background-start-silent-failure~running.json
+Started: Sun Mar  1 05:10:07 UTC 2026
+---
+
+## Codebase Patterns
+- Background start path: `platform/cli/src/commands/start.ts`, `if (options.background)` block (~line 311)
+- Foreground start path uses `spawnStreaming` with `'pipe'` stdio — not affected by WriteStream issue
+- `WriteStream` is imported as a type from `node:fs` on line 26; the type does NOT expose `fd` in TypeScript defs
+- `createWriteStream` always fires the 'open' event asynchronously (never synchronously), so registering listeners immediately after creation is always safe
+
+## 2026-03-01 - US-001
+- Implemented: wait for `WriteStream` 'open' event before calling `spawn()` in background mode
+- Files changed: `platform/cli/src/commands/start.ts` (lines 311-325)
+- Added `await new Promise<void>((resolve, reject) => { logStream.once('open', resolve); logStream.once('error', reject); }).catch(...)` before the `spawn` call
+- If the stream fails to open, prints a clear error message and exits with code 1
+- **Learnings for future iterations:**
+  - The `WriteStream` TypeScript type from `node:fs` does NOT include the `fd` property — avoid referencing it in type-safe code; just always wait for the 'open' event
+  - The `fd !== null` guard from the PRD notes is not needed in practice since Node.js always fires 'open' asynchronously
+  - All Phase 1 checks passed cleanly (build, type-check, lint, knip, test)
+---
+
+## 2026-03-01 - US-002
+- Implemented: log unexpected errors in CLI global catch handler instead of swallowing them
+- Files changed: `platform/cli/src/cli.ts`
+- Added `CommanderError` import from `commander`
+- Updated `.catch()` handler to print `Error: <message>` to stderr for non-`CommanderError` errors; Commander wraps `process.exit()` calls from action handlers in `CommanderError`, so those remain silent (no double output)
+- **Learnings for future iterations:**
+  - `CommanderError` is exported from `commander` and covers both Commander's own errors and `process.exit()` calls made from action handlers
+  - The pattern "swallow all errors" in catch handlers should be replaced with "swallow only expected errors" to avoid hiding bugs
+  - All Phase 1 checks passed cleanly (build, type-check, lint, knip, test)
+---
