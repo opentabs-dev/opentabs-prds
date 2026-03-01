@@ -1,0 +1,87 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix CLI UX friction issues discovered during fresh-user experience testing: misleading server status messages after port changes, first-use --show-config failure, stale browser tool count in README, and nonexistent browser tool names silently accepted.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix misleading 'Server not running' after config set port",
+      "description": "As a user, I want `opentabs config set port <new>` to correctly report server status so that I don't think the server crashed when I just changed the port.",
+      "acceptanceCriteria": [
+        "When `config set port <new>` is run and the server IS running on the old port, the message says something like 'Server running on port <old>. Restart to apply new port.' instead of 'Server not running'",
+        "When `config set port <new>` is run and the server is genuinely not running, it still says 'changes will apply on next start'",
+        "The notification attempt tries the old port (before the change) to detect the running server, not the new port",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The bug is in `platform/cli/src/commands/config.ts` at `handleSetPort` (line ~473). After writing the new port to config.json, it calls `notifyServer({ port: options.port, warnIfNotRunning: true })`. The `options.port` is the --port CLI flag (usually undefined). `notifyServer` then calls `resolvePort(options)` which reads from a cached config port value. The cache was set at process start before the port was changed, so it resolves to the old/default port. However, the cached value may be `null` (if config had no port field initially), causing it to fall through to DEFAULT_PORT (9515). The fix should: (1) before writing the new port to disk, capture the current effective port (the one the server is actually running on), (2) after writing, try notifying on the OLD port, (3) adjust the message to acknowledge the port is changing. The `notifyServer` function in `platform/cli/src/notify-server.ts` (lines 21-61) has the 'Server not running' message at line 32/38. The `resolvePort` function with its cache is in `platform/cli/src/parse-port.ts`. Test file: `platform/cli/src/notify-server.test.ts`."
+    },
+    {
+      "id": "US-002",
+      "title": "Make --show-config work before first opentabs start",
+      "description": "As a new user, I want `opentabs start --show-config` to either auto-initialize or give a clear friendly message so that I can preview the MCP config before starting the server.",
+      "acceptanceCriteria": [
+        "When `opentabs start --show-config` is run with no existing auth secret, it auto-generates the secret (like `opentabs start` does) and then prints the config blocks",
+        "The auto-generation only creates the auth secret — it does not start the server",
+        "If the ~/.opentabs/ directory does not exist, it is created",
+        "Subsequent `opentabs start` does not re-generate the secret (uses the one created by --show-config)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The relevant code is in `platform/cli/src/commands/start.ts` at the `handleStart` function (line ~272). Currently when `options.showConfig` is true, it reads the auth secret and exits with an error if null. The fix should auto-generate the secret instead of erroring. Look at the normal `opentabs start` flow later in the same function for how it initializes — it calls functions to ensure the config dir exists and generate auth.json. The auth secret generation and reading logic is in `platform/cli/src/config.ts`. The `ensureExtensionInstalled` function in the same area creates ~/.opentabs/ and writes auth.json. For --show-config, we only need the secret generation part, not the full extension install. Key functions to look at: `readAuthSecret` and `generateAuthSecret` (or whatever the generation function is called) in `platform/cli/src/config.ts`. Test file: `platform/cli/src/commands/start.test.ts`."
+    },
+    {
+      "id": "US-003",
+      "title": "Update stale browser tool count in README.md",
+      "description": "As a prospective user reading the README, I want the browser tool count to match reality so that the documentation is accurate.",
+      "acceptanceCriteria": [
+        "README.md line 31 says '40 built-in browser tools' instead of '39'",
+        "README.md line 84 says '40 built-in browser tools' instead of '39'",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Simple text replacement in `README.md`. Line 31: change '39 built-in browser tools' to '40 built-in browser tools'. Line 84: change '39 built-in browser tools' to '40 built-in browser tools'. The docs site already says 40 (verified in docs/content/docs/index.mdx, docs/content/docs/quick-start.mdx, docs/content/docs/install/index.mdx, docs/content/docs/reference/browser-tools.mdx)."
+    },
+    {
+      "id": "US-004",
+      "title": "Reject unrecognized browser tool names when server can validate",
+      "description": "As a user, I want `opentabs config set browser-tool.<nonexistent> disabled` to fail (exit non-zero) when the server is running and can confirm the tool doesn't exist, so that I don't silently save a bogus policy entry.",
+      "acceptanceCriteria": [
+        "When the server is running and the tool name does not match any registered browser tool, the command exits with a non-zero exit code",
+        "The warning message is preserved and is clearly visible (not dim)",
+        "When the server is NOT running (cannot validate), the current behavior is preserved: save with a dim note suggesting to verify later",
+        "When the server is running and the tool name IS valid, behavior is unchanged (exit 0, 'Server notified.')",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The code is in `platform/cli/src/commands/config.ts` in the `handleSetBrowserTool` function (lines ~400-452). After writing the config to disk (line ~433), it fetches registered browser tool names from the server (line ~439) and checks if the tool name matches (line ~440). Currently when the name doesn't match, it prints a yellow warning but continues to exit 0. The fix should: after the warning, call `process.exit(1)` when `registeredBrowserTools` is truthy (server is running and responded) but the name is not in the list. Also, undo the config write (remove the bogus entry) before exiting, or move the validation BEFORE writing to disk. The same pattern should be applied to `handleSetTool` (line ~350-397) for plugin tool names. Test file: `platform/cli/src/commands/config.test.ts`."
+    }
+  ]
+}
