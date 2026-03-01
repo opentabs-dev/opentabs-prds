@@ -1,0 +1,148 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Harden multi-tab support: fix tabId validation bugs and add comprehensive E2E test coverage for edge cases",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Validate tabId is a positive integer at extraction points",
+      "description": "As a platform developer, I want tabId to be validated as a positive integer (not NaN, Infinity, 0, or negative) so that invalid values produce clear errors instead of silently falling back to auto-select.",
+      "acceptanceCriteria": [
+        "MCP server extracts tabId only when Number.isInteger(rawTabId) && rawTabId > 0 (platform/mcp-server/src/mcp-tool-dispatch.ts line 324)",
+        "Extension tool dispatch extracts tabId only when Number.isInteger(params.tabId) && params.tabId > 0 (platform/browser-extension/src/tool-dispatch.ts line 375)",
+        "Extension resource dispatch extracts tabId only when Number.isInteger(params.tabId) && params.tabId > 0 (platform/browser-extension/src/resource-prompt-dispatch.ts lines 202, 256)",
+        "Non-positive or non-integer tabId values (NaN, Infinity, 0, -1, 1.5) are treated as undefined (no tabId), falling through to auto-select — same as non-numeric values today",
+        "Existing unit tests for non-numeric tabId still pass",
+        "New unit tests verify NaN, Infinity, 0, -1, and 1.5 are all treated as absent tabId",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "There are 4 extraction points that all use `typeof rawTabId === 'number'` which passes for NaN and Infinity:\n\n1. `platform/mcp-server/src/mcp-tool-dispatch.ts` line 324: `const tabId = typeof rawTabId === 'number' ? rawTabId : undefined;` — change to `const tabId = typeof rawTabId === 'number' && Number.isInteger(rawTabId) && rawTabId > 0 ? rawTabId : undefined;`\n2. `platform/browser-extension/src/tool-dispatch.ts` line 375: same pattern\n3. `platform/browser-extension/src/resource-prompt-dispatch.ts` lines 202 and 256: same pattern\n\nAlso update the side panel hook at `platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts` line 67 — though this is for display only, keep the pattern consistent.\n\nUnit test files to update:\n- `platform/mcp-server/src/mcp-tool-dispatch.test.ts` — add test cases for NaN, Infinity, 0, -1, 1.5 tabId values near line 1119 (existing 'non-numeric tabId' test)\n- `platform/browser-extension/src/tool-dispatch.test.ts` — add test cases near line 353 (existing 'non-numeric tabId' test)\n\nDo NOT add `minimum: 1` to the JSON Schema — that is a separate story."
+    },
+    {
+      "id": "US-002",
+      "title": "Add minimum:1 constraint to injected tabId JSON Schema property",
+      "description": "As a platform developer, I want the injected tabId JSON Schema property to have minimum:1 so that tabId:0 or tabId:-1 produce clear Ajv validation errors for browser tools rather than cryptic Chrome API errors.",
+      "acceptanceCriteria": [
+        "The tabId property injected by getEnabledToolsList includes minimum: 1 (platform/mcp-server/src/mcp-setup.ts around line 338)",
+        "The tabId schema for browser tools that accept tabId also includes minimum: 1 if they define tabId in their own schemas",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `platform/mcp-server/src/mcp-setup.ts` around line 338, the tabId property is injected as:\n```typescript\nproperties.tabId = {\n  type: 'integer',\n  description: '...',\n};\n```\n\nChange to:\n```typescript\nproperties.tabId = {\n  type: 'integer',\n  minimum: 1,\n  description: '...',\n};\n```\n\nThis only affects plugin tools (the injection loop at line 332-349). Browser tools that accept their own tabId parameter (like browser_execute_script, browser_click_element, etc.) define their schemas separately via Zod in `platform/mcp-server/src/browser-tools/`. Check if any browser tool schemas define a `tabId` parameter with z.number() and add .min(1) if so — search for `tabId` in `platform/mcp-server/src/browser-tools/` to find them.\n\nNote: For plugin tools, tabId is extracted BEFORE Ajv validation (mcp-tool-dispatch.ts line 323), so the minimum:1 constraint on the schema is informational for MCP clients — the server strips tabId before validation. But it still helps MCP clients that validate locally. For browser tools, tabId goes through Ajv directly, so minimum:1 would reject invalid values with a clear error."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: targeted dispatch to unavailable (not-ready) tab",
+      "description": "As a platform developer, I want an E2E test that verifies dispatching a tool with an explicit tabId to a tab whose adapter is injected but isReady() returns false produces a clean -32002 error with no fallback to other tabs.",
+      "acceptanceCriteria": [
+        "New test in e2e/multi-tab-targeting.e2e.ts verifies: open a matching tab, toggle auth off (making isReady() return false), call a plugin tool with that tab's tabId, expect isError:true with content mentioning 'unavailable'",
+        "Test verifies no fallback occurs — the error is for the targeted tab specifically",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The test should follow the pattern in existing multi-tab-targeting.e2e.ts tests. The test app server has auth toggling — see how e2e/tool-dispatch.e2e.ts line 317-377 toggles auth off via `testServer.setAuth(false)` (or equivalent). Steps:\n\n1. Open a matching tab with setupToolTest (adapter injected, ready)\n2. Get the tab's ID via plugin_list_tabs\n3. Toggle auth off on the test server (this makes isReady() return false on the next check)\n4. Wait for the tab state to become 'unavailable' (poll /health or plugin_list_tabs)\n5. Call a plugin tool with the explicit tabId of that unavailable tab\n6. Expect isError:true and content mentioning 'unavailable' (the MCP server prefixes -32002 errors with 'Tab unavailable:')\n7. Verify no fallback by confirming the test server received zero invocations during step 5\n\nLook at e2e/helpers.ts and e2e/test-server.ts to understand how auth toggling and invocation tracking work. The test server likely exposes setAuth() or similar. Look at tool-dispatch.e2e.ts for examples of toggling auth off."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: plugin_list_tabs reflects mixed readiness across tabs",
+      "description": "As a platform developer, I want an E2E test that verifies plugin_list_tabs correctly reports per-tab readiness when one tab is ready and another is unavailable for the same plugin.",
+      "acceptanceCriteria": [
+        "New test in e2e/multi-tab-targeting.e2e.ts: open two tabs matching the same plugin, make one tab's adapter not-ready (e.g. navigate it to a page where isReady returns false), verify plugin_list_tabs reports state:'ready' (aggregate) with one tab ready:true and one tab ready:false",
+        "Test verifies the tabs array has exactly 2 entries with distinct ready values",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The challenge is creating a state where two tabs match the same plugin but have different readiness. Two approaches:\n\n1. Open two tabs, both ready. Then toggle auth off on the test server. One tab may already have cached ready state. Actually, isReady() is re-evaluated on each probe, and the test server's auth toggle affects all tabs equally since they share the same server. So this won't produce mixed readiness.\n\n2. Better approach: Open two tabs to the same plugin URL. On one of them, use page.evaluate to override the adapter's isReady to return false. Look at how probeTabReadiness works in platform/browser-extension/src/tab-state.ts line 64 — it injects a MAIN-world script that calls `globalThis.__openTabs.adapters[pluginName].isReady()`. If you override `isReady` on one tab via page.evaluate, that tab will report ready:false while the other remains ready:true.\n\nCode to override on one tab:\n```javascript\nglobalThis.__openTabs.adapters['e2e-test'].isReady = () => Promise.resolve(false);\n```\n\nThen trigger a state recomputation by navigating or calling a tool. After recomputation, plugin_list_tabs should show mixed readiness.\n\nNote: The state recomputation happens on tab events (navigate, status=complete). To trigger it, you could navigate the tab to the same URL or use another approach. Or just wait — the next tab event will trigger it.\n\nActually, the simplest approach: after overriding isReady, call a plugin tool (which will trigger the extension to probe the tab). Then check plugin_list_tabs.\n\nWait — plugin_list_tabs reads from server-side state.tabMapping, which is only updated via tab.stateChanged. The tab state is recomputed on tab events, not on tool calls. So after overriding isReady, you need to trigger a tab state recomputation. Options:\n- Navigate the tab (triggers tabs.onUpdated with url change)\n- Close and reopen it\n- Call some browser action that triggers a tab event\n\nThe simplest: after overriding isReady on tab 2, navigate it to the same URL (`page.goto(testServer.url)`). This triggers tabs.onUpdated → checkTabChanged → computePluginTabState → probeTabReadiness (which will call the overridden isReady on that tab). The state change notification will update the server's tabMapping.\n\nPoll plugin_list_tabs until the tabs array has one ready:true and one ready:false."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: targeted dispatch to tab that closes mid-execution",
+      "description": "As a platform developer, I want an E2E test verifying that when a tool is dispatched with an explicit tabId and that tab closes during execution, the error is clean and specifically about the targeted tab.",
+      "acceptanceCriteria": [
+        "New test in e2e/multi-tab-targeting.e2e.ts: open two tabs, dispatch a slow tool (with delay) targeting a specific tab via tabId, close that tab during execution, verify isError:true with a clean 'Tab closed' error",
+        "Test verifies the other tab is not used as a fallback (targeted dispatch has no fallback)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Similar to the existing 'tab closing during in-flight dispatch' test in e2e/dispatch-resilience.e2e.ts (around line 330-380), but with two tabs and an explicit tabId.\n\nThe test server needs a slow endpoint. The existing e2e test plugin has a tool that accepts a delay parameter, or the test server may have a delay endpoint. Look at e2e/dispatch-resilience.e2e.ts to see how it creates a delayed response — it uses `testServer.setDelay(5000)` or similar to make the echo endpoint slow.\n\nSteps:\n1. Open two tabs with setupToolTest + openTestAppTab\n2. Wait for both tabs to be tracked (waitForTabCount 2)\n3. Get both tab IDs via plugin_list_tabs\n4. Set a delay on the test server (e.g., 5 seconds)\n5. Start a tool call targeting tab 1's tabId (don't await yet)\n6. Close tab 1 after a short delay (e.g., 1 second)\n7. Await the tool call result\n8. Expect isError:true with content mentioning 'tab closed' or similar\n9. Verify tab 2 was NOT used (no fallback for targeted dispatch) by checking test server invocation count\n\nThe key assertion: with targeted dispatch, closing the target tab should produce an error, NOT silently fall back to tab 2."
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: concurrent targeted dispatches to different tabs",
+      "description": "As a platform developer, I want an E2E test verifying that two concurrent tool calls targeting different tabs via tabId both execute on their respective tabs independently.",
+      "acceptanceCriteria": [
+        "New test in e2e/multi-tab-targeting.e2e.ts: open two tabs, set unique markers on each, dispatch two tool calls simultaneously (each targeting a different tabId), verify each returns the correct marker",
+        "Both tool calls succeed independently and do not interfere with each other",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Steps:\n1. Open two tabs with setupToolTest + openTestAppTab\n2. Set marker 'alpha' on tab 1: page1.evaluate(() => { globalThis.__tabMarker = 'alpha'; })\n3. Set marker 'beta' on tab 2: page2.evaluate(() => { globalThis.__tabMarker = 'beta'; })\n4. Get both tab IDs via plugin_list_tabs (waitForTabCount 2)\n5. Identify which tabId corresponds to which marker (use browser_execute_script like in the existing targeted dispatch test)\n6. Launch two concurrent tool calls using Promise.all:\n   - mcpClient.callTool('e2e-test_sdk_get_page_global', { path: '__tabMarker', tabId: tabAlphaId })\n   - mcpClient.callTool('e2e-test_sdk_get_page_global', { path: '__tabMarker', tabId: tabBetaId })\n7. Verify first result has value 'alpha' and second has value 'beta'\n\nThis tests that the dispatch pipeline correctly routes concurrent requests to different tabs without cross-talk. The existing test at line 102-181 of multi-tab-targeting.e2e.ts does sequential targeting — this test does it in parallel.\n\nUse the same marker identification approach as the existing 'tool call with tabId executes on the specified tab' test."
+    },
+    {
+      "id": "US-007",
+      "title": "E2E test: plugin_list_tabs updates in real-time as tabs open and close",
+      "description": "As a platform developer, I want an E2E test verifying that plugin_list_tabs reflects tab opens and closes in real-time, ensuring the server's tab mapping stays current.",
+      "acceptanceCriteria": [
+        "New test in e2e/multi-tab-targeting.e2e.ts: open tab 1 → verify plugin_list_tabs shows 1 tab, open tab 2 → verify shows 2 tabs, close tab 1 → verify shows 1 tab, close tab 2 → verify shows 0 tabs (or state:closed)",
+        "Each transition is verified by polling plugin_list_tabs until the expected state is reached",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "This test verifies the tab state sync pipeline works correctly through multiple transitions. Use the existing waitForTabCount helper at the top of multi-tab-targeting.e2e.ts.\n\nSteps:\n1. Open tab 1 via setupToolTest → waitForTabCount(1)\n2. Verify plugin_list_tabs shows 1 tab with ready:true\n3. Open tab 2 via openTestAppTab → waitForTabCount(2)\n4. Verify both tabs have distinct tabIds\n5. Close tab 1 → poll plugin_list_tabs until tabs.length === 1\n6. Verify the remaining tab's tabId matches tab 2's ID (not tab 1's)\n7. Close tab 2 → poll plugin_list_tabs until state === 'closed' or tabs.length === 0\n\nThe key insight is verifying that after closing tab 1, the remaining tab is specifically tab 2 (by checking tabId), not just that there's still one tab. This catches bugs where tab state gets confused.\n\nFor step 7, after closing the last tab, plugin_list_tabs for a specific plugin should return state:'closed' with empty tabs array. Use a similar polling approach but check for state === 'closed'.\n\nThis is the final E2E test in the PRD, so mark it as e2eCheckpoint:true."
+    }
+  ]
+}
