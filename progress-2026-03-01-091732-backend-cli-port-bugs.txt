@@ -1,0 +1,41 @@
+## Codebase Patterns
+- `readConfigPort()` in platform/cli/src/parse-port.ts caches the config.json port for the process lifetime — calling it after writing a new port to config.json returns the NEW port, not the old one
+- `resolvePort(options)` priority: --port flag → OPENTABS_PORT env → config.json → DEFAULT_PORT (9515)
+- lint-staged runs prettier + eslint --fix on staged .ts files before commit; committed file may differ slightly from what was staged if prettier reformats
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-091732-backend-cli-port-bugs~running.json
+Started: Sun Mar  1 17:18:01 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Fixed `handleSetPort` in platform/cli/src/commands/config.ts to use `options.port ?? oldPort` instead of `resolvePort(options)` when sending the reload notification, so the POST /reload goes to the OLD running port rather than the newly-written config port
+- Removed the else-branch that incorrectly printed a restart reminder and sent a notification when `newPort === oldPort` (port unchanged)
+- Fixed `if (!value)` falsiness check to `if (value === undefined || value === '')` in `handleConfigSet` so `opentabs config set port 0` reaches `handleSetPort`'s integer validation rather than short-circuiting with "Missing value."
+- Files changed: platform/cli/src/commands/config.ts
+- **Learnings for future iterations:**
+  - `readConfigPort()` has a process-lifetime cache (`cachedConfigPort`). After writing config.json, calling `resolvePort()` may return the new port if `readConfigPort` hasn't been called yet. This is why `oldPort` must be captured before the write and used directly.
+  - The else-branch `(newPort === oldPort)` was the catch-all for no-op port sets — removing it means a no-op port set simply prints the confirmation line and exits cleanly.
+---
+
+## 2026-03-01 - US-002
+- Fixed `notifyServer()` in platform/plugin-tools/src/commands/build.ts to read the port from config.json as a fallback between OPENTABS_PORT env var and DEFAULT_PORT
+- Port resolution order now matches the CLI: OPENTABS_PORT env var → config.json port field → DEFAULT_PORT
+- `getConfigPath` and `readFileSync` were already imported, so no new imports needed
+- Config reading implemented inline (not imported from CLI to avoid circular dependencies) mirroring the pattern in `readConfigPort()` from platform/cli/src/parse-port.ts
+- Files changed: platform/plugin-tools/src/commands/build.ts
+- **Learnings for future iterations:**
+  - `getConfigPath` is already imported from `@opentabs-dev/shared` in build.ts — no new imports needed when reading config.json
+  - `readFileSync` is already imported from `node:fs` in build.ts
+  - Inline config reading pattern (try/catch JSON.parse with port validation) is the right approach to avoid circular dependencies with `@opentabs-dev/cli`
+---
+
+## 2026-03-01 - US-003
+- Added `watcher.on('error', ...)` handler after the try-catch block that creates the FSWatcher in watch mode (platform/plugin-tools/src/commands/build.ts, after line 1247)
+- Handler prints an error message and exits cleanly (process.exit(1)) instead of crashing with unhandled exception when the watched directory is deleted or becomes unavailable
+- Uses existing `pc` (picocolors) and `toErrorMessage` helpers already in scope
+- Files changed: platform/plugin-tools/src/commands/build.ts
+- **Learnings for future iterations:**
+  - prettier enforces no-parens around single arrow function parameters (arrowParens: "avoid") — write `err =>` not `(err) =>`
+  - lint-staged will auto-fix prettier issues on commit, but it's better to get them right the first time to avoid surprises
+---
