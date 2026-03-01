@@ -1,0 +1,54 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix CLI port resolution so that `config set port` actually works — all CLI commands should read the configured port from config.json instead of always defaulting to 9515. Also improve the notify-server health check to distinguish OpenTabs from other HTTP services on the same port.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Update resolvePort() to read port from config.json",
+      "description": "As a user who configured a custom port via `opentabs config set port 8888`, I want all CLI commands (status, doctor, logs, audit, stop, start --show-config, etc.) to automatically use my configured port so that I don't have to pass --port 8888 on every command.",
+      "acceptanceCriteria": [
+        "resolvePort() priority order is: (1) --port flag, (2) OPENTABS_PORT env var, (3) config.json port field, (4) DEFAULT_PORT (9515)",
+        "After `opentabs config set port 8888`, running `opentabs status` (no --port flag) checks port 8888",
+        "After `opentabs config set port 8888`, running `opentabs start --show-config` shows MCP configs with port 8888 in all URLs",
+        "After `opentabs config set port 8888`, running `opentabs doctor` checks port 8888",
+        "After `opentabs config set port 8888`, running `opentabs logs` reads from the right server",
+        "When --port flag is provided, it overrides the config.json port (existing behavior preserved)",
+        "When OPENTABS_PORT env var is set, it overrides the config.json port (existing behavior preserved)",
+        "When no config.json exists (fresh install), DEFAULT_PORT 9515 is used (no regression)",
+        "When config.json exists but has no port field, DEFAULT_PORT 9515 is used (no regression)",
+        "All existing tests in parse-port.test.ts continue to pass",
+        "New tests cover: config.json port reading, config.json missing, config.json with no port field, flag overriding config.json, env var overriding config.json",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The core change is in `platform/cli/src/parse-port.ts` (lines 23-40). The `resolvePort()` function currently checks: (1) options.port, (2) OPENTABS_PORT env, (3) DEFAULT_PORT. It needs a new step 3: read port from config.json, shifting DEFAULT_PORT to step 4.\n\nThe config file is at `~/.opentabs/config.json` (or OPENTABS_CONFIG_DIR). Use the existing `readConfig()` from `platform/cli/src/config.ts` to read it — but be careful about circular dependencies and performance. Since resolvePort() is called by EVERY command, reading config.json synchronously on every call would add latency. Consider reading it lazily and caching the result within the process lifetime (a simple module-level cache is fine since CLI commands are short-lived processes).\n\nImportant: `resolvePort()` is currently a pure synchronous function. If you make it async (to use async file reads), you'll need to update ALL callers across the codebase — there are ~20 call sites (search for `resolvePort` in `platform/cli/src/`). Consider using `fs.readFileSync` to keep it synchronous, or if making it async, update all call sites. Check `platform/cli/src/config.ts` for existing config reading helpers — it has `readConfig()` which is async. There may also be a sync variant or you may need to create one.\n\nThe config file path comes from `getConfigDir()` in `platform/cli/src/config.ts` which reads OPENTABS_CONFIG_DIR env var or defaults to `~/.opentabs`.\n\nTests are in `platform/cli/src/parse-port.test.ts`. The existing tests mock process.env for OPENTABS_PORT. New tests should mock the config file (or use vi.mock to mock the config reading function).\n\nAll callers of resolvePort are in: commands/status.ts, commands/doctor.ts, commands/start.ts, commands/stop.ts, commands/audit.ts, commands/config.ts, commands/plugin.ts, commands/update.ts, notify-server.ts."
+    },
+    {
+      "id": "US-002",
+      "title": "Verify OpenTabs identity in notify-server health check",
+      "description": "As a user whose default port (9515) is occupied by another HTTP service (e.g., ChromeDriver), I want config set commands to say 'server not running' instead of the confusing 'Could not notify server (HTTP 401)' so that I understand it's a port conflict and not an auth problem.",
+      "acceptanceCriteria": [
+        "When /health responds but is not an OpenTabs server (no x-opentabs-version header or missing expected JSON shape), notifyServer treats it as 'server not running'",
+        "When /health responds with an OpenTabs server identity, the existing behavior is preserved (proceeds to /reload)",
+        "The confusing 'Could not notify server (HTTP 401)' message no longer appears when a non-OpenTabs service is on the port",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The fix is in `platform/cli/src/notify-server.ts` (lines 24-39). Currently the health check at line 25 fetches `/health` and checks `healthRes.ok`. If ok, it proceeds to POST `/reload`. The problem: a non-OpenTabs service (like ChromeDriver on port 9515) may return 200 for `/health`, so the code proceeds to `/reload` which returns 401.\n\nFix: After getting a successful /health response, verify it's actually OpenTabs. The MCP server's health endpoint is implemented in `platform/mcp-server/src/server.ts` — check what headers or JSON body it returns. Look for a distinctive field like `version` in the JSON body or an `x-opentabs-version` response header. If the health response doesn't contain the expected OpenTabs identifier, treat it the same as a non-ok response (print 'Server not running' and return early).\n\nTo find the health endpoint implementation, search for '/health' in `platform/mcp-server/src/`. The response likely includes a version field or status field that can be used as an identity check."
+    }
+  ]
+}
