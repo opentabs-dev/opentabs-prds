@@ -1,0 +1,51 @@
+## Codebase Patterns
+- MCP server platform code is in platform/mcp-server/src/
+- extension-handlers.ts handles progress resets and dispatch timeouts
+- The handleToolProgress function uses `nextTimeout = Math.min(DISPATCH_TIMEOUT_MS, remainingMax)` for the progress-reset timer duration
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-091732-backend-mcp-server-bugs~running.json
+Started: Sun Mar  1 17:18:05 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Fixed misleading timeout error message in handleToolProgress (extension-handlers.ts line 524)
+- Changed `DISPATCH_TIMEOUT_MS` to `nextTimeout` in the setTimeout callback's rejection message
+- The `nextTimeout` variable (line 520) already captured the actual timer duration but wasn't used in the error message
+- **Learnings for future iterations:**
+  - The fix was a single-character change: `DISPATCH_TIMEOUT_MS` → `nextTimeout` on line 524
+  - The `remainingMax <= 0` case at line 514-516 correctly uses `MAX_DISPATCH_TIMEOUT_MS` and was left alone
+  - All 89 test files / 2900 tests passed with no issues
+---
+
+## 2026-03-01 - US-002
+- Fixed network capture state tracking race in enable-network-capture.ts
+- Wrapped dispatchToExtension call in try/finally so state.activeNetworkCaptures.add(args.tabId) always runs, even on timeout
+- Added comment explaining the optimistic tracking rationale
+- **Learnings for future iterations:**
+  - The fix pattern (try/finally for optimistic state updates) applies to similar browser-tools dispatch calls
+  - browser-tools files follow the defineBrowserTool pattern: all in platform/mcp-server/src/browser-tools/
+  - The `state.activeNetworkCaptures` set is checked by export-har.ts before allowing HAR export
+---
+
+## 2026-03-01 - US-003
+- Fixed double disableNetworkCapture dispatch in analyze-site/index.ts
+- Added `let captureDisabled = false;` BEFORE the outer try block (line 819) so it's accessible in the finally even if an early throw occurs
+- In the Step 6 catch block, set `captureDisabled = true` after cleanup runs
+- In the finally block, wrapped `disableNetworkCapture` + `activeNetworkCaptures.delete` in `if (!captureDisabled)` guard
+- **Learnings for future iterations:**
+  - When declaring a flag shared between a try block and its finally, declare it BEFORE the try — declaring it inside the try causes temporal dead zone issues in the finally if early code throws
+  - The analyze-site function's outer try/finally covers all steps; inner try/catch blocks swallow errors for partial analysis
+  - The `captureDisabled` flag pattern cleanly handles exactly-once cleanup across try/catch + finally
+---
+
+## 2026-03-01 - US-004
+- Fixed detectPrimaryApiBaseUrl depth bias in detect-apis.ts (line 386)
+- Changed selection comparison from depth-first (`depth > bestDepth || (depth === bestDepth && count > bestCount)`) to coverage-first (`count > bestCount || (count === bestCount && depth > bestDepth)`)
+- Added new test `prefers broader coverage over deeper path when counts differ` with 5 endpoints covering the exact scenario from the acceptance criteria
+- Initial lint run failed due to prettier formatting (two `req({...})` calls needed multi-line format) — fixed before committing
+- **Learnings for future iterations:**
+  - The `prefixCounts` map in detectPrimaryApiBaseUrl counts distinct endpoints per prefix (not call count), capped at depth 3 in the path
+  - `prefix.split('/').length` gives depth including the `https:` and empty string parts, so origin=3, depth-1-path=4, depth-2-path=5, depth-3-path=6
+  - Prettier requires multi-line object literals in `req({...})` calls when line length would exceed limit — match the format used by adjacent tests
+---
