@@ -17,7 +17,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/server-node.ts, lines 64-73.\n\nCurrent code:\n```\nconst nodeStream = Readable.fromWeb(body as unknown as NodeReadableStream);\nnodeStream.pipe(res);\nnodeStream.on('error', err => {\n  log.warn('Response stream error:', err);\n  if (!res.headersSent) {\n    res.writeHead(500);\n  }\n  res.end();\n});\nres.on('close', () => nodeStream.destroy());\n```\n\nThe fix should change the error handler to:\n1. If headers have NOT been sent: keep existing behavior (writeHead 500, res.end())\n2. If headers HAVE been sent (SSE stream already started): call res.destroy() instead of res.end(), so the TCP connection drops and the MCP client sees a transport error rather than a valid-but-truncated SSE stream\n3. Always call nodeStream.destroy() in the error handler to stop the source stream\n\nThis is the Node.js HTTP adapter used for MCP Streamable HTTP transport. SSE responses hold the connection open while tool dispatches run (up to 30s). A mid-stream error that cleanly ends the response makes it look like a normal end-of-stream to the client."
@@ -39,7 +39,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "File: platform/mcp-server/src/resolver.ts, lines 155-176.\n\nCurrent code uses spawnSync:\n```\nconst getGlobalNodeModulesPaths = (): string[] => {\n  const cached = getCachedGlobalPaths();\n  if (cached !== null) return cached;\n  const paths: string[] = [];\n  try {\n    const result = spawnSync(platformExec('npm'), ['root', '-g'], { stdio: ['ignore', 'pipe', 'pipe'] });\n    if (!result.error && result.status === 0) {\n      const npmPath = result.stdout.toString().trim();\n      if (npmPath.length > 0) paths.push(npmPath);\n    }\n  } catch (e) {\n    log.debug(`npm root -g failed: ${toErrorMessage(e)}`);\n  }\n  if (paths.length > 0) setCachedGlobalPaths(paths);\n  return paths;\n};\n```\n\nChange to async using execFile from node:child_process/promises:\n```\nimport { execFile } from 'node:child_process';\nimport { promisify } from 'node:util';\nconst execFileAsync = promisify(execFile);\n```\nOr use the promises API directly.\n\nThe caller discoverGlobalNpmPlugins (line 266) already calls this function and can easily await it. All callers of discoverGlobalNpmPlugins are already async (discovery.ts discoverPlugins at line 54).\n\nRemove the spawnSync import if it's no longer used. Keep the platformExec import from @opentabs-dev/shared.\n\nAlso update resetGlobalPathsCache (exported for testing, line 300-302) — no change needed since it just sets the cache to null.\n\nNote: The function may be called in tests via discoverGlobalNpmPlugins. Check test files for any mocking of spawnSync that needs to be updated to the async version."

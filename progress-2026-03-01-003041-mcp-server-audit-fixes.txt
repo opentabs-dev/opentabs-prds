@@ -1,0 +1,35 @@
+## Codebase Patterns
+- platform/mcp-server/src/server-node.ts: Node.js HTTP adapter — `sendResponse()` converts Web `Response` to Node.js `ServerResponse`. SSE responses pipe a `ReadableStream` via `Readable.fromWeb()`.
+- When an error occurs after headers are sent on a streaming response, use `res.destroy()` (drops TCP connection) not `res.end()` (clean close that looks like a normal end-of-stream).
+- Always call `nodeStream.destroy()` in the error handler to stop the source from producing more data.
+- platform/mcp-server/src/resolver.ts: `getGlobalNodeModulesPaths()` is async — uses `execFile` (callback-based) wrapped in a `Promise`. The `ExecFileException` type is a structural intersection (`Omit<ExecException, "code"> & ...`) that doesn't satisfy `prefer-promise-reject-errors` statically; use `err as Error` cast since it's always an Error at runtime.
+- When mocking `node:child_process` in Vitest, mock `execFile` (callback-based). The mock's `mockImplementation` must call the `callback` argument: `(file, args, callback) => callback(null, stdout, '')` for success, `callback(err, '', '')` for failure. `vi.fn(actual.execFile)` does NOT copy `[util.promisify.custom]`, so `promisify(mockedFn)` uses standard callback wrapping (calls mock with `(file, args, callback)`).
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-003041-mcp-server-audit-fixes~running.json
+Started: Sun Mar  1 08:31:11 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Updated `sendResponse()` error handler in `platform/mcp-server/src/server-node.ts` (lines 66-75)
+- When headers have NOT been sent: writeHead(500) + res.end() (unchanged behavior)
+- When headers HAVE been sent (SSE stream mid-flight): call res.destroy() instead of res.end() so the TCP connection drops and MCP clients see a transport error rather than a valid-but-truncated SSE stream
+- Always call nodeStream.destroy() in the error handler to stop the source stream
+- **Learnings for future iterations:**
+  - The Node.js HTTP adapter lives in `platform/mcp-server/src/server-node.ts`
+  - `res.destroy()` vs `res.end()` distinction is critical for streaming responses: `end()` cleanly closes the HTTP response (client sees normal EOF), `destroy()` aborts the TCP connection (client sees an error)
+  - The `res.on('close', () => nodeStream.destroy())` cleanup listener remains correct and handles the normal close path
+---
+
+## 2026-03-01 - US-002
+- Converted `getGlobalNodeModulesPaths()` from sync to async in `platform/mcp-server/src/resolver.ts`
+- Replaced `spawnSync` import with `execFile` from `node:child_process`
+- Used callback-based `execFile` wrapped in an explicit `Promise` constructor to avoid `[util.promisify.custom]` symbol complications
+- Added `err as Error` cast because `ExecFileException` is a structural intersection type that doesn't statically satisfy `@typescript-eslint/prefer-promise-reject-errors`
+- Updated `discoverGlobalNpmPlugins` to `await getGlobalNodeModulesPaths()`
+- Updated `resolver.test.ts`: changed mock from `spawnSync` to `execFile`, updated all test helpers (`spawnResult`/`mockSpawnSync` → `execResult`/`mockExecFile`) and all nine test cases in `discoverGlobalNpmPlugins` describe block
+- **Learnings for future iterations:**
+  - `ExecFileException` in `@types/node` is `type ExecFileException = Omit<ExecException, "code"> & Omit<NodeJS.ErrnoException, "code"> & { code?: string | number | null }` — a structural intersection, NOT a class, so TypeScript can't prove it's an Error despite ExecException extending Error. Use `err as Error` cast.
+  - When mocking callback-based Node.js APIs for use with async wrappers, the mock must explicitly call the callback argument. For `execFile`, mock as `(file, args, callback) => callback(null, stdout, '')`.
+  - `vi.fn(actual.execFile)` does not copy Symbol-keyed properties like `[util.promisify.custom]`, so a manually written `new Promise(resolve => execFile(..., callback))` pattern is safer than `promisify(execFile)` in tested code.
+---
