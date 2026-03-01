@@ -1,0 +1,89 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix CLI UX friction points discovered during fresh-user testing: silent --background failure, self-referential config hints, incomplete first-run MCP config output, and non-portable stop suggestion.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix opentabs start --background silently failing without error message",
+      "description": "As a user, I want opentabs start --background to either succeed or show a clear error so that I am never left thinking the server is running when it is not.",
+      "acceptanceCriteria": [
+        "If the background child process spawn fails (pid is undefined), the error message 'Error: Failed to start background server process.' is printed to stderr",
+        "If the PID file write fails, the error is caught and a user-friendly message is printed to stderr (e.g., 'Error: Failed to write PID file: <reason>')",
+        "If the background process starts but crashes within 2 seconds (health check fails after spawn), the CLI prints a warning: 'Warning: Background server exited unexpectedly. Check logs: <log path>'",
+        "The startup header (MCP endpoint, Health check, Log file) is NOT printed before confirming the server actually started — move the header to print after the health check confirms the server is alive, or at minimum after spawn succeeds",
+        "On successful background start, the output includes: 'Server started in background (PID: <pid>)'",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The bug is in platform/cli/src/commands/start.ts lines 307-328 (the `options.background` branch). The current flow: (1) prints startup header at lines 291-297 unconditionally, (2) enters the background branch at line 307, (3) spawns a detached child at line 309, (4) checks pid at line 317. The problem: the header is already printed before the spawn attempt, so if spawn fails, the user sees a 'success-looking' output followed by a silent exit(1). Fix approach: wrap the spawn in a try-catch and add a post-spawn health check with a short timeout (e.g., 2s). If the health check fails, print a warning. Also consider moving the header print to AFTER confirming the spawn succeeded, or at minimum adding clear error handling for the writeFile at line 322 (PID file). The `platformExec('node')` call resolves the node binary path — verify it works in the test environment."
+    },
+    {
+      "id": "US-002",
+      "title": "Remove self-referential hint from config show --show-secret and start --show-config output",
+      "description": "As a user, I want to not see 'Run opentabs config show --show-secret' when I am already running that command, so that I am not confused about whether I need to do something else.",
+      "acceptanceCriteria": [
+        "opentabs config show --show-secret output does NOT contain the line 'Run opentabs config show --show-secret to see MCP client configuration at any time.'",
+        "opentabs start --show-config output does NOT contain the line 'Run opentabs config show --show-secret to see MCP client configuration at any time.'",
+        "opentabs start (first-run, primaryOnly=true) still shows the 'For other MCP clients' hint pointing to opentabs config show --show-secret (this is NOT self-referential, it's a cross-reference)",
+        "opentabs start (subsequent runs, non-first-time) still shows the 'Run opentabs config show --show-secret' hint (this is also NOT self-referential since it's the start command)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The issue is in platform/cli/src/commands/start.ts lines 232-236. The `printMcpClientConfigs` function unconditionally prints 'Run opentabs config show --show-secret to see MCP client configuration at any time.' when `primaryOnly = false`. This function is called from two places with `primaryOnly = false`: (1) `start --show-config` at ~line 268, and (2) `config show --show-secret` in platform/cli/src/commands/config.ts at ~line 206. Fix: add a parameter (e.g., `showHint = true`) to `printMcpClientConfigs` and pass `false` from the two call sites where the hint is self-referential. The trailing hint is at lines 232-236 — only print it when `showHint` is true. The callers are: start.ts handleStart ~line 268 (showConfig path), config.ts handleConfigShow ~line 206."
+    },
+    {
+      "id": "US-003",
+      "title": "Show all MCP client configs on first run of opentabs start",
+      "description": "As a non-Claude user (e.g., Cursor, Windsurf, OpenCode), I want to see my MCP client config on the first run of opentabs start, so that I can complete setup without running a second command.",
+      "acceptanceCriteria": [
+        "First-run output of opentabs start shows config blocks for all four clients: Claude Code, OpenCode, Cursor, Windsurf",
+        "The 'For other MCP clients' hint line is no longer shown on first run (since all clients are now displayed)",
+        "Subsequent (non-first-time) runs of opentabs start still show just the short hint pointing to opentabs config show --show-secret (not all config blocks — keep subsequent runs concise)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In platform/cli/src/commands/start.ts, the first-run setup calls `printFirstTimeInstructions` at line 301, which calls `printMcpClientConfigs(mcpUrl, secret, true)` with `primaryOnly = true` (line ~152). Change this to `primaryOnly = false` so all four client configs are printed on first run. The `printFirstTimeInstructions` function is at lines 139-153. The `primaryOnly = true` is at the call site inside that function. When changing to `primaryOnly = false`, the 'For other MCP clients' hint (lines 211-220) will no longer be printed (that hint is only shown when `primaryOnly = true`), which is correct. Note: after US-002 is applied, the self-referential trailing hint will already be suppressed for this code path, so this story only needs to change the `primaryOnly` argument."
+    },
+    {
+      "id": "US-004",
+      "title": "Replace lsof suggestion in opentabs stop with portable alternatives",
+      "description": "As a user on a system without lsof installed, I want the opentabs stop error message to suggest commands that work on my system, so that I can actually stop the server.",
+      "acceptanceCriteria": [
+        "The 'find the process' suggestion in opentabs stop no longer hardcodes lsof",
+        "The suggestion includes at least two options: one for macOS (lsof) and one for Linux (ss or fuser), or uses a single portable approach",
+        "Alternative approach: instead of suggesting manual process discovery, suggest 'opentabs start --background' for future starts (which supports 'opentabs stop'), since the root cause is that the server wasn't started with --background",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The message is in platform/cli/src/commands/stop.ts lines 98-99. Current text: 'Server is running but was not started with --background.\\n  - If running in a terminal: press Ctrl+C\\n  - Otherwise: find the process with `lsof -i :<port>` and kill it'. The best fix is likely to reframe the message: keep 'press Ctrl+C' for terminal users, and for the 'otherwise' case, suggest 'kill $(lsof -ti :<port>) on macOS, or fuser -k <port>/tcp on Linux'. Or even simpler: just suggest `kill <pid>` with the PID obtained from the log file or process list. Another good option: suggest `pkill -f opentabs` as a portable alternative. Keep it actionable and cross-platform."
+    }
+  ]
+}
