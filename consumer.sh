@@ -145,9 +145,9 @@ _kill_stale_consumers() {
     echo "$stale_pids" | xargs kill -9 2>/dev/null || true
     # Also kill any orphaned Docker containers from stale consumers
     local _containers
-    _containers=$(docker ps --filter 'name=ralph-consumer' -q 2>/dev/null)
+    _containers=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -E '^r-[0-9]{2}-' || true)
     [ -n "$_containers" ] && echo "$_containers" | xargs docker kill 2>/dev/null || true
-    _containers=$(docker ps -a --filter 'name=ralph-consumer' -q 2>/dev/null)
+    _containers=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^r-[0-9]{2}-' || true)
     [ -n "$_containers" ] && echo "$_containers" | xargs docker rm -f 2>/dev/null || true
     sleep 1
   fi
@@ -194,10 +194,10 @@ _start_resource_monitor() {
           mem_info="n/a"
         fi
       fi
-      active_containers=$(docker ps --filter 'name=ralph-consumer' --format '{{.Names}}' 2>/dev/null | wc -l | tr -d ' ')
+      active_containers=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -cE '^r-[0-9]{2}-' || echo 0)
       container_stats=$(docker stats --no-stream --format '{{.Name}}={{.CPUPerc}}/{{.MemUsage}}' 2>/dev/null \
-        | grep ralph \
-        | sed 's/ralph-consumer-/W/g' \
+        | grep -E '^r-[0-9]{2}-' \
+        | sed -E 's/r-0?/W/' \
         | tr '\n' ' ')
       echo -e "$(ts) ${DIM}[RESOURCES] load=$load ram=$mem_info containers=$active_containers $container_stats${RESET}"
     done
@@ -257,7 +257,7 @@ git -C "$CODE_DIR" config user.email "ralph@opentabs.dev"
 # --- Docker Check (if using Docker) ---
 
 DOCKER_IMAGE="ralph-worker:latest"
-CONTAINER_PREFIX="ralph-consumer"
+CONTAINER_PREFIX="r"
 
 if [ "$USE_DOCKER" = true ]; then
   if ! command -v docker &>/dev/null; then
@@ -716,7 +716,9 @@ _run_worker_docker() {
   local branch_name="$4"
   local tag="$5"
   local slug="$6"
-  local container_name="${CONTAINER_PREFIX}-${slot}"
+  local objective="${slug:18}"
+  local container_name
+  printf -v container_name '%s-%02d-%s' "$CONTAINER_PREFIX" "$slot" "$objective"
 
   # Clean up leftover container
   docker rm -f "$container_name" 2>/dev/null || true
@@ -1171,7 +1173,8 @@ except: pass" "$QUEUE_DIR/$running_basename" 2>/dev/null)
   local worker_pid=$!
 
   WORKER_PIDS[$slot]="$worker_pid"
-  WORKER_CONTAINERS[$slot]="${CONTAINER_PREFIX}-${slot}"
+  printf -v _cname '%s-%02d-%s' "$CONTAINER_PREFIX" "$slot" "$objective"
+  WORKER_CONTAINERS[$slot]="$_cname"
   WORKER_PRDS[$slot]="$running_basename"
   WORKER_WORKTREES[$slot]="$worktree_dir"
   WORKER_BRANCHES[$slot]="$branch_name"
