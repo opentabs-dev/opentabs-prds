@@ -1,0 +1,38 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-091554-cli-ux-polish~running.json
+Started: Sun Mar  1 17:16:21 UTC 2026
+---
+
+## Codebase Patterns
+- `resolvePort(options)` in `platform/cli/src/parse-port.ts` caches the config port in a module-level variable (`cachedConfigPort`). Reset it with `resetConfigPortCache()` between tests.
+- `notifyServer` is mocked at module level in `config.test.ts` via `vi.mock('../notify-server.js', ...)`. Import `notifyServer` from `../notify-server.js` to make assertions on the mock.
+- `handleSetLocalPluginsAdd` (and similar handlers) are tested by setting `process.env['OPENTABS_CONFIG_DIR']` to a temp dir and writing a `config.json` there. `loadConfig()` and `resolvePort()` both respect this env var.
+- The ESLint `import-x/order` rule in this project puts relative imports (`./ ` and `../`) BEFORE external packages (`vitest`, etc.).
+- `detectPortConflict` in `platform/cli/src/commands/start.ts` uses `AbortSignal.timeout(1_500)` with the native `fetch` API to probe `/health` — ECONNREFUSED returns instantly (not after timeout), so tests with no server are fast.
+- The MCP server's `/health` endpoint always returns `{ status: 'ok', ... }` when OpenTabs is running (even unauthenticated requests get `{ status: 'ok' }`). This is the reliable discriminator for distinguishing OpenTabs from other services on the same port.
+- The `createTestServer` + `findFreePort` pattern in `doctor.test.ts` (using `node:http` `createServer` on port 0) is the idiomatic way to test HTTP-dependent CLI code.
+
+## 2026-03-01 - US-001
+- Implemented fix for `handleSetPort` in `platform/cli/src/commands/config.ts`
+- The key bug: `resolvePort(options)` was called AFTER `atomicWriteConfig`, which caused it to return the newly-written port from config rather than the old running port. Additionally, the `newPort === oldPort` branch always showed a restart message even when nothing changed.
+- Fix: Move `resolvePort(options)` call BEFORE `atomicWriteConfig`. Then compare `newPort === runningPort` (not `newPort === oldPort`) to decide between "already set" message vs restart hint.
+- Exported `handleSetPort` to enable unit testing.
+- Added `describe('handleSetPort')` test block with 4 tests covering: no-op (same port in config), no-op (via --port flag), port change with restart hint, port change from explicit config port.
+- Files changed: `platform/cli/src/commands/config.ts`, `platform/cli/src/commands/config.test.ts`
+- **Learnings for future iterations:**
+  - The `cachedConfigPort` in `parse-port.ts` is critical — always call `resolvePort` before writing config when you need the pre-change value.
+  - The `notifyServer` mock in `config.test.ts` is set up with `vi.fn().mockResolvedValue(undefined)` and needs `vi.clearAllMocks()` in `beforeEach` to reset call counts between tests.
+---
+
+## 2026-03-01 - US-002
+- Implemented port conflict detection in `platform/cli/src/commands/start.ts`
+- Added `detectPortConflict(port)` async helper that GETs `/health` with a 1.5s timeout and returns `'opentabs'` when the JSON response contains `status: 'ok'`, else `'other'`
+- Replaced the old `port === 9515` ternary with a `detectPortConflict` call that produces tailored messages: "OpenTabs is already running on port N. Stop it with: opentabs stop [--port N]" vs "Port N is already in use by another service. Use a different port: opentabs start --port <number>"
+- Exported `detectPortConflict` and `PortConflictType` from `start.ts` for testability
+- Created `platform/cli/src/commands/start.test.ts` with 5 tests covering: OpenTabs health response, minimal unauthenticated status:ok, non-OpenTabs JSON, non-2xx response, and no server listening
+- Files changed: `platform/cli/src/commands/start.ts`, `platform/cli/src/commands/start.test.ts` (new)
+- **Learnings for future iterations:**
+  - The `/health` endpoint's `{ status: 'ok' }` is present in ALL OpenTabs responses (authenticated or not), making it a reliable discriminator without needing auth credentials at startup.
+  - `AbortSignal.timeout(N)` is clean and doesn't require manual cleanup — prefer it over `setTimeout` + `AbortController` pairs.
+  - For the "no server listening" test case: find a free port with a quick `createServer().listen(0)` → close pattern; ECONNREFUSED is synchronous at the OS level so the test completes nearly instantly even with a 1.5s timeout.
+---
