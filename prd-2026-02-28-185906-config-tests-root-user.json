@@ -1,0 +1,45 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix 4 unit tests in config.test.ts that fail when running as root (Docker containers, CI). The tests use chmod to simulate write failures, but root bypasses POSIX file permissions. This breaks npm run test and npm run check in Docker. Also fix CONTRIBUTING.md claiming pre-commit runs knip when it does not.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Make config.test.ts write-error tests work as root",
+      "description": "As a platform contributor running tests in Docker, I want the saveConfig error propagation tests to pass so that npm run test succeeds in containers",
+      "acceptanceCriteria": [
+        "All 4 tests in the 'saveConfig error propagation' describe block pass when run as root",
+        "The tests still verify that write errors are propagated and the mutex does not deadlock",
+        "The tests still pass when run as a non-root user",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "In `platform/mcp-server/src/config.test.ts` lines 261-344, four tests in the 'saveConfig error propagation' describe block use `chmod(path, 0o555)` or `chmod(path, 0o444)` to make directories/files read-only, then expect `saveConfig` / `saveToolConfig` to reject. When running as root (which Docker containers do by default), root bypasses POSIX file permissions, so `writeFile` succeeds and the promise resolves instead of rejecting.\n\nThe correct fix: skip these 4 tests when running as root. Use `process.getuid?.() === 0` to detect root. Wrap the tests with:\n```typescript\nconst isRoot = process.getuid?.() === 0;\ntest.skipIf(isRoot)('saveConfig propagates write errors to the caller', async () => {\n```\n\nAlternatively, Vitest supports `test.runIf(!isRoot)(...)`. Check which pattern the codebase prefers.\n\nDo NOT try to simulate write failures in other ways (mock fs, make a read-only filesystem, etc.) — the root permission bypass is a well-known POSIX behavior and skipping is the standard approach.\n\nFiles to modify: `platform/mcp-server/src/config.test.ts` (lines ~261-344, the 4 tests in 'saveConfig error propagation' describe block)."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix CONTRIBUTING.md pre-commit hook description",
+      "description": "As a platform contributor, I want CONTRIBUTING.md to accurately describe what the pre-commit hook does so that I understand which checks run when",
+      "acceptanceCriteria": [
+        "CONTRIBUTING.md no longer claims pre-commit runs knip",
+        "The pre-commit description accurately lists: ralph file rejection + lint-staged (Prettier + ESLint on staged files)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `CONTRIBUTING.md` line 129, the pre-commit section says:\n```\n- Runs `knip` to catch unused exports and dependencies\n```\n\nBut the actual `.husky/pre-commit` hook only runs:\n1. Ralph state file rejection (grep for `.ralph/` files in staging)\n2. `npx lint-staged --allow-empty` (Prettier + ESLint auto-fix on staged files)\n\nThere is NO `knip` in the pre-commit hook. Remove line 129 from the pre-commit description. The pre-commit section should list only:\n- Rejects accidentally staged ralph state files\n- Runs lint-staged: Prettier and ESLint auto-fix on staged files\n\nknip runs as part of `npm run check` but not on commit."
+    }
+  ]
+}

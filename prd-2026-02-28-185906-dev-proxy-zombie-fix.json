@@ -1,0 +1,27 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix the dev-proxy SIGTERM E2E test that fails in Docker because the worker process becomes a zombie after the proxy exits. Docker containers without --init have no init process to reap zombies, so process.kill(pid, 0) succeeds on the zombie PID indefinitely. The prior polling fix (5s timeout) does not help because the issue is zombie reaping, not shutdown timing.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix dev-proxy SIGTERM test to handle zombie processes in Docker",
+      "description": "As a platform contributor running E2E tests in Docker, I want the 'SIGTERM kills worker and proxy exits cleanly' test to pass so that the full E2E suite is green",
+      "acceptanceCriteria": [
+        "The test at e2e/dev-proxy.e2e.ts passes in Docker containers (without --init flag)",
+        "The test still verifies that the proxy exits cleanly on SIGTERM",
+        "The test still verifies the HTTP port is no longer listening after shutdown",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "In `e2e/dev-proxy.e2e.ts` around line 210-222, the test sends SIGTERM to the dev proxy, then polls worker PIDs to verify they exited. The test currently polls `process.kill(workerPid, 0)` up to 50 times with 100ms delays (5s total).\n\nThe root cause: In Docker containers without an init process (PID 1 is the container entrypoint, not tini/dumb-init), when the proxy process exits, its worker child is re-parented to PID 1. But PID 1 in a Docker container does not call `waitpid()` to reap zombie children. The worker process becomes a zombie (state Z, <defunct>). `process.kill(pid, 0)` succeeds on zombies because the process table entry still exists.\n\nVerified behavior:\n- `ps -p <worker_pid> -o state=` shows `Z` (zombie)\n- The worker IS dead (not executing any code), but its PID entry remains\n- No amount of waiting will clear the zombie without an init process\n\nThe fix should detect zombie state instead of relying on `process.kill(pid, 0)`. Two approaches:\n\n**Approach A (recommended):** Read `/proc/<pid>/status` (Linux) to check if the process is a zombie. On Linux, `fs.readFileSync('/proc/' + pid + '/status', 'utf-8')` contains a `State:` line. If it shows `Z (zombie)`, treat as dead. On macOS (where /proc doesn't exist), fall back to the existing `process.kill(pid, 0)` check. This approach works on all platforms.\n\n```typescript\nfunction isProcessDead(pid: number): boolean {\n  try {\n    // On Linux, check /proc for zombie state\n    const status = readFileSync(`/proc/${pid}/status`, 'utf-8');\n    if (/^State:\\s+Z/m.test(status)) return true; // zombie = dead\n    return false; // still running\n  } catch {\n    // /proc not available (macOS) or process gone\n    try {\n      process.kill(pid, 0);\n      return false; // still alive\n    } catch {\n      return true; // gone\n    }\n  }\n}\n```\n\n**Approach B:** Use `execSync('ps -p PID -o state=')` to check process state. If the output is `Z`, treat as dead. This works cross-platform but spawns a subprocess.\n\nApproach A is preferred because it avoids subprocess spawning in a polling loop.\n\nReplace the polling loop at lines ~211-222 with a helper function that handles zombies, keeping the same 50-attempt/100ms-delay polling structure."
+    }
+  ]
+}
