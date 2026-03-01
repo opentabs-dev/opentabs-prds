@@ -1,0 +1,20 @@
+## Codebase Patterns
+- `followFile` in `platform/cli/src/commands/logs.ts` uses a `statSync` size check before opening the stream, but the stream may read beyond that size if the file is written to concurrently. Track `actualBytesRead` by summing `chunk.length` in the `'data'` handler and use `startOffset + actualBytesRead` on `'end'`.
+- Tests for `followFile` mock `statSync`, `createReadStream`, and `watch` from `node:fs`. Streams are created as `EventEmitter` instances with events emitted manually. The watcher callback is retrieved via `mockWatch.mock.calls[0]`.
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-232021-cli-audit-fixes~running.json
+Started: Sun Mar  1 07:20:50 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Fixed `followFile` in `platform/cli/src/commands/logs.ts` to track actual bytes consumed instead of using stale `statSync` size as the new offset
+- Added `const startOffset = offset` before stream creation and `let actualBytesRead = 0` initialized to 0
+- In the `'data'` handler, added `actualBytesRead += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk)`
+- In the `'end'` handler, changed `offset = currentSize` to `offset = startOffset + actualBytesRead`
+- Added test in `platform/cli/src/commands/logs.test.ts` that simulates a stream reading 150 bytes when `statSync` reported only 100, verifying no second read stream is created on the next watcher trigger
+- **Learnings for future iterations:**
+  - The root cause: `createReadStream` without an `end` option reads to actual EOF at the time of reading, not to the captured `statSync` size. Concurrent writes extend EOF beyond the pre-read size.
+  - `Buffer.byteLength(str)` is needed for string chunks (when `encoding` is set on the stream); `chunk.length` suffices for `Buffer` chunks since `.length` gives byte count for Buffers.
+  - All 5 logs tests pass after the fix (previously 4 tests existed).
+---
