@@ -1,0 +1,29 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix unreliable side panel toggle after MV3 service worker suspension. The in-memory openWindows Set in side-panel-toggle.ts is wiped when the service worker suspends, causing the extension to lose track of whether the side panel is open. On the next toolbar click, it calls chrome.sidePanel.open() on an already-open panel (a no-op), making the click appear to do nothing.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Persist side panel open state to chrome.storage.session",
+      "description": "As a user, I want the side panel toggle to work reliably after the MV3 service worker suspends so that clicking the extension icon always opens or closes the panel as expected.",
+      "acceptanceCriteria": [
+        "openWindows state in side-panel-toggle.ts is persisted to chrome.storage.session on every onOpened, onClosed, and onRemoved event",
+        "On service worker wake (module re-initialization), openWindows is restored from chrome.storage.session before the action click handler can fire",
+        "The existing chrome.windows.get() validation for stale window IDs is preserved as a secondary safeguard",
+        "A new storage key constant (e.g., SIDE_PANEL_OPEN_WINDOWS_KEY) is added to constants.ts following the existing naming convention",
+        "The in-memory openWindows Set remains the fast-path for action click decisions (no async read in the hot path after initial restore)",
+        "The restore function follows the same pattern as restoreWsConnectedState in background-message-handlers.ts (read from session storage, update in-memory cache, catch errors)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Root cause: The `openWindows` Set in `platform/browser-extension/src/side-panel-toggle.ts` (line 6) is module-level in-memory state. When the MV3 service worker suspends (after ~30s of inactivity), all module state is wiped. On wake, `openWindows` starts as an empty Set. The `onOpened`/`onClosed` listeners are re-registered but don't replay past events, so the extension doesn't know the panel is already open. When the user clicks the icon, the code takes the `else` branch (line 46) and calls `chrome.sidePanel.open()` — which is a no-op on an already-open panel.\n\nFix approach: Persist the `openWindows` set to `chrome.storage.session` (survives service worker suspension, clears on browser restart). Follow the exact pattern used for `wsConnected` in `platform/browser-extension/src/background-message-handlers.ts` lines 17-46:\n1. Add a constant `SIDE_PANEL_OPEN_WINDOWS_KEY` to `platform/browser-extension/src/constants.ts`\n2. In `side-panel-toggle.ts`, add a `persistOpenWindows()` helper that writes `Array.from(openWindows)` to `chrome.storage.session` (best-effort, .catch(() => {}))\n3. Add a `restoreOpenWindows()` function that reads from session storage and populates the in-memory Set. Call it at the top of `initSidePanelToggle()` — the read is async but will resolve before the user can click (service worker wake + listener registration takes <50ms; storage.session reads take <5ms)\n4. Call `persistOpenWindows()` inside the `onOpened`, `onClosed`, and `onRemoved` listeners after modifying the Set\n5. Keep the existing `chrome.windows.get()` validation in the action click handler as a secondary safeguard\n\nThe `canToggle` guard (line 16) should also gate the restore — if `onOpened`/`onClosed` don't exist, there's nothing to restore.\n\nKey files:\n- `platform/browser-extension/src/side-panel-toggle.ts` — main file to modify\n- `platform/browser-extension/src/constants.ts` — add new storage key constant\n- `platform/browser-extension/src/background-message-handlers.ts` — reference pattern for persist/restore\n\nGotcha: `chrome.storage.session.get()` is async. The restore runs at `initSidePanelToggle()` call time (module top-level in background.ts line 18). There's a tiny window where a user could click the icon before the restore completes. This is acceptable — the window is <5ms and the worst case is one missed toggle (same as current behavior). Do NOT make the action click handler async-wait on the restore; that would add latency to every click."
+    }
+  ]
+}
