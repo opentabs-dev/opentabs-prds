@@ -1,5 +1,20 @@
 # Project Instructions for Claude
 
+## Destructive Actions Require Confirmation
+
+Never perform destructive or irreversible actions without explicit user
+confirmation. This includes but is not limited to:
+
+- Deleting remote git branches
+- Force-pushing
+- Dropping/resetting commits that have been pushed
+- Deleting files on remote servers
+- Stopping/disabling services
+
+Always ask first. Do not assume intent from context.
+
+---
+
 ## Pulling Latest Changes
 
 At the start of every session, pull the latest changes before doing any work:
