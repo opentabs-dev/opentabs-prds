@@ -1,0 +1,100 @@
+## Codebase Patterns
+- tabId extraction pattern: `typeof rawTabId === 'number' && Number.isInteger(rawTabId) && rawTabId > 0 ? rawTabId : undefined` — use `typeof` first so TypeScript narrows to `number` before the arithmetic comparison
+- There are 4 tabId extraction points across MCP server and browser extension: mcp-tool-dispatch.ts, tool-dispatch.ts, resource-prompt-dispatch.ts (x2), useServerNotifications.ts
+- In resource-prompt-dispatch.ts, introduce `const rawTabId = params.tabId;` to avoid accessing params.tabId multiple times in the ternary
+- Unit tests for tabId validation: mcp-tool-dispatch.test.ts uses `test.each` near line 1141; tool-dispatch.test.ts uses `test.each` near line 384
+- The tool-dispatch.test.ts pattern: set up plugin in storage + mock tabs.query([]) → dispatch with invalid tabId → expect -32001 error (fallback dispatch with no tabs)
+- E2E pattern for testing unavailable tab: `setAuth(false)` + `page.reload()` + wait for adapter re-injection + poll `plugin_list_tabs` until `ready:false`
+- After `testServer.reset()` auth is restored to true — must re-call `setAuth(false)` if still testing unavailable state
+- To create per-tab mixed readiness: use `page.route('**/api/auth.check', ...)` to intercept auth.check on one page, then `page.reload()` — the fresh adapter's `isReady()` calls the intercepted endpoint; more reliable than monkey-patching + hash navigation
+- `waitForTabCount` only checks `tabs.length >= count`, not readiness — use `waitFor` with `tabs.every(t => t.ready)` when both count AND readiness matter
+- Tab close tracking: after closing all tabs, `plugin_list_tabs` reports `state:'closed'` with empty tabs array
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-074456-multi-tab-robustness~running.json
+Started: Sun Mar  1 15:45:19 UTC 2026
+---
+
+## 2026-03-01 - US-001
+- Implemented positive-integer validation for tabId at all 4 extraction points
+- Files changed:
+  - platform/mcp-server/src/mcp-tool-dispatch.ts: `typeof rawTabId === 'number' && Number.isInteger(rawTabId) && rawTabId > 0`
+  - platform/browser-extension/src/tool-dispatch.ts: same pattern with `const rawTabId = params.tabId`
+  - platform/browser-extension/src/resource-prompt-dispatch.ts: same pattern in both handleResourceRead and handlePromptGet
+  - platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts: same pattern inline
+  - platform/mcp-server/src/mcp-tool-dispatch.test.ts: added test.each for NaN, Infinity, 0, -1, 1.5
+  - platform/browser-extension/src/tool-dispatch.test.ts: added test.each for NaN, Infinity, 0, -1, 1.5
+- **Learnings for future iterations:**
+  - The `typeof === 'number'` check is kept before `Number.isInteger()` so TypeScript narrows the type and avoids `as number` casts
+  - useServerNotifications.ts line 67 had a prettier line-length issue — run `npx prettier --write` after changes
+  - Both test files use `test.each` with `[_label, value]` destructuring to avoid unused variable lint errors
+---
+
+## 2026-03-01 - US-002
+- Added `minimum: 1` to the tabId property injected by `getEnabledToolsList` in `mcp-setup.ts`
+- Files changed:
+  - platform/mcp-server/src/mcp-setup.ts: added `minimum: 1` to the injected tabId schema property (line 339)
+- **Learnings for future iterations:**
+  - Browser tools in `platform/mcp-server/src/browser-tools/` already use `z.number().int().positive()` which already enforces a positive (≥1) integer constraint via Zod — no changes needed there
+  - The injected `tabId` in `getEnabledToolsList` is purely informational for plugin tools (tabId is stripped before Ajv validation), but `minimum: 1` helps MCP clients that validate locally
+  - This was a single-line change — just adding `minimum: 1` to the existing schema object
+---
+
+## 2026-03-01 - US-003
+- Added E2E test verifying targeted dispatch to an unavailable (not-ready) tab returns a clean -32002 error with no fallback
+- Files changed:
+  - e2e/multi-tab-targeting.e2e.ts: added "Test 7" — targeted dispatch to unavailable tab
+- **Learnings for future iterations:**
+  - To make a tab unavailable in E2E tests: `testServer.setAuth(false)` + `page.reload()` + wait for adapter re-injection + poll `plugin_list_tabs` until `ready:false`
+  - The page reload is necessary to trigger the extension's re-probe of `isReady()` — without it, the cached ready state persists
+  - After `testServer.reset()`, auth is restored to true, so must call `setAuth(false)` again if still testing unavailable state
+  - The MCP server prefixes -32002 errors with "Tab unavailable:" (mcp-tool-dispatch.ts line 448-449)
+  - `waitFor` with a lambda polling `plugin_list_tabs` is the reliable pattern for waiting on tab state transitions
+  - The `e2eCheckpoint` for this story is false, so only Phase 1 checks were needed
+---
+
+## 2026-03-01 - US-004
+- Added E2E test verifying plugin_list_tabs reports mixed readiness when one tab's isReady returns false
+- Files changed:
+  - e2e/multi-tab-targeting.e2e.ts: added "Test 8" — mixed readiness across tabs
+- **Learnings for future iterations:**
+  - To create mixed readiness without server-wide auth toggle: monkey-patch `isReady` on one page via `page.evaluate`, then trigger a hash navigation (`window.location.hash = '#...'`) to force a readiness re-probe
+  - Hash navigation fires `chrome.tabs.onUpdated` with `changeInfo.url` but NOT `changeInfo.status === 'complete'`, so the extension calls `checkTabChanged` without re-injecting adapters — the override survives
+  - The type assertion for `globalThis.__openTabs` must include `| undefined` to satisfy `@typescript-eslint/no-unnecessary-condition` when using optional chaining
+  - `e2eCheckpoint` is false for this story, so only Phase 1 checks were needed
+---
+
+## 2026-03-01 - US-005
+- Added E2E test verifying targeted dispatch to a tab that closes mid-execution returns a clean error with no fallback to other tabs
+- Files changed:
+  - e2e/multi-tab-targeting.e2e.ts: added "Test 9" — targeted dispatch to tab that closes mid-execution
+- **Learnings for future iterations:**
+  - The pattern for testing tab-close-mid-execution: `testServer.setSlow(10_000)` to block the adapter in a fetch, then `page.close()` to kill the tab, then await the tool call result
+  - Must use `testServer.reset()` then re-apply `setSlow()` to get a clean invocation baseline (reset clears all control state including slow mode)
+  - Marker identification pattern (page.evaluate + browser_execute_script) is reusable for mapping tabIds to Playwright page handles when multiple tabs are open
+  - Prettier enforces single-line arrow functions for short filter predicates — avoid multi-line `i =>\n  i.path === ... &&\n  ...` when it fits on one line
+  - `e2eCheckpoint` is false for this story, so only Phase 1 checks were needed
+---
+
+## 2026-03-01 - US-006
+- Added E2E test verifying two concurrent tool calls targeting different tabs via tabId both execute on their respective tabs independently with no cross-talk
+- Files changed:
+  - e2e/multi-tab-targeting.e2e.ts: added "Test 10" — concurrent targeted dispatches to different tabs
+- **Learnings for future iterations:**
+  - `Promise.all` with two `mcpClient.callTool` calls is the pattern for concurrent dispatch testing
+  - The marker identification pattern (set `__tabMarker` on pages, read via `browser_execute_script`) is reusable across all multi-tab targeting tests
+  - `e2eCheckpoint` is false for this story, so only Phase 1 checks were needed
+---
+
+## 2026-03-01 - US-007
+- Added E2E test verifying plugin_list_tabs reflects tab opens and closes in real-time through multiple transitions
+- Also fixed flaky Test 8 (mixed readiness) by replacing monkey-patch + hash navigation with page.route() interception
+- Files changed:
+  - e2e/multi-tab-targeting.e2e.ts: added "Test 11" — real-time tab tracking; fixed "Test 8" mixed readiness approach
+- **Learnings for future iterations:**
+  - `waitForTabCount` only checks `tabs.length >= count`, not readiness — when you need both, use `waitFor` with a custom predicate that checks `tabs.every(t => t.ready)`
+  - The monkey-patch + hash navigation approach for per-tab mixed readiness is flaky in Playwright/Chromium; `page.route()` interception of auth.check + `page.reload()` is more reliable
+  - `page.route()` survives page reloads in Playwright, so it can intercept requests from freshly re-injected adapters
+  - After closing all matching tabs, `plugin_list_tabs` reports `state:'closed'` with empty `tabs` array
+  - `e2eCheckpoint` is true for this story (final story), so full Phase 2 including E2E was required
+---
