@@ -1,0 +1,65 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix race conditions, partial-revert bugs, resource leaks, and missing error feedback in the Chrome extension side panel UI.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix npm search race condition causing stale results to overwrite newer ones",
+      "description": "As a user searching for plugins, I want search results to always reflect my latest query so that I don't see stale results from a slower earlier request.",
+      "acceptanceCriteria": [
+        "handleSearchChange tracks the latest query and discards responses from older queries",
+        "If user types 'sla' then quickly types 'slack', a slow response for 'sla' arriving after 'slack' does not overwrite the 'slack' results",
+        "npmSearchTimer ref is cleared in the useEffect cleanup to prevent timer firing after side panel closes",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two issues in `platform/browser-extension/src/side-panel/App.tsx`:\n\n**Race condition (lines 68-88):** `handleSearchChange` debounces 400ms then calls `searchPlugins(query)`. The `.then()` at line 80 calls `setNpmResults(result.results)` unconditionally. If a slow response for an earlier query arrives after a faster response for a later query, it overwrites the correct results. Fix: use a monotonically increasing counter ref. Increment on each search dispatch, capture the value in the closure, and only call `setNpmResults` if the counter still matches.\n\n**Missing cleanup (line 48, lines 142-268):** `npmSearchTimer` is a ref holding a debounce timeout ID. The `useEffect` cleanup at line 267 removes the message listener but never calls `clearTimeout(npmSearchTimer.current)`. Add `clearTimeout(npmSearchTimer.current)` to the cleanup function. The timer firing after unmount would call `searchPlugins()` → `sendRequest()` → `chrome.runtime.sendMessage()` against a potentially dead context, causing a console error."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix BrowserToolsCard toggle-all partial revert on mixed success/failure",
+      "description": "As a user toggling all browser tools, I want the UI to correctly reflect which tools were actually toggled so that the UI does not desync from the server.",
+      "acceptanceCriteria": [
+        "BrowserToolsCard.handleToggleAll sends a single batch request to the server instead of N individual requests",
+        "If the batch request fails, all tools revert correctly (same behavior as PluginCard which uses setAllToolsEnabled)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx` at lines 51-63, `handleToggleAll` sends N individual `setBrowserToolEnabled` requests via `Promise.all`. Compare with `platform/browser-extension/src/side-panel/components/PluginCard.tsx` lines 57-69 which correctly uses `setAllToolsEnabled` (a single server request).\n\nThe problem: if 3 of 5 individual requests succeed and 2 fail, `Promise.all` rejects and the catch handler reverts ALL tools to their pre-toggle state. But the server has already toggled the 3 that succeeded — creating a desync between UI and server state.\n\nFix: Check if `bridge.ts` already has a `setAllBrowserToolsEnabled` function or similar batch endpoint. If not, add one that calls `sendRequest('config.setAllBrowserToolsEnabled', { enabled })`. Then use it in `handleToggleAll` like `PluginCard` does. If the server does not support a batch endpoint for browser tools, the MCP server side may also need a handler — check `platform/mcp-server/src/` for the config.setAllToolsEnabled handler and add an analogous config.setAllBrowserToolsEnabled.\n\nAlternatively, if adding a new server endpoint is too complex for one story, the simpler fix is: on `Promise.all` rejection, re-fetch the server state via `fetchConfigState()` to get the actual state of each tool, instead of blindly reverting to `preToggleRef.current`."
+    },
+    {
+      "id": "US-003",
+      "title": "Add user feedback on plugin update and remove failures",
+      "description": "As a user managing plugins, I want to see an error message when a plugin update or removal fails so that I know the action did not succeed.",
+      "acceptanceCriteria": [
+        "When removePlugin() rejects, an error alert or toast is shown to the user indicating the failure",
+        "When updatePlugin() rejects, an error alert or toast is shown to the user indicating the failure",
+        "The error is displayed temporarily (3-5 seconds) and auto-dismisses, consistent with existing error patterns (ERROR_DISPLAY_DURATION_MS)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `platform/browser-extension/src/side-panel/App.tsx`:\n\n**handleUpdate (lines 136-139):** `updatePlugin(pluginName).catch(() => {})` silently swallows all errors. The user clicks 'Update', nothing happens, no feedback.\n\n**handleRemove (lines 117-134):** The `.catch()` at line 127 clears `removingPlugins` but gives no user feedback. The plugin remains in the list (correct) but the user doesn't know why removal failed.\n\nFollow the existing error pattern used for install errors: `App.tsx` already has `installErrors` state (a `Map<string, string>`) at line 44 and passes it to `SearchResults` → `NpmPluginCard`. Create analogous `updateErrors` and `removeErrors` state maps (or a combined `pluginErrors` map keyed by `pluginName`). Pass the error to `PluginCard` (via `PluginList`) and display it using the same `Alert` pattern already used in `PluginCard.tsx` lines 160-163 for toggle errors.\n\nFor `handleUpdate`, the error message should come from the rejection reason: `err instanceof Error ? err.message : String(err)`. For `handleRemove`, same pattern.\n\nThe `ERROR_DISPLAY_DURATION_MS` constant from `platform/browser-extension/src/side-panel/constants.ts` can be reused for auto-dismissal, or the errors can persist until the next successful operation (consistent with `installErrors` which persist until the install succeeds or a new search starts)."
+    }
+  ]
+}
