@@ -1,0 +1,28 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix session permission pruning that incorrectly drops browser tool 'Allow Always' rules on every reload. The pruneStaleState function in reload.ts filters sessionPermissions against registry.toolLookup, which only contains plugin tools — browser tool names are never in that map, causing all browser tool session permission rules to be silently dropped on every hot reload or config reload.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Preserve browser tool session permissions across reloads",
+      "description": "As a user who clicked 'Allow Always' for a browser tool, I want my permission to persist across hot reloads and config reloads so that I am not re-prompted for the same tool.",
+      "acceptanceCriteria": [
+        "pruneStaleState in reload.ts preserves session permission rules where rule.tool is a valid browser tool name (e.g., browser_execute_script, browser_click_element)",
+        "pruneStaleState still prunes session permission rules for plugin tools that no longer exist in the registry",
+        "pruneStaleState still preserves rules where rule.tool is null (domain_all scope)",
+        "Existing test 'prunes stale session permission rules for tools no longer in the registry' still passes",
+        "New test verifies that a session permission rule for a browser tool (e.g., browser_execute_script) survives a reload",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Bug location: platform/mcp-server/src/reload.ts, line 126-133, in the pruneStaleState function.\n\nCurrent code:\n```typescript\nconst prevSessionPermissionsLength = state.sessionPermissions.length;\nstate.sessionPermissions = state.sessionPermissions.filter(\n  rule => rule.tool === null || state.registry.toolLookup.has(rule.tool),\n);\n```\n\nThe problem: state.registry.toolLookup only contains plugin tools (prefixed as plugin_tool, e.g., 'slack_send_message'). Browser tool names (e.g., 'browser_execute_script', 'browser_get_cookies') are never added to toolLookup (see platform/mcp-server/src/registry.ts:96-131 — buildRegistry only iterates over plugin tools). So this filter drops ALL browser tool session permission rules on every reload.\n\nFix: Build a set of valid browser tool names from state.cachedBrowserTools and include them in the filter condition:\n```typescript\nconst validBrowserToolNames = new Set(state.cachedBrowserTools.map(c => c.name));\nconst prevSessionPermissionsLength = state.sessionPermissions.length;\nstate.sessionPermissions = state.sessionPermissions.filter(\n  rule => rule.tool === null || state.registry.toolLookup.has(rule.tool) || validBrowserToolNames.has(rule.tool),\n);\n```\n\nNote: state.cachedBrowserTools is already populated before pruneStaleState is called — it's set at platform/mcp-server/src/reload.ts:254 (the atomic swap), and pruneStaleState is called at line 257.\n\nTest file: platform/mcp-server/src/reload.test.ts. The existing test at lines 266-285 tests plugin tool pruning but does NOT include a browser tool session permission rule. Add a new test (or extend the existing test) that adds a browser tool rule (e.g., { tool: 'browser_execute_script', domain: 'example.com', scope: 'tool_domain' }) to state.sessionPermissions before reload and verifies it survives.\n\nNote: The test setup may need to ensure state.cachedBrowserTools is populated. The performReload function calls rebuildCachedBrowserTools which populates this from state.browserTools. The default createState() initializes browserTools as an empty array and cachedBrowserTools as an empty array. Either: (a) manually set state.cachedBrowserTools to include a browser_execute_script entry before the reload, or (b) let performReload populate it naturally (it updates state.browserTools from the fresh import at line 411). Approach (b) is more realistic — state.browserTools is set to the imported browserTools array at line 411, which includes browser_execute_script."
+    }
+  ]
+}
