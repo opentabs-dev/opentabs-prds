@@ -1,0 +1,156 @@
+# Ralph Progress Log
+PRD: prd-2026-02-28-232021-mcp-server-audit-fixes~running.json
+Started: Sun Mar  1 07:20:55 UTC 2026
+---
+
+## Codebase Patterns
+- `PluginTabInfo` in `@opentabs-dev/shared` has `tabId`, `url`, `title`, `ready` — `title` is required (not optional); wire format `WirePluginTabInfo` is loose and doesn't require `title`
+- `handleTabSyncAll` and `handleTabStateChanged` in `extension-handlers.ts` accept `Record<string, unknown>` params; `WirePluginTabInfo` is used internally for wire parsing (not `PluginTabInfo`)
+- For `handleTabStateChanged`, computing `newMapping = parseTabMapping(wire)` before calling `state.tabMapping.set(plugin, newMapping)` avoids a non-null assertion to re-read the just-set value
+- `isSessionAllowed` in `platform/mcp-server/src/state.ts` checks session permission rules; `domain_all` scope means "allow all tools on a specific domain" (not "allow all domains")
+- Session permission rules are pushed in `handleConfirmationResponse` in `platform/mcp-server/src/extension-handlers.ts`; the `scope` field controls which fields (tool/domain) are null
+- Tests for `isSessionAllowed` live in `state.test.ts`; tests for `handleConfirmationResponse` live in `extension-handlers.test.ts`
+- Prettier print width causes long strings in function args to be broken onto their own line with trailing comma: `log.warn(\n  \`...\`,\n);`
+- `log` is imported from `./logger.js` in extension-handlers.ts
+- `rebuildCachedBrowserTools` in `mcp-setup.ts` only reads `state.browserTools` and writes `state.cachedBrowserTools` — a minimal staging object `{ browserTools, cachedBrowserTools }` is sufficient for calling it without touching real state
+- `pruneStaleState` in `reload.ts` modifies Maps in-place (`tabMapping`, `activeDispatches`) using `state.registry` to check which plugins still exist; runs after the state swap, not before
+- `reload.test.ts` integration tests use a real temp config dir (via `OPENTABS_CONFIG_DIR`) and `(globalThis).__opentabs_global_paths__ = []` to isolate from globally-installed npm plugins
+- `file-watcher.ts:parseToolsJson` is a local helper (not exported); `validateResources` and `validatePrompts` are exported from `loader.ts` and accept `(items: unknown[], pluginName: string, sourcePath: string)` for error reporting
+- The manifest object format in tools.json is `{ tools: [...], resources: [...], prompts: [...] }`; legacy format is a plain array (tools only); `extractToolsArray` handles both but only returns the tools array
+- Bounded array pattern in `state.ts`: use a `MAX_X` constant + a `pushX(state, entry)` helper that trims oldest entries beyond the cap (e.g., `appendAuditEntry`/`MAX_AUDIT_ENTRIES`, `pushSessionPermission`/`MAX_SESSION_PERMISSIONS`)
+- `state.registry.toolLookup` provides O(1) lookup by prefixed tool name — use it in `pruneStaleState` for existence checks
+- The ws library's `'headers'` event provides `(headers: string[], request: IncomingMessage)` — use the request as a Map key for per-connection state instead of shared variables
+
+## 2026-03-01 - US-002
+- **What was implemented**: Made `reloadCore` state updates atomic so a throw during `rebuildCachedBrowserTools` (or any step after discovery) does not leave state partially corrupted.
+  1. `reload.ts` — Added `CachedBrowserTool` to the type import from `./state.js`.
+  2. `reload.ts:reloadCore` — Extracted all new state values into local variables (`newRegistry`, `newToolConfig`, `newBrowserToolPolicy`, `newPluginPaths`, `newDiscoveryErrors`, `newPermissions`, `newSkipConfirmation`). Created a minimal staging object `{ browserTools, cachedBrowserTools }` and called `rebuildCachedBrowserTools` on it (cast via `as unknown as ServerState`). After all preparation succeeds without throwing, all state fields are assigned atomically in one block. `pruneStaleState` runs after the swap (as it modifies Maps in-place and reads the new registry).
+  3. `reload.test.ts` — Added test "state fields are not mutated when rebuildCachedBrowserTools throws": sets a bad browser tool with a getter that throws on `.input` access, calls `performConfigReload`, and asserts `state.registry` and `state.toolConfig` remain unchanged.
+- **Files changed**: `platform/mcp-server/src/reload.ts`, `platform/mcp-server/src/reload.test.ts`
+- **Learnings for future iterations:**
+  - Using `as unknown as ServerState` for a staging object is the correct cast pattern when only a subset of ServerState fields are needed.
+  - A getter that throws is a clean way to force a throw inside a `.map()` callback without module mocking.
+  - The `pruneStaleState` function cannot easily run "before the swap" because it modifies Maps in-place (it reads `state.registry` to check which plugins exist). Moving it after the swap is semantically equivalent and avoids deep-cloning Maps.
+---
+
+## 2026-03-01 - US-001
+- **What was implemented**: Fixed `domain_all` session permission scope creating a null-domain rule that silently matched all tool calls.
+  1. `state.ts:240` — Changed `domain_all` case from `rule.domain === null || rule.domain === domain` to `rule.domain === domain` so null-domain rules no longer wildcard-match non-null domains.
+  2. `extension-handlers.ts:537-545` — When scope is `domain_all` and `pending.domain === null`, log a warning and fall back to `tool_domain` scope instead of creating a rule with both `tool=null` and `domain=null`.
+  3. `state.test.ts:142` — Updated test "domain_all with null domain matches calls with a specific domain" (was asserting the bug) to expect `false` and renamed to reflect correct behavior.
+  4. `extension-handlers.test.ts` — Added new test verifying `domain_all` falls back to `tool_domain` when `pending.domain` is null.
+- **Files changed**: `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/extension-handlers.ts`, `platform/mcp-server/src/state.test.ts`, `platform/mcp-server/src/extension-handlers.test.ts`
+- **Learnings for future iterations:**
+  - The existing state.test.ts test at line 142 was asserting buggy behavior (the bug was originally written as a "feature" test) — always check if existing tests encode correct or incorrect expectations before updating them.
+  - The `e2eCheckpoint: false` for all stories in this PRD means Phase 1 only is sufficient for committing each story.
+---
+
+## 2026-03-01 - US-004
+- **What was implemented**: Added cleanup of stale `activeNetworkCaptures` entries when tabs are removed.
+  1. `extension-handlers.ts:handleTabSyncAll` — After rebuilding `tabMapping` from the sync, collects all tab IDs across all plugin mappings and removes any `activeNetworkCaptures` entries not in that set.
+  2. `extension-handlers.ts:handleTabStateChanged` — Before updating `tabMapping`, captures old tab IDs for the plugin. Calls `parseTabMapping(wire)` to build `newMapping`, sets it on `tabMapping`, then removes any old tab IDs not in the new mapping from `activeNetworkCaptures`.
+  3. `reload.ts:pruneStaleState` — After existing pruning, collects all tab IDs from `tabMapping` and removes stale `activeNetworkCaptures` entries.
+  4. `extension-handlers.test.ts` — Added `describe` blocks for `handleTabSyncAll — activeNetworkCaptures cleanup` (3 tests) and `handleTabStateChanged — activeNetworkCaptures cleanup` (3 tests); imported `handleTabSyncAll`, `handleTabStateChanged`, and `RegisteredPlugin` type.
+- **Files changed**: `platform/mcp-server/src/extension-handlers.ts`, `platform/mcp-server/src/reload.ts`, `platform/mcp-server/src/extension-handlers.test.ts`
+- **Learnings for future iterations:**
+  - `PluginTabInfo.title` is required (not optional) — always include it in test fixtures that set `state.tabMapping` directly.
+  - Avoid non-null assertions (`!`) after `Map.get()`: instead, store the result of the operation (e.g., `parseTabMapping(wire)`) in a variable before calling `state.tabMapping.set(plugin, result)`.
+  - Setting up a minimal registry for `handleTabStateChanged` tests: `state.registry = { ...state.registry, plugins: new Map([[pluginName, {} as RegisteredPlugin]]) as ReadonlyMap<string, RegisteredPlugin> }`.
+---
+
+## 2026-03-01 - US-003
+- **What was implemented**: Fixed `handleToolsJsonChange` to also pick up resource and prompt changes from tools.json, not just tools.
+  1. `file-watcher.ts` — Added `ParsedManifest` interface; changed `parseToolsJson` to accept `pluginName` and return `{ tools, resources, prompts } | null` instead of `ManifestTool[] | null`; imported `validateResources`, `validatePrompts` from `./loader.js` and `ManifestPrompt`, `ManifestResource` types from `@opentabs-dev/shared`; updated `handleToolsJsonChange` to destructure `{ tools, resources, prompts }` from the parsed result and include them in `updatedFields`.
+  2. `file-watcher.test.ts` — Added `makeFullManifestJson()` helper that builds a `{ tools, resources, prompts }` format manifest; added test "resource and prompt changes in tools.json are picked up by the file watcher" that verifies resources and prompts are updated after `handleToolsJsonChange`.
+- **Files changed**: `platform/mcp-server/src/file-watcher.ts`, `platform/mcp-server/src/file-watcher.test.ts`
+- **Learnings for future iterations:**
+  - `validateResources` and `validatePrompts` in `loader.ts` need `pluginName` and `filePath` for error reporting — pass `pluginName` from the outer function scope.
+  - The `manifestObj` extraction pattern (check `typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)`) mirrors the same pattern in `loader.ts:loadPlugin` — consistent approach for extracting optional fields from the manifest.
+---
+
+## 2026-03-01 - US-005
+- **What was implemented**: Capped `sessionPermissions` array at 500 entries and pruned stale rules (referencing removed tools) on config reload.
+  1. `state.ts` — Added `MAX_SESSION_PERMISSIONS = 500` constant and `pushSessionPermission(state, rule)` helper that pushes a rule and trims oldest entries beyond the cap (mirrors `appendAuditEntry`/`MAX_AUDIT_ENTRIES` pattern).
+  2. `extension-handlers.ts` — Imported `pushSessionPermission` from `./state.js`; replaced `state.sessionPermissions.push(rule)` with `pushSessionPermission(state, rule)` in `handleConfirmationResponse`.
+  3. `reload.ts:pruneStaleState` — Added filtering of `state.sessionPermissions` to remove rules where `rule.tool !== null && !state.registry.toolLookup.has(rule.tool)`. Rules with `tool=null` (domain_all scope) are always kept since they reference a domain, not a specific tool.
+  4. `extension-handlers.test.ts` — Imported `MAX_SESSION_PERMISSIONS`; added test "sessionPermissions is capped at MAX_SESSION_PERMISSIONS — oldest entries are dropped" that pre-fills to the cap, adds one more, and verifies the oldest entry was dropped.
+  5. `reload.test.ts` — Imported `SessionPermissionRule` type; added test "prunes stale session permission rules for tools no longer in the registry" verifying that tool-referencing rules for removed tools are pruned while domain_all and valid tool rules are kept.
+- **Files changed**: `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/extension-handlers.ts`, `platform/mcp-server/src/reload.ts`, `platform/mcp-server/src/extension-handlers.test.ts`, `platform/mcp-server/src/reload.test.ts`
+- **Learnings for future iterations:**
+  - The `appendAuditEntry`/`MAX_AUDIT_ENTRIES` pattern in `state.ts` is the established convention for bounded arrays — follow the same pattern for any new bounded array in `ServerState`.
+  - `domain_all` rules have `tool=null` — any pruning logic for session permissions must preserve these (they are domain-scoped, not tool-scoped).
+  - `state.registry.toolLookup` provides O(1) lookup for prefixed tool names — use it in `pruneStaleState` for tool existence checks.
+  - `spawnAsync` in `plugin-management.ts` is now exported (along with `MAX_OUTPUT_SIZE`) to enable unit testing via mocked `spawn`; import order rule is sibling → external → builtin → type
+  - Use `vi.mock('node:child_process', () => ({ spawn: vi.fn() }))` at module level to mock child processes; create a helper with `class MockChild extends EventEmitter` with `stdout`, `stderr`, `kill` fields
+---
+
+## 2026-03-01 - US-006
+- **What was implemented**: Added a 10 MB stdout/stderr size cap to `spawnAsync` to prevent memory exhaustion from runaway npm subprocesses.
+  1. `plugin-management.ts` — Added `MAX_OUTPUT_SIZE = 10 * 1024 * 1024` constant; moved data handlers for stdout/stderr inside the Promise constructor (to access `reject`); added `totalBytes` tracking; when `totalBytes > MAX_OUTPUT_SIZE`, calls `child.kill()` and `reject(new Error(...))`. Exported `spawnAsync` and `MAX_OUTPUT_SIZE` for testability.
+  2. `plugin-management.test.ts` — Added `vi.mock('node:child_process', () => ({ spawn: vi.fn() }))` at module level; added `describe('spawnAsync size cap', ...)` with 4 tests: stdout cap, stderr cap, combined cap, and normal-resolve path.
+- **Files changed**: `platform/mcp-server/src/plugin-management.ts`, `platform/mcp-server/src/plugin-management.test.ts`
+- **Learnings for future iterations:**
+  - Moving data handlers inside the Promise constructor is necessary to access the `reject` callback for the size cap; this is a clean refactor with no behavioral change for the normal path.
+  - After `reject()` is called, the Promise ignores subsequent `resolve()` calls from the `close` event — no `sizeCapExceeded` guard flag needed.
+  - The import order rule groups `['index', 'sibling', 'parent', 'internal', 'external', 'builtin', 'object', 'type']` means local `./ imports come FIRST and `node:*` builtins come LAST (before type imports). This is the reverse of typical conventions — always check the order when adding imports to test files.
+  - `func-style: ['error', 'expression', { allowArrowFunctions: true }]` — use `const fn = () => {}` inside `describe` blocks instead of `function fn() {}`.
+---
+
+## 2026-03-01 - US-008
+- **What was implemented**: Added missing error handlers to prevent unhandled error events from crashing the process.
+  1. `server-node.ts` — Added `wss.on('error', (err) => log.error('WebSocket server error:', err))` after the `WebSocketServer` creation (before the `'headers'` event handler). This prevents unhandled error events from the ws server from crashing the Node.js process.
+  2. `dev-proxy.ts` — Added `httpServer.on('error', ...)` between the `'upgrade'` handler and `httpServer.listen()`. The handler prints a clear message for `EADDRINUSE` (port already in use) and calls `process.exit(1)` for all server errors.
+- **Files changed**: `platform/mcp-server/src/server-node.ts`, `platform/mcp-server/src/dev-proxy.ts`
+- **Learnings for future iterations:**
+  - The `wss` (WebSocketServer with `noServer: true`) still emits `'error'` events (e.g., on client protocol violations) — always add an error handler even for noServer mode.
+  - The dev-proxy's `httpServer` is a top-level module-scope server (not created inside a Promise), so its error handler calls `process.exit(1)` rather than `rejectServer()`. The MCP server's `httpServer` in `server-node.ts` already had an error handler that calls `rejectServer(err)` — the only missing handler was on `wss`.
+  - The `NodeJS.ErrnoException` type (used in `dev-proxy.ts`) has `.code` for checking error codes like `'EADDRINUSE'`.
+---
+
+## 2026-03-01 - US-007
+- **What was implemented**: Fixed concurrent WebSocket upgrade race by scoping upgrade state per-request instead of using shared mutable variables.
+  1. `server-node.ts` — Replaced shared `pendingUpgradeHeaders` variable with a `Map<IncomingMessage, Record<string, string>>` (`pendingHeadersByReq`). The `'headers'` event callback uses its second parameter (`request: IncomingMessage`) to look up the correct pending headers for each upgrade.
+  2. `server-node.ts` — Replaced shared `upgradeContext` variable with per-request `UpgradeContext` scoped inside `handleWsUpgradeEvent`. Each upgrade creates its own `perRequestAdapter` that closes over a local `upgradeCtx`, eliminating cross-upgrade corruption.
+  3. `server-node.ts` — Separated HTTP adapter from upgrade adapter: HTTP requests use a shared `httpAdapter` (with `upgrade: () => false`), while each WebSocket upgrade gets a fresh `perRequestAdapter`. The previous single shared `adapter` was both unnecessary and a race vector.
+  4. Added `UpgradeContext` interface to name the upgrade state type explicitly.
+- **Files changed**: `platform/mcp-server/src/server-node.ts`
+- **Learnings for future iterations:**
+  - The ws library's `'headers'` event signature is `(headers: string[], request: IncomingMessage)` — the second parameter provides the HTTP request, enabling per-request header lookup via a `Map<IncomingMessage, ...>` keyed by the request object.
+  - TypeScript's control flow analysis narrows `let x: T | null = nonNull` to `T` if no `null` assignment is reachable before the read — using `x?.prop` triggers `@typescript-eslint/no-unnecessary-condition`. Use `x.prop` when the value is provably non-null at the read site.
+  - HTTP requests never call `adapter.upgrade()`, so a separate `httpAdapter` with a no-op `upgrade()` is cleaner than sharing a single adapter whose `upgrade()` accesses mutable state.
+---
+
+## 2026-03-01 - US-009
+- **What was implemented**: Fixed `handlePluginToolCall` to not mutate the caller's `args` object when extracting `tabId`.
+  1. `mcp-tool-dispatch.ts:319-324` — Replaced `const tabId = ...; delete args.tabId;` with `const { tabId: rawTabId, ...pluginArgs } = args; const tabId = typeof rawTabId === 'number' ? rawTabId : undefined;`. All downstream uses of `args` (Ajv validation at line 348, dispatch payload at line 430) were updated to use `pluginArgs`.
+  2. `mcp-tool-dispatch.test.ts` — Updated stale comment in the non-numeric tabId test (was referring to `delete` which no longer applies). Added test "original args object is not mutated" that passes `{ channel: '#general', tabId: 42 }`, calls `handlePluginToolCall`, and asserts `originalArgs` still has `tabId: 42` after the call.
+- **Files changed**: `platform/mcp-server/src/mcp-tool-dispatch.ts`, `platform/mcp-server/src/mcp-tool-dispatch.test.ts`
+- **Learnings for future iterations:**
+  - Destructuring `const { tabId: rawTabId, ...rest } = args` is the correct no-mutation pattern for extracting a key before passing args to downstream code. No guard flag needed — `rest` simply never contains the extracted key.
+  - Tests for immutability: capture the original object reference before the call and assert the key is still present after the call returns.
+---
+
+## 2026-03-01 - US-010
+- **What was implemented**: Removed the redundant `buildRegistry` call from the `onManifestChanged` callback in `reload.ts`.
+  1. `reload.ts:onManifestChanged` — Removed `state.registry = buildRegistry(Array.from(state.registry.plugins.values()), [...state.registry.failures]);`. The file watcher (`handleToolsJsonChange` in `file-watcher.ts`) already calls `buildRegistry` and updates `state.registry` before invoking `onManifestChanged`, so the callback was re-building an identical registry (redundantly recompiling Ajv validators). The callback still calls `notifyAllClients()` to notify MCP clients and `sendPluginUpdate` to sync the extension adapter.
+- **Files changed**: `platform/mcp-server/src/reload.ts`
+- **Learnings for future iterations:**
+  - The `file-watcher.ts:handleToolsJsonChange` function calls `buildRegistry` (line 369) and updates `state.registry` before invoking `callbacks.onManifestChanged(pluginName)` — the callback receives an already-up-to-date registry.
+  - `onManifestChanged` does `sendPluginUpdate` (targeted plugin adapter sync), while `onPluginDiscovered` does `sendSyncFull` (full extension sync) — different callbacks have different sync scopes depending on the change type.
+  - `buildRegistry` in `onPluginDiscovered` is still justified because `onPluginDiscovered` is called after `loadPlugin` directly modifies the plugin set (adding a new plugin), not via `handleToolsJsonChange`, so no prior `buildRegistry` call was made.
+---
+
+## 2026-03-01 - US-011
+- **What was implemented**: Fixed `export-har` to not lose HTTP request data when the WebSocket frame fetch fails.
+  1. `export-har.ts:handler` — Changed both `getNetworkRequests` and `getWebSocketFrames` dispatches to omit the `clear` flag during the initial fetch phase. After all fetches succeed, if `args.clear` is true, separate clear dispatches are issued (with `clear: true`) to flush the extension buffers. This ensures that a failure in the WebSocket fetch never causes already-fetched HTTP request data to be discarded.
+  2. `export-har.test.ts` — Added a new `describe('exportHar clear-after-fetch ordering', ...)` block with three tests:
+     - "HTTP request buffer is not cleared when WebSocket frame fetch fails" — mocks the WS fetch to reject and asserts no clear dispatch is issued.
+     - "both buffers are cleared after all fetches succeed when clear: true with WebSocket frames" — verifies the exact 4-call sequence: fetch HTTP, fetch WS, clear HTTP, clear WS.
+     - "HTTP buffer is cleared after fetch succeeds when clear: true without WebSocket frames" — verifies the 2-call sequence when `includeWebSocketFrames` is false.
+- **Files changed**: `platform/mcp-server/src/browser-tools/export-har.ts`, `platform/mcp-server/src/browser-tools/export-har.test.ts`
+- **Learnings for future iterations:**
+  - When two independent side effects (clear HTTP buffer, clear WS buffer) depend on both reads succeeding, separate the read and write phases: read all → verify success → write all. Never interleave reads and writes.
+  - The extension's `getNetworkRequests` and `getWebSocketFrames` dispatches accept `{ tabId, clear?: boolean }` — omitting `clear` defaults to no-clear; passing `clear: true` clears the buffer and returns (now-empty) data in the same call.
+  - For clear-only operations, the return value from the re-dispatch is ignored; the call is just a side-effect trigger.
+  - The `export-har.test.ts` mock pattern uses `vi.hoisted` + `vi.mock('../extension-protocol.js')` with `mockDispatchToExtension.mockResolvedValueOnce` for sequential call expectations.
+---
