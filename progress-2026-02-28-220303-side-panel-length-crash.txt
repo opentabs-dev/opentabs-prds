@@ -1,0 +1,40 @@
+## Codebase Patterns
+- `fetchConfigState` in bridge.ts casts `Promise<unknown>` to the return type — change to `Partial<ConfigStateResult>` to reflect actual wire uncertainty
+- `@typescript-eslint/no-unnecessary-condition` IS enabled — do not use `?? []` on non-nullable typed properties without making the type reflect optionality first
+- To guard a field that is required in the base type (e.g. `ConfigStatePlugin.tools: WireToolDef[]`), widen the derived local type: use `Omit<Base, 'tools'> & { tools?: WireToolDef[] }` in bridge.ts, then `?? []` guards compile and satisfy the lint rule
+- `PluginState` in bridge.ts is the local side-panel type — safe to diverge from `ConfigStatePlugin` (the MCP wire type) by making fields optional to model partial server responses
+- `WireToolDef` is now exported from bridge.ts; use it directly in tests instead of `PluginState['tools'][number]`
+- When extracting a `const pluginTools = plugin.tools ?? [];` at the component scope, avoid naming it `tools` to prevent shadowing the `tools` parameter in `updatePluginTools` lambdas
+- lint-staged runs on pre-commit; unstaged changes (e.g. package-lock.json) survive via stash correctly
+
+# Ralph Progress Log
+PRD: prd-2026-02-28-220303-side-panel-length-crash~running.json
+Started: Sun Mar  1 06:03:31 UTC 2026
+---
+
+## 2026-03-01 - US-002
+- Changed `type PluginState` in bridge.ts from `ConfigStatePlugin` to `Omit<ConfigStatePlugin, 'tools'> & { tools?: WireToolDef[] }` so TypeScript allows `?? []` guards on the tools field
+- Added `WireToolDef` to imports and exports in bridge.ts
+- Updated `matchesTool` signature from `PluginState['tools'][number]` to `WireToolDef` directly
+- Added `(plugin.tools ?? []).some(...)` guard in `matchesPlugin` in bridge.ts
+- Updated bridge.test.ts: import `WireToolDef` from bridge.ts; changed `tool()` helper type from `PluginState['tools'][number]` to `WireToolDef`
+- Added `const pluginTools = plugin.tools ?? [];` in PluginCard.tsx; updated `updatePluginTools` to accept `(tools: WireToolDef[]) => WireToolDef[]` and use `p.tools ?? []` internally; updated all `plugin.tools` usages to `pluginTools`
+- Added `(p.tools ?? []).some(...)` guard in PluginList.tsx filter callback (with line break for Prettier compliance)
+- App.tsx: reverted `p.tools ?? []` normalization — unnecessary since `ConfigStatePlugin.tools` is required in the Partial<ConfigStateResult> type, which would trigger `no-unnecessary-condition`
+- Files changed: `platform/browser-extension/src/side-panel/bridge.ts`, `platform/browser-extension/src/side-panel/bridge.test.ts`, `platform/browser-extension/src/side-panel/components/PluginCard.tsx`, `platform/browser-extension/src/side-panel/components/PluginList.tsx`
+- **Learnings for future iterations:**
+  - `p.tools ?? []` in App.tsx's `result.plugins.map(...)` is still an unnecessary condition lint error — `ConfigStatePlugin.tools` is required, so normalization must happen in child components via `PluginState.tools` being optional
+  - When a local type diverges from the shared wire type, use `Omit<Base, 'field'> & { field?: T }` — this composes well and keeps the change local to the side-panel boundary
+  - Prettier enforces ternary line breaks for lines exceeding the print width; long filter chains must be split
+---
+
+## 2026-03-01 - US-001
+- Changed `fetchConfigState` return type in bridge.ts from `Promise<ConfigStateResult>` to `Promise<Partial<ConfigStateResult>>` to accurately reflect that the server response may be partial (the underlying cast is `as Promise<unknown>`)
+- Added `?? []` fallbacks in App.tsx `loadPlugins` callback: `result.plugins ?? []`, `result.failedPlugins ?? []`, `result.browserTools ?? []`
+- Skipped `p.tools ?? []` guard in the map since `ConfigStatePlugin.tools` is typed as required and `@typescript-eslint/no-unnecessary-condition` would flag it; US-002 handles the tools guard
+- Files changed: `platform/browser-extension/src/side-panel/bridge.ts`, `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - `@typescript-eslint/no-unnecessary-condition` is active — any `??` on a non-nullable type will fail lint
+  - To guard a deeply nested field that's typed as required, you must first widen the type at the boundary (e.g. `Partial<T>` or an optional field in the raw type)
+  - US-002 needs to guard `plugin.tools` in PluginCard, PluginList, and matchesPlugin — use `(plugin.tools ?? [])` pattern, but the type must allow it (PluginState has `tools: WireToolDef[]` as required, so you'll need to cast or change the type)
+---
