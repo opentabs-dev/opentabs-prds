@@ -1,0 +1,51 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix MCP client disconnection during dev proxy hot reload. When the dev proxy restarts the worker process, the MCP Streamable HTTP connection to OpenCode (and other MCP clients) is dropped and never recovers. The extension WebSocket reconnects automatically but MCP clients do not, leaving AI agents unable to use tools after any code change.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Debug and fix MCP client session loss during dev proxy hot reload",
+      "description": "As a developer using OpenCode with the MCP server in dev mode, I want my MCP client connection to survive hot reloads so that I don't lose access to tools every time code changes trigger a worker restart",
+      "acceptanceCriteria": [
+        "MCP client (OpenCode / Claude Code) retains tool access after a dev proxy hot reload triggered by a code change",
+        "The dev proxy maintains or re-establishes the MCP Streamable HTTP session across worker restarts",
+        "If the session cannot be maintained transparently, the proxy sends a proper close/reconnect signal so the MCP client can reconnect automatically",
+        "The extension WebSocket reconnection behavior is unaffected (already works correctly)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "## Bug Description\n\nWhen `npm run dev` is running and a code change triggers a hot reload, the dev proxy (in `scripts/dev.ts`) kills the old worker with SIGTERM and starts a new one on a new port. The proxy sits on port 9515 and forwards traffic to the worker.\n\nThe extension WebSocket reconnects automatically because the extension has reconnect logic. But the MCP Streamable HTTP client (OpenCode) does NOT reconnect — it loses the SSE stream and never re-establishes the session.\n\n**The core requirement: the proxy must NOT drop the MCP client's connection during a worker restart.** The proxy is the stable endpoint that clients connect to. It should absorb the worker restart internally — the client should never see it.\n\nTimeline from the server log:\n```\n[mcp] [proxy] Code change detected, restarting worker...\n[mcp] Received SIGTERM — shutting down gracefully\n[mcp] Shutdown complete\n[mcp] Extension WebSocket disconnected\n[mcp] MCP server v0.0.52 listening on http://127.0.0.1:59687 (dev mode)\n[mcp] [proxy] Worker ready on port 59687\n[mcp] Hot reload complete\n[mcp] Extension WebSocket connected        <-- extension recovers\n                                            <-- NO 'MCP client connected' log\n```\n\n## Files to Investigate\n\n1. **`scripts/dev.ts`** — the dev proxy implementation. This is where the fix should be. The proxy must keep the client-facing SSE connection alive while it swaps out the backend worker.\n\n2. **`platform/mcp-server/src/http-routes.ts`** — the MCP Streamable HTTP endpoint on the worker side.\n\n3. **`platform/mcp-server/src/mcp-setup.ts`** — MCP session management.\n\n## Root Cause\n\nThe proxy forwards the SSE stream directly from the worker to the client. When the worker dies (SIGTERM), the worker's response stream closes, which closes the proxy's forwarded response, which closes the client's SSE connection. The proxy does not intercept or buffer the SSE stream — it's a passthrough.\n\n## Required Fix\n\nThe proxy must keep the client-facing SSE response stream open during worker restarts. When the old worker dies:\n1. The proxy detects the upstream connection closed\n2. The proxy does NOT close the client-facing response — it holds it open\n3. The new worker starts and becomes ready\n4. The proxy re-establishes the MCP session with the new worker (re-sends the initialize request)\n5. The proxy resumes forwarding SSE events from the new worker to the existing client response\n\nThe client should experience at most a brief pause in SSE events during the restart — not a disconnection.\n\nIf transparent session handoff is too complex, an acceptable fallback is: the proxy sends a specific SSE event (e.g., `event: session-expired`) before closing the stream, signaling the client to re-initialize. But the preferred solution is full transparency — no client-visible disruption."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E test coverage for MCP client session continuity across hot reload",
+      "description": "As a platform developer, I want automated tests that verify MCP client connections survive dev proxy hot reloads so that regressions are caught automatically",
+      "acceptanceCriteria": [
+        "E2E test starts the dev server (npm run dev or equivalent)",
+        "E2E test establishes an MCP Streamable HTTP session and verifies tools are available",
+        "E2E test triggers a hot reload by modifying a source file",
+        "E2E test verifies the MCP session is re-established and tools are still available after the reload",
+        "E2E test verifies tool calls work correctly after the reload (not just that the connection exists)",
+        "Test runs as part of npm run test:e2e",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "The E2E test should:\n\n1. Start the dev server programmatically (or use the existing dev server if running)\n2. Create an MCP client connection via Streamable HTTP to localhost:9515/mcp\n3. Initialize the session and list tools (verify discord/slack tools are present)\n4. Touch or modify a source file in `platform/mcp-server/src/` to trigger the tsc watcher and hot reload\n5. Wait for the hot reload to complete (poll the /health endpoint or watch for the worker restart)\n6. Verify the MCP session still works — list tools again, call a simple tool\n7. Clean up\n\nLook at the existing E2E tests in `e2e/` for patterns. The test may need to use the `@modelcontextprotocol/sdk` client library to establish and verify the MCP connection.\n\nEdge cases to cover:\n- Multiple hot reloads in sequence\n- Hot reload while a tool call is in-flight\n- Hot reload while the extension is disconnected"
+    }
+  ]
+}
