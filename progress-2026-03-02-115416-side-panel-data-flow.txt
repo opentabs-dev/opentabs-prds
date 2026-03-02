@@ -1,0 +1,211 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-115416-side-panel-data-flow~running.json
+Started: Mon Mar  2 19:54:41 UTC 2026
+---
+
+## Codebase Patterns
+- Server state cache module at `platform/browser-extension/src/server-state-cache.ts` — in-memory cache + debounced (500ms) write-through to chrome.storage.session
+- Tab state cache at `platform/browser-extension/src/tab-state.ts` — lastKnownState Map also persists to chrome.storage.session with same debounce pattern (key: `lastKnownState`, serialized via Object.fromEntries)
+- Chrome API mocking pattern in tests: mock via `vi.hoisted()` + `vi.mock()`, assign chrome global before importing the module under test
+- Previous iterations committed US-001 through US-005 code (commit messages use different numbering), but the PRD was never updated because they stopped before updating the progress file
+- Server request correlator at `platform/browser-extension/src/server-request.ts` — sendServerRequest sends JSON-RPC with incrementing integer ids, consumeServerResponse matches responses, rejectAllPendingServerRequests clears all on disconnect
+- Background mutation handlers (bg:setToolEnabled, bg:setAllToolsEnabled, bg:setBrowserToolEnabled, bg:setAllBrowserToolsEnabled, bg:searchPlugins, bg:installPlugin, bg:removePlugin, bg:updatePlugin) relay to MCP server via sendServerRequest; tool/browser tool toggles do optimistic cache updates with revert on failure
+- When adding new bg:* message types: update extension-messages.ts (interface + InternalMessage union), backgroundHandlers map, EXTENSION_ONLY_TYPES set, offscreen/index.ts switch statement no-op cases
+- Side panel bridge.ts uses `sendBgMessage<T>` helper for all background communication — wraps `chrome.runtime.sendMessage(message, callback)` in a Promise with error handling for `chrome.runtime.lastError` and `response.error` fields
+- App.tsx startup: single `getFullState()` call replaces the old `getConnectionState()` + `fetchConfigState()` two-step. `applyFullState` helper applies the result to React state.
+- When removing a message type: update extension-messages.ts (interface + InternalMessage union), backgroundHandlers map, EXTENSION_ONLY_TYPES set, offscreen/index.ts switch statement
+- Import order matters for ESLint: `import-x/order` rule requires alphabetical imports within groups — when adding a new import in the same group, check sort order
+- queryExtension() in extension-protocol.ts wraps dispatchToExtension for server→extension queries; responses settle via the same pendingDispatches mechanism — keep timeout < 2s to avoid races with fetchHealth's AbortSignal
+- The background-message-handlers.test.ts mocks server-state-cache.js — when adding new exports, ensure the mock includes them if the handler file imports them
+- Test files use `await import('./module.js')` pattern for dynamic import after mocking
+- Both loadLastKnownStateFromSession() and loadServerStateCacheFromSession() are async — called on service worker wake to restore caches from session storage
+- `buildConfigStatePayload(state)` in extension-handlers.ts is the shared helper for building ConfigStateResult — used by config.getState, plugins.changed senders, and sendSyncFull
+- sync.full now carries the full ConfigStateResult payload (failedPlugins, browserTools, serverVersion) plus per-plugin source/sdkVersion/update merged with sync-specific fields (sourcePath, adapterHash, adapterFile)
+- message-router.test.ts mocks server-state-cache.js (updateServerStateCache + getServerStateCache) — async handler tests use `await new Promise(resolve => setTimeout(resolve, 0))` to flush microtasks
+- Use `toMatchObject` for partial deep matching in Vitest, NOT `toEqual([expect.objectContaining({...})])` — the latter fails with extra properties
+- `vi.clearAllMocks()` only clears call history, NOT mock implementations — use `mockReturnValueOnce` instead of `mockReturnValue` to avoid value leaking between tests
+- Connecting a raw WebSocket via `connectWs` in E2E tests DISPLACES the extension's WebSocket — use config.json modification + POST /reload to trigger server-initiated state changes instead
+- For browser tool policy E2E tests: write `browserToolPolicy: { toolName: false }` to config.json + POST /reload
+
+## 2026-03-02 - US-001
+- Added session storage persistence to server-state-cache.ts: debounced 500ms write-through, loadServerStateCacheFromSession(), clearServerStateCache() clears both in-memory and session storage
+- Created server-state-cache.test.ts with 13 tests covering get/update/clear, debounced writes, session load, and validation
+- Files changed: platform/browser-extension/src/server-state-cache.ts, platform/browser-extension/src/server-state-cache.test.ts (new)
+- **Learnings for future iterations:**
+  - The initial server-state-cache.ts was missing session storage persistence entirely — only had in-memory cache
+  - `expect.objectContaining()` returns `any` which triggers `@typescript-eslint/no-unsafe-assignment` when nested in object literals — use `.mock.calls[0]?.[0]` + `.toMatchObject()` instead
+  - clearServerStateCache() must cancel any pending debounce timer and call chrome.storage.session.remove() in addition to resetting the in-memory state
+---
+
+## 2026-03-02 - US-002
+- Added session storage persistence to lastKnownState Map in tab-state.ts: debounced 500ms write-through via scheduleLastKnownStatePersist(), loadLastKnownStateFromSession(), clearTabStateCache() clears both in-memory Map AND session storage
+- Serialization: Map is stored as a plain object via Object.fromEntries(lastKnownState), restored via Object.entries loop with string type validation
+- schedulePersist called after every lastKnownState.set() (in sendTabSyncAll lock, updateLastKnownState, notifyAffectedPlugins) and after lastKnownState.delete() (clearPluginTabState, sendTabSyncAll stale cleanup)
+- clearTabStateCache cancels pending debounce timer and calls chrome.storage.session.remove()
+- Added 12 new tests covering: debounced writes, coalescing, clearTabStateCache cancellation, clearPluginTabState persistence, loadLastKnownStateFromSession with valid/empty/error/invalid data
+- Files changed: platform/browser-extension/src/tab-state.ts, platform/browser-extension/src/tab-state.test.ts
+- **Learnings for future iterations:**
+  - The tab-state.test.ts already had chrome global mock but only for scripting + tabs — needed to add storage.session mock (set/get/remove) alongside existing mocks
+  - The debounce pattern follows server-state-cache.ts exactly: module-level timer, schedulePersist clears+resets, persist writes via chrome.storage.session.set, clear cancels timer + calls remove
+  - Read paths remain completely synchronous — only persistence writes are async (fire-and-forget)
+  - clearPluginTabState only schedules persist if the plugin actually existed (had=true check prevents unnecessary timer resets)
+---
+
+## 2026-03-02 - US-004
+- EXTENSION: Updated handleServerMessage in message-router.ts to stop forwarding response messages (id without method) to the side panel — responses will be consumed by server-request.ts (US-006) instead
+- SERVER TEST: Updated handleConfigSetBrowserToolEnabled test to verify plugins.changed notification carries full ConfigStateResult payload (plugins, failedPlugins, browserTools, serverVersion) and that disabled tool state is reflected
+- EXTENSION TEST: Updated message-router.test.ts response forwarding test to verify responses are NOT forwarded to side panel
+- All 5 plugins.changed call sites already included buildConfigStatePayload(state) from US-003, no server-side changes needed
+- The plugins.changed interception in handleServerMessage (updateServerStateCache) was already done in US-003
+- Files changed: platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts, platform/mcp-server/src/extension-handlers.test.ts
+- **Learnings for future iterations:**
+  - Prior iterations (US-003) had already enriched all plugins.changed sends with buildConfigStatePayload AND added the extension-side cache interception — US-004 only needed the response-forwarding change and test updates
+  - The response forwarding removal is a breaking change for bridge.ts (which relies on response forwarding for sendRequest) — US-007 will rewrite bridge.ts to remove sendRequest entirely
+  - When the PRD says "all 5 call sites updated", verify first if prior stories already made those changes
+---
+
+## 2026-03-02 - US-003
+- SERVER: Exported `buildConfigStatePayload` from extension-handlers.ts (already existed as internal function, now shared)
+- SERVER: Enriched sendSyncFull in extension-protocol.ts to include failedPlugins, browserTools, serverVersion at top level, and per-plugin source, sdkVersion, update fields (merged from buildConfigStatePayload results with existing sync-specific fields like sourcePath/adapterHash/adapterFile)
+- EXTENSION: Updated handleSyncFull in message-router.ts to extract failedPlugins, browserTools, serverVersion from enriched payload and pass all to updateServerStateCache() alongside per-plugin source/sdkVersion/update from raw plugin objects
+- EXTENSION: Updated handlePluginUpdate in message-router.ts to call updateServerStateCache() with the updated plugin merged into the existing cache's plugin list (uses getServerStateCache to read current plugins, filters out the updated one, appends new version)
+- Updated extension-protocol.test.ts: verified failedPlugins/browserTools/serverVersion in sync.full params, added source field assertions, added new test for sdkVersion/update fields with outdatedPlugins
+- Updated message-router.test.ts: added mock for server-state-cache.js (updateServerStateCache + getServerStateCache), added tests for plugins.changed cache update (synchronous), handleSyncFull cache update with enriched fields (async), handlePluginUpdate cache merge (async)
+- Files changed: platform/mcp-server/src/extension-handlers.ts, platform/mcp-server/src/extension-protocol.ts, platform/mcp-server/src/extension-protocol.test.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts
+- **Learnings for future iterations:**
+  - buildConfigStatePayload was already extracted (from prior iteration) — only needed to export it for cross-module use
+  - The sync.full plugins need BOTH sync-specific fields (sourcePath, adapterHash, adapterFile) AND config-specific fields (source, sdkVersion, update) — merge via buildConfigStatePayload lookup map by plugin name
+  - handlePluginUpdate needs getServerStateCache to read existing plugins for merge — filter + append pattern to update single plugin in cache
+  - message-router.test.ts handleSyncFull/handlePluginUpdate handlers run async via wrapNotification — use `await new Promise(resolve => setTimeout(resolve, 0))` to flush microtasks before asserting
+  - TypeScript narrows ternary results from `raw?.source === 'npm' || raw?.source === 'local'` correctly — no need for `as 'npm' | 'local'` assertion
+---
+
+## 2026-03-02 - US-005
+- Added wake detection to handleBgGetFullState: when wsConnected=true but in-memory caches are empty (service worker wake), loads from chrome.storage.session via loadLastKnownStateFromSession() and loadServerStateCacheFromSession() before merging
+- Imported loadServerStateCacheFromSession and loadLastKnownStateFromSession into background-message-handlers.ts
+- Refactored handler to read caches once for wake detection check, then re-read after session load if wake was detected (avoids double mock consumption in tests)
+- Fixed existing tests that used toEqual+objectContaining (broken pattern) — replaced with toMatchObject for partial deep matching
+- Added 3 new tests: session storage recovery on wake, no-load when caches populated, no-load when disconnected
+- Added mocks for loadLastKnownStateFromSession and loadServerStateCacheFromSession in test file
+- Files changed: platform/browser-extension/src/background-message-handlers.ts, platform/browser-extension/src/background-message-handlers.test.ts
+- **Learnings for future iterations:**
+  - `vi.clearAllMocks()` only clears call history, NOT mock implementations set via `mockReturnValue`. Use `mockReturnValueOnce` when values should only be consumed once, or `mockReset` to fully reset.
+  - `toEqual([expect.objectContaining({...})])` can fail unexpectedly with extra properties in Vitest — use `toMatchObject` for partial deep matching instead.
+  - Wake detection in handleBgGetFullState reads caches once, checks condition, then re-reads after session load — avoids consuming mock values twice in tests.
+  - `mockImplementationOnce` for an async function typed as `() => Promise<void>` requires explicitly returning `Promise.resolve()` when the implementation body is synchronous.
+---
+
+## 2026-03-02 - US-006
+- Created `platform/browser-extension/src/server-request.ts`: JSON-RPC request/response correlator with sendServerRequest (integer id, 30s timeout), consumeServerResponse (matches by id), rejectAllPendingServerRequests (disconnect cleanup)
+- Added 8 new message types to extension-messages.ts: BgSetToolEnabled, BgSetAllToolsEnabled, BgSetBrowserToolEnabled, BgSetAllBrowserToolsEnabled, BgSearchPlugins, BgInstallPlugin, BgRemovePlugin, BgUpdatePlugin — all added to InternalMessage union
+- Added 8 background mutation handlers in background-message-handlers.ts: tool toggles do optimistic cache update via updateServerStateCache with revert on failure; search/install/remove/update are pure relays
+- Wired consumeServerResponse into handleServerMessage (message-router.ts): responses are checked against pending requests BEFORE method-based routing; consumed responses return early
+- Added rejectAllPendingServerRequests to handleWsState disconnect path (after clearServerStateCache)
+- Added all new bg:* message types to EXTENSION_ONLY_TYPES and backgroundHandlers map
+- Added no-op cases for all new bg:* types (and bg:getFullState) in offscreen/index.ts switch statement
+- Created server-request.test.ts with 14 tests covering: message sending, response resolution/rejection, timeout, consume filtering, duplicate consumption, rejectAll cleanup
+- Updated background-message-handlers.test.ts: added mocks for updateServerStateCache, sendServerRequest, rejectAllPendingServerRequests; added tests for all 8 handlers and disconnect behavior
+- Files changed: platform/browser-extension/src/server-request.ts (new), platform/browser-extension/src/server-request.test.ts (new), platform/browser-extension/src/extension-messages.ts, platform/browser-extension/src/background-message-handlers.ts, platform/browser-extension/src/background-message-handlers.test.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/offscreen/index.ts
+- **Learnings for future iterations:**
+  - When mocking sendServerRequest in handler tests, use `vi.fn<(method: string, params?: Record<string, unknown>) => Promise<unknown>>` to match the signature
+  - Fire-and-forget promises in tests must have .catch() handlers to avoid unhandled rejection errors when rejectAllPendingServerRequests is called in cleanup
+  - The offscreen/index.ts switch statement must cover ALL InternalMessage types — TypeScript exhaustiveness checking requires no-op cases for messages not processed by the offscreen document
+  - Import order in this codebase follows `import-x/order` — new imports must be alphabetically sorted within their group or ESLint fails
+---
+
+## 2026-03-02 - US-007
+- BRIDGE.TS: Complete rewrite — removed entire JSON-RPC relay (sendRequest, handleServerResponse, rejectAllPending, pendingRequests Map, REQUEST_TIMEOUT_MS, PendingRequest interface, fetchConfigState, getConnectionState). Added sendBgMessage<T> helper that wraps chrome.runtime.sendMessage in a Promise with error handling (chrome.runtime.lastError + response.error field). New getFullState() sends bg:getFullState. All mutation functions (setToolEnabled, setAllToolsEnabled, setBrowserToolEnabled, setAllBrowserToolsEnabled, searchPlugins, installPlugin, removePlugin, updatePlugin) now send bg:* messages instead of JSON-RPC via bg:send. Exported new FullStateResult type. sendConfirmationResponse unchanged.
+- APP.TSX: Replaced getConnectionState+fetchConfigState startup flow with single getFullState() call. Created applyFullState helper to apply FullStateResult to React state. plugins.changed handler calls getFullState() instead of loadPlugins(). sp:connectionState on reconnect calls getFullState(). Removed handleServerResponse from sp:serverMessage listener (only handles notifications now). Removed ws:message listener entirely. Removed pendingTabStates ref and lastFetchRef. Removed rejectAllPending() on disconnect (handled by background).
+- useServerNotifications.ts: Removed pendingTabStates param from UseServerNotificationsParams. Removed buffering logic in tab.stateChanged handler (no more conditional check for empty plugins array).
+- DEAD CODE: Removed BgSendMessage interface from extension-messages.ts and from InternalMessage union. Removed handleBgSend from background-message-handlers.ts, backgroundHandlers map, EXTENSION_ONLY_TYPES set, and exports. Removed bg:send no-op case from offscreen/index.ts switch statement.
+- BRIDGE.TEST.TS: Complete rewrite — replaced all sendRequest/handleServerResponse/rejectAllPending/getConnectionState tests with new tests for getFullState and bg:* message functions. Mock uses callback-style chrome.runtime.sendMessage with configurable mockResponse and mockLastError. Preserved all utility tests (matchesTool, matchesPlugin, extractShortName).
+- Files changed: platform/browser-extension/src/side-panel/bridge.ts, platform/browser-extension/src/side-panel/bridge.test.ts, platform/browser-extension/src/side-panel/App.tsx, platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts, platform/browser-extension/src/extension-messages.ts, platform/browser-extension/src/background-message-handlers.ts, platform/browser-extension/src/offscreen/index.ts
+- **Learnings for future iterations:**
+  - The sendBgMessage<T> helper provides a clean pattern: wraps chrome.runtime.sendMessage(message, callback) in a Promise, rejects on chrome.runtime.lastError or response.error field, resolves with typed response otherwise
+  - When removing a message type (BgSendMessage), must update 4 places: extension-messages.ts (interface + union), backgroundHandlers map, EXTENSION_ONLY_TYPES set, offscreen/index.ts switch statement
+  - App.tsx's applyFullState unconditionally sets all state from the response — this is correct because on disconnect, state is already cleared by sp:connectionState handler; on reconnect, caches may be empty but plugins.changed will follow shortly after sync.full
+  - useServerNotifications no longer needs pendingTabStates because getFullState returns plugins synchronously from cache — tab.stateChanged always arrives after plugins are populated
+  - bridge.test.ts mock pattern for callback-based sendMessage: use getter for lastError (to avoid property assignment issues) and synchronous callback invocation with configurable mockResponse
+---
+
+## 2026-03-02 - US-008
+- Reordered handleSyncFull in message-router.ts: moved forwardToSidePanel(plugins.changed) BEFORE sendTabSyncAll, so the side panel renders plugin cards immediately from the background cache without waiting for isReady() probes
+- Changed sendTabSyncAll to fire-and-forget with startReadinessPoll chained via .then() — no longer awaited
+- Added hoisted mock references (mockSendTabSyncAll, mockStartReadinessPoll) to message-router.test.ts
+- Added new test "handleSyncFull sends plugins.changed before sendTabSyncAll" that verifies call ordering using a shared callOrder array and mockImplementation
+- Files changed: platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts
+- **Learnings for future iterations:**
+  - To test async fire-and-forget ordering (void promise.then()), flush microtasks with `await new Promise(resolve => setTimeout(resolve, 0))` — the .then() callback runs on the next microtask
+  - When mock functions are created inside `vi.mock()` factory without hoisting, they can't be referenced in tests — use `vi.hoisted()` to create named mock references and use them in the `vi.mock()` factory
+  - The `callOrder` array pattern (push string in each mockImplementation, then assert indexOf ordering) is cleaner than tracking mock.mock.invocationCallOrder for cross-module call ordering
+---
+
+## 2026-03-02 - US-009
+- Verified all existing unit tests pass (2975 passed, 1 skipped across 91 test files)
+- Verified all existing E2E tests pass (433 passed, 1 skipped)
+- No source code changes required — prior iterations (US-001 through US-008) already updated all necessary test files
+- known-methods.test.ts: already covers current DISPATCH_METHODS and PASSTHROUGH_METHODS
+- offscreen/index.test.ts: already covers all bg:* message types in switch statement
+- background-message-handlers.test.ts: already covers all 8 new bg:* handlers
+- message-router.test.ts: already covers handleSyncFull ordering and response forwarding changes
+- bridge.test.ts: already rewritten for background-only communication architecture
+- E2E timing: the faster side panel startup from background cache does not break any existing E2E assertions
+- Files changed: none (verification-only story)
+- **Learnings for future iterations:**
+  - The browser_execute_script async test (browser-tools.e2e.ts:581) is mildly flaky — fails rarely on first attempt but passes on retry. The flakiness is unrelated to the data flow changes (it's a timing issue with the async poll loop reading results from page globals)
+  - Playwright's retry mechanism (retries: 1) catches most flaky tests, but occasionally a test fails both attempts due to resource pressure when 433 tests run in parallel
+  - When running E2E tests, trust the exit code. A single flaky failure that passes on full re-run is infrastructure noise, not a code bug
+---
+## 2026-03-02 - US-010
+- Created `e2e/side-panel-instant-startup.e2e.ts` with 3 E2E tests verifying instant side panel startup from background cache
+- Test 1: Close/reopen side panel — plugin cards appear within 2 seconds (reads from background caches, no server round-trip)
+- Test 2: After dev proxy hot reload with matching tabs open — plugin cards appear from sync.full → plugins.changed, green dot fills in progressively after sendTabSyncAll probes
+- Test 3: Plugin cards visible while tab state dots still loading — verifies ordering guarantee (plugins.changed before sendTabSyncAll)
+- All tests use the non-fixture pattern (manual server/context/cleanup management) following existing side-panel-data-flow.e2e.ts and side-panel-reload.e2e.ts patterns
+- All 436 E2E tests passed (including 3 new), 2975 unit tests passed
+- Files changed: e2e/side-panel-instant-startup.e2e.ts (new)
+- **Learnings for future iterations:**
+  - The `test.slow()` marker is needed for tests that trigger hot reload (20s+ timeout for reconnection)
+  - Hot reload test pattern: clear server.logs, triggerHotReload(), waitForLog('Hot reload complete'), waitForExtensionConnected() — then assert side panel state
+  - For close/reopen tests, no need for server restart — just close the page and openSidePanel again; background caches persist across side panel lifecycle
+  - The 2-second timeout for instant startup is tight but reliable because getFullState() reads from in-memory background caches (no async I/O)
+  - Use `server.triggerHotReload()` (sends SIGUSR1 to dev proxy) to simulate server restart, not `server.kill()` + `startMcpServer()` which requires port matching
+---
+
+## 2026-03-02 - US-011
+- Created `e2e/side-panel-realtime-state.e2e.ts` with 5 E2E tests verifying real-time state propagation to the side panel without reload
+- Test 1: Tool config change (disable/enable echo tool via config.json + POST /reload) — side panel toggle updates without reload
+- Test 2: Auth off then tab reload — amber dot appears within 10s, auth back on recovers to green dot, all without side panel reload
+- Test 3: Close matching tab — green dot disappears within 10s without side panel reload
+- Test 4: Browser tool policy change (disable/enable via browserToolPolicy in config.json + POST /reload) — side panel toggle updates without reload
+- Test 5: Server disconnect/reconnect via hot reload — plugin card, green dot, and tool toggles all recover
+- All 441 E2E tests passed (including 5 new), 2975 unit tests passed
+- Files changed: e2e/side-panel-realtime-state.e2e.ts (new)
+- **Learnings for future iterations:**
+  - Connecting a raw WebSocket via `connectWs` DISPLACES the extension's existing WebSocket connection (server sets `state.extensionWs` to the new connection, closing the old one). This breaks the extension's communication channel. Do NOT use `connectWs` in tests that depend on the extension being connected.
+  - For testing server-initiated state changes reaching the side panel, use config.json modification + POST /reload instead of raw WebSocket calls. This triggers plugins.changed through the legitimate extension WebSocket.
+  - For browser tool policy changes, write `browserToolPolicy: { toolName: false }` to config.json and POST /reload — the server picks up the policy and sends plugins.changed with updated browserTools enabled states.
+  - The `readTestConfig` + `writeTestConfig` pattern works for modifying config incrementally (add browserToolPolicy, then remove it).
+  - Tab state changes (auth toggle + tab reload, tab close) propagate to the side panel in real-time via tab.stateChanged without any side panel reload — this is the key benefit of the background-only architecture.
+  - After `server.logs.length = 0`, `waitForLog` correctly detects new log entries (since it checks the logs array, which was cleared).
+---
+
+## 2026-03-02 - US-012
+- EXTENSION: Added `extension.getTabState` to DISPATCH_METHODS in known-methods.ts
+- EXTENSION: Added `handleExtensionGetTabState` handler in message-router.ts — reads getLastKnownStates(), parses each serialized JSON value, sends tabStates map back via sendToServer with matching id
+- SERVER: Added `queryExtension(state, method, params, timeoutMs)` in extension-protocol.ts — thin wrapper around dispatchToExtension with configurable timeout and label
+- SERVER: Updated handleHealth in http-routes.ts — now async, queries extension live for tab state via queryExtension('extension.getTabState', {}, 1000) when extensionWs connected, falls back to tabMapping cache on timeout/error
+- E2E: Added test in health-endpoint.e2e.ts verifying /health returns live tab state with per-tab details (tabId, url, ready) when extension connected
+- E2E: Added `tabs` field to PluginDetail interface in e2e/fixtures.ts
+- UNIT: Added 2 tests in message-router.test.ts for extension.getTabState handler (populated states + empty map)
+- UNIT: Added 2 tests in extension-protocol.test.ts for queryExtension (success response + rejected when disconnected)
+- All 442 E2E tests passed, 2979 unit tests passed, all Phase 1 + Phase 2 checks green
+- Files changed: platform/browser-extension/src/known-methods.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/message-router.test.ts, platform/mcp-server/src/extension-protocol.ts, platform/mcp-server/src/extension-protocol.test.ts, platform/mcp-server/src/http-routes.ts, e2e/fixtures.ts, e2e/health-endpoint.e2e.ts
+- **Learnings for future iterations:**
+  - queryExtension reuses the existing dispatchToExtension/pendingDispatches mechanism — no separate pending map needed, responses are already settled by handleExtensionMessage's response handler
+  - The queryExtension timeout must be < fetchHealth's AbortSignal.timeout (2s) — 1s works; 2s caused race conditions in E2E tests where raw WebSocket clients don't respond to extension.getTabState
+  - E2E tests that start non-extension servers but connect a raw WebSocket (connectWs) will trigger the queryExtension path because state.extensionWs gets set — the raw WS client doesn't handle extension.getTabState, so it times out
+  - handleExtensionGetTabState uses wrapSync because getLastKnownStates is synchronous — no async needed
+  - The existing tabMapping cache and tab.syncAll/tab.stateChanged flows are preserved unchanged for tool dispatch; the live query is only used by /health
+---
+
