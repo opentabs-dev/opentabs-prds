@@ -1,0 +1,51 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add unit tests for backward compatibility of the old skipConfirmation config/env var/CLI flag names, and E2E tests verifying the --dangerously-skip-permissions flag bypasses confirmation dialogs. These tests were planned in the rename-skip-permissions PRD but the story was never completed.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add unit tests for skip-permissions backward compatibility",
+      "description": "As a platform contributor, I want unit tests verifying that the old env var (OPENTABS_SKIP_CONFIRMATION) and old CLI flag (--dangerously-skip-confirmation) still work after the rename, so that existing deployments using the old names are not silently broken.",
+      "acceptanceCriteria": [
+        "Unit test verifies isCliSkipPermissions() returns true when OPENTABS_SKIP_PERMISSIONS=1",
+        "Unit test verifies isCliSkipPermissions() returns true when OPENTABS_SKIP_CONFIRMATION=1 (backward compat)",
+        "Unit test verifies isCliSkipPermissions() returns false when neither env var is set",
+        "Unit test for loadConfig: config.json with { skipConfirmation: true } (old name) is read as skipPermissions: true",
+        "Unit test for loadConfig: config.json with { skipPermissions: true } (new name) works",
+        "Unit test for /health endpoint: skipPermissions field is present in health response",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "The skip-permissions module is at `platform/mcp-server/src/skip-permissions.ts` (24 lines). It computes the value once at module load time from `process.argv` and `process.env`. Since it reads env vars at import time, the unit test needs to either:\n1. Use `vi.stubEnv()` and dynamic `import()` to reload the module with different env vars\n2. Or test the backward compat behavior through the config loading path instead\n\nThe config backward compat is in `platform/mcp-server/src/config.ts` — look for where `skipConfirmation` is read from config.json and mapped to `skipPermissions`. The existing config unit tests are in `platform/mcp-server/src/config.test.ts`.\n\nFor the /health endpoint, check `platform/mcp-server/src/http-routes.ts` for where `skipPermissions` is included in the health response. The existing health tests are in `platform/mcp-server/src/http-routes.test.ts` — look for a local `HealthResponse` interface around line 261.\n\nExisting permission unit tests are in `platform/mcp-server/src/permissions.test.ts` — the `evaluatePermission — bypass flag` group tests that `skipPermissions: true` in state bypasses all permission checks. New tests should go in appropriate existing test files, not a new file.\n\n**Important gotcha:** `isCliSkipPermissions()` is computed at module load time. Testing different env vars requires re-importing the module. Use Vitest's `vi.resetModules()` + dynamic `await import()` pattern. See existing patterns in `config.test.ts` for how env vars are stubbed in tests."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E test verifying --dangerously-skip-permissions bypasses confirmation",
+      "description": "As a platform contributor, I want an E2E test that verifies the --dangerously-skip-permissions flag causes interact-tier browser tools to execute immediately without a confirmation dialog, so that the flag's runtime behavior is covered by automated tests.",
+      "acceptanceCriteria": [
+        "E2E test starts MCP server with OPENTABS_SKIP_PERMISSIONS=1 env var on a non-trusted domain",
+        "E2E test calls an interact-tier tool (e.g. browser_navigate_tab) and verifies it succeeds immediately (no 30s timeout, no confirmation dialog)",
+        "E2E test verifies /health endpoint reports skipPermissions: true",
+        "E2E test starts a second server WITHOUT the flag and verifies the same tool triggers confirmation (blocks until timeout or approval)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "This test belongs in `e2e/permissions.e2e.ts`. The existing test infrastructure already has the pieces needed:\n\n1. **With flag (bypass):** The default E2E fixture already sets `OPENTABS_SKIP_PERMISSIONS: '1'` (in `e2e/fixtures.ts` line 503). Every other E2E test runs with permissions bypassed. So the 'with flag' case is the normal test flow — just verify an interact-tier tool like `browser_navigate_tab` succeeds quickly (under 5s, not 30s).\n\n2. **Without flag (confirmation):** The existing `permissions.e2e.ts` already has a custom fixture that starts the server with `OPENTABS_SKIP_PERMISSIONS: ''` to disable bypass. The test at line 131 ('interact-tier tool on non-trusted domain triggers confirmation progress notification') already verifies that without the flag, interact-tier tools block waiting for confirmation. This behavior is already tested.\n\n3. **Health endpoint check:** The /health endpoint includes `skipPermissions` field. The test should fetch /health and verify the field matches the flag state.\n\nSo the new test primarily needs to:\n- Add a test that explicitly verifies the /health `skipPermissions` field is `true` when the flag is set and `false` when it's not\n- Optionally add a test that verifies an interact-tier tool on a non-trusted domain succeeds immediately when the flag is set (contrasting with the existing test that shows it blocks when the flag is not set)\n\nUse the existing `testServer` bound to `0.0.0.0` so `127.0.0.2` (non-trusted) works. The existing test at line 131 navigates to `http://127.0.0.2:${testServer.port}` for this purpose.\n\nThe `/health` endpoint is at `http://localhost:${server.port}/health` and requires `Authorization: Bearer ${server.secret}` header. Response is JSON with `skipPermissions: boolean` field."
+    }
+  ]
+}
