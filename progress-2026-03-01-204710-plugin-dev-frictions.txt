@@ -1,0 +1,72 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-204710-plugin-dev-frictions~running.json
+Started: Mon Mar  2 04:47:40 UTC 2026
+---
+
+## Codebase Patterns
+- Scaffold template is in `platform/cli/src/scaffold.ts` — `generatePackageJson` produces the package.json, `PRETTIERRC_CONTENT` for .prettierrc, `generateReadme` for README.md, `generatePluginIndex` for src/index.ts
+- Established plugin conventions (from plugins/slack and plugins/e2e-test): `check` script runs `npm run build && npm run type-check && npm run lint && npm run format:check`; `dev` uses shell background `&` not concurrently; no `concurrently` dependency; `description` at top-level package.json; no `//` comment in opentabs field
+- `publishConfig: { access: 'restricted' }` is used by scoped packages (`@opentabs-dev/...`) but NOT included in unscoped scaffold output (scaffold creates unscoped packages: `opentabs-plugin-<name>`)
+
+## 2026-03-02 - US-001
+- Updated `generatePackageJson` in `platform/cli/src/scaffold.ts`:
+  - Added top-level `description` field (was only inside `opentabs` field)
+  - Added `check` script: `npm run build && npm run type-check && npm run lint && npm run format:check`
+  - Changed `dev` script from `concurrently ...` to `tsc --watch --preserveWatchOutput & opentabs-plugin build --watch`
+  - Removed `concurrently` from devDependencies
+  - Removed the `'//': 'Optional: place icon.svg ...'` comment from the `opentabs` field
+- All Phase 1 checks passed: build, type-check, lint, knip, test (89 test files, 2910 tests)
+- **Learnings for future iterations:**
+  - The PRD acceptance criterion "includes publishConfig for scoped or omits for unscoped" means we should NOT add publishConfig to unscoped scaffold output (scaffold always creates unscoped packages)
+  - The `platform/create-plugin` package imports from `@opentabs-dev/cli/scaffold` but doesn't need changes — it reuses the same `generatePackageJson` function
+  - Tests in `platform/create-plugin/src/index.test.ts` actually build a real plugin and check the output — worth checking if scaffold changes break these integration tests
+---
+
+## 2026-03-02 - US-002
+- Updated `PRETTIERRC_CONTENT` in `platform/cli/src/scaffold.ts`:
+  - Added `bracketSameLine: true`
+  - Added `htmlWhitespaceSensitivity: 'strict'`
+- Verified against `plugins/slack/.prettierrc` as the reference implementation
+- All Phase 1 checks passed: build, type-check, lint, knip, test (89 test files, 2910 tests)
+- **Learnings for future iterations:**
+  - `PRETTIERRC_CONTENT` is a `JSON.stringify` call with an object literal — add new fields directly to the object
+  - The integration test in `platform/create-plugin/src/index.test.ts` builds a real plugin but doesn't verify the .prettierrc contents, only that the scaffold builds
+---
+
+## 2026-03-02 - US-003
+- Updated `generatePluginIndex` in `platform/cli/src/scaffold.ts` (isReady comments):
+  - Added a simple localStorage example: `localStorage.getItem('token') !== null`
+  - Added a polling pattern with `setInterval` for SPAs that hydrate auth asynchronously
+  - Added an iframe localStorage fallback example for apps (e.g., Discord) that delete `window.localStorage`
+  - Method body remains `return false;` (safe default)
+- All Phase 1 checks passed: build, type-check, lint, knip, test (89 test files, 2910 tests)
+- **Learnings for future iterations:**
+  - The `generatePluginIndex` function returns a template string — the isReady comments are literal `//` lines inside the returned string (not actual code comments in the .ts file itself)
+  - Comments must use `//` prefix within the template string since they'll appear inside the class body in the scaffolded file
+  - No need to update any CLAUDE.md files — this was a documentation-only change in comment content
+---
+
+## 2026-03-02 - US-004
+- Added `## Authentication` section to `generateReadme` in `platform/cli/src/scaffold.ts`, inserted between the "Adding Tools" and "Shared Schemas" sections
+- Section covers: localStorage via `getLocalStorage`, cookies via `getCookie`, page globals via `getPageGlobal`, iframe fallback note (mentioning `getLocalStorage` handles it automatically), and SPA hydration note referring to `isReady()` comments
+- All Phase 1 checks passed: build, type-check, lint, knip, test (89 test files, 2910 tests)
+- **Learnings for future iterations:**
+  - The README template is a template string inside `generateReadme` — backticks inside the string must be escaped as `` \` ``
+  - SDK utility references (`getLocalStorage`, `getCookie`, `getPageGlobal`) are the right names to use in documentation — confirmed by existing usage in plugins/slack
+  - The integration test in `platform/create-plugin/src/index.test.ts` builds a real scaffold and runs its tests but does not inspect README content
+---
+
+## 2026-03-02 - US-005
+- Updated `getLocalStorage` in `platform/plugin-sdk/src/storage.ts` to add iframe fallback
+- Implementation: fast path tries direct `localStorage.getItem(key)`; on failure, accesses `localStorage` again to distinguish deleted (undefined) vs. throwing getter (SecurityError); if undefined, creates a hidden iframe and reads from `iframe.contentWindow?.localStorage`; all outer exceptions caught and return null
+- Added tests in `platform/plugin-sdk/src/storage.test.ts` (3 new tests in iframe fallback describe block): returns value from iframe when localStorage is undefined, returns null when contentWindow is null, returns null when createElement throws SecurityError
+- Used `vi.spyOn(document, 'createElement')` + `vi.spyOn(document.body, 'appendChild/removeChild')` to mock iframe creation in tests without requiring real DOM node handling
+- Phase 1 checks passed: build, type-check, lint, knip, test (89 test files, 2913 tests)
+- Phase 2 (E2E) passed: 427 tests in 1.0m
+- **Learnings for future iterations:**
+  - `eqeqeq: ['error', 'always']` is configured — must use `===`/`!==`, never `==`/`!=`
+  - `tseslintConfigs.strictTypeChecked` does NOT include `strict-boolean-expressions` (that's `strictest`), so truthy checks on object-typed values are allowed
+  - To safely distinguish "localStorage is undefined" from "localStorage getter throws": assign `localStorage as Storage | undefined` to a `Storage | undefined` local variable inside a try-catch — if it throws, SecurityError; if the variable is `undefined`, the property was deleted
+  - Test mocking pattern: use `vi.spyOn(document.body, 'appendChild').mockImplementation(...)` to prevent real DOM node insertion of mock objects that lack Node interface
+  - Only `getLocalStorage` got the iframe fallback — `setLocalStorage` and `removeLocalStorage` were not updated since the acceptance criteria only covered reads
+---
