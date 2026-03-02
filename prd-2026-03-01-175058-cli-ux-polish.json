@@ -1,0 +1,46 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two CLI UX issues found during fresh-user experience testing: (1) rotate-secret success message lacks guidance on viewing the new secret, (2) audit command shows misleading 'Authentication failed' when a non-OpenTabs service occupies the port.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add actionable follow-up hint to rotate-secret success message",
+      "description": "As a user who just rotated their secret, I want the success message to tell me how to view the new secret so that I can update my MCP client configs without guessing.",
+      "acceptanceCriteria": [
+        "After `opentabs config rotate-secret --confirm` succeeds (server running), the output includes a line like: Run `opentabs config show --show-secret` to see MCP client configuration with the new secret.",
+        "After `opentabs config rotate-secret --confirm` succeeds (server NOT running), the output also includes the same hint about `opentabs config show --show-secret`",
+        "The hint appears on all success paths (lines 729-731, 734-736, 738-743, 746-747)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/config.ts, function handleRotateSecret (lines 694-749).\n\nThere are four success paths, each printing slightly different messages:\n1. Lines 729-731: Server successfully notified. Currently says 'Update MCP client configs (Claude Code, OpenCode, etc.) with the new secret.' — add a follow-up line with the hint.\n2. Lines 734-736: Server responded but non-OK status.\n3. Lines 738-743: Server not reachable (connection refused or other error).\n4. Lines 746-747: No old secret existed.\n\nAll four paths should include the hint. Add a single console.log line after each path's existing output: console.log(pc.dim('Run `opentabs config show --show-secret` to see MCP client configuration with the new secret.'));\n\nKeep the style consistent with the existing output — use pc.dim() for the hint, matching the surrounding code."
+    },
+    {
+      "id": "US-002",
+      "title": "Add non-OpenTabs service detection to audit command",
+      "description": "As a user who accidentally has another service on port 9515, I want `opentabs audit` to tell me 'No OpenTabs server found' instead of the misleading 'Authentication failed' so that I understand the actual problem.",
+      "acceptanceCriteria": [
+        "When a non-OpenTabs HTTP service on the target port returns a non-401 4xx or non-JSON content type, audit prints 'No OpenTabs server found on port <N>. The port may be in use by another service.' instead of 'Error: MCP server returned HTTP <status>'",
+        "When the server returns 401, audit still prints 'Authentication failed' (unchanged behavior — 401 means the service might be OpenTabs with a wrong secret)",
+        "The detection logic uses the same isNonOpenTabsHttpError() helper already used by the status command",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: platform/cli/src/commands/audit.ts (lines 241-305) — the handleAudit function's try/catch for the server fetch.\n\nThe status command already has the correct pattern. In platform/cli/src/commands/status.ts:\n- Lines 62-69: isNonOpenTabsHttpError() checks for 4xx (except 401) or non-JSON content type\n- Lines 87-96: When isNonOpenTabsHttpError returns true, status prints 'No OpenTabs server found on port <N>. The port may be in use by another service.'\n\nThe audit command (audit.ts) currently handles HTTP errors at lines 255-261:\n```\nif (res.status === 401) { ... 'Authentication failed' ... }\nif (!res.ok) { ... 'Error: MCP server returned HTTP ${res.status}.' ... }\n```\n\nFix: Import isNonOpenTabsHttpError from status.ts (or extract it to a shared location if it's not already exported — check first). Add a check between the 401 handler and the generic !res.ok handler:\n```\nif (isNonOpenTabsHttpError(res.status, res.headers.get('content-type'))) {\n  console.error(pc.red(`No OpenTabs server found on port ${port}.`));\n  console.error(pc.dim('The port may be in use by another service.'));\n  process.exit(1);\n}\n```\n\nIMPORTANT: isNonOpenTabsHttpError is currently a local function in status.ts (not exported). You will need to either: (a) extract it to a shared utility (e.g., platform/cli/src/config.ts where isConnectionRefused already lives), or (b) export it from status.ts and import in audit.ts. Option (a) is cleaner — move it to config.ts alongside isConnectionRefused since both are error-classification helpers used across commands. Move the isTimeout helper too if it's also duplicated. Make sure to update the imports in status.ts after the move."
+    }
+  ]
+}
