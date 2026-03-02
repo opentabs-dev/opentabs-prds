@@ -168,6 +168,50 @@ trap cleanup EXIT
 
 # --- Helper Functions ---
 
+# Push main to origin with proper error handling. Captures stderr, verifies
+# the remote ref advanced, and logs diagnostics on failure. Returns 0 only
+# when the remote ref matches the local HEAD after push.
+#
+# Usage: _push_main "$tag"
+_push_main() {
+  local tag="$1"
+  local local_sha push_stderr push_exit
+
+  local_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
+
+  push_stderr=$(git -C "$CODE_DIR" push origin main 2>&1 1>/dev/null)
+  push_exit=$?
+
+  if [ "$push_exit" -ne 0 ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}git push failed (exit $push_exit):${RESET}"
+    if [ -n "$push_stderr" ]; then
+      echo "$push_stderr" | while IFS= read -r line; do
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}  $line${RESET}"
+      done
+    fi
+    return 1
+  fi
+
+  # Verify the remote actually has our commit. The push may return 0 but
+  # silently no-op (e.g., if local main was already behind origin/main after
+  # a concurrent push, or if the pre-push hook output confused exit detection).
+  git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
+  local remote_sha
+  remote_sha=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
+
+  if [ "$local_sha" != "$remote_sha" ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push returned 0 but remote HEAD ($remote_sha) != local HEAD ($local_sha). Push was a no-op or lost.${RESET}"
+    if [ -n "$push_stderr" ]; then
+      echo "$push_stderr" | while IFS= read -r line; do
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}  $line${RESET}"
+      done
+    fi
+    return 1
+  fi
+
+  return 0
+}
+
 # Short model label for log tags: "claude-opus" → "opus", "claude-sonnet" → "sonnet"
 _model_label() {
   local m="$1"
@@ -351,13 +395,13 @@ merge_branch() {
     # Push main to remote — retry before giving up (preserves merge work)
     local push_ok=false
     for push_attempt in 1 2 3; do
-      if git -C "$CODE_DIR" push origin main --quiet 2>/dev/null; then
+      if _push_main "$tag"; then
         echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main.${RESET}"
         push_ok=true
         break
       fi
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push attempt $push_attempt failed. Retrying...${RESET}"
-      sleep 1
+      sleep 2
     done
 
     if [ "$push_ok" = true ]; then
@@ -380,7 +424,7 @@ merge_branch() {
     # AI fixed the build — amend the merge commit and push
     git -C "$CODE_DIR" add -A 2>/dev/null || true
     git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
-    if git -C "$CODE_DIR" push origin main --quiet 2>/dev/null; then
+    if _push_main "$tag"; then
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI build fix).${RESET}"
       git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
@@ -615,12 +659,13 @@ except: pass" 2>/dev/null)
       # Push the AI-resolved merge
       local push_ok=false
       for push_attempt in 1 2 3; do
-        if git -C "$CODE_DIR" push origin main --quiet 2>/dev/null; then
+        if _push_main "$tag"; then
           echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI-resolved merge).${RESET}"
           push_ok=true
           break
         fi
         echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push attempt $push_attempt failed. Retrying...${RESET}"
+        sleep 2
       done
 
       if [ "$push_ok" = true ]; then
@@ -634,7 +679,7 @@ except: pass" 2>/dev/null)
       if _ai_fix_build "$tag"; then
         git -C "$CODE_DIR" add -A 2>/dev/null || true
         git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
-        if git -C "$CODE_DIR" push origin main --quiet 2>/dev/null; then
+        if _push_main "$tag"; then
           echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI conflict + build fix).${RESET}"
           git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
           echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
