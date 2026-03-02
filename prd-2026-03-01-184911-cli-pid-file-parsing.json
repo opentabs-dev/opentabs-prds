@@ -1,0 +1,28 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix PID file JSON parsing bug in CLI status and doctor commands — both use parseInt() on JSON content, which always returns NaN, breaking PID display and stale PID cleanup.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix PID file JSON parsing in status and doctor commands",
+      "description": "As a user running `opentabs status` or `opentabs doctor` after starting the server with `--background`, I want the PID and background indicator to display correctly so that I can see the server's process ID and clean up stale PID files.",
+      "acceptanceCriteria": [
+        "Both `status.ts` and `doctor.ts` parse the PID file using JSON-aware parsing that handles the `{\"pid\":N,\"port\":P}` format written by `start.ts`",
+        "When a background server is running, `opentabs status` shows the PID line with '(background)' indicator",
+        "When a background server is running, `opentabs doctor` shows '(background, PID N)' in the server health detail",
+        "Stale PID file cleanup works: when the PID file references a dead process, both commands delete the stale PID file",
+        "Backward compatibility: plain-integer PID files (legacy format) are still parsed correctly",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Root cause: `start.ts` line 383 writes the PID file as JSON: `JSON.stringify({ pid, port })`, producing content like `{\"pid\":1234,\"port\":8888}`. But `status.ts` line 148 and `doctor.ts` line 472 both parse it with `parseInt(await readFile(pidPath, 'utf-8'), 10)`. `parseInt('{\"pid\":1234}', 10)` returns NaN because the string starts with `{`. The `!isNaN(pid)` check then fails, silently skipping both the PID display and the stale PID cleanup code.\n\nThe correct parser already exists in `stop.ts` lines 62-78 as `parsePidFile()`. It handles both JSON and plain-integer legacy formats. The fix is to extract `parsePidFile` to a shared location (e.g., `platform/cli/src/config.ts` which already exports `getPidFilePath`) and use it in all three files.\n\nFiles to modify:\n- `platform/cli/src/commands/status.ts` — line 148: replace `parseInt(...)` with JSON-aware parsing\n- `platform/cli/src/commands/doctor.ts` — line 472: same fix\n- `platform/cli/src/commands/stop.ts` — lines 62-78: extract `parsePidFile` to shared location, import it back\n- `platform/cli/src/config.ts` — add the shared `parsePidFile` export\n\nDo NOT change the PID file write format in start.ts — it is correct. Only fix the readers.\n\nThe `parsePidFile` function from stop.ts handles both formats:\n1. Try JSON.parse — extract `.pid` and `.port` from the object\n2. Fall back to parseInt for plain-integer legacy format\n3. Return null if neither works"
+    }
+  ]
+}
