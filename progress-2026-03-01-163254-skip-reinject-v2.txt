@@ -1,0 +1,74 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-163254-skip-reinject-v2~running.json
+Started: Mon Mar  2 00:33:26 UTC 2026
+---
+
+## Codebase Patterns
+- The `__adapterHash` property name is set by the `hashAndFreeze` snippet in `platform/plugin-tools/src/commands/build.ts` and read by `readAdapterHash` in `iife-injection.ts` and `extension.checkAdapter` in `extension-commands.ts`
+- `chrome.scripting.executeScript` `func` callbacks are serialized closures that cannot reference module-scope variables — string literals must be used inside them, with comments referencing the canonical constant
+- The canonical constant `ADAPTER_HASH_PROP` lives in `platform/browser-extension/src/constants.ts`
+- The test mock for `../constants.js` in `extension-commands.test.ts` must include all constants used by the module under test
+- `injectPluginIntoMatchingTabs` supports `skipIfHashMatches` to skip re-injection when the adapter hash matches — used only by handleSyncFull, never by handlePluginUpdate
+- The message-router.test.ts mock for `./iife-injection.js` must include `injectPluginIntoMatchingTabs` and `cleanupAdaptersInMatchingTabs` (these are the actual imports used by message-router.ts)
+- When testing executeScript-based injection, the mock must track per-tab state (pre-injection vs post-injection) because `verifyAdapterHash` runs after file injection and expects the new hash
+- The fixture-based `mcpServer` shares `plugins/e2e-test` — use `copyE2eTestPlugin()` via `setupIsolatedIifeTest` when modifying adapter files on disk
+- The file watcher watches `dist/adapter.iife.js` in the local plugin dir, NOT the copies in `configDir/extension/adapters/`
+- `triggerHotReload()` = SIGUSR1 → dev proxy restarts worker → sync.full → hash-based skip if adapter hash matches
+
+## 2026-03-02 00:39 UTC - US-001
+- Fixed the `__hash` → `__adapterHash` bug in `extension-commands.ts:236` (checkAdapter func callback)
+- Created `ADAPTER_HASH_PROP = '__adapterHash'` constant in `platform/browser-extension/src/constants.ts`
+- Added comments referencing the constant in `readAdapterHash` (iife-injection.ts), checkAdapter func (extension-commands.ts), and hashAndFreeze snippet (build.ts)
+- Added unit test verifying the checkAdapter executeScript func references `__adapterHash` (not `__hash`) by inspecting the serialized func source
+- Files changed:
+  - `platform/browser-extension/src/constants.ts` (added ADAPTER_HASH_PROP)
+  - `platform/browser-extension/src/browser-commands/extension-commands.ts` (fixed __hash → __adapterHash)
+  - `platform/browser-extension/src/browser-commands/extension-commands.test.ts` (added hash prop test)
+  - `platform/browser-extension/src/iife-injection.ts` (added doc comment)
+  - `platform/plugin-tools/src/commands/build.ts` (added doc comment)
+- **Learnings for future iterations:**
+  - The knip config uses `ignoreExportsUsedInFile: true`, so exported constants need at least one importer to avoid being flagged
+  - The test imports `ADAPTER_HASH_PROP` from the mocked constants module — the mock must include the constant for the import to work
+  - When verifying that a string doesn't contain a substring that's part of a longer match (e.g., `__hash` inside `__adapterHash`), strip the longer match first with `replaceAll`
+---
+
+## 2026-03-02 00:46 UTC - US-002
+- Added `skipIfHashMatches` parameter to `injectPluginIntoMatchingTabs` in `iife-injection.ts`
+- When `forceReinject=true` and `skipIfHashMatches` is provided, calls `readAdapterHash` before injecting; if hash matches, skips entire injection pipeline for that tab
+- Updated `handleSyncFull` in `message-router.ts` to pass `meta.adapterHash` as `skipIfHashMatches`
+- `handlePluginUpdate` intentionally does NOT pass `skipIfHashMatches` — plugin code changed and must always re-inject
+- Fixed stale mock in `message-router.test.ts`: replaced `syncAdaptersForPlugins` with correct `injectPluginIntoMatchingTabs` + `cleanupAdaptersInMatchingTabs`
+- Added 5 unit tests for skipIfHashMatches behavior: hash matches (skip), hash mismatch (inject), no hash (inject), no skipIfHashMatches param (inject), mixed tabs (skip some, inject others)
+- Files changed:
+  - `platform/browser-extension/src/iife-injection.ts` (added skipIfHashMatches parameter + logic)
+  - `platform/browser-extension/src/iife-injection.test.ts` (5 new tests)
+  - `platform/browser-extension/src/message-router.ts` (handleSyncFull passes skipIfHashMatches)
+  - `platform/browser-extension/src/message-router.test.ts` (fixed stale iife-injection mock)
+- **Learnings for future iterations:**
+  - The `verifyAdapterHash` step after file injection also calls `readAdapterHash` — test mocks must return different values pre- vs post-injection per tab
+  - The embedded `__adapterHash` is computed from the core IIFE BEFORE the hashAndFreeze snippet is appended, so it can match even when the full file content changed — this is why `skipIfHashMatches` must never be used by `handlePluginUpdate`
+  - The message-router.test.ts mock for `./iife-injection.js` had a stale export name (`syncAdaptersForPlugins`) that doesn't exist — the handlers worked because errors were swallowed by `wrapNotification`'s `.catch()`
+---
+
+## 2026-03-02 01:10 UTC - US-003
+- Created new E2E test file `e2e/adapter-hash.e2e.ts` with 4 tests:
+  1. Adapter re-injection is skipped on hot reload when hash matches (verifies onActivate/onDeactivate do NOT fire)
+  2. Tools work after multiple consecutive hash-skipped reconnects (3 hot reloads)
+  3. extension_check_adapter reports correct hash, hashMatch:true, isReady:true, and tool names
+  4. extension_check_adapter hash still matches after a hash-skipped reconnect
+- Updated `e2e/lifecycle-hooks.e2e.ts`:
+  - Changed "onDeactivate fires on adapter re-injection via hot reload" → "onDeactivate does NOT fire on hot reload when adapter hash matches (skip)"
+  - The old test expected hot reload to cause re-injection; with the US-002 hash-based skip, hot reload no longer re-injects when the hash matches
+  - The updated test verifies the new correct behavior: neither onDeactivate nor onActivate fires during a hash-skipped hot reload
+- All 427 E2E tests pass (including 4 new tests)
+- All Phase 1 + Phase 2 checks pass: build, type-check, lint, knip, test, test:e2e
+- Files changed:
+  - `e2e/adapter-hash.e2e.ts` (new file — 4 E2E tests)
+  - `e2e/lifecycle-hooks.e2e.ts` (updated onDeactivate test to verify hash-skip behavior)
+- **Learnings for future iterations:**
+  - The fixture-based `mcpServer` uses the shared `plugins/e2e-test` directory — modifying adapter files there affects all parallel tests. Use `copyE2eTestPlugin()` from `setupIsolatedIifeTest` for tests that need to modify the IIFE on disk.
+  - The file watcher watches `dist/adapter.iife.js` in the local plugin directory, NOT the copied adapter files in `configDir/extension/adapters/`. Modifying the copy won't trigger `plugin.update`.
+  - `triggerHotReload()` sends SIGUSR1 → dev proxy restarts worker → sync.full with same adapter hash → hash-based skip in handleSyncFull. This is the reconnect scenario.
+  - Prettier requires short `page.evaluate` callbacks to be on a single line — wrapping `() => (globalThis as Record<string, unknown>).__opentabs_onActivate_called` across lines triggers a formatting error.
+  - The `@typescript-eslint/no-non-null-assertion` rule forbids `!` — use `if (!x) throw new Error(...)` guards instead (matches existing codebase pattern in `multi-tab-targeting.e2e.ts`).
+---
