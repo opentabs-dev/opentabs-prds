@@ -1,0 +1,67 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Skip adapter re-injection on sync.full when the adapter is already present and its content hash matches. This eliminates Chrome executeScript pipeline saturation during WebSocket reconnects, fixing the isReady() timeout warnings. Also fixes the __hash vs __adapterHash property name mismatch in the extension.checkAdapter diagnostic.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix __hash vs __adapterHash property name mismatch in extension.checkAdapter",
+      "description": "As a developer debugging adapter injection, I want extension.checkAdapter to correctly report whether the injected adapter hash matches the expected hash so that I can trust the diagnostic output.",
+      "acceptanceCriteria": [
+        "extension-commands.ts reads adapter.__adapterHash instead of adapter.__hash",
+        "The hashMatch field in the checkAdapter response is true when the adapter is present and its hash matches the expected value from plugin metadata",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Bug: `platform/browser-extension/src/browser-commands/extension-commands.ts:236` reads `adapter.__hash` but the build tool (`platform/plugin-tools/src/commands/build.ts:1110-1125`) sets the property as `adapter.__adapterHash`. The fix is a one-line change: replace `adapter.__hash` with `adapter.__adapterHash`. Also check if there are any other references to `__hash` that should be `__adapterHash` — grep the codebase. The `readAdapterHash` function in `platform/browser-extension/src/iife-injection.ts:67-85` already correctly reads `adapter.__adapterHash`."
+    },
+    {
+      "id": "US-002",
+      "title": "Skip adapter re-injection in handleSyncFull when hash matches",
+      "description": "As a user switching ports or reconnecting, I want the extension to skip adapter re-injection when the adapter code hasn't changed so that the isReady() probe runs quickly without Chrome executeScript pipeline saturation.",
+      "acceptanceCriteria": [
+        "handleSyncFull no longer passes forceReinject=true unconditionally for all plugins",
+        "For each plugin in sync.full, the extension checks if the adapter is already present in the tab AND its __adapterHash matches the adapterHash from the sync.full payload",
+        "If both conditions are true, injection is skipped entirely for that plugin+tab pair (no prepareForReinjection, no injectLogRelay, no IIFE injection, no version/hash verification)",
+        "If the adapter is missing OR the hash differs, full injection proceeds as before (with prepareForReinjection, teardown, the whole pipeline)",
+        "If the plugin in sync.full has no adapterHash (legacy/missing), fall back to always re-injecting (current behavior)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "This is the core fix. The change is in `platform/browser-extension/src/message-router.ts:282-291` and `platform/browser-extension/src/iife-injection.ts`.\n\nCurrent flow in handleSyncFull (message-router.ts:282-284):\n```typescript\nconst injectionResults = await Promise.allSettled(\n  metas.map(meta =>\n    injectPluginIntoMatchingTabs(meta.name, meta.urlPatterns, true, meta.version, meta.adapterHash, meta.adapterFile),\n  ),\n);\n```\n\nThe `true` for forceReinject means every sync.full tears down and re-injects ALL adapters, even when nothing changed. On reconnect, this causes 6+ executeScript calls per plugin per tab, saturating Chrome's pipeline so the subsequent isReady() probe (which races against a 5-second timeout) fires before the script even runs.\n\nDesign approach — two options:\n\nOption A (recommended): Change `injectPluginIntoMatchingTabs` to accept the adapterHash and do the hash comparison internally. When `forceReinject=true` AND `adapterHash` is provided, check each tab: if `readAdapterHash(tabId, pluginName) === adapterHash`, skip that tab. If not, proceed with full re-injection (prepareForReinjection + injectAdapterFile). This keeps the optimization inside the injection function.\n\nOption B: Change handleSyncFull to pass `forceReinject=false` and rely on `isAdapterPresent` alone. But this is weaker — it only checks presence, not correctness. The hash-based check is more precise.\n\nGo with Option A. The key insight is that `readAdapterHash` (iife-injection.ts:67-85) already exists and reads `__openTabs.adapters[pluginName].__adapterHash` via executeScript. This is ONE executeScript call vs the 6 calls for full re-injection.\n\nImportant edge cases:\n- If `adapterHash` is undefined/null (legacy plugin without hash), always re-inject (preserve current behavior)\n- If `readAdapterHash` throws or returns undefined (adapter not present, tab not accessible), proceed with full injection\n- `handlePluginUpdate` (message-router.ts:314) should ALWAYS force re-inject regardless of hash — that's the code-changed case\n- The existing `forceReinject=false` path in `reinjectStoredPlugins` and `injectPluginsIntoTab` should remain unchanged\n\nTest approach: The existing unit tests in `platform/mcp-server/src/extension-protocol.test.ts` test sync.full payload generation. The injection logic is in the browser extension which doesn't have unit tests for this specific flow — the E2E tests cover it. Make sure the E2E tests still pass."
+    },
+    {
+      "id": "US-003",
+      "title": "Verify isReady timeout fix works end-to-end",
+      "description": "As a user, I want the extension to report plugins as 'ready' immediately on reconnect (without timeout warnings) when the adapter is already injected and the plugin is authenticated.",
+      "acceptanceCriteria": [
+        "After a WebSocket reconnect (simulated by extension reload or port change), plugins with already-injected adapters report ready state without isReady() timeout warnings in the background console",
+        "The E2E test suite passes, confirming adapter injection and tool dispatch still work correctly after reconnect",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "This story verifies US-002 works end-to-end. The E2E tests in `e2e/` exercise the full flow: extension connects, plugins are injected, tools are dispatched. After US-002, the E2E tests should still pass because:\n- First connection: adapters are not present → full injection (same as before)\n- Reconnection: adapters are present with matching hash → skip injection → isReady() probe runs fast\n\nThe E2E test infrastructure (`e2e/helpers/`) manages the MCP server, extension, and browser. Look at existing tests to understand the reconnect behavior. If there's a reconnect test, verify it passes. If not, consider whether adding one is appropriate (but don't over-scope — the existing E2E suite exercising the happy path is sufficient).\n\nAlso verify that the `extension.checkAdapter` diagnostic (fixed in US-001) now correctly reports `hashMatch: true` when the adapter is present and hash matches."
+    }
+  ]
+}
