@@ -1,0 +1,50 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Change adapter injection timing from status:'complete' to status:'loading' so adapters are injected before page JavaScript runs. This allows plugins to read volatile auth state (like localStorage tokens) before the host app deletes it. Combined with a Discord plugin change to cache the token at first read.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Inject adapters at status:'loading' instead of status:'complete'",
+      "description": "As a plugin developer, I want adapters to be injected before page JavaScript runs so that my plugin can intercept or read state that the host app modifies or deletes during initialization",
+      "acceptanceCriteria": [
+        "Adapters are injected when chrome.tabs.onUpdated fires with status:'loading' instead of status:'complete'",
+        "The isReady probe and tab state check are deferred to status:'complete' (NOT at loading time) to avoid false 'unavailable' reports before page globals exist",
+        "Existing plugins (Slack, e2e-test) continue to work correctly — their isReady polling handles the timing gap",
+        "The adapter IIFE wrapper registers on globalThis.__openTabs at injection time (no DOM access needed)",
+        "SPA navigations (pushState/replaceState) are unaffected — they don't trigger onUpdated",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Edit `platform/browser-extension/src/background.ts`, lines 65-77.\n\nCurrent code:\n```typescript\nchrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {\n  if (changeInfo.status === 'complete' && tab.url) {\n    injectPluginsIntoTab(tabId, tab.url)\n      .then(() => checkTabChanged(tabId, changeInfo))\n      .catch(...);\n  } else if (changeInfo.url) {\n    checkTabChanged(tabId, changeInfo).catch(...);\n  }\n});\n```\n\nNew logic needs TWO events:\n1. On `status === 'loading'` — inject adapters (so they run before page JS)\n2. On `status === 'complete'` — check tab state (isReady probe happens here)\n\n```typescript\nchrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {\n  if (changeInfo.status === 'loading' && tab.url) {\n    // Inject early so adapters are present before page JavaScript runs.\n    // This lets plugins cache volatile state (e.g., localStorage tokens)\n    // that the host app may delete during initialization.\n    injectPluginsIntoTab(tabId, tab.url)\n      .catch((err: unknown) => console.warn('[opentabs] early tab injection failed:', err));\n  } else if (changeInfo.status === 'complete' && tab.url) {\n    // Re-inject (idempotent) and check state after page has fully loaded.\n    // isReady() probes run here because plugins depend on page globals\n    // and DOM elements that only exist after page JavaScript executes.\n    injectPluginsIntoTab(tabId, tab.url)\n      .then(() => checkTabChanged(tabId, changeInfo))\n      .catch((err: unknown) => console.warn('[opentabs] tab injection failed:', err));\n  } else if (changeInfo.url) {\n    checkTabChanged(tabId, changeInfo).catch((err: unknown) => console.warn('[opentabs] tab state check failed:', err));\n  }\n});\n```\n\nCRITICAL: `injectPluginsIntoTab` must be IDEMPOTENT — if the adapter is already injected (from the loading event), the complete event's re-injection should be a no-op. Check `platform/browser-extension/src/iife-injection.ts` function `injectPluginsIntoTab` to verify it already handles re-injection gracefully. The IIFE wrapper in `platform/plugin-tools/src/build.ts` checks `globalThis.__openTabs?.adapters?.[pluginName]` and calls teardown before re-registering, so re-injection IS safe.\n\nRISK: At `status:'loading'`, the tab's document may be in the process of being created. `chrome.scripting.executeScript` should still work because it queues execution. Test with the e2e test suite to verify.\n\nSECOND RISK: The `tab.url` might not be available at `status:'loading'`. The `tab` parameter in onUpdated has a `url` property, but Chrome may not populate it until the navigation commits. If `tab.url` is undefined at loading time, we need to use `changeInfo.url` instead (which is present when the URL changes).\n\nVerify all existing E2E tests pass — the Slack plugin and e2e-test plugin should be unaffected because their isReady polling handles the timing gap between injection (loading) and state check (complete)."
+    },
+    {
+      "id": "US-002",
+      "title": "Cache Discord auth token at first read so it survives localStorage deletion",
+      "description": "As a Discord user, I want the Discord plugin to cache the auth token after first successful read so that tool calls continue working even after Discord deletes the token from localStorage",
+      "acceptanceCriteria": [
+        "getAuth() caches the token in a module-level variable after first successful read",
+        "Subsequent getAuth() calls return the cached token without re-reading localStorage",
+        "isDiscordAuthenticated() uses the cached token if available",
+        "If the cached token results in a 401 API error, the cache is cleared and getAuth() retries from localStorage (handles token rotation)",
+        "The iframe localStorage fallback is still used as a fallback when direct localStorage access fails AND no cached token exists",
+        "cd plugins/discord && npm run build passes",
+        "cd plugins/discord && npm run type-check passes",
+        "cd plugins/discord && npm run lint passes",
+        "cd plugins/discord && npm run format:check passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Edit `plugins/discord/src/discord-api.ts`.\n\nAdd a module-level cache variable and modify getAuth() to use it:\n\n```typescript\nlet cachedAuth: DiscordAuth | null = null;\n\nconst getAuth = (): DiscordAuth | null => {\n  // Return cached token if available\n  if (cachedAuth) return cachedAuth;\n\n  const raw = readLocalStorage('token');\n  if (!raw) return null;\n\n  try {\n    const token = JSON.parse(raw) as unknown;\n    if (typeof token !== 'string' || token.length === 0) return null;\n    cachedAuth = { token };\n    return cachedAuth;\n  } catch {\n    return null;\n  }\n};\n```\n\nAlso add a cache-clearing mechanism for 401 errors. In the discordApi function, when a 401 is received, clear the cache before throwing:\n\n```typescript\nif (response.status === 401 || response.status === 403) {\n  cachedAuth = null; // Clear cache on auth failure — token may have been rotated\n  throw ToolError.auth(...);\n}\n```\n\nThis ensures:\n1. First call reads from localStorage (works at loading time before Discord deletes it)\n2. Subsequent calls use the cached value (works after Discord deletes localStorage)\n3. Token rotation is handled (401 clears cache, next call retries localStorage/iframe)"
+    }
+  ]
+}
