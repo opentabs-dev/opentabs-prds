@@ -1,0 +1,30 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-211138-isready-periodic-poll~running.json
+Started: Mon Mar  2 05:12:04 UTC 2026
+---
+
+## Codebase Patterns
+- Tab state management lives in `platform/browser-extension/src/tab-state.ts` — all state computation and caching is centralized there
+- `notifyAffectedPlugins` is the key function for re-evaluating and diffing plugin state; it uses `withPluginLock` to serialize per-plugin
+- `lastKnownState` is a Map<string, serialized JSON> used for diff detection — changes in aggregate state, tab list, or per-tab readiness all produce different serialized strings
+- WebSocket connection/disconnection is handled in `background-message-handlers.ts` via `handleWsState`; cleanup (cache clear, poll stop) happens on disconnect
+- `sync.full` from the MCP server triggers `handleSyncFull` in `message-router.ts` which stores plugins, injects adapters, then calls `sendTabSyncAll`
+- Constants for timeouts and intervals live in `platform/browser-extension/src/constants.ts`
+- Test mocks for `tab-state.js` must include ALL exported functions — when adding new exports, update mocks in `background-message-handlers.test.ts`, `message-router.test.ts`, and `known-methods.test.ts`
+
+## 2026-03-02 05:20 UTC - US-001
+- Implemented periodic isReady() re-evaluation for active plugin tabs
+- Files changed:
+  - `platform/browser-extension/src/constants.ts` — added `READINESS_POLL_INTERVAL_MS` (30s)
+  - `platform/browser-extension/src/tab-state.ts` — added `startReadinessPoll()`, `stopReadinessPoll()`, and `runReadinessPoll()` with concurrency guard
+  - `platform/browser-extension/src/message-router.ts` — call `startReadinessPoll()` after `sendTabSyncAll()` in `handleSyncFull`
+  - `platform/browser-extension/src/background-message-handlers.ts` — call `stopReadinessPoll()` on WebSocket disconnect
+  - `platform/browser-extension/src/tab-state.test.ts` — 6 new tests for polling behavior (polls active, skips closed, polls unavailable, stop works, idempotent start, no overlap)
+  - `platform/browser-extension/src/background-message-handlers.test.ts` — added `stopReadinessPoll` mock and disconnect test
+  - `platform/browser-extension/src/message-router.test.ts` — added `startReadinessPoll` to tab-state mock
+- **Learnings for future iterations:**
+  - The polling reuses `notifyAffectedPlugins` which already handles per-plugin locking, state diffing, and notification — no need to duplicate that logic
+  - A `readinessPollRunning` boolean guard prevents overlapping poll cycles when the interval fires before the previous poll completes
+  - `startReadinessPoll` is idempotent (checks for existing timer) so calling it on every `sync.full` is safe
+  - Vitest fake timers work well for testing setInterval-based polling — use `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync()` for async interval callbacks
+---
