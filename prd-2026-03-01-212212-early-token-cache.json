@@ -1,0 +1,33 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add document_start injection support for plugins that need to cache volatile auth state (like localStorage tokens) before the host app's JavaScript deletes it. Discord and similar apps clear localStorage after reading the token, making the current document_complete injection too late.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Support an optional earlyInject script for plugins that runs at document_start",
+      "description": "As a plugin developer, I want to specify an optional early-inject script that runs at document_start (before page JavaScript) so that I can cache volatile auth state like localStorage tokens before the host app deletes them",
+      "acceptanceCriteria": [
+        "Plugins can define an optional `earlyInject` field in their package.json opentabs config that points to a small JS file",
+        "The early-inject script runs in the page MAIN world at document_start timing, before any page scripts execute",
+        "The early-inject script has access to localStorage, sessionStorage, cookies, and document (but NOT document.body)",
+        "The early-inject script can write to globalThis to pass data to the main adapter IIFE",
+        "The main adapter IIFE injection at document_complete is unchanged — it reads from globalThis to get cached values",
+        "Plugins without earlyInject work exactly as before (no change to existing behavior)",
+        "The early-inject script is bundled by opentabs-plugin build alongside the adapter IIFE",
+        "The extension's manifest.json registers the early-inject scripts via content_scripts with run_at: document_start, OR the background script injects them on tabs.onUpdated with status: loading",
+        "CSP is not a concern (file-based injection bypasses page CSP)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "This is a platform feature that enables plugins like Discord to reliably extract auth tokens.\n\nThe problem: Discord reads the token from localStorage at page load, then deletes the localStorage property via Object.defineProperty. The current adapter injection happens at document_complete (chrome.tabs.onUpdated with status=complete), which is after Discord's main bundle has already run and deleted the token.\n\nProposed architecture:\n\n1. Plugin package.json gains an optional field:\n```json\n{\n  \"opentabs\": {\n    \"earlyInject\": \"dist/early.iife.js\"\n  }\n}\n```\n\n2. opentabs-plugin build bundles a small early-inject script from a plugin's `src/early.ts` (if present). This script should be tiny — just read localStorage and cache to globalThis.\n\n3. The extension detects plugins with earlyInject and injects them at the earliest possible moment:\n   - Option A: Use chrome.tabs.onUpdated with status='loading' to call chrome.scripting.executeScript with world:'MAIN' and files:[earlyInjectFile]\n   - Option B: Dynamically register content scripts via chrome.scripting.registerContentScripts() with runAt:'document_start' for matching URL patterns\n   \n   Option B is likely better because it guarantees document_start timing. Option A (status=loading) may still be too late if the page's inline scripts run before the event handler fires.\n\n4. The early-inject script writes to a namespaced global:\n```javascript\n// early.iife.js\n(function() {\n  try {\n    const token = localStorage.getItem('token');\n    if (token) {\n      globalThis.__openTabs = globalThis.__openTabs || {};\n      globalThis.__openTabs.earlyCache = globalThis.__openTabs.earlyCache || {};\n      globalThis.__openTabs.earlyCache.discord = { token };\n    }\n  } catch(e) {}\n})();\n```\n\n5. The plugin's getAuth() reads from `globalThis.__openTabs.earlyCache.discord` first, falling back to the iframe localStorage approach.\n\nKey files to modify:\n- `platform/browser-extension/manifest.json` — may need to add permissions or content_scripts\n- `platform/browser-extension/src/background.ts` — register early scripts on sync.full and plugin.update\n- `platform/browser-extension/src/iife-injection.ts` — add early injection logic\n- `platform/plugin-tools/src/build.ts` — bundle the early-inject script\n- `platform/plugin-sdk/src/types.ts` — add earlyInject to manifest types\n- `platform/mcp-server/src/` — pass earlyInject file info through to the extension\n\nRisk: chrome.scripting.registerContentScripts is powerful and should only register for URL patterns that the plugin explicitly declares. Validate that the earlyInject script exists and is small (< 4KB limit). The script runs before any CSP or page JS, so it must be carefully sandboxed."
+    }
+  ]
+}
