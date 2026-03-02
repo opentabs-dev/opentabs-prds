@@ -16,7 +16,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "Bug: `platform/browser-extension/src/browser-commands/extension-commands.ts:236` reads `adapter.__hash` but the build tool (`platform/plugin-tools/src/commands/build.ts:1110-1125`) sets the property as `adapter.__adapterHash`. The fix is a one-line change: replace `adapter.__hash` with `adapter.__adapterHash`. Also check if there are any other references to `__hash` that should be `__adapterHash` — grep the codebase. The `readAdapterHash` function in `platform/browser-extension/src/iife-injection.ts:67-85` already correctly reads `adapter.__adapterHash`."
@@ -38,7 +38,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "This is the core fix. The change is in `platform/browser-extension/src/message-router.ts:282-291` and `platform/browser-extension/src/iife-injection.ts`.\n\nCurrent flow in handleSyncFull (message-router.ts:282-284):\n```typescript\nconst injectionResults = await Promise.allSettled(\n  metas.map(meta =>\n    injectPluginIntoMatchingTabs(meta.name, meta.urlPatterns, true, meta.version, meta.adapterHash, meta.adapterFile),\n  ),\n);\n```\n\nThe `true` for forceReinject means every sync.full tears down and re-injects ALL adapters, even when nothing changed. On reconnect, this causes 6+ executeScript calls per plugin per tab, saturating Chrome's pipeline so the subsequent isReady() probe (which races against a 5-second timeout) fires before the script even runs.\n\nDesign approach — two options:\n\nOption A (recommended): Change `injectPluginIntoMatchingTabs` to accept the adapterHash and do the hash comparison internally. When `forceReinject=true` AND `adapterHash` is provided, check each tab: if `readAdapterHash(tabId, pluginName) === adapterHash`, skip that tab. If not, proceed with full re-injection (prepareForReinjection + injectAdapterFile). This keeps the optimization inside the injection function.\n\nOption B: Change handleSyncFull to pass `forceReinject=false` and rely on `isAdapterPresent` alone. But this is weaker — it only checks presence, not correctness. The hash-based check is more precise.\n\nGo with Option A. The key insight is that `readAdapterHash` (iife-injection.ts:67-85) already exists and reads `__openTabs.adapters[pluginName].__adapterHash` via executeScript. This is ONE executeScript call vs the 6 calls for full re-injection.\n\nImportant edge cases:\n- If `adapterHash` is undefined/null (legacy plugin without hash), always re-inject (preserve current behavior)\n- If `readAdapterHash` throws or returns undefined (adapter not present, tab not accessible), proceed with full injection\n- `handlePluginUpdate` (message-router.ts:314) should ALWAYS force re-inject regardless of hash — that's the code-changed case\n- The existing `forceReinject=false` path in `reinjectStoredPlugins` and `injectPluginsIntoTab` should remain unchanged\n\nTest approach: The existing unit tests in `platform/mcp-server/src/extension-protocol.test.ts` test sync.full payload generation. The injection logic is in the browser extension which doesn't have unit tests for this specific flow — the E2E tests cover it. Make sure the E2E tests still pass."
@@ -58,7 +58,7 @@
         "npm run test:e2e passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "This story verifies US-002 works end-to-end. The E2E tests in `e2e/` exercise the full flow: extension connects, plugins are injected, tools are dispatched. After US-002, the E2E tests should still pass because:\n- First connection: adapters are not present → full injection (same as before)\n- Reconnection: adapters are present with matching hash → skip injection → isReady() probe runs fast\n\nThe E2E test infrastructure (`e2e/helpers/`) manages the MCP server, extension, and browser. Look at existing tests to understand the reconnect behavior. If there's a reconnect test, verify it passes. If not, consider whether adding one is appropriate (but don't over-scope — the existing E2E suite exercising the happy path is sufficient).\n\nAlso verify that the `extension.checkAdapter` diagnostic (fixed in US-001) now correctly reports `hashMatch: true` when the adapter is present and hash matches."

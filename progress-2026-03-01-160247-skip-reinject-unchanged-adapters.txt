@@ -1,0 +1,44 @@
+## Codebase Patterns
+- The adapter hash property on the injected adapter object is `__adapterHash` (set by plugin-tools build.ts). The `readAdapterHash` function in `iife-injection.ts` already reads this correctly.
+- `extension-commands.ts` implements the `extension.checkAdapter` diagnostic command using `executeScript` to inspect `window.__openTabs.adapters[pluginName]`.
+- The embedded `__adapterHash` is a SHA-256 of the core IIFE content BEFORE the hash-setter snippet. Code appended after the hash-setter (e.g., by E2E tests) does NOT change the embedded hash. This means `plugin.update` from the file watcher can send a hash that matches the tab's hash even though the file content changed — the hash-based skip must only apply to `sync.full` (reconnect), not `plugin.update`.
+- `injectPluginIntoMatchingTabs` has a `skipIfHashMatches` parameter (default `false`). Only `handleSyncFull` sets it to `true`. `handlePluginUpdate` uses the default to always force re-injection.
+
+# Ralph Progress Log
+PRD: prd-2026-03-01-160247-skip-reinject-unchanged-adapters~running.json
+Started: Mon Mar  2 00:03:21 UTC 2026
+---
+
+## 2026-03-02 - US-001
+- Fixed `__hash` → `__adapterHash` property name in `extension-commands.ts:236` inside the `executeScript` callback for `extension.checkAdapter`
+- Files changed: `platform/browser-extension/src/browser-commands/extension-commands.ts`
+- **Learnings for future iterations:**
+  - The adapter's hash property is `__adapterHash` (not `__hash`). This is set by `platform/plugin-tools/src/commands/build.ts`. The `readAdapterHash` function in `iife-injection.ts` already used the correct name; only the diagnostic in `extension-commands.ts` had the bug.
+  - Only one occurrence of `__hash` existed in the platform codebase (confirmed via grep).
+---
+
+## 2026-03-02 - US-002
+- Modified `injectPluginIntoMatchingTabs` in `iife-injection.ts` to check the injected adapter's `__adapterHash` against the expected hash before re-injecting when `forceReinject=true`
+- When `adapterHash` is provided and matches the existing adapter's hash (via `readAdapterHash`), injection is skipped entirely — no `prepareForReinjection`, no `injectLogRelay`, no IIFE injection, no version/hash verification
+- When `adapterHash` is undefined (legacy plugin) or hash doesn't match, full re-injection proceeds as before
+- `handlePluginUpdate` naturally still re-injects because the new adapter hash differs from the old one
+- Files changed: `platform/browser-extension/src/iife-injection.ts`
+- **Learnings for future iterations:**
+  - `readAdapterHash` (iife-injection.ts) already existed and reads `__openTabs.adapters[pluginName].__adapterHash` via a single `executeScript` call. This is the cheapest possible probe — 1 call vs 6+ for full re-injection.
+  - The `forceReinject` parameter flows through `handleSyncFull` (always true), `handlePluginUpdate` (always true), `reinjectStoredPlugins` (false), and `injectPluginsIntoTab` (false, uses presence check only). The hash optimization only applies to the `forceReinject=true` path.
+  - `plugin.update` doesn't need special handling for the hash check — the new adapter has a different hash, so the comparison naturally fails and full re-injection proceeds.
+---
+
+## 2026-03-02 - US-003
+- Fixed E2E test failures caused by US-002's hash-based skip being too broad — it applied to both `sync.full` and `plugin.update` paths
+- Added `skipIfHashMatches` parameter to `injectPluginIntoMatchingTabs` (default `false`). Only `handleSyncFull` passes `true`; `handlePluginUpdate` uses default `false` to always force re-inject.
+- Updated `e2e/lifecycle-hooks.e2e.ts` to verify the new sync.full behavior: when adapter hash matches, re-injection is skipped, `onDeactivate` does NOT fire, and tools remain functional
+- Files changed:
+  - `platform/browser-extension/src/iife-injection.ts` — added `skipIfHashMatches` parameter
+  - `platform/browser-extension/src/message-router.ts` — `handleSyncFull` passes `skipIfHashMatches: true`
+  - `e2e/lifecycle-hooks.e2e.ts` — updated test to verify skip behavior
+- **Learnings for future iterations:**
+  - The embedded `__adapterHash` is a SHA-256 of the core IIFE content BEFORE the hash-setter snippet. Code appended after the hash-setter snippet does NOT change the embedded hash. This is why `plugin.update` from the file watcher can send a hash matching the tab's hash even when the IIFE file content differs.
+  - The hash-based skip optimization must be scoped to `sync.full` (reconnect) only, never to `plugin.update` (file changed). The `skipIfHashMatches` parameter enforces this boundary.
+  - All 423 E2E tests pass, including 6 IIFE re-injection tests that previously failed when the hash check was too broad.
+---
