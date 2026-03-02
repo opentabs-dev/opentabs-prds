@@ -1,0 +1,31 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add periodic re-evaluation of plugin isReady() so the side panel state stays accurate when a plugin becomes unavailable without a page navigation (e.g., token expires, user logs out via SPA transition)",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add periodic isReady re-evaluation for active plugin tabs",
+      "description": "As a user, I want the side panel plugin state to accurately reflect whether a plugin is ready, even when the auth token expires or is cleared without a page navigation, so that the green/red indicator is trustworthy",
+      "acceptanceCriteria": [
+        "Plugin tabs that were previously `ready` are re-probed periodically (e.g., every 30-60 seconds)",
+        "If isReady() returns false during a periodic probe, the tab state transitions from `ready` to `unavailable` and a `tab.stateChanged` notification is sent to the MCP server",
+        "If isReady() returns true during a periodic probe for a previously `unavailable` tab, it transitions to `ready`",
+        "The polling interval is configurable via a constant (not hardcoded in multiple places)",
+        "Polling does NOT run for tabs in `closed` state (no matching tab exists)",
+        "Polling stops when the extension's WebSocket is disconnected (no point probing if we can't notify the server)",
+        "The periodic probe uses the same 5-second timeout as the existing probeTabReadiness function",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "The readiness state is managed in `platform/browser-extension/src/tab-state.ts`. Key functions:\n\n- `probeTabReadiness(tabId, adapterFile)` (line 64) — calls `isReady()` via `chrome.scripting.executeScript` with a 5-second timeout\n- `computePluginTabState(plugin)` (line 117) — computes per-tab state for a plugin, calls `probeTabReadiness` for each matching tab\n- `sendTabSyncAll()` (line 143) — computes state for ALL plugins after `sync.full`\n- `notifyAffectedPlugins(tabId, url)` (line 256) — re-computes state for plugins affected by a tab event, diffs against `lastKnownState`, and sends `tab.stateChanged` only when state actually changed\n- `lastKnownState` (line 26) — Map<pluginName, serialized state> used for diffing\n\nCurrently `isReady()` is re-evaluated ONLY on:\n1. `chrome.tabs.onUpdated` (URL change or page load complete) — via `checkTabChanged`\n2. `chrome.tabs.onRemoved` / `onReplaced` — via `checkTabRemoved`\n3. `sync.full` from MCP server — via `sendTabSyncAll`\n4. `plugin.update` — direct re-computation\n5. Tool/resource/prompt dispatch — just-in-time gate check (but does NOT update `lastKnownState`)\n\nThe gap: if a plugin's auth token expires or is cleared while the page stays open (no navigation), the side panel keeps showing the stale `ready` state until the next page load or WebSocket reconnect.\n\nImplementation approach:\n- Add a `setInterval` in `background.ts` or `tab-state.ts` that periodically calls `notifyAffectedPlugins` or a similar function for all tabs with `ready` or `unavailable` state\n- Use a reasonable interval (30-60 seconds) — this is a background probe, not a real-time check\n- Only probe tabs that are currently in `ready` or `unavailable` state (skip `closed`)\n- Guard against concurrent probes (if a probe is already running from a tab event, skip the periodic one)\n- Make sure to clear the interval when the WebSocket disconnects and restart it on reconnect\n\nAlternative approach: Instead of polling ALL plugins, only poll plugins whose tabs haven't had a navigation event in the last N seconds. This reduces unnecessary work for actively-used tabs where navigation events already trigger re-evaluation.\n\nIMPORTANT: The `isReady()` call involves `chrome.scripting.executeScript` which is asynchronous and can fail (tab closed, adapter not injected, etc.). Handle all error cases gracefully — a failed probe should not crash the background service worker or leave stale state."
+    }
+  ]
+}
