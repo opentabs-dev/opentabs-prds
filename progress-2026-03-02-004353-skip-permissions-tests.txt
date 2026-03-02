@@ -1,0 +1,39 @@
+## Codebase Patterns
+- `skip-permissions.ts` computes `cliSkipPermissions` at module load time. Testing it requires `vi.stubEnv()` + `vi.resetModules()` + dynamic `await import('./skip-permissions.js')` pattern.
+- Test files for mcp-server: `permissions.test.ts` (evaluatePermission + isCliSkipPermissions), `config.test.ts` (config loading/saving), `http-routes.test.ts` (HTTP route handlers).
+- `vi.stubEnv()` requires `vi` and `afterEach` imported from vitest. Use `vi.unstubAllEnvs()` in afterEach to restore env vars after each test.
+- `createTestHandlers()` in http-routes.test.ts creates a test state and handlers for testing HTTP routes.
+
+# Ralph Progress Log
+PRD: prd-2026-03-02-004353-skip-permissions-tests~running.json
+Started: Mon Mar  2 08:44:32 UTC 2026
+---
+
+## 2026-03-02 - US-001
+- What was implemented: Added backward compatibility for old env var `OPENTABS_SKIP_CONFIRMATION` and CLI flag `--dangerously-skip-confirmation` to `skip-permissions.ts`. Added unit tests for `isCliSkipPermissions()` in `permissions.test.ts`, config backward compat tests in `config.test.ts`, and `/health` endpoint `skipPermissions` field test in `http-routes.test.ts`.
+- Files changed:
+  - `platform/mcp-server/src/skip-permissions.ts` — added `OPENTABS_SKIP_CONFIRMATION` env var and `--dangerously-skip-confirmation` CLI flag backward compat
+  - `platform/mcp-server/src/permissions.test.ts` — added `isCliSkipPermissions` describe block (3 tests using vi.stubEnv + vi.resetModules + dynamic import)
+  - `platform/mcp-server/src/config.test.ts` — added `skipPermissions config backward compatibility` describe block (4 tests for skipConfirmation → skipPermissions migration)
+  - `platform/mcp-server/src/http-routes.test.ts` — added test verifying `skipPermissions` field is present in /health response and reflects `state.skipPermissions`
+- **Learnings for future iterations:**
+  - The `isCliSkipPermissions()` function returns a constant computed at module import time. Dynamic `import()` after `vi.stubEnv()` + `vi.resetModules()` is the correct testing pattern.
+  - `vi.stubEnv()` stubs the env var synchronously; `vi.resetModules()` must be called after to clear the module cache so the next `import()` sees the stubbed value.
+  - Always stub BOTH `OPENTABS_SKIP_PERMISSIONS` and `OPENTABS_SKIP_CONFIRMATION` in tests to avoid false positives from a previously-set env var.
+  - `config.test.ts` already isolates config to a temp dir via `OPENTABS_CONFIG_DIR` env var — new test groups just need `beforeEach` to reset the dir and remove config file.
+---
+
+## 2026-03-02 - US-002
+- What was implemented: Added E2E tests verifying OPENTABS_SKIP_PERMISSIONS=1 bypasses confirmation dialogs for interact-tier tools on non-trusted domains. Fixed side-panel animation test to use activity indicator locator and direct server spawn.
+- Files changed:
+  - `e2e/permissions.e2e.ts` — added two test groups:
+    1. `skip-permissions flag — health endpoint`: two standalone tests (no extension needed) that start servers with/without OPENTABS_SKIP_PERMISSIONS=1 and verify /health.skipPermissions is true/false
+    2. `skip-permissions flag — interact-tier bypass`: custom fixture (`testWithSkipPermissions`) that starts server with OPENTABS_SKIP_PERMISSIONS=1 and verifies browser_navigate_tab on 127.0.0.2 succeeds immediately (5s timeout, not 30s CONFIRMATION_TIMEOUT)
+  - `e2e/side-panel-data-flow.e2e.ts` — fixed animation test: renamed "spinner" → "activity indicator", switched to `startMcpServer(configDir, false)` to avoid dev proxy SSE race condition, scoped `animate-activity-flash` locator to `pluginCard` for Playwright strict mode
+  - `package-lock.json` and `plugins/e2e-test/package-lock.json` — npm lock file updates
+- **Learnings for future iterations:**
+  - The skip-permissions bypass tests required a CUSTOM fixture (`testWithSkipPermissions`) because the default `test` fixture uses OPENTABS_SKIP_PERMISSIONS=1 already. The /health tests work as standalone tests (no `base.extend`) since they only need a raw server, not an extension context.
+  - For E2E tests that don't need the extension, use standalone `startMcpServer` + manual cleanup in try/finally — simpler than creating a full fixture.
+  - The `startMcpServer(configDir, false)` direct spawn mode avoids the dev proxy SSE empty-response race condition. Use it for animation/timing-sensitive tests.
+  - Playwright strict mode: `expect(locator).toBeVisible()` fails if locator matches >1 element. Scope `animate-activity-flash` to `pluginCard` (the button element) to get exactly one match.
+---
