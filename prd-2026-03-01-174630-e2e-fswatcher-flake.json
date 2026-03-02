@@ -1,0 +1,29 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix flaky file-watcher E2E tests in iife-injection and strict-csp that use bare waitForLog instead of the retry-capable writeAndWaitForWatcher helper, causing intermittent timeouts on macOS when FSEvents misses the write event.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Use writeAndWaitForWatcher in iife-injection and strict-csp file watcher tests",
+      "description": "As a platform contributor, I want file-watcher E2E tests to use the writeAndWaitForWatcher helper so that they do not flake on macOS when FSEvents misses the initial file write event.",
+      "acceptanceCriteria": [
+        "e2e/iife-injection.e2e.ts line ~79-82 uses writeAndWaitForWatcher instead of bare fs.writeFileSync + waitForLog for the IIFE modification",
+        "e2e/strict-csp.e2e.ts line ~537-540 uses writeAndWaitForWatcher instead of bare fs.writeFileSync + waitForLog for the IIFE modification",
+        "Both tests import writeAndWaitForWatcher from ./helpers.js",
+        "The writeAndWaitForWatcher call wraps the fs.writeFileSync in the writeFn callback parameter and uses 'IIFE updated for' as the expectedLog parameter, matching the pattern used throughout hot-reload-dynamic.e2e.ts",
+        "Both tests still verify the same behavior after the change: the __e2eReinjectMarker global is set after re-injection, and tool dispatch works after re-injection",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "## Root cause\n\nOn macOS, fs.watch uses FSEvents which has a known registration race: if the watcher's fs.watch() call hasn't finished registering when the file write lands, the event is silently lost and never fires. The existing `writeAndWaitForWatcher` helper in `e2e/helpers.ts` (line ~477) was purpose-built to handle this — it (1) waits for the 'File watcher: Watching' log to confirm the watcher is registered, and (2) retries the file write with a trivial modification if the expected log doesn't appear within a timeout.\n\nAll file-watcher tests in `e2e/hot-reload-dynamic.e2e.ts` use this helper (12 call sites). However, two other test files still use the old pattern of bare `fs.writeFileSync` + `waitForLog`, which can flake.\n\n## Files to change\n\n1. `e2e/iife-injection.e2e.ts` — the 'modified IIFE is re-injected into matching tab after file watcher detects change' test (line ~44). Currently at lines 78-82 it does:\n   ```\n   fs.writeFileSync(iifePath, modifiedIife, 'utf-8');\n   await waitForLog(ctx.server, 'IIFE updated for', 15_000);\n   ```\n   Replace with:\n   ```\n   await writeAndWaitForWatcher(\n     ctx.server,\n     () => fs.writeFileSync(iifePath, modifiedIife, 'utf-8'),\n     'IIFE updated for',\n   );\n   ```\n   Add `writeAndWaitForWatcher` to the imports from `./helpers.js`.\n\n2. `e2e/strict-csp.e2e.ts` — the 'modified IIFE is force re-injected into strict-CSP tab after file watcher detects change' test (line ~476). Currently at lines 537-540 it does:\n   ```\n   fs.writeFileSync(iifePath, modifiedIife, 'utf-8');\n   await waitForLog(server, 'IIFE updated for', 15_000);\n   ```\n   Replace with:\n   ```\n   await writeAndWaitForWatcher(\n     server,\n     () => fs.writeFileSync(iifePath, modifiedIife, 'utf-8'),\n     'IIFE updated for',\n   );\n   ```\n   Add `writeAndWaitForWatcher` to the imports from `./helpers.js`. Note: `strict-csp.e2e.ts` uses a mix of raw `test` and `fixtureTest` — the IIFE watcher test at line 476 uses raw `test` (not fixtureTest) and manages its own server lifecycle. The `server` variable is a local McpServer, not a fixture.\n\n## What NOT to change\n\n- Do NOT modify the `writeAndWaitForWatcher` helper itself — it already works correctly.\n- Do NOT change the test logic, assertions, or marker code — only replace the file-write + waitForLog pattern with the helper.\n- Do NOT add `writeAndWaitForWatcher` to the `waitForLog` calls in these files that are NOT about IIFE file changes (e.g., `waitForLog(server, 'tab.syncAll received')` or `waitForLog(server, 'Hot reload complete')` — those are not file-watcher events).\n- The `replaceIifeClosing` helper call and the IIFE content construction must remain unchanged."
+    }
+  ]
+}
