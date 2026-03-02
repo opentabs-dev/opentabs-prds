@@ -1,0 +1,140 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Replace the bouncing dots Loader in ToolRow with HDD-style activity flash indicators on PluginIcon and ToolIcon green dots, with soft fade-out when activity stops",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add CSS keyframes for HDD-style activity flash animation",
+      "description": "As a developer, I want a reusable CSS animation class that produces a hard-drive activity light effect (rapid on/off flashing that speeds up with frequency and soft-fades out when removed) so that icon status dots can indicate tool activity",
+      "acceptanceCriteria": [
+        "A new @keyframes `activity-flash` is defined in `platform/browser-extension/src/side-panel/styles.css` that rapidly pulses opacity between 1.0 and 0.3 with a fast cycle (around 300-400ms per full cycle, ease-in-out)",
+        "A new utility class `.animate-activity-flash` applies the animation with infinite iteration",
+        "A new @keyframes `activity-fade-out` is defined that transitions opacity from 1.0 to 0.0 over ~500ms with ease-out timing, for the soft-end behavior when activity stops",
+        "A new utility class `.animate-activity-fade-out` applies the fade-out animation once (fill-mode forwards so it stays at opacity 0 after completing)",
+        "The existing `pulse-dot` and `tool-pulse` keyframes and their classes are removed since they are unused",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Edit `platform/browser-extension/src/side-panel/styles.css`.\n\nThe HDD activity light effect is a rapid opacity flash — the dot appears to blink on and off like a hard drive indicator LED. The key is a short cycle time (300-400ms) so it looks like rapid flickering when tools are being called frequently.\n\nAdd these after removing the existing `pulse-dot` and `tool-pulse` blocks (lines 144-170):\n\n```css\n@keyframes activity-flash {\n  0%, 100% { opacity: 1; }\n  50% { opacity: 0.3; }\n}\n\n.animate-activity-flash {\n  animation: activity-flash 0.4s ease-in-out infinite;\n}\n\n@keyframes activity-fade-out {\n  from { opacity: 1; }\n  to { opacity: 0; }\n}\n\n.animate-activity-fade-out {\n  animation: activity-fade-out 0.5s ease-out forwards;\n}\n```\n\nBefore removing `pulse-dot` and `tool-pulse`, verify they are truly unused by searching for `animate-pulse-dot` and `animate-tool-pulse` in the codebase. They should have zero usages in source code (only defined in styles.css)."
+    },
+    {
+      "id": "US-002",
+      "title": "Add activity flash to PluginIcon status dot and BrowserToolsCard icon",
+      "description": "As a user, I want the green ready dot on plugin icons and the browser tools icon to flash like an HDD activity light when any tool in that plugin is being invoked, with a soft fade-out when the invocation ends, so I can see at a glance which plugin is working",
+      "acceptanceCriteria": [
+        "PluginIcon accepts a new optional `active` boolean prop (default false)",
+        "When `active` is true AND `tabState` is 'ready' (and no update), the green status dot gets the `animate-activity-flash` CSS class, causing it to flash rapidly",
+        "When `active` transitions from true to false, the dot gets the `animate-activity-fade-out` class for ~500ms, then returns to the normal static green dot — this is the soft-end behavior",
+        "The `active` prop has no visual effect when `tabState` is not 'ready' or when `hasUpdate` is true (those states have their own indicators)",
+        "In PluginCard.tsx, compute `hasActiveTool` as `pluginTools.some(t => activeTools.has(`${plugin.name}:${t.name}`))` and pass it as the `active` prop to PluginIcon",
+        "In BrowserToolsCard.tsx, compute `hasActiveTool` as `tools.some(t => activeTools.has(`browser:${t.name}`))` and pass it as the `active` prop to PluginIcon",
+        "The activity flash also works in SearchResults (which renders PluginCard and BrowserToolsCard with activeTools — no changes needed there since props flow through)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "This story modifies three files: `PluginIcon.tsx`, `PluginCard.tsx`, and `BrowserToolsCard.tsx`.\n\n## PluginIcon.tsx changes\n\n1. Add `active?: boolean` to `PluginIconProps` (default `false`).\n2. Pass `active` through to `StatusIndicator`.\n3. In `StatusIndicator`, the ready+no-update green dot (lines 64-69) needs to support three visual states:\n   - **Static** (normal): no animation class, full opacity — the current behavior.\n   - **Flashing** (`active` is true): add `animate-activity-flash` class.\n   - **Fading out** (`active` just became false): add `animate-activity-fade-out` class for 500ms, then remove it.\n\nThe fade-out requires tracking the previous `active` value. Use a `useRef` + `useEffect` pattern inside `StatusIndicator` (or lift it to `PluginIcon`):\n```ts\nconst prevActiveRef = useRef(false);\nconst [fadingOut, setFadingOut] = useState(false);\nuseEffect(() => {\n  if (prevActiveRef.current && !active) {\n    setFadingOut(true);\n    const timer = setTimeout(() => setFadingOut(false), 500);\n    return () => clearTimeout(timer);\n  }\n  prevActiveRef.current = active;\n}, [active]);\n```\nThen apply classes:\n- `active && 'animate-activity-flash'`\n- `fadingOut && !active && 'animate-activity-fade-out'`\n\nImport `useState`, `useEffect`, `useRef` from React. `StatusIndicator` will need to become a function body (not an arrow returning JSX directly) to hold hooks. Use `cn()` from `../../lib/cn.js` for conditional class merging.\n\n## PluginCard.tsx changes\n\nAdd before the return:\n```ts\nconst hasActiveTool = pluginTools.some(t => activeTools.has(`${plugin.name}:${t.name}`));\n```\nPass `active={hasActiveTool}` to both `<PluginIcon>` renders (lines 100-108).\n\n## BrowserToolsCard.tsx changes\n\nAdd before the return:\n```ts\nconst hasActiveTool = tools.some(t => activeTools.has(`browser:${t.name}`));\n```\nPass `active={hasActiveTool}` to the `<PluginIcon>` render (lines 118-124)."
+    },
+    {
+      "id": "US-003",
+      "title": "Add activity flash dot to ToolIcon for individual tool invocations",
+      "description": "As a user, I want each tool's icon to show a small green activity dot at the bottom-right corner (like the PluginIcon ready dot) that flashes when that specific tool is being invoked, with the same soft fade-out, so I can see which exact tool is running",
+      "acceptanceCriteria": [
+        "ToolIcon accepts a new optional `active` boolean prop (default false)",
+        "When `active` is true, a small green dot appears at the bottom-right corner of the ToolIcon (positioned absolutely, same style as PluginIcon's status dot: `bg-success border-card rounded-full border-2`, sized proportionally to the 24px icon — about 8px diameter)",
+        "The dot flashes with the `animate-activity-flash` class while active",
+        "When `active` transitions from true to false, the dot soft-fades out using `animate-activity-fade-out` over ~500ms, then is removed from the DOM",
+        "The dot does not appear at all when the tool has never been active (no invisible placeholder — zero layout impact since it's absolutely positioned)",
+        "The ToolIcon container needs `relative` added to its className to support the absolutely-positioned dot",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Edit `platform/browser-extension/src/side-panel/components/ToolIcon.tsx`.\n\nThe ToolIcon is 24x24 (`h-6 w-6`). The activity dot should be ~8px diameter, positioned at `bottom: -2, right: -2` — same pattern as PluginIcon's StatusIndicator for the 32px icon.\n\n1. Add `active?: boolean` to `ToolIconProps` (default `false`).\n2. Add `relative` to the container div's className (currently `flex h-6 w-6 shrink-0 items-center justify-center rounded border-2 transition-colors`).\n3. Use the same `useRef`/`useEffect`/`useState` fade-out pattern from US-002.\n4. Conditionally render the dot when `active || fadingOut`:\n\n```tsx\n{(active || fadingOut) && (\n  <div\n    className={cn(\n      'bg-success border-card absolute rounded-full border-2',\n      active && 'animate-activity-flash',\n      fadingOut && !active && 'animate-activity-fade-out',\n    )}\n    style={{ width: 8, height: 8, bottom: -2, right: -2 }}\n  />\n)}\n```\n\nThe dot is absolutely positioned outside the icon box, so it has zero layout impact — no shift when it appears or disappears. Import `cn` from `../lib/cn.js`, `useState`, `useEffect`, `useRef` from React.\n\nNote: Since ToolIcon now uses hooks, it must become a function body (not a const arrow returning JSX). Convert from `const ToolIcon = (...) => (...)` to `const ToolIcon = (...) => { ... return (...); }`."
+    },
+    {
+      "id": "US-004",
+      "title": "Remove Loader from ToolRow and wire up active prop to ToolIcon",
+      "description": "As a user, I want the old bouncing dots animation removed from tool rows and replaced with the new ToolIcon activity dot, so the activity indication is consistent across the UI",
+      "acceptanceCriteria": [
+        "The `Loader` import is removed from ToolRow.tsx",
+        "The `{active && <Loader .../>}` render is removed from ToolRow.tsx",
+        "The `bg-accent/20` background highlight on active tool rows is removed (the activity dot on the icon is now the sole indicator)",
+        "The `active` prop is passed through to `<ToolIcon active={active} .../>` instead",
+        "The ToolRow still accepts the `active` boolean prop (it passes it to ToolIcon)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Edit `platform/browser-extension/src/side-panel/components/ToolRow.tsx`.\n\nCurrent code (lines 1-49):\n- Line 1: `import { Loader } from './retro/Loader.js';` — **remove this import**\n- Lines 25-29: The `cn()` call includes `active && 'bg-accent/20'` — **remove the active conditional** so the className is just:\n  ```ts\n  cn(\n    'border-border flex items-center gap-2 border-b px-3 py-2 transition-colors last:border-b-0',\n    enabled ? 'hover:bg-primary/10' : 'hover:bg-muted/50',\n  )\n  ```\n- Line 30: `<ToolIcon icon={icon} enabled={enabled} />` — **add `active={active}`**: `<ToolIcon icon={icon} enabled={enabled} active={active} />`\n- Lines 39-47: The right-side `<div className=\"flex shrink-0 items-center gap-2\">` currently contains `{active && <Loader .../>}` and `<Switch>`. **Remove the Loader** render. The `gap-2` in the wrapper can stay (it only affects spacing when there are multiple children, which is now just the Switch — harmless).\n\nAfter this change, ToolRow's `active` prop flows to ToolIcon, which shows the green flashing dot. The Loader is no longer used in ToolRow."
+    },
+    {
+      "id": "US-005",
+      "title": "Update E2E test for tool invocation animation to check activity dot instead of Loader",
+      "description": "As a developer, I want the E2E test that verifies tool invocation animation to check for the new activity dot indicator instead of the old Loader component, so the test suite stays green",
+      "acceptanceCriteria": [
+        "The E2E test in `e2e/side-panel-data-flow.e2e.ts` (the 'shows spinner during tool call and removes it after' test) is updated to check for the activity dot instead of the Loader",
+        "The test verifies that a green dot with the `animate-activity-flash` class appears on the ToolIcon during a tool invocation",
+        "The test verifies the dot disappears (or fades out) after the tool call completes",
+        "The `activeRowLocator` check for `.bg-accent/20` is removed (that class is no longer applied)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Edit `e2e/side-panel-data-flow.e2e.ts`, specifically the test starting at line 355.\n\nCurrent test locators (lines 422-423):\n```ts\nconst loaderLocator = sidePanelPage.locator('[role=\"status\"][aria-label=\"Loading...\"]');\nconst activeRowLocator = sidePanelPage.locator('.bg-accent\\\\/20');\n```\n\nReplace with a locator for the activity dot. The activity dot is a `div` with class `animate-activity-flash` and `bg-success` inside a ToolIcon. A good locator:\n```ts\nconst activityDotLocator = sidePanelPage.locator('.animate-activity-flash');\n```\n\nUpdate the assertions:\n- Line 426: `await expect(loaderLocator).toBeHidden(...)` → `await expect(activityDotLocator).toBeHidden(...)` (or `.toHaveCount(0)` since the dot is not in DOM when inactive)\n- Line 432: `await expect(loaderLocator).toBeVisible(...)` → `await expect(activityDotLocator).toBeVisible(...)`\n- Line 433: Remove the `activeRowLocator` assertion (no more `bg-accent/20` highlight)\n- Line 440: `await expect(loaderLocator).toBeHidden(...)` → `await expect(activityDotLocator).toBeHidden(...)` (after fade-out completes, the dot should not be visible — allow extra timeout for the 500ms fade-out)\n- Line 441: Remove the `activeRowLocator` assertion\n\nAlso update the test title and the file's opening comment (line 6) to reference 'activity dot' instead of 'spinner'.\n\nNote: The activity dot fades out over 500ms after invocationEnd, so the 'hidden' check after tool completion may need a slightly longer timeout (e.g., 12_000 instead of 10_000) to account for the fade-out animation completing."
+    },
+    {
+      "id": "US-006",
+      "title": "Update Storybook stories for ToolRow, ToolIcon, and PluginIcon to showcase activity state",
+      "description": "As a developer, I want Storybook stories updated to showcase the new activity dot behavior on ToolIcon and PluginIcon, and the updated ToolRow without the Loader, so the component library is accurate",
+      "acceptanceCriteria": [
+        "PluginIcon.stories.tsx has a new 'Active' story showing the icon with `active={true}` and `tabState='ready'`",
+        "ToolIcon.stories.tsx has a new 'Active' story showing the icon with `active={true}`",
+        "ToolRow.stories.tsx 'Active' story still works (it passes `active={true}` which now shows via the ToolIcon dot instead of Loader)",
+        "The ToolList story in ToolRow.stories.tsx still shows one active tool (visually confirmed by the green dot on its icon)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Three story files to update:\n\n### PluginIcon.stories.tsx\nAdd after the existing exports:\n```ts\nconst Active: Story = {\n  args: { pluginName: 'slack', displayName: 'Slack', tabState: 'ready', size: 32, active: true },\n};\n```\nAdd `Active` to the exports.\n\n### ToolIcon.stories.tsx\nAdd after the existing exports:\n```ts\nconst Active: Story = { args: { icon: 'send', active: true } };\nconst ActiveDisabled: Story = { args: { icon: 'send', enabled: false, active: true } };\n```\nAdd to exports. Also update the Gallery story to include one active icon in the row.\n\n### ToolRow.stories.tsx\nThe existing `Active` story at line 25 (`args: { ...Enabled.args, active: true }`) should still work since `active` still flows through ToolRow to ToolIcon. No changes needed beyond verifying it compiles.\n\nThe `ToolList` story at line 46 already has `active={t.name === 'search'}` on one row — this should now show the green dot on the Search tool's icon instead of the old Loader dots.\n\nAll existing stories should continue to work without modification since the `active` prop still exists on ToolRow."
+    }
+  ]
+}
