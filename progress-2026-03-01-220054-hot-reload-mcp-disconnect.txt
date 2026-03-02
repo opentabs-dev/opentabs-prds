@@ -1,0 +1,48 @@
+# Ralph Progress Log
+PRD: prd-2026-03-01-220054-hot-reload-mcp-disconnect~running.json
+Started: Mon Mar  2 06:01:25 UTC 2026
+---
+
+## Codebase Patterns
+- The dev proxy lives in `platform/mcp-server/src/dev-proxy.ts` and is both a build artifact entry point and a source file
+- MCP Streamable HTTP uses session IDs via `mcp-session-id` header; the client POSTs initialize, GETs SSE stream, POSTs tool calls
+- The proxy forks `dist/index.js` as a worker with PORT=0 and detects ready via IPC `{ type: 'ready', port: N }` message
+- Worker restarts are triggered by SIGUSR1 (test fixtures) or fs.watch on dist/ (tsc compilation)
+- The E2E test fixture `createMcpClient` already has auto-reinitialize logic for session loss (400/502/503 retry)
+- `req.headers.authorization` and `req.headers.accept` are `string | undefined` in Node IncomingMessage (known headers)
+- Import order must follow ESLint import-x/order: external packages first, then node: modules in alphabetical order
+
+## 2026-03-02 06:10 - US-001
+- Implemented MCP session persistence in the dev proxy (`platform/mcp-server/src/dev-proxy.ts`)
+- The proxy now:
+  1. Assigns stable proxy session IDs decoupled from worker session IDs
+  2. Tracks the original initialize request body for session replay
+  3. On worker restart, re-initializes all tracked sessions with the new worker
+  4. Holds client-facing SSE responses open and reconnects upstream SSE streams
+  5. Rewrites `mcp-session-id` headers transparently in both directions
+- Files changed: `platform/mcp-server/src/dev-proxy.ts`
+- **Learnings for future iterations:**
+  - The `ProxySession` tracks: proxySessionId, workerSessionId, initializeBody, sseStreams (Set<ServerResponse>), authHeader
+  - `reinitializeSessions()` is called when the worker reports ready (before `drainPending()`)
+  - `connectUpstreamSse()` opens an HTTP GET to the worker's `/mcp` with the worker session ID and forwards chunks to the client response
+  - The upstream SSE stream's `end`/`error` events do NOT close the client response — this is the key to surviving worker restarts
+  - Session cleanup happens when the client disconnects (SSE `close` event) or when re-initialization fails
+---
+
+## 2026-03-02 06:25 - US-002
+- Added E2E test file `e2e/mcp-session-persistence.e2e.ts` with 5 tests covering MCP session persistence across hot reloads
+- Test 1: Single hot reload — verifies tools/list works without client re-initialization, confirms proxy logs "Re-initializing"
+- Test 2: Multiple sequential hot reloads (3x) — verifies session survives repeated restarts
+- Test 3: Multiple concurrent MCP clients — verifies proxy re-initializes all sessions (checks "2 MCP session" in log)
+- Test 4: End-to-end tool dispatch with extension — full stack relay after hot reload (MCP → proxy → worker → extension → adapter)
+- Test 5: In-flight tool call during hot reload — verifies recovery and subsequent calls succeed
+- All Phase 1 checks pass (build, type-check, lint, knip, test: 2920 passed)
+- All Phase 2 checks pass (test:e2e: 432 passed including new tests)
+- Files changed: `e2e/mcp-session-persistence.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - The `e2e/tsconfig.json` uses `include: ["*.ts"]` which auto-includes new test files without configuration
+  - Tests using fixtures (`mcpServer`, `testServer`, `extensionContext`, `mcpClient`) go in `test.describe.serial()` blocks; standalone tests use manual `createTestConfigDir()` + `startMcpServer()` + cleanup
+  - The proxy logs "Re-initializing N MCP session(s)" during hot reload — useful for verifying session persistence in tests
+  - `waitForToolResult` is the right polling primitive after hot reload to confirm end-to-end readiness (polls tool call until expected result)
+  - The `test.slow()` marker doubles the test timeout — use for tests that involve hot reloads + extension reconnection
+---
