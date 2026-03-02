@@ -18,7 +18,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "Root cause: In `platform/mcp-server/src/browser-tools/analyze-site/index.ts`, the `analyzeSite` function at line 808 calls `dispatchToExtension(state, 'browser.openTab', { url: 'about:blank' })`. The result validation (lines 809-817) and `tabId` extraction (line 818) happen BEFORE the `try` block at line 820. If the dispatch succeeds (a real tab is opened in the browser) but the result has an unexpected shape (e.g., `id` is not a number), the validation throws at line 814. Since this throw happens before the `try` block, the `finally` block (which closes the tab at ~line 1032) never executes. The tab remains open in the browser as an orphan.\n\nFix: Move the openTab call and result validation inside the try block. Use a `let tabId: number | null = null` declared before the try, assign it after validation succeeds, and make the finally block conditional on `tabId !== null` for the closeTab call.\n\nStructure should be:\n```\nlet tabId: number | null = null;\ntry {\n  const openResult = await dispatchToExtension(state, 'browser.openTab', { url: 'about:blank' });\n  // validate openResult\n  tabId = (openResult as { id: number }).id;\n  // ... rest of analysis ...\n} finally {\n  if (tabId !== null) {\n    // existing cleanup: disable network capture, close tab\n  }\n}\n```\n\nBe careful to preserve the existing cleanup logic in the finally block — it already handles `disableNetworkCapture` (best-effort) and `closeTab`. The only change is making the cleanup conditional on `tabId !== null` and moving the openTab + validation inside the try.\n\nFile to modify: `platform/mcp-server/src/browser-tools/analyze-site/index.ts`"
@@ -37,7 +37,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "Root cause: In `platform/mcp-server/src/plugin-management.ts` line 426, the directory name is extracted with `resolvedPath.split('/').pop()`. On Windows, `resolve()` produces paths with backslashes (e.g., `C:\\Users\\foo\\plugin`), so `split('/')` would not split correctly — `pop()` would return the entire path string instead of just the directory name. This means the directory name matching on lines 429-432 would never match on Windows.\n\nFix: Import `basename` from `node:path` (which is already imported in the file — check the imports at the top) and replace `resolvedPath.split('/').pop() ?? ''` with `basename(resolvedPath)`. The `basename` function handles both forward and backslash separators on all platforms.\n\nFile to modify: `platform/mcp-server/src/plugin-management.ts` — line 426\n\nCheck the existing imports at the top of the file. If `basename` is not yet imported from `node:path`, add it to the existing import statement. If `path` functions are already imported (e.g., `resolve`, `join`), just add `basename` to that import.\n\nThis is a one-line fix: change `const dirName = resolvedPath.split('/').pop() ?? '';` to `const dirName = basename(resolvedPath);`"
