@@ -1,0 +1,55 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add Chrome desktop notification when a browser tool confirmation dialog is pending, so users notice the approval request even when focused on another window (like the terminal). The side panel dialog times out silently after 30 seconds, causing AI agents to fail when users don't notice.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Show Chrome desktop notification when confirmation is pending",
+      "description": "As a user running AI agents that use browser tools, I want a Chrome desktop notification when a confirmation dialog is waiting for my approval so I don't miss it while focused on the terminal",
+      "acceptanceCriteria": [
+        "When a confirmation.request arrives and the side panel is not focused, a Chrome desktop notification is shown",
+        "The notification title is 'OpenTabs — Approval Required'",
+        "The notification body includes the tool name and domain (if present), e.g. 'browser_navigate_tab on discord.com'",
+        "Clicking the notification opens/focuses the side panel",
+        "The notification is automatically dismissed when the user responds to the confirmation (allow, deny, or timeout)",
+        "If the side panel IS focused when the confirmation arrives, no desktop notification is shown (the dialog is already visible)",
+        "Multiple pending confirmations show a single notification with a count, e.g. '3 tools awaiting approval'",
+        "The notification uses the OpenTabs extension icon",
+        "The notification does not play a sound by default (Chrome's default notification sound behavior is acceptable)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The confirmation badge logic already exists in `platform/browser-extension/src/confirmation-badge.ts`. This file manages badge counts on the extension icon and has a fallback timeout for when the side panel is closed.\n\nThe key function is `trackConfirmationRequest()` (line 54) which is called from `message-router.ts` when a `confirmation.request` arrives. This is the right place to add `chrome.notifications.create()`.\n\nImplementation:\n1. In `trackConfirmationRequest()`, after setting the badge, call `chrome.notifications.create()` with:\n   - `notificationId`: `'opentabs-confirmation-' + id` (so we can dismiss it later)\n   - `type`: `'basic'`\n   - `title`: `'OpenTabs — Approval Required'`\n   - `message`: `tool + (domain ? ' on ' + domain : '')`\n   - `iconUrl`: path to the extension icon\n\n2. Add a `chrome.notifications.onClicked` listener that opens the side panel when the notification is clicked. Use `chrome.sidePanel.open()` or `chrome.sidePanel.setOptions({ enabled: true })` + focus.\n\n3. When a confirmation is resolved (allow/deny/timeout), call `chrome.notifications.clear(notificationId)` to dismiss the notification. The `clearConfirmationBadge()` function (line 134) is the right place for this.\n\n4. For multiple pending confirmations, update the existing notification instead of creating new ones. Use `chrome.notifications.update()` with an updated count.\n\nIMPORTANT: Check if the extension has the `notifications` permission in `manifest.json`. If not, add it. Also check if `chrome.notifications` is available in the MV3 service worker context (it should be).\n\nFor detecting if the side panel is focused: the side panel sends `sp:panelOpened` and `sp:panelClosed` messages to the background script. Track this state and skip the desktop notification when the panel is open."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E test for confirmation desktop notification",
+      "description": "As a platform developer, I want automated tests verifying that desktop notifications are shown for pending confirmations",
+      "acceptanceCriteria": [
+        "E2E test triggers a browser tool that requires confirmation",
+        "E2E test verifies a Chrome notification was created with the correct title and message",
+        "E2E test verifies the notification is cleared when the confirmation is resolved",
+        "E2E test verifies no notification is shown when the side panel is focused",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "E2E testing Chrome notifications with Playwright is tricky. Options:\n\n1. **Unit test the notification logic** in `confirmation-badge.test.ts` by mocking `chrome.notifications.create/clear/update`. This is the most reliable approach.\n\n2. **E2E test with Playwright**: Playwright can grant notification permissions via `context.grantPermissions(['notifications'])` but intercepting Chrome extension notifications requires the `--auto-open-devtools-for-tabs` flag or checking `chrome.notifications.getAll()` via `chrome.scripting.executeScript` in the extension context.\n\nThe unit test approach (option 1) is recommended for reliability. The E2E test should focus on the end-to-end flow: trigger a tool that needs confirmation → verify the confirmation appears in the side panel → respond to it → verify the tool succeeds."
+    }
+  ]
+}
