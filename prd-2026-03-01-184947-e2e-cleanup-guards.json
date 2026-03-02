@@ -1,0 +1,88 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add .catch(() => {}) guards to sequential cleanup calls in E2E test finally blocks so that a thrown error from one cleanup call (e.g., context.close() on a crashed browser) does not prevent subsequent cleanup of server processes and temp directories.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Guard cleanup calls in helpers.ts setupIsolatedIifeTest",
+      "description": "As a platform contributor, I want the setupIsolatedIifeTest cleanup function to guard each async call so that a crash in one cleanup step does not skip the remaining steps.",
+      "acceptanceCriteria": [
+        "The cleanup() function returned by setupIsolatedIifeTest wraps each async cleanup call (client.close, context.close, server.kill, testServer.kill) with .catch(() => {}) so that if any single call throws, the remaining cleanup calls still execute",
+        "The existing catch block at lines 444-452 (which already uses .catch(() => {}) guards) is left unchanged",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: e2e/helpers.ts, lines 433-441.\n\nThe cleanup() function chains 5 async calls sequentially without guards:\n```\nconst cleanup = async () => {\n  await client.close();\n  await finalContext.close();\n  await finalServer.kill();\n  await finalTestSrv.kill();\n  fs.rmSync(tmpDir, { recursive: true, force: true });\n  ...\n};\n```\n\nIf `finalContext.close()` throws (e.g., Chromium crashed), `finalServer.kill()` and `finalTestSrv.kill()` are never called, leaving orphaned Node processes. The temp directories also leak.\n\nThe fix: wrap each async call with .catch(() => {}). The existing catch block on lines 444-452 already does this correctly — follow the same pattern for the happy-path cleanup.\n\nFixed cleanup should look like:\n```\nconst cleanup = async () => {\n  await client.close();\n  await finalContext.close().catch(() => {});\n  await finalServer.kill();\n  await finalTestSrv.kill();\n  fs.rmSync(tmpDir, { recursive: true, force: true });\n  fs.rmSync(finalCleanupDir, { recursive: true, force: true });\n  cleanupTestConfigDir(configDir);\n};\n```\n\nNote: client.close() and server.kill()/testSrv.kill() already have internal try/catch guards (verified in fixtures.ts), so they never throw. The only call that can throw is context.close() (Playwright BrowserContext.close). Adding .catch(() => {}) to context.close() is sufficient, but adding it to all async calls is defensive and consistent with the catch block pattern.\n\nDo NOT modify the catch block on lines 444-452 — it is already correct."
+    },
+    {
+      "id": "US-002",
+      "title": "Guard cleanup calls in side-panel-data-flow and side-panel-icons tests",
+      "description": "As a platform contributor, I want the manually-managed finally blocks in side-panel-data-flow.e2e.ts and side-panel-icons.e2e.ts to guard cleanup calls so orphaned processes are not left running when Chromium crashes during a test.",
+      "acceptanceCriteria": [
+        "Every finally block in side-panel-data-flow.e2e.ts wraps context.close() with .catch(() => {}) to prevent subsequent server.kill() and testServer.kill() from being skipped",
+        "Every finally block in side-panel-icons.e2e.ts wraps context.close() with .catch(() => {}) to prevent subsequent server.kill() from being skipped",
+        "All existing cleanup calls (server.kill, testServer.kill, fs.rmSync, cleanupTestConfigDir) remain in the same order",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- e2e/side-panel-data-flow.e2e.ts — 2 finally blocks (around lines 340 and 448)\n- e2e/side-panel-icons.e2e.ts — 2 finally blocks (around lines 94 and 170+)\n\nThe pattern in each finally block looks like:\n```\n} finally {\n  await context.close();      // can throw if browser crashed\n  await server.kill();\n  await testServer.kill();\n  fs.rmSync(cleanupDir, { recursive: true, force: true });\n  cleanupTestConfigDir(configDir);\n}\n```\n\nFix: Add .catch(() => {}) to the `await context.close()` call:\n```\n} finally {\n  await context.close().catch(() => {});\n  await server.kill();\n  ...\n}\n```\n\nAlso add .catch(() => {}) to `await mcpClient.close()` where it appears before context.close() in the side-panel-data-flow.e2e.ts animation test (line 449) — mcpClient.close() is already internally guarded but adding the catch is consistent.\n\nDo NOT change the order of cleanup calls or add/remove any cleanup steps. The fix is purely adding .catch(() => {}) guards."
+    },
+    {
+      "id": "US-003",
+      "title": "Guard cleanup calls in side-panel-plugin-toggle and side-panel-reload tests",
+      "description": "As a platform contributor, I want the manually-managed finally blocks in side-panel-plugin-toggle.e2e.ts and side-panel-reload.e2e.ts to guard cleanup calls so orphaned processes are not left running when Chromium crashes during a test.",
+      "acceptanceCriteria": [
+        "Every finally block in side-panel-plugin-toggle.e2e.ts wraps context.close() with .catch(() => {}) to prevent subsequent server.kill() and testServer.kill() from being skipped",
+        "Every finally block in side-panel-reload.e2e.ts wraps context.close() with .catch(() => {}) to prevent subsequent server.kill() from being skipped",
+        "All existing cleanup calls remain in the same order",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- e2e/side-panel-plugin-toggle.e2e.ts — 4 finally blocks (around lines 112, 204, 309, 433)\n- e2e/side-panel-reload.e2e.ts — 4 finally blocks (around lines 94, 137, 176, 230)\n\nSame pattern as US-002. Each finally block chains:\n```\nawait context.close();  // can throw\nawait server.kill();\n...\n```\n\nFix: `await context.close().catch(() => {});`\n\nAlso guard `await mcpClient.close()` where it appears (side-panel-plugin-toggle.e2e.ts lines 205, 310, 434).\n\nDo NOT change the order of cleanup calls or add/remove any cleanup steps."
+    },
+    {
+      "id": "US-004",
+      "title": "Guard cleanup calls in remaining side-panel and tab-state-sync tests",
+      "description": "As a platform contributor, I want the manually-managed finally blocks in side-panel-live-update.e2e.ts, side-panel-port-change.e2e.ts, onboarding.e2e.ts, and tab-state-sync.e2e.ts to guard cleanup calls so orphaned processes are not left running when Chromium crashes during a test.",
+      "acceptanceCriteria": [
+        "Every finally block in side-panel-live-update.e2e.ts wraps context.close() with .catch(() => {})",
+        "Every finally block in side-panel-port-change.e2e.ts wraps context.close() with .catch(() => {})",
+        "Every finally block in onboarding.e2e.ts wraps context?.close() with .catch(() => {})",
+        "The finally block in the tab-state-sync.e2e.ts server restart test wraps context.close() with .catch(() => {})",
+        "All existing cleanup calls remain in the same order",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Files:\n- e2e/side-panel-live-update.e2e.ts — 2 finally blocks (around lines 95 and 139)\n- e2e/side-panel-port-change.e2e.ts — 1 finally block (around line 75+)\n- e2e/onboarding.e2e.ts — 4 finally blocks (around lines 71, 119, 155, 204). Note: these use optional chaining `await context?.close()` — change to `await context?.close().catch(() => {})`\n- e2e/tab-state-sync.e2e.ts — 1 finally block in the server restart test (around line 416). Pattern: `await context.close();`\n\nSame fix pattern as previous stories: wrap `context.close()` (or `context?.close()`) with `.catch(() => {})`.\n\nFor onboarding.e2e.ts, note the optional chaining: `await context?.close().catch(() => {})` is valid JS — if context is undefined, the expression short-circuits to undefined and .catch is never called.\n\nDo NOT change the order of cleanup calls or add/remove any cleanup steps. The fix is purely adding .catch(() => {}) guards."
+    }
+  ]
+}
