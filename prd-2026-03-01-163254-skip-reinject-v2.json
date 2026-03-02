@@ -1,0 +1,73 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Skip adapter re-injection on sync.full when the adapter is already present and its content hash matches. Eliminates Chrome executeScript pipeline saturation during WebSocket reconnects that causes isReady() timeout warnings. Also fixes the __hash vs __adapterHash bug in extension.checkAdapter with a shared constant to prevent regression.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Extract __adapterHash property name into a shared constant and fix the bug in extension.checkAdapter",
+      "description": "As a developer, I want the adapter hash property name to be defined in one place so that typos like __hash vs __adapterHash cannot happen again, and I want the extension.checkAdapter diagnostic to correctly report hash match status.",
+      "acceptanceCriteria": [
+        "A constant (e.g., ADAPTER_HASH_PROP = '__adapterHash') is defined in a single location within the browser extension source",
+        "The build tool's hashAndFreeze snippet in platform/plugin-tools/src/commands/build.ts references or documents this constant name",
+        "extension-commands.ts line 236 reads adapter.__adapterHash (not adapter.__hash)",
+        "readAdapterHash in iife-injection.ts uses the same property name (already correct, just verify)",
+        "The unit test for handleExtensionCheckAdapter verifies that the executeScript func callback references the correct property name — either by testing the func's source text contains '__adapterHash', or by extracting the property read into a testable helper",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The bug: `platform/browser-extension/src/browser-commands/extension-commands.ts:236` reads `adapter.__hash` but the build tool (`platform/plugin-tools/src/commands/build.ts`) sets the property as `adapter.__adapterHash`. The `readAdapterHash` function in `iife-injection.ts:67-85` already correctly reads `__adapterHash`.\n\nThe root cause is that the property name is a magic string duplicated across three locations: (1) build.ts hashAndFreeze snippet, (2) readAdapterHash in iife-injection.ts, (3) extension-commands.ts checkAdapter. Location 3 had a typo.\n\nFix approach:\n1. Create a constant like `ADAPTER_HASH_PROP = '__adapterHash'` in a shared location within the browser extension (e.g., `constants.ts`). The build tool in plugin-tools is a separate package so it cannot import from browser-extension — add a comment in build.ts referencing the canonical constant.\n2. Use the constant in `readAdapterHash` (iife-injection.ts) and the checkAdapter func (extension-commands.ts).\n3. For the `chrome.scripting.executeScript` func callbacks: these are serialized closures that cannot reference module-scope variables. The constant CANNOT be used inside the `func` directly. Two options:\n   - Option A: Pass the constant as an additional arg to executeScript (alongside pluginName). The func receives it as a parameter.\n   - Option B: Keep the string literal inside the func but add a unit test that verifies the func source contains '__adapterHash' (not '__hash'). This is hacky but catches typos.\n   - Option C (recommended): Extract the hash-reading logic into a dedicated function (like `readAdapterHash` already does for iife-injection.ts). The checkAdapter can call `readAdapterHash(tabId, pluginName)` instead of duplicating the executeScript call. This eliminates the duplication entirely.\n\nOption C is best — `readAdapterHash` already exists and does exactly what checkAdapter needs. The checkAdapter func at line 215-242 currently does TWO things in one executeScript call: (1) checks adapter presence + reads hash + counts tools, and (2) is a separate executeScript for isReady. Splitting the hash read into a call to `readAdapterHash` adds one more executeScript but eliminates the property name duplication.\n\nHowever, be careful: the current executeScript func also returns `adapterPresent`, `toolCount`, and `toolNames` — not just the hash. So you can't simply replace the whole func with `readAdapterHash`. Instead, fix the property name in the func AND add the constant for documentation/grep-ability.\n\nFor test coverage: The existing test at `extension-commands.test.ts:198-201` mocks `executeScript` and returns hardcoded `{ adapterPresent: true, adapterHash: 'abc' }`. This mock bypasses the actual func entirely. To actually test the property name, you'd need to either:\n- Test the func source code (fragile)\n- Use the E2E tests (US-003 covers this)\n- Extract the property access into a testable helper that both the func and tests can verify\n\nThe pragmatic approach: fix the bug, add the constant for grep-ability, and rely on E2E test in US-003 to verify the full chain works."
+    },
+    {
+      "id": "US-002",
+      "title": "Skip adapter re-injection in handleSyncFull when adapter hash matches",
+      "description": "As a user switching ports or reconnecting, I want the extension to skip adapter re-injection when the adapter code hasn't changed so that the isReady() probe runs quickly without Chrome executeScript pipeline saturation.",
+      "acceptanceCriteria": [
+        "handleSyncFull does not unconditionally force re-inject all plugins",
+        "For each plugin in sync.full, the extension checks if the adapter is already present AND its __adapterHash matches the adapterHash from the sync.full payload",
+        "If both match, injection is skipped entirely (no prepareForReinjection, no injectLogRelay, no IIFE injection, no hash verification)",
+        "If adapter is missing OR hash differs OR adapterHash is not provided (legacy plugin), full injection proceeds as before",
+        "handlePluginUpdate continues to always force re-inject regardless of hash (plugin code actually changed — must not be skipped)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "This is the core optimization. Previous ralph attempt (archived) added a `skipIfHashMatches` parameter to `injectPluginIntoMatchingTabs`. That approach is sound.\n\nKey files:\n- `platform/browser-extension/src/message-router.ts:282-284` — handleSyncFull calls `injectPluginIntoMatchingTabs` with `forceReinject=true`\n- `platform/browser-extension/src/iife-injection.ts` — `injectPluginIntoMatchingTabs` function (line 328+)\n- `platform/browser-extension/src/iife-injection.ts:67-85` — `readAdapterHash` already exists\n\nDesign: Add a parameter to `injectPluginIntoMatchingTabs` (e.g., `skipIfHashMatches?: string`) that, when provided, checks `readAdapterHash(tabId, pluginName) === skipIfHashMatches` before injecting. If match, skip. If no match or readAdapterHash fails/returns undefined, proceed with full injection.\n\nCall sites:\n- `handleSyncFull` (message-router.ts:284): pass `skipIfHashMatches: meta.adapterHash` (when available)\n- `handlePluginUpdate` (message-router.ts:~314): do NOT pass skipIfHashMatches — always force re-inject. This is critical because `plugin.update` means the code changed.\n- `reinjectStoredPlugins` (iife-injection.ts:495): uses `forceReinject=false`, no change needed\n- `injectPluginsIntoTab` (iife-injection.ts:381): uses presence check, no change needed\n\nIMPORTANT: The previous attempt had an E2E failure because the hash-based skip was too broad (applied to plugin.update too). The embedded __adapterHash is computed from the core IIFE BEFORE the hashAndFreeze snippet is appended. When the plugin-tools build adds the hash snippet, the resulting file has different content but the embedded hash stays the same. So plugin.update can send a hash matching the tab even when the file changed. The `skipIfHashMatches` parameter must ONLY be used by handleSyncFull, never by handlePluginUpdate.\n\nNote: The previous PRD also had `verifyAdapterVersion` in the injection pipeline, but commit 1d93b8e3 already removed version plumbing from the injection pipeline. So the current code has fewer executeScript calls per injection than before. Verify the current injection flow before counting calls."
+    },
+    {
+      "id": "US-003",
+      "title": "Add E2E test verifying hash-based skip on reconnect and extension.checkAdapter hash accuracy",
+      "description": "As a developer, I want E2E tests that verify (1) adapter re-injection is skipped on reconnect when the hash matches, and (2) extension.checkAdapter reports hashMatch: true for correctly injected adapters.",
+      "acceptanceCriteria": [
+        "E2E test verifies that after initial connection + sync.full, a simulated reconnect (extension.forceReconnect or equivalent) does NOT re-inject the adapter when the hash hasn't changed",
+        "E2E test verifies extension.checkAdapter returns hashMatch: true for a correctly injected adapter",
+        "E2E test verifies extension.checkAdapter returns the correct adapterHash value (not null) for an injected adapter",
+        "E2E test verifies tools still work after a reconnect where injection was skipped",
+        "All existing E2E tests continue to pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "This story adds E2E coverage for both the hash-based skip (US-002) and the __adapterHash fix (US-001). E2E tests run in a real Chrome instance so they exercise the actual executeScript func callbacks — unlike unit tests which mock executeScript.\n\nExisting E2E infrastructure:\n- `e2e/helpers/` contains test harness (MCP server, extension, browser setup)\n- `e2e/lifecycle-hooks.e2e.ts` tests onActivate/onDeactivate/onNavigate lifecycle hooks\n- The e2e-test plugin (`e2e/fixtures/e2e-test-plugin/`) implements lifecycle hooks and sets global markers\n\nFor the hash-based skip test:\n1. After initial connection, the e2e-test adapter sets `__opentabs_activated = true` marker\n2. Clear the marker (set to false)\n3. Trigger a reconnect (e.g., via `extension.forceReconnect`)\n4. After reconnect + sync.full, check that `__opentabs_activated` is still false — proving onActivate did NOT fire again (adapter was not re-injected)\n5. Verify tools still work by dispatching a tool call\n\nFor the extension.checkAdapter test:\n1. After initial connection, call `extension.checkAdapter` for the e2e-test plugin\n2. Assert `adapterPresent: true`, `adapterHash` is a non-null string, and `hashMatch: true`\n\nCheck if `e2e/lifecycle-hooks.e2e.ts` already has reconnect tests. If so, extend them. If not, add a new test in an appropriate E2E file.\n\nBe careful with test isolation — the E2E test infrastructure may restart the server between tests. Make sure the reconnect test doesn't interfere with other tests."
+    }
+  ]
+}
