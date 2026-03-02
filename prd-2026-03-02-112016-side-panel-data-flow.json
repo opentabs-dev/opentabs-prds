@@ -1,0 +1,233 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Redesign the side panel data flow so the background script is the single API surface for the side panel. The side panel never communicates with the MCP server directly — it only talks to the background script. The background script owns browser state (tab readiness, adapter injection) firsthand and caches server-owned state (tool config, browser tool policy, failed plugins, server version) received via sync.full and push notifications. The MCP server remains the source of truth for registry/config data, but the background script mediates all access. This eliminates the config.getState round-trip on startup, unblocks plugins.changed from sendTabSyncAll, and ensures state changes propagate instantly to the side panel.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add server state cache to background script",
+      "description": "As a platform developer, I want the background script to cache server-owned state (tool enabled/disabled, browser tool enabled/disabled, failed plugins, server version, plugin source, sdkVersion, update info) so the side panel can read it locally without an MCP server round-trip.",
+      "acceptanceCriteria": [
+        "A new module `platform/browser-extension/src/server-state-cache.ts` exports functions: `getServerStateCache()`, `updateServerStateCache(partial)`, `clearServerStateCache()`",
+        "The cache stores: plugins (with tool enabled states, source, sdkVersion, update info), failedPlugins, browserTools (with enabled state), serverVersion",
+        "The cache shape matches ConfigStateResult from @opentabs-dev/shared so there is no translation layer",
+        "Cache is in-memory (Map/object) — no chrome.storage persistence needed since it is rebuilt from sync.full on every connection",
+        "clearServerStateCache() is called from handleWsState when connected=false (alongside existing clearTabStateCache)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "This is a new module. The cache shape should mirror ConfigStateResult from `platform/shared/src/wire-types.ts` (search for `ConfigStateResult`). The cache is populated in US-002 and US-003. For now just create the module with the get/update/clear functions and the TypeScript types. Wire the clear call into `handleWsState` in `platform/browser-extension/src/background-message-handlers.ts` — add `clearServerStateCache()` right after the existing `clearTabStateCache()` call on line 84. Import from the new module."
+    },
+    {
+      "id": "US-002",
+      "title": "Populate server state cache from sync.full",
+      "description": "As a platform developer, I want the background script to populate the server state cache when sync.full arrives so that server-owned data (tool enabled states, plugin source, etc.) is available locally without a round-trip.",
+      "acceptanceCriteria": [
+        "handleSyncFull in message-router.ts calls updateServerStateCache() with plugin data extracted from the sync.full payload",
+        "The sync.full payload already contains tool enabled states (via validatePluginPayload) — these are stored in the cache",
+        "Server-only fields not in sync.full (failedPlugins, browserTools enabled state, serverVersion, source, sdkVersion, update) are NOT populated here — they come from a one-time config.getState fetch (US-004) or future push notifications",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "In `platform/browser-extension/src/message-router.ts`, `handleSyncFull` (line 235) already validates and stores plugin metadata via `storePluginsBatch`. After that call, also call `updateServerStateCache({ plugins: ... })` with the plugin data mapped to the ConfigStateResult plugin shape. The sync.full payload has: name, version, displayName, urlPatterns, trustTier, iconSvg, iconInactiveSvg, tools (with name, displayName, description, icon, enabled). What sync.full does NOT have: source, sdkVersion, update, tabState — these fields should be omitted or set to defaults. The cache update should happen BEFORE the `plugins.changed` notification to the side panel so the side panel can read fresh data."
+    },
+    {
+      "id": "US-003",
+      "title": "Populate server state cache from plugins.changed push with full payload",
+      "description": "As a platform developer, I want the MCP server to include full ConfigStateResult data in plugins.changed notifications, and the background script to update its cache from this payload, so that tool toggles, plugin install/remove, and browser tool changes are reflected instantly without a round-trip.",
+      "acceptanceCriteria": [
+        "In the MCP server extension-handlers.ts, every place that sends `plugins.changed` now includes the full ConfigStateResult payload in the params (same shape as config.getState response)",
+        "The background script's message-router.ts intercepts plugins.changed in handleServerMessage before forwarding to the side panel, extracts the payload, and calls updateServerStateCache()",
+        "This covers: handleConfigSetBrowserToolEnabled, handleConfigSetAllBrowserToolsEnabled, handlePluginInstall, handlePluginUpdateFromRegistry, handlePluginRemove (all in extension-handlers.ts) and the sync.full post-reload notification in extension-protocol.ts",
+        "The side panel receives plugins.changed as before (it is still in SIDE_PANEL_METHODS), but the background cache is already updated before the side panel processes it",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "In `platform/mcp-server/src/extension-handlers.ts`, the `sendToExtension(state, { jsonrpc: '2.0', method: 'plugins.changed', params: {} })` calls (lines ~427, 461, 674, 701, 736) should include the full state. Extract the config.getState response building logic from `handleConfigGetState` (line 273) into a shared helper (e.g., `buildConfigStatePayload(state)`) and use it in both places. The plugins.changed params should be: `{ plugins, failedPlugins, browserTools, serverVersion }` — the same shape as the config.getState result. In `platform/browser-extension/src/message-router.ts`, in `handleServerMessage` (line 451), when forwarding a `plugins.changed` message, extract `params` and call `updateServerStateCache()` before the `forwardToSidePanel` call. Also check `platform/mcp-server/src/extension-protocol.ts` for any additional places that send plugins.changed (e.g., after reload)."
+    },
+    {
+      "id": "US-004",
+      "title": "Add bg:getFullState handler as the single API for side panel initial state",
+      "description": "As a side panel developer, I want to call a single bg:getFullState message to the background script and receive all state (plugins with tab states, browser tools, failed plugins, server version, connection status) from one source so I never need to talk to the MCP server directly.",
+      "acceptanceCriteria": [
+        "A new bg:getFullState message type is added to extension-messages.ts InternalMessage union",
+        "A new handler in background-message-handlers.ts responds with: { connected, disconnectReason, plugins (merged from metaCache + lastKnownState + serverStateCache), failedPlugins, browserTools, serverVersion }",
+        "Each plugin in the response has: name, version, displayName, urlPatterns, trustTier, iconSvg, iconInactiveSvg, tools (with enabled state from server cache), tabState (from lastKnownState), source, sdkVersion, update — all merged from the three local caches",
+        "If the server state cache is empty (e.g., sync.full hasn't arrived yet), plugins are still returned from metaCache with tool enabled defaults and tabState from lastKnownState",
+        "The handler is synchronous from the side panel's perspective — it reads only in-memory/chrome.storage.local data, no WebSocket round-trip",
+        "The message type is added to EXTENSION_ONLY_TYPES set",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "This is the key architectural change. The handler merges three data sources: (1) `getAllPluginMeta()` from `platform/browser-extension/src/plugin-storage.ts` — plugin metadata with tools list, (2) `getLastKnownStates()` from `platform/browser-extension/src/tab-state.ts` — per-plugin tab state (parse the serialized JSON to get `{ state, tabs }`), (3) `getServerStateCache()` from the new server-state-cache.ts — tool enabled states, source, sdkVersion, update, browserTools, failedPlugins, serverVersion. The merge logic: for each plugin in metaCache, look up its tool enabled states from serverStateCache (if available, otherwise default enabled=true), look up its tabState from lastKnownState (if available, otherwise 'closed'), and include source/sdkVersion/update from serverStateCache. Also include the `connected` and `disconnectReason` from the existing in-memory state (wsConnected, lastDisconnectReason — these are already module-level variables in background-message-handlers.ts). Note: `getAllPluginMeta()` is async (reads chrome.storage.local on first call), so the handler must be async. Add the message type to `extension-messages.ts` and to the `EXTENSION_ONLY_TYPES` set in background-message-handlers.ts. The response shape should match what the side panel currently expects from fetchConfigState() plus getConnectionState() combined."
+    },
+    {
+      "id": "US-005",
+      "title": "Rewrite side panel bridge and App.tsx to use bg:getFullState",
+      "description": "As a user, I want the side panel to load instantly from the background script's local state so that plugins show up immediately when I open the side panel, with tab states filling in progressively.",
+      "acceptanceCriteria": [
+        "bridge.ts: fetchConfigState() is removed. A new getFullState() function sends bg:getFullState and returns the merged result",
+        "bridge.ts: The sendRequest/handleServerResponse/rejectAllPending JSON-RPC relay infrastructure is removed — the side panel no longer sends JSON-RPC requests to the MCP server",
+        "bridge.ts: setToolEnabled, setAllToolsEnabled, setBrowserToolEnabled, setAllBrowserToolsEnabled now send new bg:* messages instead of JSON-RPC via sendRequest",
+        "bridge.ts: searchPlugins, installPlugin, removePlugin, updatePlugin now send new bg:* messages instead of JSON-RPC via sendRequest",
+        "App.tsx startup: calls getFullState() instead of getConnectionState() + fetchConfigState(). Single call, single response, renders immediately",
+        "App.tsx: plugins.changed handler calls getFullState() to refresh (background cache is already updated by US-003)",
+        "App.tsx: tab.stateChanged handler continues to work as-is (already pushed directly by background)",
+        "App.tsx: sp:connectionState handler on disconnect clears state as before; on reconnect calls getFullState()",
+        "App.tsx: the sp:serverMessage listener is simplified — it only handles tab.stateChanged, tool.invocationStart, tool.invocationEnd, and confirmation.request (no more handleServerResponse for JSON-RPC correlation)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "This is the largest story but is focused on one concern: rewiring the side panel to talk only to the background script. Key changes to bridge.ts: (1) Remove sendRequest, handleServerResponse, rejectAllPending, pendingRequests map, REQUEST_TIMEOUT_MS — the entire JSON-RPC relay infrastructure. (2) Replace fetchConfigState with getFullState that sends `bg:getFullState` via chrome.runtime.sendMessage (same pattern as getConnectionState). (3) For mutations (setToolEnabled etc.), create new bg:* message types (bg:setToolEnabled, bg:setAllToolsEnabled, bg:setBrowserToolEnabled, bg:setAllBrowserToolsEnabled, bg:searchPlugins, bg:installPlugin, bg:removePlugin, bg:updatePlugin). These send chrome.runtime.sendMessage to background, which relays to the server. The response comes back via the sendMessage callback (for simple ok/error) or via a plugins.changed push (for state changes). Add all new message types to extension-messages.ts. Key changes to App.tsx: (1) startup useEffect calls getFullState() — single call replaces getConnectionState() + loadPlugins(). (2) plugins.changed handler calls getFullState() instead of loadPlugins(). (3) Remove pendingTabStates buffering — no longer needed because getFullState returns tab states from background cache, and tab.stateChanged arrives as push. (4) The sp:serverMessage listener no longer needs handleServerResponse since there are no pending JSON-RPC requests. For the bg:* mutation handlers in background-message-handlers.ts, they should relay to the server via sendToServer and return the response. The mutations that change tool config will trigger a plugins.changed from the server, which updates the cache (US-003) and notifies the side panel."
+    },
+    {
+      "id": "US-006",
+      "title": "Add background handlers for side panel mutation commands",
+      "description": "As a side panel developer, I want the background script to handle tool toggle, browser tool toggle, plugin search, install, remove, and update commands so the side panel never sends JSON-RPC directly to the MCP server.",
+      "acceptanceCriteria": [
+        "New bg:* message handlers in background-message-handlers.ts for: bg:setToolEnabled, bg:setAllToolsEnabled, bg:setBrowserToolEnabled, bg:setAllBrowserToolsEnabled, bg:searchPlugins, bg:installPlugin, bg:removePlugin, bg:updatePlugin",
+        "Each handler relays the request to the MCP server via sendToServer as a JSON-RPC request with a unique id",
+        "Each handler correlates the server's JSON-RPC response back to the side panel via the sendMessage callback (using a pending-request map in the background script, similar to what bridge.ts had)",
+        "All new message types are added to extension-messages.ts and EXTENSION_ONLY_TYPES",
+        "Tool toggle handlers optimistically update the server state cache before the server responds, so the side panel sees the change instantly via the next getFullState call",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The background script needs to become a JSON-RPC request correlator for these commands. Pattern: (1) side panel sends bg:setToolEnabled { plugin, tool, enabled } via chrome.runtime.sendMessage. (2) Background handler generates a JSON-RPC request id, sends `{ jsonrpc: '2.0', method: 'config.setToolEnabled', params: { plugin, tool, enabled }, id }` to server via sendToServer. (3) Background needs to track this pending request and match the response. The response comes back via handleServerMessage (ws:message → handleServerMessage). Currently handleServerMessage only forwards responses matching pending side panel requests — this logic needs to move to the background. Create a new module `platform/browser-extension/src/server-request.ts` with sendServerRequest(method, params) that returns a Promise. It uses sendToServer with a generated id and registers a callback. In handleServerMessage, check if a response matches a pending server request before forwarding to the side panel. For optimistic cache updates on tool toggles: after calling sendServerRequest, immediately update the server state cache's tool enabled field. If the server returns an error, revert."
+    },
+    {
+      "id": "US-007",
+      "title": "Unblock plugins.changed from sendTabSyncAll in handleSyncFull",
+      "description": "As a user, I want to see plugin cards in the side panel immediately when the extension connects, without waiting for all isReady() probes to complete.",
+      "acceptanceCriteria": [
+        "In handleSyncFull, the plugins.changed notification to the side panel is sent immediately after storePluginsBatch and adapter injection, BEFORE sendTabSyncAll",
+        "sendTabSyncAll runs after the notification (fire-and-forget, not awaited before the notification)",
+        "As each plugin's computePluginTabState completes, tab.stateChanged is forwarded to the side panel individually (this already happens in sendTabSyncAll lines 190-199)",
+        "The side panel shows plugin cards immediately with tab state 'closed' (default), then tab states update progressively to 'ready' or 'unavailable' as probes complete",
+        "startReadinessPoll is still called after sendTabSyncAll completes",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "In `platform/browser-extension/src/message-router.ts`, `handleSyncFull` (line 235), the current order is: (1) storePluginsBatch, (2) inject adapters, (3) await sendTabSyncAll(), (4) startReadinessPoll(), (5) forwardToSidePanel plugins.changed. Change to: (1) storePluginsBatch, (2) inject adapters, (3) updateServerStateCache (from US-002), (4) forwardToSidePanel plugins.changed, (5) fire sendTabSyncAll() without awaiting (use void prefix), (6) after sendTabSyncAll resolves, call startReadinessPoll(). The sendTabSyncAll and startReadinessPoll should be chained with .then() since startReadinessPoll needs to run after sendTabSyncAll populates lastKnownState. The key insight: the side panel gets plugin metadata from the background cache immediately, then gets tab state updates as they stream in via tab.stateChanged."
+    },
+    {
+      "id": "US-008",
+      "title": "Update existing E2E tests for new data flow architecture",
+      "description": "As a platform developer, I want all existing E2E tests to pass with the new data flow architecture where the side panel talks to the background script instead of the MCP server.",
+      "acceptanceCriteria": [
+        "All existing E2E tests in e2e/ pass without modification OR are updated to work with the new architecture",
+        "Tests that reload the side panel to pick up tab state changes (the sidePanelPage.reload() workaround) continue to work because bg:getFullState returns current tab state from lastKnownState",
+        "Tests that check plugins.changed behavior (side-panel-live-update, side-panel-reload) work because the background still forwards plugins.changed to the side panel",
+        "Tests that check tool toggles (side-panel-plugin-toggle) work because bg:setToolEnabled relays to the server",
+        "Tests that check tab state dots (side-panel-data-flow) work because tab.stateChanged is still pushed to the side panel",
+        "Tests that check connection/disconnection (side-panel-data-flow, lifecycle) work because sp:connectionState is unchanged",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "This story is specifically about making existing E2E tests pass. The main risk areas: (1) Tests that assert on timing of data availability — with the new architecture, data may be available sooner (from background cache) so assertions that expect a loading delay may need shorter timeouts. (2) Tests that depend on the config.getState round-trip — these should work because bg:getFullState returns equivalent data. (3) Tests that use the MCP client fixture to call tools and check side panel updates — the tool dispatch pipeline is unchanged (MCP server → extension → adapter), only the side panel's data source changed. (4) Tests that check /health endpoint pluginDetails[].tabState — the server's tabMapping is still populated by tab.syncAll/tab.stateChanged, so /health data is unchanged. Read each failing test carefully, understand what it expects, and make the minimal change to align with the new architecture. Do NOT change the architecture to make tests pass — change the tests to match the new architecture."
+    },
+    {
+      "id": "US-009",
+      "title": "Add E2E tests for instant side panel startup from background cache",
+      "description": "As a platform developer, I want E2E tests that verify the side panel renders plugins instantly from the background script's cache without waiting for MCP server round-trips.",
+      "acceptanceCriteria": [
+        "New test file e2e/side-panel-instant-startup.e2e.ts",
+        "Test 1: After extension connects and sync.full completes, close and reopen the side panel — plugins appear within 2 seconds (not the previous 5+ seconds)",
+        "Test 2: After extension reload with matching tabs already open, open the side panel — plugin cards appear immediately (metadata from chrome.storage.local), tab states fill in progressively (green dots appear after isReady probes)",
+        "Test 3: Open side panel during sync.full processing — side panel shows loading state, then plugins appear as soon as storePluginsBatch completes (not after sendTabSyncAll)",
+        "Test 4: Verify tab state dot updates in real-time without side panel reload — open a matching tab while side panel is open, green dot appears without calling sidePanelPage.reload()",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 9,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Follow the patterns in existing E2E tests (see `e2e/side-panel-data-flow.e2e.ts` and `e2e/helpers.ts`). Use the fixtures (mcpServer, extensionContext, testServer). Key helpers: `openSidePanel(context)`, `waitForExtensionConnected(server)`, `openTestAppTab(context, url, server)`. For Test 1, the key assertion is timing — use a tight timeout (2000ms) on the `expect(sidePanelPage.getByText('E2E Test')).toBeVisible()` assertion. For Test 2, use the extension reload approach from side-panel-data-flow tests. For Test 3, this is tricky — you need to open the side panel at the right moment. Consider using `waitForLog(server, 'sync.full')` to time it. For Test 4, this tests that tab.stateChanged push works in the Playwright test environment — note the existing tests use sidePanelPage.reload() as a workaround because chrome.runtime.sendMessage doesn't reliably reach extension pages opened via URL in Playwright. This test should still attempt the direct push and fall back to reload with a comment explaining the limitation. IMPORTANT: read `e2e/CLAUDE.md` for E2E-specific conventions before writing tests."
+    },
+    {
+      "id": "US-010",
+      "title": "Add E2E tests for real-time state propagation (tool toggles, auth changes, tab close)",
+      "description": "As a platform developer, I want E2E tests that verify state changes propagate to the side panel in real-time via the background script's push mechanism.",
+      "acceptanceCriteria": [
+        "New test file e2e/side-panel-realtime-state.e2e.ts",
+        "Test 1: Toggle a tool enabled/disabled via MCP client (config.setToolEnabled) — side panel reflects the change within 5 seconds without reload",
+        "Test 2: Toggle auth off on the test server (testServer.setAuth(false)) → reload the app tab — side panel shows unavailable (amber dot) within 10 seconds",
+        "Test 3: Close a matching tab — side panel shows closed state (no dot) within 10 seconds",
+        "Test 4: Toggle a browser tool enabled/disabled via MCP client — side panel reflects the change within 5 seconds",
+        "Test 5: Disconnect and reconnect — side panel transitions through disconnected state and recovers all plugin states",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 10,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "These tests verify the push-based data flow end-to-end. For tool toggle tests: use the MCP client fixture to call config.setToolEnabled (this goes through the MCP server which sends plugins.changed with full payload → background caches it → side panel refreshes via getFullState). For auth toggle: use testServer.setAuth(false) then reload the app tab — this triggers isReady() returning false → tab.stateChanged → side panel updates. For tab close: close the app tab page — checkTabRemoved fires → notifyAffectedPlugins → tab.stateChanged → side panel. For browser tool toggle: the MCP client would need to call the tool — check if there's an existing RPC method for this. For disconnect/reconnect: kill and restart the server (same pattern as side-panel-data-flow tests). NOTE: some of these behaviors may already be tested in existing E2E tests — check side-panel-data-flow.e2e.ts and side-panel-plugin-toggle.e2e.ts first. If so, focus on the NEW behaviors (instant propagation without reload). Read `e2e/CLAUDE.md` for conventions."
+    }
+  ]
+}
