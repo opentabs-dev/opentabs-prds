@@ -1,0 +1,35 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-231906-backend-audit-fixes~running.json
+Started: Tue Mar  3 07:19:37 UTC 2026
+---
+
+## Codebase Patterns
+- Browser tools live in `platform/mcp-server/src/browser-tools/` with co-located test files
+- `dispatchToExtension` is the primary interface for sending commands to the Chrome extension
+- `validateDispatchResult` validates and types the raw dispatch response
+- `defineBrowserTool` factory creates browser tools with standard name/description/input/handler shape
+- Tests use `vi.hoisted` + `vi.mock` pattern for mocking extension protocol dispatches
+
+## 2026-03-03 - US-001
+- **Implemented**: Fixed data loss in `export-har.ts` when WS clearing fetch fails during `clear=true` + `includeWebSocketFrames=true` flow
+- **Root cause**: `entries.length = 0` was called after the HTTP clearing fetch but before the WS clearing fetch. If the WS fetch failed, original non-clearing fetch results were already wiped.
+- **Fix**: Collect both clearing fetch results into local variables (`clearRequests` and `clearWsEntries`) before modifying `entries`. Only rebuild `entries` after all clearing fetches succeed.
+- **Files changed**:
+  - `platform/mcp-server/src/browser-tools/export-har.ts` — deferred entries replacement
+  - `platform/mcp-server/src/browser-tools/export-har.test.ts` — added test for WS clear failure after HTTP clear succeeds
+- **Learnings for future iterations:**
+  - The HTTP `clear:true` fetch is atomic (returns data AND clears the buffer in one dispatch). You can't un-clear it. The fix focuses on not wiping the local `entries` array until all clearing fetches succeed.
+  - Tests mock `dispatchToExtension` with ordered `mockResolvedValueOnce`/`mockRejectedValueOnce` calls — order matters and maps to the dispatch sequence in the handler.
+---
+
+## 2026-03-03 - US-002
+- **Implemented**: Fixed dev proxy SSE client hanging when upstream returns non-200 status
+- **Root cause**: In `connectUpstreamSse()`, when the upstream worker responds with non-200 (e.g., 400 for stale session ID), the code drained the response but never closed `clientRes`. The MCP client hung forever waiting for SSE events.
+- **Fix**: Added warning log, removed `clientRes` from session's `sseStreams`, and ended `clientRes` when upstream returns non-200. Deliberately did NOT call `cleanupSession()` — only this SSE stream is affected, not the entire session. The `on('end')` and `on('error')` handlers were left unchanged as they intentionally keep client open for reconnection after worker restart.
+- **Files changed**:
+  - `platform/mcp-server/src/dev-proxy.ts` — added non-200 handling in `connectUpstreamSse`
+- **Learnings for future iterations:**
+  - `dev-proxy.ts` has no unit tests — it's a standalone process script with no exported functions. Integration testing requires spawning actual servers.
+  - `connectUpstreamSse` is called from two sites: `handleMcpGet` (initial SSE) and `reinitializeSessions` (after worker restart). In both cases, `clientRes` headers are already sent (200 SSE), so you can't send a new status code — only `end()` or `destroy()` the response.
+  - The `on('end')` and `on('error')` handlers intentionally keep `clientRes` open for reconnection — this is different from the non-200 path where the upstream explicitly rejected the request.
+---
