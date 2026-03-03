@@ -1,0 +1,51 @@
+# Ralph Progress Log
+PRD: prd-2026-03-03-070713-fix-execute-script-csp~running.json
+Started: Tue Mar  3 15:07:49 UTC 2026
+---
+
+## Codebase Patterns
+- The exec file wrapper in adapter-files.ts uses an inline inner function expression `(function() { <user_code> })()` to wrap user code, avoiding eval-like constructs (new Function, eval) that strict CSP blocks
+- File-based injection via chrome.scripting.executeScript({ files }) runs as extension-origin code and bypasses page CSP entirely — the key is ensuring no eval-like constructs exist *inside* the injected file
+- Unit tests for writeExecFile are in platform/mcp-server/src/adapter-files.test.ts and verify the wrapper structure, inline code placement, async support, and error capture
+
+---
+
+## 2026-03-03 15:12 UTC - US-001
+- Replaced `new Function(JSON.stringify(code))` with inline code placement in writeExecFile (adapter-files.ts)
+- User code is now placed directly inside an inner function expression `(function() { <code> })()` within the wrapper IIFE
+- Updated the comment block explaining the wrapper approach (removed new Function references, added CSP bypass explanation)
+- Updated 3 unit tests in adapter-files.test.ts to verify inline code placement instead of new Function
+- Files changed:
+  - platform/mcp-server/src/adapter-files.ts (writeExecFile wrapper template + comments)
+  - platform/mcp-server/src/adapter-files.test.ts (3 tests updated)
+- **Learnings for future iterations:**
+  - The execute-script.ts module-level comment already correctly describes file-based CSP bypass — no changes needed there
+  - The extension-side handler (extension-commands.ts) is completely decoupled from the wrapper format — it only cares about the namespaced globalThis keys, so server-side wrapper changes don't require extension changes
+  - All 435 E2E tests pass including all 19+ browser_execute_script tests (return types, DOM access, async, errors, cleanup, concurrency, truncation)
+---
+
+## 2026-03-03 15:25 UTC - US-003
+- Updated .claude/skills/build-plugin/__SKILL__.md to remove incorrect CSP warnings
+- Removed the "If CSP blocks browser_execute_script" conditional in Step 3 (auth discovery) — replaced with a single sentence stating the tool bypasses page CSP via file-based injection and works on all pages
+- Updated Gotcha #11 from "CSP may block browser_execute_script" to "browser_execute_script bypasses page CSP" — updated to explain file-based injection (chrome.scripting.executeScript with files[]) runs as extension-origin code not subject to page CSP
+- Files changed:
+  - .claude/skills/build-plugin/__SKILL__.md (2 targeted edits)
+- All Phase 1 checks passed: build, type-check, lint, knip, 90 test files / 2960 tests
+- **Learnings for future iterations:**
+  - Documentation-only changes still require full Phase 1 quality checks (they pass trivially for .md files but rules require it)
+  - The build-plugin skill file is at .claude/skills/build-plugin/__SKILL__.md — skills are user-facing AI instructions, not generated code
+---
+
+## 2026-03-03 15:20 UTC - US-002
+- Added 8 E2E tests in new `Strict CSP — browser_execute_script` describe block in e2e/strict-csp.e2e.ts
+- Tests cover: sync result (document.title), DOM access, async Promise resolution, error throwing, no-return null, sequential cleanup, concurrent non-collision, and CSP enforcement canary
+- Created `openStrictCspTab` helper that opens a tab via `browser_open_tab` and polls readyState via `browser_execute_script`
+- The CSP enforcement canary test proves eval() and new Function() are blocked by CSP while our inline wrapper succeeds — this is the regression test that would catch any reintroduction of eval-based wrapping
+- Files changed:
+  - e2e/strict-csp.e2e.ts (253 lines added: openStrictCspTab helper + 8 tests)
+- **Learnings for future iterations:**
+  - The strict-CSP tests use `fixtureTest` (aliased from `test` in fixtures.ts) with `{ mcpServer, strictCspServer, extensionContext, mcpClient }` — `strictCspServer` is a separate fixture from `testServer`
+  - `browser_open_tab` + polling `browser_execute_script` for readyState is the right pattern for opening tabs in browser_execute_script tests (mirrors browser-tools.e2e.ts)
+  - The strict-CSP server title is "Strict CSP Test App" — useful for asserting document.title
+  - All 443 E2E tests pass (8 new + 435 existing)
+---
