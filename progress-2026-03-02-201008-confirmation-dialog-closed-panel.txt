@@ -1,0 +1,52 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-201008-confirmation-dialog-closed-panel~running.json
+Started: Tue Mar  3 04:10:40 UTC 2026
+---
+
+## Codebase Patterns
+- confirmation-badge.ts uses module-level Maps for state tracking with a count variable kept in sync manually (not derived from map size, because clearConfirmationBadge can be called without an id)
+- The test file uses `vi.hoisted` + `vi.mock` pattern for mocking Chrome APIs and module dependencies, with `await import()` for the module under test
+- `clearAllConfirmationBadges()` is used in `beforeEach` to reset internal module state between tests
+- PendingConfirmationParams interface in confirmation-badge.ts matches ConfirmationData type in ConfirmationDialog.tsx (same shape)
+- When adding new exports to a module, all vi.mock() calls for that module in test files must be updated to include the new export — otherwise the import resolves to undefined and causes the async handler to throw into the catch branch
+- useServerNotifications.handleNotification accepts an optional receivedAt in params for hydrated confirmations; the auto-removal timeout is computed from elapsed time since receivedAt
+- Dedup in handleNotification uses timeoutIds ref (not state) to skip already-registered confirmations — this is more reliable than checking React state which may be stale
+
+## 2026-03-03 04:14 - US-001
+- Replaced `pendingConfirmationInfo` map (storing `{ tool, domain }`) with `pendingConfirmations` map storing full `PendingConfirmationParams` (id, tool, domain, tabId, paramsPreview, timeoutMs, receivedAt)
+- Added `PendingConfirmationParams` interface and exported it
+- Added `getPendingConfirmations()` function that returns array of all pending confirmation values
+- Updated `notifyConfirmationRequest` to extract and store tabId, paramsPreview, and receivedAt (Date.now())
+- Updated `syncConfirmationNotification` type assertion to use new `PendingConfirmationParams` type
+- Added 3 new unit tests for `getPendingConfirmations()`: returns correct entries, entries removed after clear, empty after clearAll
+- Files changed: `platform/browser-extension/src/confirmation-badge.ts`, `platform/browser-extension/src/confirmation-badge.test.ts`
+- **Learnings for future iterations:**
+  - The confirmation-badge module's internal state can only be reset via `clearAllConfirmationBadges()` — there's no direct way to reset from tests
+  - All existing tests continued to pass without modification because the new fields (tabId, paramsPreview, receivedAt) are additive
+---
+
+## 2026-03-03 04:20 - US-002
+- Added `getPendingConfirmations` import to background-message-handlers.ts and included `pendingConfirmations` array in handleBgGetFullState response (both success and catch paths)
+- Added `FullStateConfirmation` interface and `pendingConfirmations?` field to `FullStateResult` in bridge.ts
+- Updated `applyFullState` in App.tsx to hydrate pending confirmations by replaying each one through `handleNotification`, which registers auto-removal timeouts
+- Updated `useServerNotifications.ts` to: use `receivedAt` from params when available (for hydrated confirmations), compute remaining timeout from elapsed time, and skip duplicates via `timeoutIds` ref
+- Updated `background-message-handlers.test.ts`: added `mockGetPendingConfirmations` mock, updated `FullStateResponse` type, and updated exact-match assertion
+- Files changed: `platform/browser-extension/src/background-message-handlers.ts`, `platform/browser-extension/src/background-message-handlers.test.ts`, `platform/browser-extension/src/side-panel/bridge.ts`, `platform/browser-extension/src/side-panel/App.tsx`, `platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts`
+- **Learnings for future iterations:**
+  - When adding new exports to a mocked module, the vi.mock factory AND the vi.hoisted destructuring must both be updated — missing either causes "not defined" errors
+  - The handleBgGetFullState catch branch also needs new fields, or the fallback response shape won't match the type
+  - Hydrated confirmations from bg:getFullState must flow through the same handleNotification path as real-time ones to ensure timeout registration
+  - Dedup via timeoutIds ref is the correct approach — React state may be stale inside callbacks
+---
+
+## 2026-03-03 04:30 - US-003
+- Added new E2E test in `e2e/permissions.e2e.ts` in describe block "Confirmation dialog — late side panel open"
+- Test verifies: trigger sensitive-tier tool on non-trusted domain WITHOUT side panel open, poll until badge shows "1", then open side panel and verify confirmation dialog appears with correct tool name and domain, click Allow Once, verify tool completes successfully and badge clears
+- Reused existing helpers: getBackgroundWorker, getBadgeText, waitForConfirmationDialog, openSidePanel, waitFor
+- All 445 E2E tests pass including the new test
+- Files changed: `e2e/permissions.e2e.ts`
+- **Learnings for future iterations:**
+  - The bg:getFullState hydration from US-002 works correctly — confirmation dialog appears on side panel open even when the request arrived while the panel was closed
+  - The Promise.all pattern (tool call + async side-effects) is the standard E2E pattern for testing blocking confirmation flows
+  - Badge polling with waitFor is reliable for detecting when the confirmation has arrived at the background before opening the side panel
+---
