@@ -1,0 +1,78 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add a cookie-aware cross-origin fetch proxy to the extension. Chrome MV3 does not send HttpOnly cookies on cross-origin fetch requests from extension-injected MAIN world code (both file-based IIFE injection and inline chrome.scripting.executeScript). This blocks any plugin whose web app API is on a different subdomain from the page (e.g., linear.app -> client-api.linear.app). The fix: add a bidirectional message bridge so tool handlers can route fetch requests through the extension background service worker, which reads cookies via chrome.cookies.getAll() and attaches them as headers.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add fetch:proxy message types and background handler",
+      "description": "As a platform developer, I want the extension background to handle fetch:proxy requests so that plugin tools can make cross-origin authenticated requests via the background service worker.",
+      "acceptanceCriteria": [
+        "New InternalMessage types added: 'fetch:proxy' (content script -> background) and 'fetch:proxy:response' (background -> content script via chrome.tabs.sendMessage)",
+        "fetch:proxy message carries: requestId (string), url (string), method (string), headers (Record<string,string>), body (string|undefined), pluginName (string)",
+        "fetch:proxy:response message carries: requestId (string), status (number), statusText (string), headers (Record<string,string>), body (string)",
+        "Background handler reads cookies via chrome.cookies.getAll({ url }) and builds a Cookie header from them",
+        "Background handler makes the actual fetch with the Cookie header + all original headers from the request",
+        "Background handler validates that the request URL's registrable domain matches at least one of the plugin's urlPatterns (security check) — reject with an error if not",
+        "fetch:proxy is NOT in EXTENSION_ONLY_TYPES (it comes from content scripts, same as tool:progress and plugin:logs)",
+        "Background handler is registered in the backgroundHandlers map",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files to modify:\n\n1. `platform/browser-extension/src/extension-messages.ts` — add two new interfaces to the InternalMessage union:\n   - `FetchProxyRequestMessage` with type 'fetch:proxy', fields: requestId, url, method, headers, body, pluginName\n   - `FetchProxyResponseMessage` with type 'fetch:proxy:response', fields: requestId, status, statusText, headers, body, error?\n\n2. `platform/browser-extension/src/background-message-handlers.ts` — add `handleFetchProxy` handler:\n   - Extract pluginName from message, look up PluginMeta via getAllPluginMeta()\n   - Validate the request URL's origin is same-site with at least one of the plugin's urlPatterns. Use `new URL(url).hostname` and check that it shares the same registrable domain (eTLD+1) as at least one pattern. A simple approach: extract the hostname from the pattern, then compare the last two domain segments (e.g., 'linear.app' from '*://linear.app/*' and 'client-api.linear.app' share 'linear.app')\n   - Read cookies via `chrome.cookies.getAll({ url: message.url })` and build a `Cookie` header string from `name=value` pairs joined by '; '\n   - Make `fetch(url, { method, headers: { ...originalHeaders, Cookie: cookieHeader }, body })` from the background service worker\n   - Read the response: status, statusText, response headers (via `Object.fromEntries(response.headers.entries())`), and body text via `response.text()`\n   - Send the response back via `chrome.tabs.sendMessage(senderTabId, { type: 'fetch:proxy:response', requestId, status, statusText, headers, body })`. The sender tab ID comes from the `sender` parameter of the chrome.runtime.onMessage callback — this is available in the `handleMessage` function in `initBackgroundMessageHandlers`. Currently the handler functions only receive `(message, sendResponse)`. The handler signature needs to be extended to also pass the sender tab ID. The cleanest approach: change MessageHandler type to include sender info, or pass tabId as part of the message from the ISOLATED world relay (recommended — have the ISOLATED world script add `tabId: chrome.runtime.id` or use `sender.tab?.id` in the background). Actually, `sender.tab.id` is already available in the `chrome.runtime.onMessage` listener at line 596 — just pass it to the handler. Change the `MessageHandler` type to `(message, sendResponse, senderTabId?: number)` and pass `sender.tab?.id` from the listener.\n   - Add 'fetch:proxy' to the backgroundHandlers map\n   - Do NOT add 'fetch:proxy' to EXTENSION_ONLY_TYPES (it comes from content scripts)\n   - Wrap fetch in try/catch — on network error, send back { type: 'fetch:proxy:response', requestId, status: 0, statusText: '', headers: {}, body: '', error: errorMessage }\n   - Add a 30-second timeout via AbortSignal.timeout(30_000)\n\nSecurity: The URL domain validation prevents a compromised page from using the proxy to make authenticated requests to arbitrary domains. A plugin can only proxy-fetch to domains that share the same registrable domain as its declared urlPatterns."
+    },
+    {
+      "id": "US-002",
+      "title": "Add bidirectional ISOLATED world bridge for fetch proxy in tool dispatch",
+      "description": "As a platform developer, I want the tool dispatch to inject an ISOLATED world bridge that relays fetch:proxy requests from MAIN world to the background and responses back, using the same CustomEvent pattern as progress reporting.",
+      "acceptanceCriteria": [
+        "A new function injectFetchProxyBridge(tabId, dispatchId) injects an ISOLATED world script that listens for CustomEvent 'opentabs:fetch-proxy:request:{dispatchId}' on document",
+        "The ISOLATED world listener extracts requestId, url, method, headers, body, pluginName from the event detail and sends them to the background via chrome.runtime.sendMessage({ type: 'fetch:proxy', ... })",
+        "The ISOLATED world script also listens for chrome.runtime.onMessage with type 'fetch:proxy:response' and matching requestId, then dispatches a CustomEvent 'opentabs:fetch-proxy:response:{requestId}' on document with the response data",
+        "A removeFetchProxyBridge(tabId, dispatchId) function cleans up the ISOLATED world listeners (same pattern as removeProgressListener)",
+        "injectFetchProxyBridge is called before executeToolOnTab and removeFetchProxyBridge is called after (same lifecycle as progress listener)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files to modify:\n\n`platform/browser-extension/src/tool-dispatch.ts`\n\nFollow the exact pattern of `injectProgressListener` / `removeProgressListener` (lines 71-130).\n\nThe ISOLATED world script needs two listeners:\n1. `document.addEventListener('opentabs:fetch-proxy:request:' + dId, handler)` — relays request to background via `chrome.runtime.sendMessage({ type: 'fetch:proxy', ...detail })`\n2. `chrome.runtime.onMessage.addListener(handler)` — listens for `{ type: 'fetch:proxy:response' }` messages from background and dispatches `new CustomEvent('opentabs:fetch-proxy:response:' + msg.requestId, { detail: msg })` on document\n\nThe cleanup function should remove both listeners.\n\nImportant: the chrome.runtime.onMessage listener in ISOLATED world must filter by `type === 'fetch:proxy:response'` and should only handle messages whose requestId matches a pending request (to avoid cross-talk between concurrent tool dispatches). A simple approach: maintain a Set of pending requestIds in the ISOLATED world closure.\n\nThe lifecycle in the executeToolOnTab call site (around line 386):\n```\nawait injectProgressListener(tid, dispatchId);\nawait injectFetchProxyBridge(tid, dispatchId);\ntry { ... } finally { removeProgressListener(tid, dispatchId); removeFetchProxyBridge(tid, dispatchId); }\n```"
+    },
+    {
+      "id": "US-003",
+      "title": "Add fetchViaBackground to ToolHandlerContext and wire it in the MAIN world dispatch func",
+      "description": "As a plugin developer, I want a fetchViaBackground(url, init) method on ToolHandlerContext so that I can make cross-origin authenticated requests that include cookies without needing to know about the proxy mechanism.",
+      "acceptanceCriteria": [
+        "ToolHandlerContext in platform/plugin-sdk/src/index.ts gains a new method: fetchViaBackground(url: string, init?: RequestInit): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string; ok: boolean }>",
+        "The MAIN world dispatch func in tool-dispatch.ts constructs context.fetchViaBackground that dispatches a CustomEvent 'opentabs:fetch-proxy:request:{dispatchId}' with a unique requestId and returns a Promise",
+        "The Promise resolves when a 'opentabs:fetch-proxy:response:{requestId}' CustomEvent is received on document",
+        "The requestId is generated uniquely per call (e.g., dispatchId + ':' + counter or crypto.randomUUID())",
+        "The init parameter supports method, headers, and body (serialized to string if object)",
+        "The response object includes ok (status >= 200 && status < 300), status, statusText, headers, and body as a string",
+        "If the response contains an error field (network failure), the Promise rejects with a descriptive error",
+        "A 30-second timeout is applied — if no response CustomEvent is received within 30s, the Promise rejects",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files to modify:\n\n1. `platform/plugin-sdk/src/index.ts` — extend `ToolHandlerContext`:\n```typescript\nexport interface FetchProxyResponse {\n  status: number;\n  statusText: string;\n  headers: Record<string, string>;\n  body: string;\n  ok: boolean;\n}\n\nexport interface ToolHandlerContext {\n  reportProgress(opts: ProgressOptions): void;\n  fetchViaBackground(url: string, init?: RequestInit): Promise<FetchProxyResponse>;\n}\n```\n\n2. `platform/browser-extension/src/tool-dispatch.ts` — in the MAIN world `func` passed to `chrome.scripting.executeScript` (around line 223), extend the context construction:\n```typescript\nlet fetchCounter = 0;\nconst context = {\n  reportProgress(opts) { /* existing code */ },\n  fetchViaBackground(url, init) {\n    return new Promise((resolve, reject) => {\n      const requestId = dId + ':' + (fetchCounter++);\n      const timeout = setTimeout(() => {\n        document.removeEventListener(responseEvent, handler);\n        reject(new Error('Fetch proxy timeout after 30s'));\n      }, 30000);\n      const responseEvent = 'opentabs:fetch-proxy:response:' + requestId;\n      const handler = (e) => {\n        clearTimeout(timeout);\n        document.removeEventListener(responseEvent, handler);\n        const detail = e.detail;\n        if (detail.error) { reject(new Error(detail.error)); return; }\n        resolve({ status: detail.status, statusText: detail.statusText, headers: detail.headers, body: detail.body, ok: detail.status >= 200 && detail.status < 300 });\n      };\n      document.addEventListener(responseEvent, handler);\n      document.dispatchEvent(new CustomEvent('opentabs:fetch-proxy:request:' + dId, {\n        detail: { requestId, url, method: init?.method || 'GET', headers: Object.fromEntries(new Headers(init?.headers).entries()), body: typeof init?.body === 'string' ? init.body : init?.body ? JSON.stringify(init.body) : undefined, pluginName: pName }\n      }));\n    });\n  }\n};\n```\n\nNote: The `func` parameter passed to `chrome.scripting.executeScript` must be self-contained — it cannot reference variables from the outer TypeScript scope. All types used inside the func must be inline (no imported types). The existing code at line 154-277 already follows this pattern.\n\nThe `pluginName` (pName) is already available as a parameter to the func. This is passed in the CustomEvent detail so the ISOLATED world relay can include it in the chrome.runtime.sendMessage, and the background handler can validate it.\n\nNote on `context?` parameter: The handle() signature uses `context?: ToolHandlerContext`, meaning context is optional. The new `fetchViaBackground` method is always present when context is provided (which is always the case at runtime — the `?` is only for SDK-level type safety since the SDK doesn't know about the runtime context)."
+    }
+  ]
+}
