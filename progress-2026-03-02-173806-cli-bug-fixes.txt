@@ -1,0 +1,83 @@
+## Codebase Patterns
+- `platformExec('npm')` is the correct way to invoke npm in all spawn calls — resolves to `npm.cmd` on Windows, `npm` elsewhere
+- `platformExec` is exported from `@opentabs-dev/shared` and imported in CLI command files
+- Prettier enforces trailing commas in multi-element arrays — run `npx prettier --write` to auto-fix formatting errors rather than manually adjusting
+- `/health` endpoint returns JSON body with `mode: 'dev' | 'production'` and `x-opentabs-version` response header
+- `getPidFilePath` and `parsePidFile` are exported from `platform/cli/src/config.ts` — use these for PID file background detection
+- Background server detection: read PID file with `getPidFilePath()`, parse with `parsePidFile()`, check `isProcessAlive(pid)` using `process.kill(pid, 0)`
+
+# Ralph Progress Log
+PRD: prd-2026-03-02-173806-cli-bug-fixes~running.json
+Started: Tue Mar  3 01:38:40 UTC 2026
+---
+
+## 2026-03-03 - US-001
+- Replaced 4 bare `'npm'` string literals in `platform/cli/src/commands/plugin.ts` with `platformExec('npm')`: `packageExistsOnNpmAsync`, `warnIfNotPlugin`, `fetchPackageInfo`, `npmSearchPlugins` (PRD notes mentioned 3, but a 4th was in `warnIfNotPlugin`)
+- Added `platformExec` import to `platform/cli/src/commands/update.ts` from `@opentabs-dev/shared`
+- Replaced 2 bare `'npm'` string literals in `update.ts` with `platformExec('npm')`: `getLatestVersion` and `performUpdate`
+- Ran `npx prettier --write` to fix line-length formatting after edits (longer function call expressions triggered multi-line reformatting)
+- Files changed: `platform/cli/src/commands/plugin.ts`, `platform/cli/src/commands/update.ts`
+- **Learnings for future iterations:**
+  - The PRD notes said "three call sites" in plugin.ts but there were actually four — always scan the full file with Grep rather than relying solely on notes
+  - Extending a short line (e.g., adding `platformExec('npm')` before args array) can push it past Prettier's print width, triggering multi-line formatting errors — auto-fix with prettier rather than manual edits
+---
+
+## 2026-03-03 - US-002
+- Changed `opentabs start --show-config` to call `ensureAuthSecret()` instead of `readAuthSecret()`, so the secret is generated on the fly if it doesn't exist
+- Removed the null check and error exit that previously blocked `--show-config` before first run
+- Removed the unused `readAuthSecret` import from `platform/cli/src/commands/start.ts`
+- Files changed: `platform/cli/src/commands/start.ts`
+- **Learnings for future iterations:**
+  - `ensureAuthSecret()` in `platform/cli/src/config.ts` creates the `~/.opentabs/extension/` directory and writes `auth.json` if missing — it is fully self-contained, no need to call `mkdirSync` separately before it
+  - `readAuthSecret()` vs `ensureAuthSecret()`: the former is read-only (returns null if missing), the latter creates and returns the secret if missing
+---
+
+## 2026-03-03 - US-003
+- Counted 40 browser tools in the `browserTools` array in `platform/mcp-server/src/browser-tools/index.ts`
+- Updated README.md line 31: `39 built-in browser tools` → `40 built-in browser tools`
+- Updated README.md line 84: `the 39 built-in browser tools` → `the 40 built-in browser tools`
+- All docs/ pages already had the correct count of 40
+- Files changed: `README.md`
+- **Learnings for future iterations:**
+  - The docs/ site was already up to date with the correct count (40) — only README.md was stale
+  - The browser tools catalog is auto-generated via `npm run generate:browser-tools-catalog`; the build output confirms the count (`40 tools`)
+---
+
+## 2026-03-03 - US-004
+- Moved `fetchBrowserToolNames` call before `loadConfig()` and `atomicWriteConfig` in `handleSetBrowserTool`
+- When server is reachable and tool name is not in the registered list, the command now prints an error and exits 1 WITHOUT writing the config
+- When server is not reachable (returns null), proceeds with writing and shows the existing "could not validate" warning after the write
+- Removed the now-redundant post-write validation block (the duplicate `registeredBrowserTools && !registeredBrowserTools.includes(toolName)` warning)
+- Files changed: `platform/cli/src/commands/config.ts`
+- **Learnings for future iterations:**
+  - The `handleSetTool` function (for plugin tools) still uses post-write validation with a warning; only `handleSetBrowserTool` was changed to pre-write hard rejection as specified by the story
+  - `resolvePort(options)` must be called before the early-exit validation so the same `port` variable can be reused for `notifyServer` at the end
+---
+
+## 2026-03-03 - US-005
+- Changed `isServerRunning` to `getServerStatus` returning `{ running: boolean, version?: string, mode?: string, serverType?: 'background' | 'dev' | 'foreground' }`
+- Added `ServerStatus` interface for the return type
+- Added `isProcessAlive` helper (same pattern as `stop.ts`) for PID-based background detection
+- Added `isBackgroundServerRunning` which reads PID file via `getPidFilePath`/`parsePidFile` and checks `isProcessAlive`
+- `getServerStatus` fetches `/health`, reads `x-opentabs-version` header and JSON body's `mode` field, then determines server type: background if PID file alive, dev if `mode === 'dev'`, otherwise foreground
+- Updated warning message in `handleUpdate` to display version (e.g., `v1.2.3`) and type (e.g., `[background]`) when server is running
+- Files changed: `platform/cli/src/commands/update.ts`
+- **Learnings for future iterations:**
+  - `/health` returns JSON `{ mode: 'dev' | 'production', ... }` and sets `x-opentabs-version` response header
+  - `getPidFilePath` and `parsePidFile` are both exported from `platform/cli/src/config.ts` — no need to duplicate the PID parsing logic
+  - `isProcessAlive` must be a local function (it uses `process.kill(pid, 0)`) — it's not exported from config or shared
+  - US-006 will extend this same file to implement auto-restart logic using the `serverType` field from `getServerStatus`
+---
+
+## 2026-03-03 - US-006
+- Added `waitForExit` helper (same pattern as `stop.ts`) — polls `isProcessAlive` every 200ms up to a timeout
+- Added `restartBackgroundServer` helper — reads PID file, sends SIGTERM, waits for exit, then spawns `opentabs start --background` via `spawnSync(platformExec('node'), [cliEntry, ...startArgs])`
+- Replaced generic post-update restart block with a `switch (serverStatus.serverType)`: background → auto-restart; dev → "Restart your dev server: npm run dev"; foreground (default) → "Stop the server (Ctrl+C) and run: opentabs start"
+- Updated pre-update warning message to say "will be automatically restarted" for background servers vs "will need to be restarted" for others
+- Added `DEFAULT_PORT` to the import from `@opentabs-dev/shared` for the restart port comparison
+- Files changed: `platform/cli/src/commands/update.ts`
+- **Learnings for future iterations:**
+  - `process.argv[1]` is typed as `string | undefined` in TypeScript — guard against undefined before passing to `spawnSync`
+  - Use `spawnSync(platformExec('node'), [cliEntry, 'start', '--background'])` to re-launch the CLI — `cliEntry` is `process.argv[1]`, the full path to the CLI entry script
+  - The PID file stores `{ pid, port }` — use `pidData.port ?? fallbackPort` to preserve the original server port during restart
+---
