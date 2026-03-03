@@ -1,0 +1,39 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-184846-data-flow-polish-3~running.json
+Started: Tue Mar  3 02:49:17 UTC 2026
+---
+
+## Codebase Patterns
+- `McpCallbacks` interface in `extension-handlers.ts` is the dependency injection boundary between extension-handlers and extension-protocol — add new protocol capabilities here to avoid circular imports
+- `noopCallbacks` objects exist in 3 test files (`extension-handlers.test.ts`, `extension-protocol.test.ts`, `mcp-setup-dispatch.test.ts`) — all must be updated when `McpCallbacks` changes
+- `extension-protocol.test.ts` has both a shared `noopCallbacks` and inline callback objects in individual tests — both need updating
+- `queryExtension` in `extension-protocol.ts` wraps `dispatchToExtension` with a simpler API for request-response queries to the extension
+- Optimistic rollback in background-message-handlers.ts should always re-read the current cache and surgically revert only the changed fields, never store/restore entire array snapshots
+
+## 2026-03-03 - US-001
+- Implemented: Changed `handlePluginRemove` to send `plugin.uninstall` as a JSON-RPC request (with id) via `callbacks.queryExtension()` instead of `sendToExtension()` notification
+- Added `queryExtension` callback to `McpCallbacks` interface to avoid circular dependency between extension-handlers.ts and extension-protocol.ts
+- Files changed:
+  - `platform/mcp-server/src/extension-handlers.ts` — Added `queryExtension` to McpCallbacks, replaced `sendToExtension` notification with `callbacks.queryExtension()` call (5s timeout, best-effort)
+  - `platform/mcp-server/src/http-routes.ts` — Wired `queryExtension` into `createMcpCallbacks`
+  - `platform/mcp-server/src/extension-handlers.test.ts` — Added `vi.mock` for plugin-management, added `handlePluginRemove` tests verifying queryExtension is called as request and timeout is handled gracefully
+  - `platform/mcp-server/src/extension-protocol.test.ts` — Added `queryExtension` to all noopCallbacks instances
+  - `platform/mcp-server/src/mcp-setup-dispatch.test.ts` — Added `queryExtension` to noopCallbacks
+  - `platform/browser-extension/src/message-router.test.ts` — Updated test description for "does not dispatch without id" to clarify wrapAsync guard still protects against malformed messages
+- **Learnings for future iterations:**
+  - Circular dependency between extension-handlers.ts and extension-protocol.ts prevents direct imports; use McpCallbacks for protocol features needed by handlers
+  - When adding a field to McpCallbacks, must update noopCallbacks in 3+ test files plus inline callback objects in extension-protocol.test.ts
+  - `vi.mock` calls must come after all imports to satisfy ESLint import-x/first rule (vitest hoists them automatically)
+---
+
+## 2026-03-03 - US-002
+- Implemented: Fixed optimistic rollback in all four toggle handlers to surgically revert only the specific changed tool(s) instead of restoring the entire plugins/browserTools array snapshot
+- Pattern: Each handler now captures the original enabled value(s) at the start, and on failure re-reads the current cache via `getServerStateCache()` to build the reverted state — preserving any concurrent `plugins.changed` updates
+- Files changed:
+  - `platform/browser-extension/src/background-message-handlers.ts` — Fixed `handleBgSetToolEnabled`, `handleBgSetAllToolsEnabled`, `handleBgSetBrowserToolEnabled`, and `handleBgSetAllBrowserToolsEnabled` to use surgical rollback instead of snapshot-restore
+  - `platform/browser-extension/src/background-message-handlers.test.ts` — Added 5 new tests: rollback-only-reverts-target-tool (setToolEnabled), rollback-preserves-concurrent-updates (setToolEnabled, setAllToolsEnabled, setBrowserToolEnabled, setAllBrowserToolsEnabled)
+- **Learnings for future iterations:**
+  - `mockGetServerStateCache.mockReturnValueOnce(a).mockReturnValueOnce(b)` is the pattern for testing functions that call `getServerStateCache()` twice (once at start, once during rollback) with different cache states to simulate concurrent updates
+  - The `pendingOptimisticUpdates` mechanism ensures that while a request is pending, incoming `plugins.changed` re-applies the optimistic value — so rollback using the captured original enabled value (not `!enabled`) is correct
+  - For `Map<string, boolean>` to capture original tool states, use `.get(name) ?? t.enabled` fallback for tools that may have been added concurrently (not in the original map)
+---

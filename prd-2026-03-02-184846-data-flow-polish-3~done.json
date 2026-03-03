@@ -20,7 +20,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "The root cause: in `platform/mcp-server/src/extension-handlers.ts` line 751-755, `sendToExtension` sends `plugin.uninstall` without an `id` field, making it a JSON-RPC notification. But in `platform/browser-extension/src/message-router.ts` line 545, `handlePluginUninstall` is wrapped with `wrapAsync` which silently drops messages without `id` (line 78-84). The server needs to send it as a request. Use the existing `dispatchToExtension` pattern or create a new `sendRequestToExtension` helper in extension-protocol.ts that generates an id and returns a Promise. The server should use `queryExtension` (already exists from US-012 — used for extension.getTabState) to send plugin.uninstall as a request: `queryExtension(state, 'plugin.uninstall', { name: pluginName }, 5000)`. But wait — `queryExtension` expects a response with `result`, and `handlePluginUninstall` sends back a JSON-RPC response via `sendToServer`. Verify that `queryExtension`'s response matching works for this (it checks `data.id` match and `!data.method`). The `handlePluginUninstall` function sends `{ jsonrpc: '2.0', result: { success: true }, id }` — this matches queryExtension's pattern. So the fix on the server side is: `await queryExtension(state, 'plugin.uninstall', { name: pluginName }, 5000).catch(() => {})` (ignore timeout/error — best effort). On the extension side, no change needed — the handler already works with an id."
@@ -43,7 +43,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "In `platform/browser-extension/src/background-message-handlers.ts`, four handlers need the same fix pattern. (1) `handleBgSetToolEnabled` (line 320): instead of storing `originalPlugins` and restoring the entire array, the rollback should: `const currentCache = getServerStateCache(); const revertedPlugins = currentCache.plugins.map(p => p.name !== plugin ? p : { ...p, tools: p.tools.map(t => t.name === tool ? { ...t, enabled: !enabled } : t) }); updateServerStateCache({ plugins: revertedPlugins });`. This reads the CURRENT cache (which may have been updated by a concurrent plugins.changed) and only flips the one tool back. Remove the `originalPlugins` variable. (2) `handleBgSetAllToolsEnabled` (line 352): same pattern — re-read current cache, find the plugin, flip all its tools back to `!enabled`. Remove `originalPlugins`. (3) `handleBgSetBrowserToolEnabled` (line 386): re-read current cache, find the browser tool, flip it back. Remove `originalBrowserTools`. (4) `handleBgSetAllBrowserToolsEnabled` (line 411): re-read current cache, flip all browser tools back to `!enabled`. Remove `originalBrowserTools`. Note: this approach uses `!enabled` for the revert which was flagged in a previous review as incorrect for concurrent toggles. But the `pendingOptimisticUpdates` mechanism (added in the previous round) ensures that while the request is pending, any incoming plugins.changed will re-apply the optimistic value. The rollback only runs after `removePendingPluginToolUpdate`, so at that point no pending flag exists and the `!enabled` value is correct (it's the pre-toggle state). The concurrent toggle scenario is handled by the counter-based mechanism — a newer toggle bumps the counter and its own pending flag replaces the older one."
