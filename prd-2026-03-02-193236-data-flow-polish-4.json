@@ -1,0 +1,29 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix chicken-and-egg bug in MV3 service worker wake detection: cachesInitialized is persisted to session storage but never restored before the wake detection check, so the branch that loads caches from session storage is never entered after suspension.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Restore cachesInitialized from session storage before wake detection check in bg:getFullState",
+      "description": "As a user, I want the side panel to correctly show disabled tools and failed plugins after the service worker wakes from MV3 suspension, instead of resetting all tools to enabled.",
+      "acceptanceCriteria": [
+        "handleBgGetFullState in background-message-handlers.ts eagerly loads cachesInitialized from session storage before checking getCachesInitialized() in the wake detection branch",
+        "When wsConnected is true and in-memory caches are empty, loadServerStateCacheFromSession is called first (which restores both the cache data AND cachesInitialized), then the restored cachesInitialized value is checked to decide whether to also load tab state",
+        "The connect-to-sync.full gap behavior is preserved: if cachesInitialized is false after session load (meaning sync.full never ran this session), stale session data is NOT restored",
+        "handleExtensionGetTabState in message-router.ts uses the same pattern: eagerly loads from session when in-memory state is empty, regardless of cachesInitialized (tab state is owned by the extension, not dependent on sync.full)",
+        "Unit tests in background-message-handlers.test.ts verify: (1) after suspension with cachesInitialized=true in session storage, bg:getFullState restores caches correctly, (2) after suspension with cachesInitialized=false in session storage (connect-to-sync.full gap), bg:getFullState returns empty state",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "The root cause: in `platform/browser-extension/src/background-message-handlers.ts` line 162, the wake detection condition is `wsConnected && getCachesInitialized() && tabStates.size === 0 && serverCache.plugins.length === 0`. After MV3 suspension, `cachesInitialized` resets to `false` (its module default). `loadServerStateCacheFromSession()` (which restores `cachesInitialized` from session storage) is only called INSIDE this branch, creating a chicken-and-egg: the branch that would restore `cachesInitialized` can never be entered because `cachesInitialized` hasn't been restored. FIX: restructure the wake detection logic. When `wsConnected` is true and in-memory caches are empty, ALWAYS call `loadServerStateCacheFromSession()` first. This restores both the cache data AND the `cachesInitialized` flag. After the load, check `getCachesInitialized()`: if true, the data is from a valid session (sync.full ran) and can be used; also load tab state. If false, the data is from a connect-to-sync.full gap — discard it (call clearServerStateCache to clean up). The new flow: `if (wsConnected && tabStates.size === 0 && serverCache.plugins.length === 0) { await loadServerStateCacheFromSession(); if (getCachesInitialized()) { await loadLastKnownStateFromSession(); tabStates = getLastKnownStates(); } serverCache = getServerStateCache(); }`. Note: `loadServerStateCacheFromSession` already updates the in-memory cache, so `getServerStateCache()` returns the restored data after the call. For `handleExtensionGetTabState` in `platform/browser-extension/src/message-router.ts` (line ~520), the same issue exists — it was fixed in round 2's US-004 to load from session when empty, but it should verify the session load pattern is consistent. Check that it calls `loadLastKnownStateFromSession()` eagerly when states are empty."
+    }
+  ]
+}
