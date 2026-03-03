@@ -1,0 +1,51 @@
+# Ralph Progress Log
+PRD: prd-2026-03-03-085729-cross-origin-fetch-proxy~running.json
+Started: Tue Mar  3 16:58:00 UTC 2026
+---
+
+## Codebase Patterns
+- The `MessageHandler` type in `background-message-handlers.ts` now takes an optional `senderTabId` parameter (3rd arg), which is `sender.tab?.id` from the chrome.runtime.onMessage listener
+- Chrome API stubs in tests must include all Chrome APIs used by handlers (e.g., `chrome.cookies.getAll`, `chrome.tabs.sendMessage`)
+- Message types that come from content scripts (not extension-only) should NOT be added to `EXTENSION_ONLY_TYPES`
+- The `vi.hoisted()` pattern requires adding new mocks to BOTH the return object AND the outer destructuring
+- URL pattern parsing: patterns like `*://linear.app/*` or `*://*.slack.com/*` — strip wildcard scheme and hostname prefix for domain extraction
+- Registrable domain comparison (eTLD+1) uses simple last-two-segments comparison for same-site validation
+- ISOLATED world bridge pattern: inject via `chrome.scripting.executeScript` with `world: 'ISOLATED'`, store cleanup function on `document` as `__opentabs_<feature>_cleanup_<id>`, remove via separate executeScript that calls the cleanup function
+- Cross-world communication uses CustomEvents (MAIN↔ISOLATED share the same DOM) and `chrome.runtime.sendMessage`/`chrome.runtime.onMessage` (ISOLATED↔background)
+
+## 2026-03-03 17:04 - US-001
+- Implemented fetch:proxy message types and background handler for cross-origin authenticated requests
+- Files changed:
+  - `platform/browser-extension/src/extension-messages.ts` — added `FetchProxyRequestMessage` and `FetchProxyResponseMessage` interfaces and added them to `InternalMessage` union
+  - `platform/browser-extension/src/background-message-handlers.ts` — extended `MessageHandler` type with optional `senderTabId`, added `getRegistrableDomain` and `hostnameFromPattern` helpers, implemented `handleFetchProxy` handler with cookie reading, domain validation, and response relay via `chrome.tabs.sendMessage`
+  - `platform/browser-extension/src/background-message-handlers.test.ts` — added 8 tests covering: successful fetch with cookies, domain rejection, unknown plugin, subdomain matching, network failure, no cookies, no sender tab ID, wildcard subdomain patterns
+- **Learnings for future iterations:**
+  - The `chrome.cookies` permission is already in `manifest.json`, no changes needed there
+  - Biome lint prefers dot notation (`obj.Cookie`) over bracket notation (`obj['Cookie']`)
+  - The handler sends responses back via `chrome.tabs.sendMessage` (not via `sendResponse` callback) because the response is asynchronous and needs to go to the content script in the specific tab
+---
+
+## 2026-03-03 17:08 - US-002
+- Implemented bidirectional ISOLATED world bridge for fetch proxy in tool dispatch
+- Files changed:
+  - `platform/browser-extension/src/tool-dispatch.ts` — added `injectFetchProxyBridge` and `removeFetchProxyBridge` functions following the same pattern as `injectProgressListener`/`removeProgressListener`, wired them into the `executeOnTab` lifecycle in `handleToolDispatch`
+- **Learnings for future iterations:**
+  - The ISOLATED world bridge pattern uses two listeners: a CustomEvent listener for MAIN→ISOLATED relay and a chrome.runtime.onMessage listener for background→ISOLATED→MAIN relay
+  - A `Set<string>` of pending requestIds in the ISOLATED closure prevents cross-talk between concurrent tool dispatches sharing the same tab
+  - Cleanup stores a function on `document` as a keyed property (same pattern as progress listener) — enables removal from a separate executeScript call
+  - The fetch proxy bridge lifecycle mirrors progress listener: inject before `executeToolOnTab`, remove in `finally` block
+---
+
+## 2026-03-03 17:15 - US-003
+- Added `fetchViaBackground` to `ToolHandlerContext` in plugin-sdk and wired it into the MAIN world dispatch function in tool-dispatch.ts
+- Files changed:
+  - `platform/plugin-sdk/src/index.ts` — added `FetchProxyResponse` interface and `fetchViaBackground` method to `ToolHandlerContext`
+  - `platform/plugin-sdk/src/index.test.ts` — added `fetchViaBackground` stub to all 3 test contexts to satisfy the new required interface property
+  - `platform/browser-extension/src/tool-dispatch.ts` — implemented `fetchViaBackground` in the MAIN world `func` context object; uses CustomEvent dispatch/listen pattern with dispatchId-scoped request counter for unique requestIds; updated the inline `__openTabs` type annotation to include the new method
+- **Learnings for future iterations:**
+  - The MAIN world `func` in `chrome.scripting.executeScript` must be fully self-contained — no outer TypeScript scope references, no imported types. All types must be inline.
+  - The `fetchViaBackground` implementation dispatches `opentabs:fetch-proxy:request:{dispatchId}` CustomEvents and listens for `opentabs:fetch-proxy:response:{requestId}` CustomEvents — the request uses the dispatchId (shared scope), while the response uses the requestId (per-call unique)
+  - Adding a required method to `ToolHandlerContext` requires updating all test contexts that construct the interface — search for `ToolHandlerContext` in test files
+  - `HeadersInit` → plain object conversion uses `Object.fromEntries(new Headers(init.headers).entries())`
+  - 30-second timeout on the response Promise matches the 30-second `AbortSignal.timeout` in the background handler
+---
