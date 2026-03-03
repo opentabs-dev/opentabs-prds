@@ -1,0 +1,129 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add optional tool grouping to the plugin SDK and render grouped tool sections in the side panel. Plugin authors tag tools with a `group` string. The side panel renders tools organized under lightweight section headers with group-level toggle switches. Ungrouped tools fall into an implicit 'Other' section when mixed with grouped tools. Plugins with no groups render flat as today.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add group field to shared types (ManifestTool and WireToolDef)",
+      "description": "As a platform developer, I want the shared type definitions to include an optional group field so that tool grouping data flows through the entire pipeline.",
+      "acceptanceCriteria": [
+        "ManifestTool interface in platform/shared/src/index.ts has `group?: string` field with JSDoc comment",
+        "WireToolDef interface in platform/shared/src/index.ts has `group?: string` field with JSDoc comment",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Minimal change — add `/** Tool group for visual grouping in the side panel */ group?: string;` to both interfaces.\n\n- ManifestTool: platform/shared/src/index.ts:91-104. Add after the `icon` field (line 97).\n- WireToolDef: platform/shared/src/index.ts:154-166. Add after the `icon` field (line 160).\n\nNo logic changes — just type definitions. All existing code continues to work since the field is optional."
+    },
+    {
+      "id": "US-002",
+      "title": "Add group field to ToolDefinition in the plugin SDK",
+      "description": "As a plugin author, I want to specify an optional group string on my tool definitions so that my tools are visually grouped in the side panel.",
+      "acceptanceCriteria": [
+        "ToolDefinition interface in platform/plugin-sdk/src/index.ts has `group?: string` field with JSDoc comment",
+        "JSDoc explains that the group is used for visual grouping in the side panel and is optional",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Add `/** Optional group name for visual grouping in the side panel. Tools with the same group are rendered together under a section header. */ group?: string;` to the ToolDefinition interface in platform/plugin-sdk/src/index.ts:53-71. Add it after the `icon` field. The defineTool factory (line 73-76) is a pass-through identity function — no changes needed there."
+    },
+    {
+      "id": "US-003",
+      "title": "Pass group through the build pipeline (plugin-tools)",
+      "description": "As a platform developer, I want the plugin build tool to include the group field in the generated tools.json manifest so that group data reaches the MCP server.",
+      "acceptanceCriteria": [
+        "generateToolsManifest in platform/plugin-tools/src/commands/build.ts includes `group: tool.group` in the ManifestTool output (only when the field is present)",
+        "A plugin tool with group='Messages' produces a tools.json entry containing `\"group\": \"Messages\"`",
+        "A plugin tool without a group produces a tools.json entry with no group field",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In platform/plugin-tools/src/commands/build.ts, the `generateToolsManifest` function (line 497-508) maps each tool to a ManifestTool. After line 504 (`icon: tool.icon || 'wrench'`), add: `...(tool.group ? { group: tool.group } : {})`. Use spread-conditional so the field is omitted entirely when undefined, keeping the manifest clean for plugins that don't use grouping.\n\nThe existing tests in platform/plugin-tools/src/commands/build.test.ts may need a test case added to verify group passthrough."
+    },
+    {
+      "id": "US-004",
+      "title": "Pass group through the MCP server wire serialization and file watcher",
+      "description": "As a platform developer, I want the MCP server to forward the group field from the manifest to the extension via the wire protocol so that the side panel can render groups.",
+      "acceptanceCriteria": [
+        "serializePluginForExtension in platform/mcp-server/src/extension-handlers.ts includes `group` in the tool wire payload when present in the manifest",
+        "parseManifest in platform/mcp-server/src/file-watcher.ts reads the `group` field from tools.json and includes it in the parsed ManifestTool",
+        "A tool with group='Messages' in tools.json results in group='Messages' in the WireToolDef sent to the extension",
+        "A tool without a group results in no group field in the WireToolDef",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Two files to update:\n\n1. platform/mcp-server/src/extension-handlers.ts — In `serializePluginForExtension` (line 109), the tools mapping (lines 137-145) constructs each wire tool object. After `icon: t.icon` (line 141), add: `...(t.group ? { group: t.group } : {})`. This conditionally includes the group only when present.\n\n2. platform/mcp-server/src/file-watcher.ts — In `parseManifest` (around line 254-276), where each ManifestTool is constructed from the raw JSON. After `icon` is parsed (line 260), add: `const group = typeof obj.group === 'string' ? obj.group : undefined;`. Then in the `tools.push({...})` call (line 269-276), add `...(group ? { group } : {})` to the object.\n\n3. platform/browser-extension/src/message-router.ts — In the WireToolDef mapping (lines 193-206), add group extraction: `...(typeof obj.group === 'string' ? { group: obj.group } : {})` in the returned object."
+    },
+    {
+      "id": "US-005",
+      "title": "Render grouped tool sections in the side panel PluginCard",
+      "description": "As a user, I want tools in an expanded plugin card to be visually organized under group section headers so that I can quickly scan and find tools in plugins with many tools.",
+      "acceptanceCriteria": [
+        "When a plugin has tools with group values, tools are rendered organized under section headers showing the group name",
+        "Group headers use font-head at text-xs size with uppercase tracking and muted-foreground color, creating a clear visual hierarchy below the plugin name",
+        "Each group header has a convenience Switch that toggles all tools in that group",
+        "Tools without a group value are rendered under an 'Other' section at the bottom when mixed with grouped tools",
+        "When no tools in a plugin have groups, the tool list renders flat with no section headers (same as current behavior)",
+        "Group order follows first appearance in the tools array (manifest order)",
+        "Tool order within each group follows manifest order",
+        "The tool filter (search) still works correctly — filtered tools show under their group headers, empty groups are hidden",
+        "The filter count ('N of M tools') still displays correctly",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "This is the main UI story. Changes are in platform/browser-extension/src/side-panel/components/PluginCard.tsx.\n\n**Grouping logic:** Before rendering, group `visibleTools` by their `group` field. Preserve manifest order: iterate tools once, collect groups in first-seen order, bucket tools into each group. Tools with no `group` go into a special bucket. If all tools lack groups, render the flat list as-is (no headers). If any tool has a group, render all groups including an 'Other' group for ungrouped tools at the bottom.\n\n**Group header design:** The group header is a simple div row — NOT a new retro primitive. It should feel like a lightweight label within the card content area, not a nested card or accordion. Design:\n\n```\n<div className=\"flex items-center gap-2 border-border border-b bg-muted/20 px-3 py-1\">\n  <span className=\"flex-1 font-head text-xs uppercase tracking-wider text-muted-foreground\">\n    {groupName}\n  </span>\n  <Switch\n    checked={allInGroupEnabled}\n    onCheckedChange={handleToggleGroup}\n    aria-label={`Toggle all ${groupName} tools`}\n  />\n</div>\n```\n\nKey visual decisions:\n- `font-head` (Archivo Black) at `text-xs` with `uppercase tracking-wider` — creates a distinct label feel that sits between the plugin name hierarchy and tool names\n- `bg-muted/20` — subtle background tint to differentiate the header row from tool rows\n- `py-1` — thinner than tool rows (py-1.5) so headers feel like labels, not content\n- `border-b border-border` — consistent with tool row borders\n- Group-level Switch uses the existing retro Switch component — toggles all tools in the group\n\n**Group toggle handler:** When the group Switch is toggled, it should call handleToggleTool for each tool in the group. Or better — create a handleToggleGroup function similar to the existing handleToggleAll, but scoped to tools in a specific group. It should use the same optimistic update + rollback pattern as handleToggleAll (lines 59-71).\n\nThe group toggle needs a server-side batch toggle. For now, call setToolEnabled for each tool in the group sequentially, or better — reuse setAllToolsEnabled with a filter. Check if the existing bridge functions support this. If not, iterate tools in the group and call setToolEnabled for each, with a single optimistic UI update.\n\n**Alternating row backgrounds:** The existing `even:bg-muted/10` on ToolRow uses CSS :even pseudo-class which counts all sibling elements. With group headers interspersed, the even/odd pattern will shift. This is acceptable — the alternating pattern still provides visual rhythm within each group. Alternatively, reset the counter per group by wrapping each group's tools in a div.\n\n**Existing retro components used:** Switch (for group toggle), no new primitives needed.\n\n**Files to modify:**\n- platform/browser-extension/src/side-panel/components/PluginCard.tsx — main changes here\n- platform/browser-extension/src/side-panel/bridge.ts — may need a new bridge function for group-level toggle, or reuse existing ones"
+    },
+    {
+      "id": "US-006",
+      "title": "Add tool groups to all existing plugins",
+      "description": "As a user, I want the existing plugins (Slack, Discord, GitHub, Notion) to have their tools organized into meaningful groups so that the grouping feature is immediately useful.",
+      "acceptanceCriteria": [
+        "Slack plugin tools have groups: Messages, Channels, Users, Reactions, Files, DMs",
+        "Discord plugin tools have groups: Messages, Channels, Users, Reactions, DMs, Servers",
+        "GitHub plugin tools have groups: Issues, Pull Requests, Comments, Repositories, Users, Reactions",
+        "Notion plugin tools have groups: Pages, Databases, Users, Blocks",
+        "Each plugin builds successfully with `cd plugins/<name> && npm run build`",
+        "tools.json for each plugin contains the group field on every tool"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Add `group` to every `defineTool()` call in each plugin's tool files. The group names should map to domain entities.\n\nPlugin tool files are typically at `plugins/<name>/src/tools/*.ts` or `plugins/<name>/src/tools.ts`. Read the existing tool definitions to understand the tool names, then assign groups based on the domain entity each tool operates on.\n\n**Slack** (plugins/slack/src/tools/):\n- Messages: send_message, read_messages, read_thread, search_messages, edit_message, delete_message\n- Channels: list_channels, create_channel, get_channel_info, set_channel_topic, set_channel_purpose\n- Users: list_members, list_users, get_user_profile, invite_to_channel\n- Reactions: pin_message, unpin_message, add_reaction, remove_reaction\n- Files: upload_file, list_files\n- DMs: open_dm\n\n**Discord** (plugins/discord/src/tools/):\n- Messages: send_message, read_messages, read_thread, search_messages, edit_message, delete_message\n- Channels: list_channels, create_channel, get_channel_info, create_thread\n- Users: list_members, get_user_profile\n- Reactions: pin_message, unpin_message, add_reaction, remove_reaction\n- DMs: list_dms, open_dm\n- Servers: list_guilds\n\n**GitHub** (plugins/github/src/tools/):\n- Issues: create_issue, get_issue, update_issue, search_issues, list_issues\n- Pull Requests: create_pull_request, get_pull_request, merge_pull_request, list_pull_requests\n- Comments: create_comment, list_comments\n- Repositories: list_repositories, get_repository, create_repository, list_branches, get_file_content, create_or_update_file\n- Users: get_user_profile, list_organization_members, list_notifications\n- Reactions: add_reaction\n\n**Notion** (plugins/notion/src/tools/):\n- Pages: create_page, get_page, update_page, delete_page, list_pages, search\n- Databases: get_database, query_database, create_database_item\n- Users: get_user, list_users\n- Blocks: get_block_children, append_block\n\nNote: Notion's 'search' tool is a general search that returns pages — put it in Pages group.\n\nBuild each plugin after making changes: `cd plugins/<name> && npm run build`. Each plugin is standalone (not in npm workspaces), so they build independently.\n\nIMPORTANT: The plugin SDK version these plugins depend on must have the `group` field (from US-002). The plugins import from `@opentabs-dev/plugin-sdk` which is the local workspace version. After US-002 is committed, the SDK types will be available. If TypeScript errors occur because the SDK hasn't been rebuilt, run `npm run build` from the repo root first to rebuild all platform packages."
+    }
+  ]
+}
