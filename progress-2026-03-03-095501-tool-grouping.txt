@@ -1,0 +1,80 @@
+## Codebase Patterns
+- Shared types (ManifestTool, WireToolDef, etc.) live in platform/shared/src/index.ts — this is the single source of truth for the wire protocol
+- Optional fields on interfaces use `field?: type` with a JSDoc comment
+- The `group` field follows the same optional pattern as `icon`, `iconSvg`, `iconInactiveSvg`
+- Wire protocol optional field pattern: parse with `typeof obj.field === 'string' ? obj.field : undefined`, then spread-conditionally include: `...(field ? { field } : {})`
+- `serializePluginForExtension` in extension-handlers.ts has an inline return type annotation — add new optional fields to both the type annotation and the implementation
+- message-router.ts parses WirePluginDef from raw JSON using defensive type checks — new optional string fields use `typeof t.field === 'string'` guards
+- Plugins are standalone npm packages — they install from npm registry, not workspace. In worktrees, override local SDK/plugin-tools by copying dist/ into plugin node_modules
+- Tool `group` field goes after `icon` in `defineTool()` calls; uses capitalized plural domain entity names (e.g., "Messages", "Pull Requests")
+
+# Ralph Progress Log
+PRD: prd-2026-03-03-095501-tool-grouping~running.json
+Started: Tue Mar  3 17:55:28 UTC 2026
+---
+
+## 2026-03-03 - US-001
+- Added `group?: string` field to `ManifestTool` interface after the `icon` field (platform/shared/src/index.ts:98)
+- Added `group?: string` field to `WireToolDef` interface after the `icon` field (platform/shared/src/index.ts:162)
+- Both fields have JSDoc: "Tool group for visual grouping in the side panel"
+- Files changed: platform/shared/src/index.ts
+- **Learnings for future iterations:**
+  - The shared types file is a barrel that re-exports from sub-modules; ManifestTool and WireToolDef are defined directly in this file (not sub-modules)
+  - All Phase 1 checks passed without any issues — purely additive type change
+  - The `icon` field in ManifestTool has a different position than `icon` in WireToolDef due to WireToolDef having the `enabled` field
+---
+
+## 2026-03-03 - US-003
+- Updated `generateToolsManifest` in platform/plugin-tools/src/commands/build.ts to include `group` conditionally with spread: `...(tool.group ? { group: tool.group } : {})`
+- Added two tests to platform/plugin-tools/src/commands/build.test.ts: one verifying group is included when present, one verifying it is omitted when absent
+- Files changed: platform/plugin-tools/src/commands/build.ts, platform/plugin-tools/src/commands/build.test.ts
+- **Learnings for future iterations:**
+  - `makeRealTool` in the test file only accepts `Partial<Pick<ToolDefinition, 'name' | 'description' | 'input' | 'output'>>` — to add extra fields like `group`, spread with `as unknown as ToolDefinition` cast (same pattern as existing tests for `displayName`/`icon`)
+  - The spread-conditional pattern `...(field ? { field } : {})` is the correct way to conditionally include optional fields so they are entirely absent (not `undefined`) when not set
+  - All 90 test files / 2970 tests passed after the change
+---
+
+## 2026-03-03 - US-004
+- Updated `serializePluginForExtension` in platform/mcp-server/src/extension-handlers.ts to include `...(t.group ? { group: t.group } : {})` in the tools mapping, and added `group?: string` to the inline return type annotation
+- Updated `parseManifest` in platform/mcp-server/src/file-watcher.ts to parse `group` with `typeof obj.group === 'string' ? obj.group : undefined` and spread-conditionally include it in `tools.push({...})`
+- Updated the WireToolDef mapping in platform/browser-extension/src/message-router.ts to extract `...(typeof t.group === 'string' ? { group: t.group } : {})` and include it in the returned object
+- Files changed: platform/mcp-server/src/extension-handlers.ts, platform/mcp-server/src/file-watcher.ts, platform/browser-extension/src/message-router.ts
+- **Learnings for future iterations:**
+  - `serializePluginForExtension` has an explicit inline return type that must be kept in sync with the implementation — new optional fields need to be added in both places
+  - The three-layer pattern (file-watcher parses manifest → extension-handlers serializes to wire → message-router deserializes in extension) each need independent defensive parsing since they cross process/runtime boundaries
+  - All Phase 1 checks passed on first try — purely additive changes with no breaking impact
+---
+
+## 2026-03-03 - US-005
+- Implemented tool grouping in PluginCard.tsx with group headers and group-level Switch toggles
+- Grouping logic: tools are grouped by their `group` field in first-seen order; ungrouped tools go to "Other" at the bottom; if no tools have groups, the list renders flat as before
+- Group headers use `font-head text-xs uppercase tracking-wider text-muted-foreground` with `bg-muted/20` background and `border-b border-border`
+- Group toggle handler: `handleToggleGroup` uses same optimistic update + rollback pattern as `handleToggleAll`, calls `setToolEnabled` for each tool in the group via `Promise.all`
+- Filter/search still works: tools are filtered first, then grouped from the filtered results; empty groups are naturally excluded since they have no visible tools
+- Filter count ("N of M tools") still displays correctly
+- Files changed: platform/browser-extension/src/side-panel/components/PluginCard.tsx
+- **Learnings for future iterations:**
+  - No bridge.ts changes were needed — the existing `setToolEnabled` function suffices for group toggles by calling it for each tool in the group
+  - The `WireToolDef` type from `../bridge.js` already includes the `group?: string` field (added in US-001/US-004)
+  - Group headers are intentionally NOT retro primitives — they are lightweight div rows styled inline per the PRD design spec
+  - The group toggle uses `Promise.all` (parallel) rather than sequential calls for better latency on groups with many tools
+  - Each group's tools are wrapped in their own `<div>` to reset the even/odd alternation pattern per group
+---
+
+## 2026-03-03 - US-006
+- Added `group` field to every `defineTool()` call across all four plugins (Slack, Discord, GitHub, Notion)
+- Slack (22 tools): Messages (6), Channels (5), Users (4), Reactions (4), Files (2), DMs (1)
+- Discord (19 tools): Messages (6), Channels (4), Users (2), Reactions (4), DMs (2), Servers (1)
+- GitHub (21 tools): Issues (5), Pull Requests (4), Comments (2), Repositories (6), Users (3), Reactions (1)
+- Notion (13 tools): Pages (6), Databases (3), Users (2), Blocks (2)
+- Built all four plugins successfully — tools.json for each contains the group field on every tool
+- All Phase 1 checks passed (build, type-check, lint, knip, test — 2970 tests)
+- All Phase 2 E2E tests passed (443 tests)
+- Files changed: 75 tool files across plugins/slack/src/tools/, plugins/discord/src/tools/, plugins/github/src/tools/, plugins/notion/src/tools/
+- **Learnings for future iterations:**
+  - Plugins are standalone npm packages outside the workspace — they install `@opentabs-dev/plugin-sdk` and `@opentabs-dev/plugin-tools` from npm registry, NOT the local workspace
+  - In a worktree, the published SDK/plugin-tools may not have the latest features. Override by copying local dist/ into `plugins/<name>/node_modules/@opentabs-dev/{plugin-sdk,plugin-tools}/dist/`
+  - The `group` field goes after `icon` in the `defineTool()` call: `icon: '...', group: '...',`
+  - The `group` string should be a human-readable domain entity name (e.g., "Messages", "Channels", "Pull Requests") — capitalized, plural
+  - Some files have the same `icon` value (e.g., `'git-branch'` in Discord's read-thread and create-thread) — use more context in Edit's old_string to disambiguate
+---
