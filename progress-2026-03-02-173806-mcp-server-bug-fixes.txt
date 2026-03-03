@@ -1,0 +1,57 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-173806-mcp-server-bug-fixes~running.json
+Started: Tue Mar  3 01:38:48 UTC 2026
+---
+
+## Codebase Patterns
+- sanitize-error.ts chains .replace() calls in a specific order: URLs first, then paths, then localhost, then IPs. New IP-family regexes must go BEFORE IPv4 to avoid partial matches.
+- IPv6 compressed-form regex requires separating colon-terminated middle groups from the final pre-:: group: `(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{0,4}::` — greedy `hex:*` alone eats the colon before `::` and breaks the match.
+- Bracket-wrapped IPv6 regex `\[[0-9a-fA-F]*:[0-9a-fA-F:]*\]` requires at least one colon inside brackets to avoid false-positives on array indices like `[0]`.
+- Shared browser-tools utilities go in `platform/mcp-server/src/browser-tools/` (e.g., dispatch-utils.ts). Files in analyze-site/ import with `../`, files in browser-tools/ import with `./`.
+- The ESLint import-x/order rule requires `./` (same-dir) imports to appear before `../` (parent-dir) imports — add new imports in the right order or run `npm run lint:fix`.
+
+## 2026-03-03 - US-001
+- Added IPv6 address sanitization to platform/mcp-server/src/sanitize-error.ts
+- Added bracket-wrapped regex `/\[[0-9a-fA-F]*:[0-9a-fA-F:]*(?:%[^\]]+)?\]/g` before IPv4 regex
+- Added compressed-form regex `/(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{0,4}::(?:[0-9a-fA-F:.]+)?/g` before IPv4 regex
+- Added 9 IPv6 unit tests in sanitize-error.test.ts covering: [::1], [fe80::1], [2001:db8::1], ::1, fe80::1, 2001:db8::1, ::ffff:192.168.1.1, plus false-positive guards for [0] and version strings
+- **Learnings for future iterations:**
+  - The greedy `(?:[hex]{1,4}:)*::` pattern fails for `fe80::1` because the `*` group eats `fe80:` (consuming the first colon of `::`) leaving only `:1` — not `::`. Fix: use `(?:[hex]{1,4}:)*[hex]{0,4}::` to separate middle groups from the immediate pre-:: group.
+  - Mixed IPv6/IPv4 like `::ffff:192.168.1.1` is fully consumed by the IPv6 regex because `(?:[0-9a-fA-F:.]+)?` includes dots, so no IPv4 residue leaks.
+---
+
+## 2026-03-03 - US-002
+- Removed redundant disableNetworkCapture dispatch from the catch block in platform/mcp-server/src/browser-tools/analyze-site/index.ts (~lines 956-964)
+- The finally block (lines 1034-1049) already dispatches disableNetworkCapture and calls state.activeNetworkCaptures.delete unconditionally for all code paths
+- The catch block now only contains a comment noting that cleanup is handled by the finally block
+- Files changed: platform/mcp-server/src/browser-tools/analyze-site/index.ts
+- **Learnings for future iterations:**
+  - The analyze-site function has a try/finally structure wrapping nearly the entire function body — the finally block is the single place for cleanup (disableNetworkCapture, activeNetworkCaptures.delete, closeTab)
+  - Catch blocks within the try body should only handle partial-analysis fallback (log + set empty result), never perform cleanup — cleanup belongs exclusively in the outer finally
+---
+
+## 2026-03-03 - US-003
+- Created platform/mcp-server/src/browser-tools/dispatch-utils.ts with `validateDispatchResult<T>` helper
+- The helper accepts array (legacy format) or object-with-named-key (current format); logs `log.warn` and returns [] for unexpected shapes
+- Updated platform/mcp-server/src/browser-tools/export-har.ts: replaced 4 inline dispatch result extractions (getNetworkRequests, getWebSocketFrames, and their clear variants) with helper calls
+- Updated platform/mcp-server/src/browser-tools/analyze-site/index.ts: replaced 3 inline dispatch result extractions (networkRequests, wsFrames, cookies) with helper calls
+- **Learnings for future iterations:**
+  - `dispatchToExtension` returns `Promise<unknown>` — no casting needed before passing to a type-guarded helper
+  - ESLint import-x/order requires `./` imports before `../` imports — inserting a new import in the wrong position causes a lint error; `npm run lint:fix` fixes it automatically
+  - Prettier wraps multi-arg function calls to a single line when it fits; explicit multi-line formatting triggers `prettier/prettier` lint errors
+---
+
+## 2026-03-03 - US-004
+- Changed comparison in `detectPrimaryApiBaseUrl` in platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts (~line 386)
+- Old: `if (depth > bestDepth || (depth === bestDepth && count > bestCount))` — depth wins first
+- New: `if (count > bestCount || (count === bestCount && depth > bestDepth))` — count wins first, depth as tiebreaker
+- Added test "prefers prefix with higher endpoint count over deeper prefix with fewer endpoints" in detect-apis.test.ts
+  - 3 endpoints: 2 under `/v1/*` and 1 at `/health`; origin has count=3, `/v1` has count=2
+  - Old algorithm: `/v1` (depth=4) wins over origin (depth=3) despite covering only 2/3 endpoints
+  - New algorithm: origin (count=3) wins over `/v1` (count=2) — correct, origin covers all 3
+- Files changed: platform/mcp-server/src/browser-tools/analyze-site/detect-apis.ts, detect-apis.test.ts
+- **Learnings for future iterations:**
+  - In this prefix-counting model, an ancestor prefix always has count >= any descendant prefix. The depth bias bug manifests when depth-first selection picks a descendant with lower endpoint count over its ancestor.
+  - The depth cap of 3 segments means max prefix depth is `origin/seg1/seg2/seg3` — "50 endpoints at depth 3 vs 2 at depth 6" from the PRD is illustrative; in practice origin always has max count, so the effective fix is ancestor-vs-descendant comparison (count first, depth as tiebreaker).
+  - When writing test cases for multi-req objects where Prettier wraps long single-line `req({...})` calls, format them as multi-line from the start to avoid lint errors.
+---
