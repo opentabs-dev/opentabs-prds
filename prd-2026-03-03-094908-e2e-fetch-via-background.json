@@ -1,0 +1,59 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add E2E test coverage for the fetchViaBackground cross-origin cookie proxy. The entire chain (MAIN world CustomEvent -> ISOLATED world relay -> background service worker -> chrome.cookies.getAll -> cross-origin fetch -> response chain) currently has zero E2E coverage. This PRD adds a cross-origin test server, a test plugin tool exercising fetchViaBackground, and comprehensive E2E tests.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add cross-origin test server and fetchViaBackground test tool to e2e-test plugin",
+      "description": "As a platform developer, I want a cross-origin test server and a test tool that exercises fetchViaBackground so that E2E tests can verify the full proxy chain.",
+      "acceptanceCriteria": [
+        "A new cross-origin test server exists at e2e/cross-origin-test-server.ts that listens on an ephemeral port (PORT=0)",
+        "The cross-origin test server has POST /api/echo-with-cookies that returns JSON with: { cookies: Record<string,string>, body: <request body>, method: <request method> } so tests can verify cookies were attached",
+        "The cross-origin test server has GET /api/simple that returns { ok: true } for basic connectivity tests",
+        "The cross-origin test server has POST /control/set-cookie that sets an HttpOnly cookie on the response (for the test server's domain), and GET /control/cookies that returns all cookies set via /control/set-cookie",
+        "The cross-origin test server returns proper CORS headers: Access-Control-Allow-Origin matching the requesting origin, Access-Control-Allow-Credentials: true, Access-Control-Allow-Headers listing Content-Type and any custom headers",
+        "A Playwright fixture crossOriginServer is added to e2e/fixtures.ts that starts the cross-origin test server",
+        "A new tool sdk_fetch_via_background is added to the e2e-test plugin that calls context.fetchViaBackground(url, init) with the provided url and init, returning the FetchProxyResponse",
+        "A new tool sdk_fetch_via_background_concurrent is added that makes N parallel fetchViaBackground calls and returns all responses",
+        "The e2e-test plugin passes build, type-check, lint, format:check",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files to create/modify:\n\n1. `e2e/cross-origin-test-server.ts` — model after `e2e/test-server.ts` but much simpler. Key endpoints:\n   - `POST /api/echo-with-cookies` — reads Cookie header from request, returns `{ cookies: parsedCookies, body: requestBody, method: 'POST', headers: requestHeaders }`\n   - `GET /api/simple` — returns `{ ok: true }`\n   - `POST /control/set-cookie` — body `{ name, value, httpOnly?, sameSite? }` — sets a Set-Cookie header on the response\n   - CORS: respond to OPTIONS preflight with `Access-Control-Allow-Origin: <origin>`, `Access-Control-Allow-Credentials: true`, `Access-Control-Allow-Headers: Content-Type, useraccount, linear-client-id`\n   - Start with `PORT=0` and print the URL to stdout (same pattern as test-server.ts)\n\n2. `e2e/fixtures.ts` — add a `crossOriginServer` fixture:\n   - Uses `startServerProcess()` with `e2e/cross-origin-test-server.ts`\n   - Provides the server URL to tests\n   - Also sets a cookie on the Chromium browser context for the cross-origin server's URL using `browserContext.addCookies()` (to simulate HttpOnly session cookies)\n\n3. `plugins/e2e-test/src/tools/sdk-fetch-via-background.ts` — new tool:\n   ```typescript\n   export const sdkFetchViaBackground = defineTool({\n     name: 'sdk_fetch_via_background',\n     input: z.object({ url: z.string(), method: z.string().optional(), headers: z.record(z.string()).optional(), body: z.string().optional() }),\n     output: z.object({ status: z.number(), statusText: z.string(), headers: z.record(z.string()), body: z.string(), ok: z.boolean() }),\n     handle: async (params, context) => {\n       if (!context?.fetchViaBackground) throw ToolError.internal('fetchViaBackground not available');\n       const response = await context.fetchViaBackground(params.url, { method: params.method ?? 'GET', headers: params.headers, body: params.body });\n       return response;\n     },\n   });\n   ```\n\n4. `plugins/e2e-test/src/tools/sdk-fetch-via-background-concurrent.ts` — new tool:\n   - Takes `{ urls: string[], method?: string, headers?: Record<string,string> }`\n   - Makes parallel `context.fetchViaBackground()` calls for each URL\n   - Returns `{ responses: FetchProxyResponse[] }`\n\n5. `plugins/e2e-test/src/index.ts` — register the two new tools\n\nImportant: The e2e-test plugin's urlPatterns is `['http://localhost/*']`. The cross-origin test server runs on a different port but same hostname (localhost). The fetchViaBackground domain validation checks registrable domain, so `localhost` -> `localhost` will pass. If using `127.0.0.1` as the cross-origin host, ensure the e2e-test plugin's urlPatterns include it or use localhost for both (just different ports). Different ports on the same hostname ARE cross-origin for CORS but share the same registrable domain for the security check.\n\nThe test harness should use `context.addCookies()` from Playwright to set HttpOnly cookies on the cross-origin server's URL before running tests. This simulates how a real web app (like Linear) has HttpOnly session cookies set by the server."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E tests for fetchViaBackground cross-origin proxy",
+      "description": "As a platform developer, I want comprehensive E2E tests for fetchViaBackground so that the full proxy chain is verified against a real Chrome extension.",
+      "acceptanceCriteria": [
+        "New test file e2e/sdk-fetch-via-background.e2e.ts exists",
+        "Test: basic cross-origin fetch — calls sdk_fetch_via_background with a cross-origin URL, verifies the response status, body, and ok field",
+        "Test: cookies attached — sets HttpOnly cookies via Playwright context.addCookies() for the cross-origin server, calls sdk_fetch_via_background, verifies the cross-origin server received the cookies in the request",
+        "Test: custom headers forwarded — passes custom headers (e.g. useraccount, Content-Type), verifies the cross-origin server received them",
+        "Test: POST with body — sends a POST with JSON body, verifies the cross-origin server received the body",
+        "Test: domain validation — calls sdk_fetch_via_background with a URL on a domain that does NOT match the plugin's urlPatterns (e.g. https://evil.example.com), verifies the call is rejected with an error",
+        "Test: concurrent requests — calls sdk_fetch_via_background_concurrent with multiple URLs, verifies all responses are received correctly",
+        "Test: network error handling — calls sdk_fetch_via_background with an unreachable URL, verifies the error is propagated",
+        "All existing E2E tests continue to pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "File to create: `e2e/sdk-fetch-via-background.e2e.ts`\n\nFollow the patterns in existing SDK test files like `e2e/sdk-fetch-errors.e2e.ts` and `e2e/sdk-utilities.e2e.ts`.\n\nTest structure:\n```typescript\nimport { expect, test } from './fixtures.js';\nimport { callToolExpectSuccess, callToolExpectError, setupToolTest } from './helpers.js';\n\ntest.describe('fetchViaBackground', () => {\n  test('makes cross-origin request with cookies', async ({ mcpServer, testServer, crossOriginServer, extensionContext, mcpClient }) => {\n    const page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n    // Set HttpOnly cookie on cross-origin server's URL\n    const context = page.context();\n    await context.addCookies([{\n      name: 'session',\n      value: 'test-session-token',\n      url: crossOriginServer.url,\n      httpOnly: true,\n      sameSite: 'None',\n      secure: false,\n    }]);\n    // Call the tool\n    const output = await callToolExpectSuccess(mcpClient, mcpServer, 'e2e-test_sdk_fetch_via_background', {\n      url: `${crossOriginServer.url}/api/echo-with-cookies`,\n      method: 'POST',\n      headers: { 'Content-Type': 'application/json' },\n      body: JSON.stringify({ test: true }),\n    });\n    // Verify cookies were attached\n    const body = JSON.parse(output.body);\n    expect(body.cookies.session).toBe('test-session-token');\n    expect(output.ok).toBe(true);\n    expect(output.status).toBe(200);\n  });\n});\n```\n\nFor the domain validation test, use a URL like `https://evil.example.com/api/test` — this domain does not share a registrable domain with `localhost`, so the background handler should reject it.\n\nFor the network error test, use `http://localhost:1/never` (port 1 is almost certainly not listening).\n\nFor concurrent tests, make 5 parallel requests to the cross-origin server and verify all 5 responses are received.\n\nImportant: The `crossOriginServer` fixture must be available in the test. Check if `fixtures.ts` already exports it or if it needs to be added to the test fixture type."
+    }
+  ]
+}
