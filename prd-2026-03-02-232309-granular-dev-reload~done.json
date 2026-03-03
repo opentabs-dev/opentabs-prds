@@ -19,7 +19,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Create a new file `scripts/dev-reload-server.ts` that exports a `startDevReloadServer(port: number)` function returning `{ broadcast(id: string): void; close(): void }`. The WebSocket server should use the `ws` package (already a dependency). Message protocol: `{ type: 'build_complete', id: string }` inbound from build, `{ type: 'do_update', id: string }` outbound to clients. Keep it simple — no authentication needed since this is localhost-only dev tooling. The relay server is imported and started in `scripts/dev.ts` right before the startup banner (after initial build, before tsc recompile watcher). Add cleanup to the existing `cleanup()` function. Use a non-standard port (18515) to avoid conflicts with the MCP server (9515). The port should be exported as a constant so the extension can reference it at build time."
@@ -43,7 +43,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Modify `scripts/dev.ts`. The change detection strategy: before each tsc compilation, snapshot mtimes of key dist/ files. After compilation, compare. The key insight is which *source* directories changed — map dist output paths back to source:\n\n- `platform/browser-extension/dist/side-panel/` → side panel only\n- `platform/browser-extension/dist/background.js` or `platform/browser-extension/dist/offscreen/` → background/offscreen\n- `platform/browser-extension/dist/` (other files like bridge, messaging, etc.) → shared code used by both → rebuild both\n- Any other platform package dist/ change (mcp-server, plugin-sdk, shared, cli) → not extension code, skip extension rebuild\n\nA simpler approach that's more robust: use tsc's own output. After tsc finishes, scan `platform/browser-extension/dist/` for files with mtime newer than the compilation start timestamp. Categorize them:\n- Files under `dist/side-panel/` → side panel target\n- `dist/background.js`, files under `dist/offscreen/` → background target\n- All other `.js` files in `dist/` (e.g., `dist/bridge.js`, `dist/messaging.js`, `dist/message-router.js`) → shared, triggers both targets\n\nThe `scheduleExtensionRebuild` callback should be updated to call this analysis, then conditionally run only the needed build steps. After build + install, call `reloadServer.broadcast('side-panel')` or `reloadServer.broadcast('extension')` instead of calling the old `reloadExtension()` POST endpoint.\n\nKeep the old `reloadExtension()` function as a fallback — if the WebSocket relay is not running (e.g., port conflict), fall back to the full `POST /extension/reload` behavior."
@@ -67,7 +67,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Modify `platform/browser-extension/build-side-panel.ts` to accept a dev mode flag. The approach:\n\n1. Create `platform/browser-extension/src/dev-reload-client.ts` containing the WebSocket client code. This file is a self-contained IIFE that:\n   - Connects to `ws://localhost:${DEV_RELOAD_PORT}`\n   - Listens for `{ type: 'do_update', id: string }` messages\n   - If `id === 'side-panel'` OR `id === 'extension'`, calls `window.location.reload()`\n   - On close/error, reconnects with exponential backoff (500ms → 1s → 2s → 4s, cap 10s)\n   - Logs connection status to console with `[dev-reload]` prefix\n\n2. In `build-side-panel.ts`, check for `process.env.OPENTABS_DEV` (set by the dev orchestrator). If truthy, read the dev reload client source file and use an esbuild `banner` option to prepend it to the output bundle, wrapped in an IIFE. The banner approach means no import needed — it's just prepended JS text.\n\n3. The `DEV_RELOAD_PORT` constant should be imported from a shared location. Since this is a build-time concern, define it in a file that both `scripts/dev-reload-server.ts` and the build script can import. A good location is `scripts/dev-reload-constants.ts` exporting `DEV_RELOAD_PORT = 18515`. The build script can use `define` in esbuild to replace a `__DEV_RELOAD_PORT__` global with the actual port value.\n\n4. The dev reload client should respond to BOTH 'side-panel' and 'extension' IDs — because if the background changes, the extension does a full reload which destroys the side panel anyway, but if the side panel receives the signal first it can refresh faster. This is harmless.\n\n5. The client must work within MV3 CSP. WebSocket connections from chrome-extension:// pages are allowed by default CSP (no connect-src restriction). The script is bundled as part of the extension's own JS — satisfies script-src 'self'. No CSP modification needed.\n\nDev mode detection: `scripts/dev.ts` should set `OPENTABS_DEV=1` in the environment before calling build functions, or pass it as an argument to `buildSidePanel()`. The simpler approach is to pass `--dev` as a CLI arg to the build script."
@@ -91,7 +91,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Modify `platform/browser-extension/build-extension.ts` to accept a dev mode flag, similar to US-003.\n\n1. Create `platform/browser-extension/src/dev-reload-background.ts` containing the background-specific WebSocket client. This is different from the side panel client because:\n   - It only responds to `id === 'extension'` (not 'side-panel')\n   - It calls `chrome.runtime.reload()` instead of `window.location.reload()`\n   - Before reloading, it should clear `wsConnected` from session storage (same as the existing `handleExtensionReload` in `message-router.ts:232-251`) to prevent stale state on restart\n   - It runs in a service worker context (no `window`, no `document`)\n\n2. In `build-extension.ts`, check for `process.env.OPENTABS_DEV`. If truthy, prepend the dev reload background client to the background bundle output using esbuild's `banner` option. Only prepend to `background.js`, NOT to `offscreen/index.js` — the offscreen document doesn't need its own reload client since it's destroyed when the extension reloads.\n\n3. In `scripts/dev.ts`, update `scheduleExtensionRebuild` to:\n   - For background/offscreen changes: call `reloadServer.broadcast('extension')` — the background script's embedded client handles the rest\n   - For side-panel-only changes: call `reloadServer.broadcast('side-panel')` — the side panel's embedded client handles the rest\n   - Remove the `reloadExtension()` POST call from the rebuild pipeline (keep the function for fallback if relay server is unavailable)\n\n4. The service worker WebSocket client needs to handle the service worker lifecycle. Service workers can be terminated by Chrome when idle. On `do_update`, the reload is immediate so this is not a concern. For the WebSocket connection itself: if it disconnects, the reconnect logic keeps it alive. Chrome's alarm API can be used as a keepalive if needed, but in practice during active dev the service worker stays alive due to the side panel being open.\n\n5. Important: the `WS_CONNECTED_KEY` constant is defined in `platform/browser-extension/src/constants.ts`. The dev reload background script needs this value. Since it's prepended as a banner (not imported), hardcode the key string 'wsConnected' in the dev reload script (it's a stable constant that won't change)."
@@ -113,7 +113,7 @@
         "npm run test passes"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "This story wires the plumbing between the orchestrator and the build scripts.\n\nIn `scripts/dev.ts`:\n- When calling `buildExtension()`, `buildSidePanel()`, or `buildBackground()`, set `process.env.OPENTABS_DEV = '1'` before spawning the child processes. Since `runWithPrefix` uses `spawn`, the child processes inherit the parent's environment. Alternatively, pass it explicitly in the spawn env.\n- Actually, the simpler approach: since `buildExtension` calls `npm run build:bundle` and `npm run build:side-panel` via `runWithPrefix`, and those spawn child processes that inherit `process.env`, setting `process.env.OPENTABS_DEV = '1'` at the top of dev.ts (before any builds) is sufficient.\n\nIn `build-side-panel.ts`:\n- Read `const isDev = process.env.OPENTABS_DEV === '1'`\n- If isDev, read the dev reload client source, bundle it with esbuild separately (or inline it), and prepend via the `banner` esbuild option\n- Use esbuild's `define` to replace `__DEV_RELOAD_PORT__` with the actual port number in the dev reload client\n\nIn `build-extension.ts`:\n- Same pattern but for the background bundle only\n- The banner should only apply to the background entry point, not offscreen\n\nNote: The dev reload client TypeScript files (`src/dev-reload-client.ts` and `src/dev-reload-background.ts`) from US-003/US-004 need to be compiled to JS before they can be used as banner text. Two options:\n  a) Write them as plain JS files (no compilation needed) — simpler, no build step dependency\n  b) Use esbuild to compile them inline before using as banner text\n\nOption (a) is recommended for simplicity. Place them in `platform/browser-extension/src/dev/reload-client.js` and `src/dev/reload-background.js` as plain JS. Read them with `readFileSync` in the build scripts."
@@ -135,7 +135,7 @@
         "npm run test passes"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "Modify `scripts/dev.ts`.\n\nUpdate the startup banner `contentLines` array to include the dev reload port info. The banner is built at lines 319-336.\n\nUpdate the log messages in the rebuild pipeline:\n- After `buildSidePanel()` succeeds + broadcast('side-panel'): log `[ext] Side panel refreshed (UI-only)`\n- After `buildBackground()` succeeds + broadcast('extension'): log `[ext] Extension reloaded (full)`\n- After both build + broadcast('extension'): log `[ext] Extension reloaded (full — background + UI changed)`\n\nThe fallback path (when relay server is unavailable) should log `[ext] Extension reloaded (full — via HTTP fallback)`.\n\nThis is the final story and touches browser-observable behavior (the extension reload mechanism changes), so mark as e2eCheckpoint."

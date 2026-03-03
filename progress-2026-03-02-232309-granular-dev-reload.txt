@@ -1,0 +1,91 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-232309-granular-dev-reload~running.json
+Started: Tue Mar  3 07:23:41 UTC 2026
+---
+
+## Codebase Patterns
+- Scripts in `scripts/` are type-checked by `tsconfig.scripts.json` with `noEmit: true` — use extensionless imports (not `.ts` or `.js`) since `moduleResolution: "bundler"` is configured
+- Knip treats all `scripts/*.ts` files as entry points, so exports from new script files are considered used
+- The `ws` package + `@types/ws` are available as root dependencies
+- The dev orchestrator (`scripts/dev.ts`) uses top-level await and runs via `tsx`
+- lint-staged runs on commit; verify unstaged changes survived after each commit with `git diff --stat && git stash list`
+- Extension dist/ layout: `dist/side-panel/` = side panel, `dist/background.js` + `dist/offscreen/` = background/offscreen, other `.js` in dist root = shared code
+- The dev orchestrator now has targeted rebuild: `buildSidePanel()` and `buildBackground()` for incremental builds, `buildExtension()` for initial full build
+- `devReloadServer.broadcast('side-panel')` for UI-only reloads, `broadcast('extension')` for full extension reloads
+- Plain JS build assets in `platform/browser-extension/src/dev/*.js` are read via `readFileSync` at build time and injected via esbuild `banner` — not imported, so must be ignored by knip
+- esbuild `banner` option injects raw text without `define` replacements — use string substitution for build-time constants in banner content
+- `build-side-panel.ts` checks `process.env.OPENTABS_DEV === '1'` to conditionally include dev reload clients (set by the dev orchestrator)
+- `build-extension.ts` follows the same pattern: `isDev` check → `readFileSync` → string substitution → esbuild `banner` option (background bundle only, not offscreen)
+- Background reload client uses `addEventListener` (service worker context) instead of `ws.onopen` etc. (both work, but addEventListener is idiomatic for service workers)
+- Background client clears `wsConnected` session storage before `chrome.runtime.reload()` — mirrors `handleExtensionReload` in `message-router.ts`
+
+## 2026-03-03 - US-001
+- Implemented dev reload WebSocket relay server for the dev orchestrator
+- Files created:
+  - `scripts/dev-reload-constants.ts` — exports `DEV_RELOAD_PORT = 18515`
+  - `scripts/dev-reload-server.ts` — exports `startDevReloadServer(port)` returning `{ broadcast, close }` or `null` on port conflict
+- Files modified:
+  - `scripts/dev.ts` — imports and starts the relay server after initial extension build, adds cleanup on SIGINT/SIGTERM
+- **Learnings for future iterations:**
+  - Import paths in `scripts/` must be extensionless (e.g., `'./dev-reload-server'` not `'./dev-reload-server.ts'`) because `allowImportingTsExtensions` is not enabled
+  - The relay server returns `null` on EADDRINUSE so the orchestrator can gracefully degrade
+  - The `devReloadServer` variable is declared before `cleanup()` so the signal handlers can access it, then assigned after the `await` call
+---
+
+## 2026-03-03 - US-002
+- Implemented targeted extension rebuild: `buildSidePanel()`, `buildBackground()`, and `determineChangedTargets()` in `scripts/dev.ts`
+- Files modified:
+  - `scripts/dev.ts` — added `readdir`/`stat`/`relative` imports, `RebuildTarget` type, `EXT_DIST` constant, `determineChangedTargets()` + `scanDir()` for mtime-based change detection, `buildSidePanel()` and `buildBackground()` for targeted builds, `runTargetedRebuild()` for the rebuild decision logic, updated `scheduleExtensionRebuild` to use targeted pipeline
+- **Learnings for future iterations:**
+  - The mtime-based change detection uses `lastCompilationTimestamp` to track the time window between tsc compilations. Files with mtime after the previous timestamp are newly emitted by tsc.
+  - File categorization: `dist/side-panel/**` → side-panel target, `dist/background.js` and `dist/offscreen/**` → extension target, all other `.js` files in dist (bridge, messaging, etc.) → shared code that triggers both targets
+  - The existing `buildExtension()` is preserved for the initial build; only incremental rebuilds use the targeted pipeline
+  - When `devReloadServer` is null (port conflict), the fallback path uses the existing `reloadExtension()` HTTP POST method
+---
+
+## 2026-03-03 - US-003
+- Implemented dev reload client injection into the side panel bundle
+- Files created:
+  - `platform/browser-extension/src/dev/reload-client.js` — plain JS IIFE that connects to the dev reload WebSocket relay server, listens for `do_update` messages with id `side-panel` or `extension`, and calls `window.location.reload()` on match. Reconnects with exponential backoff (500ms → 10s cap).
+- Files modified:
+  - `platform/browser-extension/build-side-panel.ts` — added `readFileSync` import, `isDev` check for `OPENTABS_DEV` env var, reads reload-client.js and replaces `__DEV_RELOAD_PORT__` placeholder with the port number, passes it as esbuild `banner` option. Production builds are unaffected.
+  - `knip.ts` — added `platform/browser-extension/src/dev/*.js` to the ignore list (these files are read at build time via readFileSync, not via imports, so knip cannot trace them).
+- **Learnings for future iterations:**
+  - esbuild's `banner` option injects raw text — it does NOT process `define` replacements in banner content. Use string substitution (`replace()`) to inject build-time constants into banner JS.
+  - Plain `.js` files in `src/dev/` are not covered by any tsconfig (intentionally — they're build-time assets, not TypeScript source). They need to be ignored by knip since they appear as "unused files" (not imported anywhere).
+  - Biome lints `.js` files too — must use modern JS (const/let, arrow functions, template literals) even in plain JS build assets.
+  - The side panel client responds to both `side-panel` and `extension` IDs — because on a full extension reload the side panel is destroyed anyway, and refreshing it first is harmless.
+---
+
+## 2026-03-03 - US-004
+- Implemented dev reload client injection into the background bundle for full extension reload
+- Files created:
+  - `platform/browser-extension/src/dev/reload-background.js` — plain JS IIFE that connects to the dev reload WebSocket relay server, listens for `do_update` messages with id `extension` only, clears `wsConnected` session storage, then calls `chrome.runtime.reload()`. Uses `addEventListener` (idiomatic for service workers). Reconnects with exponential backoff (500ms → 10s cap).
+- Files modified:
+  - `platform/browser-extension/build-extension.ts` — added `readFileSync` import, `isDev` check for `OPENTABS_DEV` env var, reads reload-background.js and replaces `__DEV_RELOAD_PORT__` placeholder with port number, passes it as esbuild `banner` option for the background bundle only (not offscreen). Production builds are unaffected.
+- **Learnings for future iterations:**
+  - The background client only reacts to `id === 'extension'` — unlike the side panel client which reacts to both. This is intentional: side panel refreshes should not trigger a full extension reload.
+  - The background service worker's WebSocket connection stays alive during active dev because the side panel keeps the service worker active. No keepalive alarm is needed.
+  - The `reloadExtension()` POST function is preserved in dev.ts as a fallback when the WebSocket relay server is unavailable (port conflict), but the primary path is WebSocket broadcast.
+  - The `wsConnected` key is hardcoded as the string 'wsConnected' in the dev reload script (matching the constant `WS_CONNECTED_KEY` in `constants.ts`) because the banner is prepended text, not imported code.
+---
+
+## 2026-03-03 - US-005
+- Wired OPENTABS_DEV=1 environment variable into the dev orchestrator
+- Files modified:
+  - `scripts/dev.ts` — added `process.env.OPENTABS_DEV = '1'` before the tsc watcher starts, just after signal handlers. Child processes spawned via `runWithPrefix` inherit the parent's `process.env`, so both the initial `buildExtension()` call and all subsequent targeted rebuilds (`buildSidePanel()`, `buildBackground()`) receive the flag automatically.
+- **Learnings for future iterations:**
+  - The env var is set at the top level of dev.ts (before any builds start), so it covers the initial build AND all incremental targeted rebuilds without needing to pass it explicitly to each function call.
+  - `install-extension.ts` correctly handles dev-built artifacts: `EXTENSION_COPY_EXCLUDE_PATTERN` already excludes `src/` (and thus `src/dev/*.js`), so only the built bundles (with dev reload clients baked in) are copied to the extension install dir.
+  - Production builds (`npm run build`) spawn `npx tsx build-side-panel.ts` / `npx tsx build-extension.ts` directly without setting `OPENTABS_DEV`, so dev reload clients are correctly excluded from production bundles.
+---
+
+## 2026-03-03 - US-006
+- Added dev reload status to the startup banner and updated console output for all rebuild scenarios
+- Files modified:
+  - `scripts/dev.ts` — added `devReloadText` variable to conditionally display `Dev Reload: ws://localhost:18515` or `Dev Reload: disabled (port 18515 in use)` in the startup banner; updated log messages in `runTargetedRebuild()` to use specified phrasing: side panel → "Side panel refreshed (UI-only)", background → "Extension reloaded (full)", mixed → "Extension reloaded (full — background + UI changed)"; updated `reloadExtension()` fallback log to "Extension reloaded (full — via HTTP fallback)."
+- **Learnings for future iterations:**
+  - The startup banner `contentLines` uses a `text` property for width calculation and an optional `display` property for rendering with ANSI colors — new lines only need `text` unless color is desired
+  - The banner width auto-adjusts to the longest `text` entry, so adding a new line doesn't require manual width tweaks
+  - This was the e2eCheckpoint story — all 435 E2E tests and 2959 unit tests passed
+---
