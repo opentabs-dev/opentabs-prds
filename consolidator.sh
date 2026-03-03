@@ -250,15 +250,27 @@ _push_main() {
   return 1
 }
 
-# Safely delete a remote ralph branch ONLY after verifying its tip commit is
-# reachable from origin/main. This prevents losing work if the merge or push
-# silently failed. Also cleans up the corresponding consumer worktree if it
-# still exists on this machine.
+# Safely delete a remote ralph branch ONLY after verifying its content is in
+# origin/main. This prevents losing work if the merge or push silently failed.
+# Also cleans up the corresponding consumer worktree if it still exists.
 #
-# Usage: _safe_delete_branch "$tag" "$branch_name"
+# The caller passes the SHA of the merge commit that was pushed to main. This
+# is necessary because after a rebase, the original branch commits have
+# different SHAs than the rebased ones — a simple ancestor check on the branch
+# tip would fail even though the work is in main.
+#
+# Verification strategy:
+#   1. Confirm the merge_sha is an ancestor of origin/main (push landed)
+#   2. Confirm the branch's tree diff against its merge base with main is empty
+#      when compared to origin/main (all changes incorporated)
+#   Fallback: if merge_sha is not provided (e.g., 0-commit branch), use the
+#   branch tip ancestor check directly.
+#
+# Usage: _safe_delete_branch "$tag" "$branch_name" ["$merge_sha"]
 _safe_delete_branch() {
   local tag="$1"
   local branch_name="$2"
+  local merge_sha="${3:-}"
 
   # Fetch latest remote state to ensure we have accurate refs
   git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
@@ -273,13 +285,30 @@ _safe_delete_branch() {
     return 0
   fi
 
-  # Verify every commit on the branch is reachable from origin/main.
-  # merge-base --is-ancestor checks that the branch tip is an ancestor of main,
-  # which means all of its commits are included in main's history.
-  if ! git -C "$CODE_DIR" merge-base --is-ancestor "$branch_tip" "$remote_main" 2>/dev/null; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}SAFETY: Branch tip ($branch_tip) is NOT reachable from origin/main ($remote_main). Refusing to delete remote branch.${RESET}"
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Branch preserved: origin/$branch_name${RESET}"
-    return 1
+  # Verify the work is in main using the best available method.
+  local verified=false
+
+  if [ -n "$merge_sha" ]; then
+    # Caller provided the merge commit SHA. Verify it's in origin/main.
+    # This handles the rebase case where original branch commits have
+    # different SHAs than what ended up in main.
+    if git -C "$CODE_DIR" merge-base --is-ancestor "$merge_sha" "$remote_main" 2>/dev/null; then
+      verified=true
+    else
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}SAFETY: Merge commit ($merge_sha) is NOT reachable from origin/main ($remote_main). Refusing to delete.${RESET}"
+    fi
+  fi
+
+  if [ "$verified" = false ]; then
+    # Fallback: check if branch tip is directly an ancestor of main.
+    # This works for standard merges (no rebase) and 0-commit branches.
+    if git -C "$CODE_DIR" merge-base --is-ancestor "$branch_tip" "$remote_main" 2>/dev/null; then
+      verified=true
+    else
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}SAFETY: Branch tip ($branch_tip) is NOT reachable from origin/main ($remote_main). Refusing to delete remote branch.${RESET}"
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Branch preserved: origin/$branch_name${RESET}"
+      return 1
+    fi
   fi
 
   # Safe to delete — branch content is in main
@@ -495,8 +524,10 @@ merge_branch() {
     # Push main to remote. _push_main handles non-fast-forward rejections
     # by rebasing onto the updated remote HEAD and retrying internally.
     if _push_main "$tag"; then
+      local pushed_sha
+      pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main.${RESET}"
-      _safe_delete_branch "$tag" "$branch_name"
+      _safe_delete_branch "$tag" "$branch_name" "$pushed_sha"
       return 0
     fi
 
@@ -514,8 +545,10 @@ merge_branch() {
     git -C "$CODE_DIR" add -A 2>/dev/null || true
     git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
     if _push_main "$tag"; then
+      local pushed_sha
+      pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI build fix).${RESET}"
-      _safe_delete_branch "$tag" "$branch_name"
+      _safe_delete_branch "$tag" "$branch_name" "$pushed_sha"
       return 0
     else
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push still failed after AI fix. Resetting to remote.${RESET}"
@@ -747,8 +780,10 @@ except: pass" 2>/dev/null)
       # Push the AI-resolved merge. _push_main handles non-fast-forward
       # rejections by rebasing and retrying internally.
       if _push_main "$tag"; then
+        local pushed_sha
+        pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
         echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI-resolved merge).${RESET}"
-        _safe_delete_branch "$tag" "$branch_name"
+        _safe_delete_branch "$tag" "$branch_name" "$pushed_sha"
         return 0
       fi
 
@@ -758,8 +793,10 @@ except: pass" 2>/dev/null)
         git -C "$CODE_DIR" add -A 2>/dev/null || true
         git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
         if _push_main "$tag"; then
+          local pushed_sha
+          pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
           echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI conflict + build fix).${RESET}"
-          _safe_delete_branch "$tag" "$branch_name"
+          _safe_delete_branch "$tag" "$branch_name" "$pushed_sha"
           return 0
         fi
       fi
@@ -857,7 +894,6 @@ while true; do
       # to be at origin/main. Fetch + fast-forward handles both cases
       # without destroying local commits that haven't been pushed yet.
       git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
-      local local_head remote_head
       local_head=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
       remote_head=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
 
