@@ -1,0 +1,133 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-165957-data-flow-polish-2~running.json
+Started: Tue Mar  3 01:00:21 UTC 2026
+---
+
+## Codebase Patterns
+- `restoreWsConnectedState` in `background-message-handlers.ts` is called once from `background.ts` at service worker startup. Pattern for awaitable one-shot async init: store the promise in a module-level variable, export `waitForXxx()` that returns it (or `Promise.resolve()` if not started).
+- `handleBgGetFullState` uses an async IIFE pattern: `(async () => { ... })().catch(...)`. Await calls go inside the IIFE.
+- Module-level state (`wsConnected`, `wsConnectedRestorePromise`) persists across tests in the same module import. The `beforeEach` resets `wsConnected` via `handleWsState({ connected: false })`.
+- When adding a new export to `background-message-handlers.ts`, add it to both the `export { }` block at the bottom AND the destructured import in the test file.
+- `server-state-cache.ts` uses pending optimistic update Maps (`pendingPluginToolUpdates`, `pendingBrowserToolUpdates`) that are re-applied after every `updateServerStateCache` call. This protects in-flight toggle states from `plugins.changed` overwrites. Pattern: register before the optimistic cache update, remove on server response (success or failure), then revert on failure.
+- When adding new exports from `server-state-cache.ts`, update both the `export { }` block AND the `vi.mock('./server-state-cache.js')` in `background-message-handlers.test.ts` (which has a separate `vi.hoisted()` block + destructured const for mock variables).
+- When adding new mocks to `message-router.test.ts`, update FOUR places: `vi.hoisted()` return object, destructured `const { }`, `vi.mock()` factory, AND `resetRoutingMocks()`. Also add `mockResolvedValue` in `beforeEach` for async mocks that need a default. Missing `resetRoutingMocks` causes call-count pollution across tests.
+- `wrapAsync` in `message-router.ts` fires `fn(params, id).catch(...)` without returning the promise. Tests that check side effects after an async handler must `await Promise.resolve()` (twice) to flush microtasks after calling `handleServerMessage`.
+- For `offscreen/index.ts` tests: mock Chrome APIs, WebSocket (as a class), and fetch via direct `globalThis` assignment BEFORE `await import('./index.js')`. Use `await new Promise(r => setTimeout(r, 0))` after import to let the async IIFE (bootstrapFromAuthFile + connect) complete. Use a class-based mock for WebSocket — `vi.fn().mockImplementation(factory)` is unreliable as a constructor mock for overriding Node.js built-ins.
+
+## 2026-03-03 - US-001
+- Fixed `applyFullState` in `platform/browser-extension/src/side-panel/App.tsx` (line ~202)
+- Changed `setBrowserTools` to use server's tool list as the authoritative base instead of mapping over local catalog
+- When server returns non-empty browser tools: uses server list as base, adds any local catalog tools not in server list with `enabled: true`
+- When server returns empty browser tools: falls back to local catalog with `enabled: true`
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - `setBrowserTools` initializer doesn't need `prev` when computing from scratch — use `() =>` not `prev =>`
+  - `BROWSER_TOOLS_CATALOG` is imported from `@opentabs-dev/shared/browser-tools-catalog` (subpath import, not barrel)
+  - The disconnect handler at line ~261 also resets browser tools to the catalog; that path was already correct
+---
+
+## 2026-03-03 - US-002
+- Added `wsConnectedRestorePromise: Promise<void> | undefined` module-level variable to `background-message-handlers.ts`
+- Changed `restoreWsConnectedState` to be idempotent: stores promise on first call, no-op on subsequent calls
+- Added `waitForWsConnectedRestore()` that returns the stored promise (or `Promise.resolve()` if not yet called)
+- Added `await waitForWsConnectedRestore()` at the start of `handleBgGetFullState`'s async IIFE
+- Exported `waitForWsConnectedRestore` from the module
+- Added unit test: "returns connected=true when session storage has wsConnected=true but in-memory flag not yet restored"
+- Files changed: `platform/browser-extension/src/background-message-handlers.ts`, `platform/browser-extension/src/background-message-handlers.test.ts`
+- **Learnings for future iterations:**
+  - The idempotency guard (`if (wsConnectedRestorePromise !== undefined) return`) works well for test isolation — since no existing tests call `restoreWsConnectedState()`, `wsConnectedRestorePromise` is `undefined` until the new test runs. After the new test, it's a resolved promise, which means `waitForWsConnectedRestore()` returns immediately for all subsequent tests (correct behavior since `beforeEach` resets `wsConnected` via `handleWsState`).
+  - To add `restoreWsConnectedState` to the test's destructured import, find the `await import('./background-message-handlers.js')` block.
+---
+
+## 2026-03-03 - US-003
+- Added pending optimistic update tracking to `server-state-cache.ts` — two module-level Maps (`pendingPluginToolUpdates`, `pendingBrowserToolUpdates`) that protect in-flight toggle states from being overwritten by `plugins.changed` notifications
+- `reapplyPendingOptimisticUpdates()` runs inside `updateServerStateCache()` after the cache merge, re-applying any pending values on top
+- `clearServerStateCache()` clears both pending Maps
+- Exported 8 new functions: `add/removePendingPluginToolUpdate`, `add/removePendingPluginAllToolsUpdate`, `add/removePendingBrowserToolUpdate`, `add/removePendingAllBrowserToolsUpdate`
+- Updated all 4 toggle handlers in `background-message-handlers.ts` (`handleBgSetToolEnabled`, `handleBgSetAllToolsEnabled`, `handleBgSetBrowserToolEnabled`, `handleBgSetAllBrowserToolsEnabled`) to register pending updates before the optimistic cache write and clear them on server response (success or failure, before any revert)
+- Added 10 unit tests in `server-state-cache.test.ts` verifying pending updates survive concurrent cache writes and are properly cleared
+- Added 8 unit tests in `background-message-handlers.test.ts` verifying the handlers call the correct add/remove pending update functions
+- Files changed: `platform/browser-extension/src/server-state-cache.ts`, `platform/browser-extension/src/server-state-cache.test.ts`, `platform/browser-extension/src/background-message-handlers.ts`, `platform/browser-extension/src/background-message-handlers.test.ts`
+- **Learnings for future iterations:**
+  - The key insight is that `updateServerStateCache` in `message-router.ts` (line ~598) is the point where `plugins.changed` writes data into the cache, so re-applying pending overrides there ensures they survive any incoming server data
+  - The pending update must be registered BEFORE `updateServerStateCache` is called (so the re-apply happens during the optimistic update too), and cleared BEFORE any revert on failure (so the revert call doesn't get the override re-applied)
+  - When adding mock functions to `background-message-handlers.test.ts`, you must add them in THREE places: (1) the `vi.hoisted()` return object, (2) the destructured `const { }` at the top, and (3) the `vi.mock('./server-state-cache.js')` factory
+---
+
+## 2026-03-03 - US-004
+- Changed `handleExtensionGetTabState` in `platform/browser-extension/src/message-router.ts` from sync to async
+- Added `loadLastKnownStateFromSession` to the tab-state import
+- Handler now checks `states.size === 0` on wake and calls `await loadLastKnownStateFromSession()` then re-reads the states
+- Changed registration from `wrapSync` to `wrapAsync` in the dispatch table
+- Updated `message-router.test.ts`: added `mockLoadLastKnownStateFromSession` to `vi.hoisted()`, destructured const, `vi.mock('./tab-state.js')` factory, `resetRoutingMocks`, and `beforeEach`
+- Also added `mockGetLastKnownStates.mockReset()` + `mockReturnValue(new Map())` to `resetRoutingMocks` to prevent call-count pollution between tests
+- Updated "empty states map" test to be `async` (now triggers the await path) with `await Promise.resolve()` flushes
+- Added unit test "loads from session storage when in-memory map is empty on service worker wake" with two `mockReturnValueOnce` calls
+- Files changed: `platform/browser-extension/src/message-router.ts`, `platform/browser-extension/src/message-router.test.ts`
+- **Learnings for future iterations:**
+  - When converting a `wrapSync` handler to `wrapAsync`, existing sync tests that pass non-empty data still work synchronously (async function runs synchronously until first `await`; if the empty-map branch is never taken, no `await` occurs and `sendToServer` is called in the same microtask). Only tests using the empty-map path need to be made async.
+  - When adding new mocks to `message-router.test.ts`, add them in FOUR places: (1) `vi.hoisted()` return object, (2) destructured `const { }`, (3) `vi.mock()` factory, AND (4) `resetRoutingMocks()` — plus `beforeEach` if a default resolved value is needed. Missing `resetRoutingMocks` causes call-count pollution between tests.
+  - `wrapAsync` fires `fn(params, id).catch(...)` without returning the promise. For tests awaiting side effects (like `sendToServer`), use `await Promise.resolve()` twice to flush microtasks after calling `handleServerMessage`.
+---
+
+## 2026-03-03 - US-005
+- Modified `validatePluginPayload` in `platform/browser-extension/src/message-router.ts` (line ~185)
+- Removed `typeof (t as Record<string, unknown>).enabled === 'boolean'` from the tool filter — tools without `enabled` are now retained instead of dropped
+- Added `console.warn` when `enabled` is missing, naming the tool and plugin to help flag server bugs
+- Updated `.map()` to default `enabled` to `true` when missing: `typeof t.enabled === 'boolean' ? t.enabled : true`
+- Updated test "filters out tools missing enabled flag" → renamed to "defaults enabled=true for tools missing the enabled field and logs a warning"
+  - Now expects 2 tools (both retained), verifies the no-enabled tool has `enabled: true`, verifies `console.warn` was called once with the tool name in the message
+- Files changed: `platform/browser-extension/src/message-router.ts`, `platform/browser-extension/src/message-router.test.ts`
+- **Learnings for future iterations:**
+  - When spying on `console.warn` in tests, use `vi.spyOn(console, 'warn').mockImplementation(() => undefined)` and always call `warnSpy.mockRestore()` at the end to avoid polluting other tests
+  - `npm run lint:fix` auto-fixes prettier formatting issues (indentation, trailing commas) — run it when switching from arrow-function `.map(t => ...)` to block-body `.map((t) => { ... })` since the indentation changes
+---
+
+## 2026-03-03 - US-006
+- Added missing state resets to the disconnect path in `platform/browser-extension/src/side-panel/App.tsx` (inside the `sp:connectionState` handler, `else` branch)
+- Added: `setInstallingPlugins(new Set())`, `setRemovingPlugins(new Set())`, `setInstallErrors(new Map())`
+- Added: timer cleanup loop `for (const timer of pluginErrorTimers.current.values()) clearTimeout(timer)` + `pluginErrorTimers.current.clear()`
+- Added: `setPluginErrors(new Map())`
+- No new tests required — purely additive state resets with no branching logic to unit-test
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - The disconnect handler is in `App.tsx` inside the `useEffect` listener callback at ~line 263. It's in the `sp:connectionState` message handler's `else` (disconnected) branch.
+  - `pluginErrorTimers` is a `useRef<Map<string, ReturnType<typeof setTimeout>>>` — timers must be cleared imperatively before resetting `pluginErrors` state to avoid dangling timeouts that would re-set an already-cleared error map entry after reconnect.
+  - The timer cleanup pattern is identical to the unmount cleanup in the `useEffect(() => () => { ... }, [])` at line 74 — both iterate and clearTimeout all entries.
+---
+
+## 2026-03-03 - US-007
+- Renamed `dispatchId` → `__opentabs_dispatchId` in `platform/mcp-server/src/extension-protocol.ts` (line 160): `params: { ...params, __opentabs_dispatchId: id }` — the platform-namespaced field avoids colliding with plugin tool input params
+- Updated `platform/browser-extension/src/tool-dispatch.ts` (line 330): reads `params.__opentabs_dispatchId` instead of `params.dispatchId` to extract the correlation key
+- Updated 4 places in `extension-protocol.test.ts` that extracted the dispatch correlation ID from `sentMsg.params.dispatchId` → `sentMsg.params.__opentabs_dispatchId`
+- Added new test in `extension-protocol.test.ts`: "injects __opentabs_dispatchId (not dispatchId) into sent params" — asserts `__opentabs_dispatchId === id` and `dispatchId === undefined` in the sent message params
+- Added new test in `tool-dispatch.test.ts`: "passes __opentabs_dispatchId from params as the correlation id to executeScript" — verifies the MAIN world executeScript args[3] equals the `__opentabs_dispatchId` value from params
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`, `platform/mcp-server/src/extension-protocol.test.ts`, `platform/browser-extension/src/tool-dispatch.ts`, `platform/browser-extension/src/tool-dispatch.test.ts`
+- **Learnings for future iterations:**
+  - The rename is ONLY for the server→extension dispatch injection path (`extension-protocol.ts`). The internal progress wire protocol (`tool:progress` chrome messages, `ToolProgressMessage.dispatchId`, `background-message-handlers.ts` `handleToolProgress`) still uses `dispatchId` — it's a separate channel and doesn't conflict with plugin inputs.
+  - `parseJson` in `extension-protocol.test.ts` has a narrow return type that lacks `params`. Use `JSON.parse(raw as string) as { id: string; params: { ... } }` for tests that need to inspect `params`.
+  - The `arrowParens: "avoid"` prettier config means single-param arrow functions should NOT have `(c) =>` but `c =>`. Forgetting this triggers lint errors.
+  - `calls.find(c => c[0].world === ...)` — no optional chaining needed on `c[0]` when the `calls` type is `Array<[{ world?: string; args?: unknown[] }]>` because tuple element 0 is always defined.
+---
+
+## 2026-03-03 - US-008
+- Wrapped `ws.send(JSON.stringify(message.data))` in a try-catch in `platform/browser-extension/src/offscreen/index.ts` (the `ws:send` case in `chrome.runtime.onMessage.addListener`)
+- On error: logs `console.error('[opentabs:offscreen] Failed to serialize message for WebSocket:', method, err)` where `method` is extracted from `message.data` if it's an object
+- `sendResponse({ sent: true })` is called after the try-catch block, so the response is always sent — the WebSocket connection is not disrupted by a serialization error
+- Added test in `platform/browser-extension/src/offscreen/index.test.ts` — new `describe('ws:send handler')` block that:
+  - Mocks chrome APIs, fetch, and WebSocket (using a class-based mock) in `beforeAll` before importing the module
+  - Imports `./index.js` dynamically so the module registers its listener with the mock chrome API
+  - Waits for the async IIFE (bootstrapFromAuthFile + connect) to complete via `setTimeout(0)`
+  - Verifies that a circular reference in `message.data` causes `console.error` instead of crashing
+  - Verifies `sendResponse({ sent: true })` is still called and `ws.send` is not called (JSON.stringify threw before reaching it)
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`, `platform/browser-extension/src/offscreen/index.test.ts`
+- **Learnings for future iterations:**
+  - Testing `offscreen/index.ts` requires mocking Chrome APIs, WebSocket, and fetch BEFORE dynamically importing the module. The module registers `chrome.runtime.onMessage.addListener` synchronously at load time, and fires the async IIFE (bootstrapFromAuthFile → sendMessage → connect) immediately.
+  - Use a class (not `vi.fn().mockImplementation(() => ({...}))`) for constructor mocks. `vi.stubGlobal('WebSocket', factory_mock)` may not properly replace the Node.js 22 built-in `WebSocket` constructor. Direct assignment `(globalThis as Record<string, unknown>).WebSocket = MockWebSocketClass` is more reliable.
+  - Direct assignment also works for `fetch`: `(globalThis as Record<string, unknown>).fetch = fn`. Using `vi.stubGlobal` for these builtins is less reliable.
+  - The class field `send = capturedSendFn` pattern works for capturing a `vi.fn()` reference into a mock WebSocket class — the closure is captured at class instantiation time.
+  - `installLogCollector` wraps `console.error` at module import time. Spying on `console.error` AFTER import still works because the offscreen code accesses `console.error` dynamically at call time (not a captured reference). The spy replaces `console.error` on the `console` object, so the offscreen code picks it up.
+  - `@typescript-eslint/no-non-null-assertion` forbids `!`. Pattern to avoid it: `const x = nullable; if (!x) throw new Error('...'); x.method()`.
+  - `@typescript-eslint/no-unsafe-assignment` fires when destructuring `mock.calls[0] ?? []`. Use `mock.calls[0] as [T, ...] | undefined` and optional chaining instead.
+  - `@typescript-eslint/require-await` fires on `async` functions that don't use `await`. Return `Promise.resolve(...)` synchronously instead of using `async`.
+---

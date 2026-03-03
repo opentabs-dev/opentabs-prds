@@ -18,7 +18,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/side-panel/App.tsx`, `applyFullState` (line ~202-207). Current code: `setBrowserTools(prev => prev.map(t => { const serverTool = result.browserTools.find(s => s.name === t.name); return serverTool ? { ...t, enabled: serverTool.enabled } : t; }))`. Problem: this only maps over `prev` (the local catalog), so server-added tools are invisible and server-removed tools persist. Fix: if `result.browserTools` is non-empty, use it as the base set (it has all fields). Merge with the local catalog for any tools that exist locally but not on the server (shouldn't happen normally, but defense-in-depth). Something like: `setBrowserTools(() => { if (result.browserTools.length === 0) return BROWSER_TOOLS_CATALOG.map(t => ({ ...t, enabled: true })); const serverNames = new Set(result.browserTools.map(t => t.name)); const merged = [...result.browserTools]; for (const local of BROWSER_TOOLS_CATALOG) { if (!serverNames.has(local.name)) merged.push({ ...local, enabled: true }); } return merged; })`. This ensures server tools are authoritative when present."
@@ -38,7 +38,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/background-message-handlers.ts`, `handleBgGetFullState` (line 126). The issue: `wsConnected` is a module-level variable initialized to `false`. `restoreWsConnectedState()` (line ~42-53) fires async `chrome.storage.session.get()` at module load time, but bg:getFullState can be called before it resolves. Fix: either (1) await `restoreWsConnectedState()` inside `handleBgGetFullState` (it needs to be idempotent — only read from storage once, then return cached), or (2) track whether restoration is complete via a promise and await it. The simplest approach: change `restoreWsConnectedState()` to store its promise and export a `waitForWsConnectedRestore()` that returns the promise. In `handleBgGetFullState`, add `await waitForWsConnectedRestore()` before reading `wsConnected`. Make `restoreWsConnectedState` return the same promise on repeated calls (not a new storage read each time)."
@@ -59,7 +59,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "The race: (1) user toggles tool X disabled → background optimistically sets enabled=false in cache, sends request. (2) Server sends plugins.changed (for unrelated reason) → background updates cache from server payload → tool X is now enabled=true (server hasn't processed step 1 yet). (3) Side panel calls getFullState() → sees tool X as enabled → UI flickers. Fix approach: in `platform/browser-extension/src/server-state-cache.ts`, add a `pendingOptimisticUpdates` Map<string, Map<string, boolean>> where outer key is plugin name, inner key is tool name, value is the optimistic enabled state. In `updateServerStateCache`, after merging the partial update, re-apply all pending optimistic updates on top. In the bg:setToolEnabled handler, add to the map before the request, remove from the map on success or failure (before revert on failure). In bg:setAllToolsEnabled, same but add all tools. Also apply for browser tools: a `pendingBrowserToolUpdates` Map<string, boolean>. This ensures that incoming plugins.changed data is always overlaid with pending optimistic values."
@@ -79,7 +79,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/message-router.ts`, `handleExtensionGetTabState` (line ~483). Currently reads `getLastKnownStates()` which returns the in-memory Map. On service worker wake, this Map is empty. Fix: check if the Map is empty, and if so, call `await loadLastKnownStateFromSession()` first, then re-read. But `handleExtensionGetTabState` is registered with `wrapSync` which means the handler is synchronous (can't await). Change it to use `wrapAsync` instead so it can await the session storage load. Or change the approach: have `loadLastKnownStateFromSession` be proactively called during service worker initialization (same as `restoreWsConnectedState`), and await its completion before responding. The simplest fix: change `extension.getTabState` from `wrapSync` to `wrapAsync`, make the handler async, check `if (states.size === 0) await loadLastKnownStateFromSession(); states = getLastKnownStates();`."
@@ -99,7 +99,7 @@
         "npm run test passes"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/message-router.ts`, `validatePluginPayload` (line ~175-192). The tool filter on line ~186-192 requires `typeof (t as Record<string, unknown>).enabled === 'boolean'`. This drops tools without `enabled`. Change the filter to only require `name` (string) and `description` (string). Then in the `.map()` that follows the filter, default `enabled: typeof t.enabled === 'boolean' ? t.enabled : true`. Add a `console.warn` when `enabled` is missing to flag server bugs. The `name` and `description` requirements should remain strict (tools without names are genuinely invalid)."
@@ -119,7 +119,7 @@
         "npm run test passes"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/side-panel/App.tsx`, the `sp:connectionState` handler disconnect path (line ~257-268). Currently clears: plugins, failedPlugins, browserTools (reset to catalog), serverVersion, activeTools, pendingConfirmations, searchQuery, npmResults, npmSearching. Missing: `setInstallingPlugins(new Set())`, `setRemovingPlugins(new Set())`, `setInstallErrors(new Map())`, `setPluginErrors(new Map())`. Also iterate `pluginErrorTimers.current` and clear all timers: `for (const timer of pluginErrorTimers.current.values()) clearTimeout(timer); pluginErrorTimers.current.clear();`. Search for these state variables in App.tsx to find their declarations and confirm the setter names."
@@ -139,7 +139,7 @@
         "npm run test passes"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/mcp-server/src/extension-protocol.ts`, `dispatchToExtension` (line ~160): change `params: { ...params, dispatchId: id }` to `params: { ...params, __opentabs_dispatchId: id }`. In `platform/browser-extension/src/tool-dispatch.ts`, line ~330: change `typeof params.dispatchId === 'string' ? params.dispatchId : String(id)` to `typeof params.__opentabs_dispatchId === 'string' ? params.__opentabs_dispatchId : String(id)`. Search for all uses of `dispatchId` across both platform/mcp-server and platform/browser-extension to find all consumers. The field is used for: (1) dispatch correlation in pendingDispatches, (2) progress reporting via tool.progress, (3) tool:progress handler in background-message-handlers.ts. All must use the new name. The `tool.progress` wire protocol from content scripts also sends `dispatchId` — check if the content script relay uses this field name. If so, update the content script relay too, or keep `dispatchId` in the extension-internal protocol and only rename the server→extension injection."
@@ -160,7 +160,7 @@
         "npm run test passes"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/offscreen/index.ts`, the `ws:send` case (line ~391-393). Currently: `ws.send(JSON.stringify(message.data))`. Wrap in try-catch: `try { ws.send(JSON.stringify(message.data)); } catch (err) { const method = typeof message.data === 'object' && message.data !== null ? (message.data as Record<string, unknown>).method : undefined; console.error('[opentabs:offscreen] Failed to serialize message for WebSocket:', method, err); }`. This ensures a single bad message doesn't crash the offscreen document or affect other messages."
