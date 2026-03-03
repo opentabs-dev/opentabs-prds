@@ -928,12 +928,25 @@ cleanup() {
     fi
   done
 
-  # Phase 3: Clean up worktrees and branches
+  # Phase 3: Clean up worktrees and branches — only if the push succeeded.
+  # If the push failed, preserve the worktree so the commits aren't lost.
+  # The consolidator will clean up worktrees after verifying work is in main.
   for (( s=0; s<=SLOT_HIGH_WATER; s++ )); do
     local wt="${WORKER_WORKTREES[$s]}"
     local br="${WORKER_BRANCHES[$s]}"
 
     if [ -n "$wt" ] && [ -d "$wt" ]; then
+      # Only remove if the branch has no unpushed commits
+      local unpushed=0
+      if [ -n "$br" ]; then
+        unpushed=$(git -C "$wt" rev-list --count "origin/main..$br" 2>/dev/null || echo "0")
+        local remote_exists
+        remote_exists=$(git -C "$wt" ls-remote --heads origin "$br" 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$unpushed" -gt 0 ] && [ "$remote_exists" -eq 0 ]; then
+          echo -e "$(ts) ${YELLOW}Preserving worktree with unpushed commits: $wt ($br, $unpushed commits)${RESET}"
+          continue
+        fi
+      fi
       remove_worktree "$wt"
     fi
     if [ -n "$br" ]; then
