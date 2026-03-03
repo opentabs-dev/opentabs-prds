@@ -1,0 +1,169 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix all bugs found in the second independent architectural review of the side panel data flow redesign. Covers: asymmetric browser tool merge, wsConnected race on wake, plugins.changed clobbering optimistic updates, extension.getTabState empty on wake, silent tool dropping, permanent install spinners on disconnect, dispatchId parameter collision, and ws:send JSON.stringify crash.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix applyFullState browser tools merge to handle new and removed server-side tools",
+      "description": "As a user, I want the side panel to show browser tools that the server adds dynamically and hide browser tools that the server removes, instead of only updating enabled state for tools already in the local catalog.",
+      "acceptanceCriteria": [
+        "applyFullState in App.tsx replaces the browser tools array with the server's full list merged with the local catalog, instead of only mapping over the local catalog",
+        "New server-side browser tools not in BROWSER_TOOLS_CATALOG appear in the side panel",
+        "Browser tools removed from the server's list are removed from the side panel",
+        "Local catalog tools not in the server response retain their default enabled=true state",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `platform/browser-extension/src/side-panel/App.tsx`, `applyFullState` (line ~202-207). Current code: `setBrowserTools(prev => prev.map(t => { const serverTool = result.browserTools.find(s => s.name === t.name); return serverTool ? { ...t, enabled: serverTool.enabled } : t; }))`. Problem: this only maps over `prev` (the local catalog), so server-added tools are invisible and server-removed tools persist. Fix: if `result.browserTools` is non-empty, use it as the base set (it has all fields). Merge with the local catalog for any tools that exist locally but not on the server (shouldn't happen normally, but defense-in-depth). Something like: `setBrowserTools(() => { if (result.browserTools.length === 0) return BROWSER_TOOLS_CATALOG.map(t => ({ ...t, enabled: true })); const serverNames = new Set(result.browserTools.map(t => t.name)); const merged = [...result.browserTools]; for (const local of BROWSER_TOOLS_CATALOG) { if (!serverNames.has(local.name)) merged.push({ ...local, enabled: true }); } return merged; })`. This ensures server tools are authoritative when present."
+    },
+    {
+      "id": "US-002",
+      "title": "Await restoreWsConnectedState before reading wsConnected in bg:getFullState",
+      "description": "As a user, I want the side panel to show the correct connection state immediately on service worker wake, not a flash of disconnected state.",
+      "acceptanceCriteria": [
+        "handleBgGetFullState awaits restoreWsConnectedState() completion before reading wsConnected",
+        "restoreWsConnectedState is called at most once per service worker lifecycle (idempotent guard)",
+        "Unit test verifies: bg:getFullState returns connected=true when session storage has wsConnected=true, even if the in-memory flag hasn't been restored yet",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `platform/browser-extension/src/background-message-handlers.ts`, `handleBgGetFullState` (line 126). The issue: `wsConnected` is a module-level variable initialized to `false`. `restoreWsConnectedState()` (line ~42-53) fires async `chrome.storage.session.get()` at module load time, but bg:getFullState can be called before it resolves. Fix: either (1) await `restoreWsConnectedState()` inside `handleBgGetFullState` (it needs to be idempotent — only read from storage once, then return cached), or (2) track whether restoration is complete via a promise and await it. The simplest approach: change `restoreWsConnectedState()` to store its promise and export a `waitForWsConnectedRestore()` that returns the promise. In `handleBgGetFullState`, add `await waitForWsConnectedRestore()` before reading `wsConnected`. Make `restoreWsConnectedState` return the same promise on repeated calls (not a new storage read each time)."
+    },
+    {
+      "id": "US-003",
+      "title": "Prevent plugins.changed from clobbering optimistic tool toggle updates",
+      "description": "As a user, I want tool toggle changes I make to be preserved even when an unrelated plugins.changed notification arrives from the server before my toggle's server response.",
+      "acceptanceCriteria": [
+        "When an optimistic tool toggle is in-flight (sendServerRequest pending), plugins.changed from the server does NOT overwrite the optimistic toggle state for that specific tool",
+        "The background script tracks which plugin+tool combinations have pending optimistic updates and applies them on top of incoming plugins.changed data before updating the cache",
+        "Once the server responds to the toggle request, the pending optimistic flag is cleared",
+        "Unit tests verify: (1) optimistic toggle survives a concurrent plugins.changed, (2) toggle revert on server error still works after a plugins.changed arrived mid-flight",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The race: (1) user toggles tool X disabled → background optimistically sets enabled=false in cache, sends request. (2) Server sends plugins.changed (for unrelated reason) → background updates cache from server payload → tool X is now enabled=true (server hasn't processed step 1 yet). (3) Side panel calls getFullState() → sees tool X as enabled → UI flickers. Fix approach: in `platform/browser-extension/src/server-state-cache.ts`, add a `pendingOptimisticUpdates` Map<string, Map<string, boolean>> where outer key is plugin name, inner key is tool name, value is the optimistic enabled state. In `updateServerStateCache`, after merging the partial update, re-apply all pending optimistic updates on top. In the bg:setToolEnabled handler, add to the map before the request, remove from the map on success or failure (before revert on failure). In bg:setAllToolsEnabled, same but add all tools. Also apply for browser tools: a `pendingBrowserToolUpdates` Map<string, boolean>. This ensures that incoming plugins.changed data is always overlaid with pending optimistic values."
+    },
+    {
+      "id": "US-004",
+      "title": "Load lastKnownState from session storage in handleExtensionGetTabState on wake",
+      "description": "As a CLI user, I want opentabs status to show correct tab states even after the service worker wakes from suspension.",
+      "acceptanceCriteria": [
+        "handleExtensionGetTabState in message-router.ts detects an empty lastKnownState Map and loads from session storage before responding",
+        "The detection uses the same heuristic as bg:getFullState (empty map + wsConnected=true indicates wake)",
+        "Unit test verifies: after session storage is populated and in-memory map is cleared, extension.getTabState returns the session data",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `platform/browser-extension/src/message-router.ts`, `handleExtensionGetTabState` (line ~483). Currently reads `getLastKnownStates()` which returns the in-memory Map. On service worker wake, this Map is empty. Fix: check if the Map is empty, and if so, call `await loadLastKnownStateFromSession()` first, then re-read. But `handleExtensionGetTabState` is registered with `wrapSync` which means the handler is synchronous (can't await). Change it to use `wrapAsync` instead so it can await the session storage load. Or change the approach: have `loadLastKnownStateFromSession` be proactively called during service worker initialization (same as `restoreWsConnectedState`), and await its completion before responding. The simplest fix: change `extension.getTabState` from `wrapSync` to `wrapAsync`, make the handler async, check `if (states.size === 0) await loadLastKnownStateFromSession(); states = getLastKnownStates();`."
+    },
+    {
+      "id": "US-005",
+      "title": "Default enabled=true for tools missing the enabled field instead of dropping them",
+      "description": "As a platform developer, I want tools that are missing the enabled field to default to enabled=true instead of being silently dropped from the plugin's tool list.",
+      "acceptanceCriteria": [
+        "validatePluginPayload in message-router.ts removes the typeof enabled === 'boolean' filter requirement and instead defaults enabled to true when missing",
+        "A log warning is emitted when a tool is missing the enabled field (to flag server-side bugs)",
+        "Unit test in message-router.test.ts verifies: a tool payload without enabled field is retained with enabled=true",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `platform/browser-extension/src/message-router.ts`, `validatePluginPayload` (line ~175-192). The tool filter on line ~186-192 requires `typeof (t as Record<string, unknown>).enabled === 'boolean'`. This drops tools without `enabled`. Change the filter to only require `name` (string) and `description` (string). Then in the `.map()` that follows the filter, default `enabled: typeof t.enabled === 'boolean' ? t.enabled : true`. Add a `console.warn` when `enabled` is missing to flag server bugs. The `name` and `description` requirements should remain strict (tools without names are genuinely invalid)."
+    },
+    {
+      "id": "US-006",
+      "title": "Clear installingPlugins, removingPlugins, and error state on disconnect",
+      "description": "As a user, I want the side panel to clear all in-flight operation state when the server disconnects so I don't see permanent loading spinners after reconnecting.",
+      "acceptanceCriteria": [
+        "App.tsx disconnect handler clears installingPlugins Set, removingPlugins Set, installErrors Map, pluginErrors Map",
+        "pluginErrorTimers ref timers are cleared on disconnect",
+        "After reconnect, no permanent spinners or stale error messages from the previous session",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `platform/browser-extension/src/side-panel/App.tsx`, the `sp:connectionState` handler disconnect path (line ~257-268). Currently clears: plugins, failedPlugins, browserTools (reset to catalog), serverVersion, activeTools, pendingConfirmations, searchQuery, npmResults, npmSearching. Missing: `setInstallingPlugins(new Set())`, `setRemovingPlugins(new Set())`, `setInstallErrors(new Map())`, `setPluginErrors(new Map())`. Also iterate `pluginErrorTimers.current` and clear all timers: `for (const timer of pluginErrorTimers.current.values()) clearTimeout(timer); pluginErrorTimers.current.clear();`. Search for these state variables in App.tsx to find their declarations and confirm the setter names."
+    },
+    {
+      "id": "US-007",
+      "title": "Rename dispatchId parameter injection to avoid collision with plugin tool inputs",
+      "description": "As a plugin developer, I want to use 'dispatchId' as a tool input parameter name without it being silently overwritten by the platform.",
+      "acceptanceCriteria": [
+        "extension-protocol.ts uses a platform-namespaced field name (e.g., __opentabs_dispatchId) instead of dispatchId when injecting the dispatch correlation ID into tool params",
+        "All consumers of dispatchId on the extension side (tool-dispatch.ts, handleToolProgress, etc.) are updated to read the new field name",
+        "Unit tests verify the renamed field",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "In `platform/mcp-server/src/extension-protocol.ts`, `dispatchToExtension` (line ~160): change `params: { ...params, dispatchId: id }` to `params: { ...params, __opentabs_dispatchId: id }`. In `platform/browser-extension/src/tool-dispatch.ts`, line ~330: change `typeof params.dispatchId === 'string' ? params.dispatchId : String(id)` to `typeof params.__opentabs_dispatchId === 'string' ? params.__opentabs_dispatchId : String(id)`. Search for all uses of `dispatchId` across both platform/mcp-server and platform/browser-extension to find all consumers. The field is used for: (1) dispatch correlation in pendingDispatches, (2) progress reporting via tool.progress, (3) tool:progress handler in background-message-handlers.ts. All must use the new name. The `tool.progress` wire protocol from content scripts also sends `dispatchId` — check if the content script relay uses this field name. If so, update the content script relay too, or keep `dispatchId` in the extension-internal protocol and only rename the server→extension injection."
+    },
+    {
+      "id": "US-008",
+      "title": "Add try-catch around JSON.stringify in ws:send to prevent silent message drops",
+      "description": "As a platform developer, I want the offscreen document to handle unserializable data gracefully instead of silently dropping messages.",
+      "acceptanceCriteria": [
+        "offscreen/index.ts ws:send case wraps JSON.stringify + ws.send in a try-catch",
+        "On error, a console.error is logged with the method name (if available) and error message",
+        "The WebSocket is not closed or disrupted by a serialization error",
+        "Unit test in offscreen/index.test.ts verifies: unserializable data logs an error instead of crashing",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "In `platform/browser-extension/src/offscreen/index.ts`, the `ws:send` case (line ~391-393). Currently: `ws.send(JSON.stringify(message.data))`. Wrap in try-catch: `try { ws.send(JSON.stringify(message.data)); } catch (err) { const method = typeof message.data === 'object' && message.data !== null ? (message.data as Record<string, unknown>).method : undefined; console.error('[opentabs:offscreen] Failed to serialize message for WebSocket:', method, err); }`. This ensures a single bad message doesn't crash the offscreen document or affect other messages."
+    }
+  ]
+}
