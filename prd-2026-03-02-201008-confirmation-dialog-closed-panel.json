@@ -1,0 +1,73 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix bug where the confirmation dialog does not appear in the side panel when the panel is opened after a confirmation request arrives. The root cause is that confirmation.request messages forwarded via forwardToSidePanel() are lost when the side panel is closed (no listener), and bg:getFullState does not include pending confirmations, so the side panel mounts with empty state.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Store full confirmation params in confirmation-badge.ts and expose via getter",
+      "description": "As a developer, I want the background script to retain full confirmation request params so that the side panel can retrieve pending confirmations on mount",
+      "acceptanceCriteria": [
+        "pendingConfirmationInfo map in confirmation-badge.ts is replaced with a pendingConfirmations map that stores full params: { id, tool, domain, tabId, paramsPreview, timeoutMs, receivedAt }",
+        "A new exported function getPendingConfirmations() returns an array of all pending confirmation params (values from the map)",
+        "notifyConfirmationRequest() stores the full params (including tabId, paramsPreview, timeoutMs, receivedAt timestamp) instead of just { tool, domain }",
+        "All existing references to pendingConfirmationInfo are updated to use pendingConfirmations (clearConfirmationBadge deletes by id, clearAllConfirmationBadges clears the map, syncConfirmationNotification reads tool/domain from the new map shape)",
+        "Existing unit tests in confirmation-badge.test.ts continue to pass without modification",
+        "A new unit test verifies getPendingConfirmations() returns correct entries after notifyConfirmationRequest calls and that entries are removed after clearConfirmationBadge",
+        "A new unit test verifies getPendingConfirmations() returns empty array after clearAllConfirmationBadges",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The key file is platform/browser-extension/src/confirmation-badge.ts. Currently line 10 defines `pendingConfirmationInfo` as `Map<string, { tool: string; domain: string | null }>`. Replace the value type with a full interface that matches what the side panel needs (see ConfirmationData type in platform/browser-extension/src/side-panel/components/ConfirmationDialog.tsx lines 9-18 for the shape the side panel expects). The receivedAt timestamp should be set to Date.now() in notifyConfirmationRequest() so the side panel can compute elapsed time for the countdown bar. The existing map is already keyed by confirmation id and entries are already deleted in clearConfirmationBadge (line 150) and cleared in clearAllConfirmationBadges (line 186). The syncConfirmationNotification function (line 65) reads tool/domain from the map — update the type assertion on line 66 to match the new shape. Export the new getPendingConfirmations function alongside the existing exports at line 213. Do NOT change the PendingConfirmationParams interface name or put it in a separate file — keep it in confirmation-badge.ts and export the type."
+    },
+    {
+      "id": "US-002",
+      "title": "Include pending confirmations in bg:getFullState response and hydrate on side panel mount",
+      "description": "As a user, I want to see the confirmation dialog when I open the side panel after a confirmation request arrived while the panel was closed, so that I can approve or deny the pending tool call",
+      "acceptanceCriteria": [
+        "handleBgGetFullState in background-message-handlers.ts includes a pendingConfirmations array in its response, sourced from getPendingConfirmations() in confirmation-badge.ts",
+        "FullStateResult type in bridge.ts includes an optional pendingConfirmations field typed as an array of objects matching the PendingConfirmationParams shape exported from confirmation-badge.ts (the side panel cannot import from background modules directly due to build isolation, so the type should be defined inline or via a shared type — use the ConfirmationData type from ConfirmationDialog.tsx which has the same shape)",
+        "getFullState() in bridge.ts returns the pendingConfirmations field",
+        "App.tsx applyFullState function hydrates the pendingConfirmations React state from result.pendingConfirmations when present (only add confirmations whose ids are not already in state, to avoid duplicates if the panel was already open)",
+        "The confirmation countdown bar correctly shows remaining time based on receivedAt (elapsed time since the background received the request, not since the panel opened)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Four files to modify:\n\n1. platform/browser-extension/src/background-message-handlers.ts — In handleBgGetFullState (line 144), import getPendingConfirmations from confirmation-badge.ts. Add pendingConfirmations to the response object at line 221. Also add it to the catch fallback response at line 230. The import of getPendingConfirmations joins the existing imports from confirmation-badge.ts on line 1-5.\n\n2. platform/browser-extension/src/side-panel/bridge.ts — Add pendingConfirmations to the FullStateResult interface (line 48). The array element type should match ConfirmationData from ConfirmationDialog.tsx: { id: string; tool: string; domain: string | null; tabId?: number; paramsPreview: string; timeoutMs: number; receivedAt: number }. Since bridge.ts cannot import the background's PendingConfirmationParams type (different build targets), define the type inline or import ConfirmationData from ConfirmationDialog.tsx.\n\n3. platform/browser-extension/src/side-panel/App.tsx — In the applyFullState function (line 197), after the existing state updates, hydrate pendingConfirmations. Use setPendingConfirmations and merge: only add confirmations whose ids are not already present in the current state. This handles the case where the panel is already open and receives a real-time sp:serverMessage AND a bg:getFullState response (e.g., on reconnect). The merge logic: `setPendingConfirmations(prev => { const existingIds = new Set(prev.map(c => c.id)); const newOnes = (result.pendingConfirmations ?? []).filter(c => !existingIds.has(c.id)); return newOnes.length > 0 ? [...prev, ...newOnes] : prev; });`\n\n4. IMPORTANT: The side panel's useServerNotifications hook (platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts) sets up auto-removal timeouts for each confirmation. When hydrating from bg:getFullState, the same timeout logic must be applied. The cleanest approach: after hydrating in applyFullState, the confirmations will be in React state, but they won't have auto-removal timeouts registered via useServerNotifications. To solve this, call handleNotification for each pending confirmation as if it were a fresh sp:serverMessage. Construct the JSON-RPC message shape: { method: 'confirmation.request', params: { id, tool, domain, tabId, paramsPreview, timeoutMs } }. This reuses the existing timeout registration logic without duplication. Do this in the applyFullState function after setting the state, iterating over the new confirmations only."
+    },
+    {
+      "id": "US-003",
+      "title": "Add E2E test for confirmation dialog appearing when side panel opens after request",
+      "description": "As a developer, I want an E2E test that verifies the confirmation dialog appears when the side panel is opened after a confirmation request arrived while the panel was closed",
+      "acceptanceCriteria": [
+        "A new test in e2e/permissions.e2e.ts verifies: trigger a sensitive-tier tool on a non-trusted domain WITHOUT the side panel open, wait for the badge to show '1', then open the side panel and verify the confirmation dialog appears with the correct tool name and domain",
+        "After clicking Allow Once in the dialog, the tool call completes successfully",
+        "The test uses the existing permission fixtures (non-skipPermissions MCP server, non-trusted domain via 127.0.0.2)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Add the test to e2e/permissions.e2e.ts in a new describe block (e.g., 'Confirmation dialog — late side panel open'). Use the existing pattern from the 'Confirmation notification — badge lifecycle' describe block (line 443) which already demonstrates: getting the background worker, reading badge text, and opening the side panel.\n\nTest flow:\n1. waitForExtensionConnected + waitForLog('tab.syncAll received')\n2. Get the background worker via getBackgroundWorker(extensionContext)\n3. Build nonTrustedUrl from testServer.url replacing localhost with 127.0.0.2\n4. Do NOT open the side panel yet\n5. Call mcpClient.callTool('browser_get_cookies', { url: nonTrustedUrl }, { timeout: 35_000 }) — this will block waiting for confirmation. Use Promise.all with an async function that:\n   a. Polls until badge text === '1' (confirmation arrived at background)\n   b. Opens the side panel via openSidePanel(extensionContext)\n   c. Waits for the confirmation dialog via waitForConfirmationDialog(sidePanel)\n   d. Verifies the dialog shows 'browser_get_cookies' and '127.0.0.2'\n   e. Clicks 'Allow Once'\n6. Verify the tool result is not an error\n7. Verify the badge clears back to ''\n\nAll helper functions (getBackgroundWorker, getBadgeText, waitForConfirmationDialog, clickAllowOnce, openSidePanel, waitFor) are already defined in the file or in e2e/helpers.ts."
+    }
+  ]
+}
