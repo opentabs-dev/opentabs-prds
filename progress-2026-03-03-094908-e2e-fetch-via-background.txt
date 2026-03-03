@@ -1,0 +1,40 @@
+# Ralph Progress Log
+PRD: prd-2026-03-03-094908-e2e-fetch-via-background~running.json
+Started: Tue Mar  3 17:49:53 UTC 2026
+---
+
+## Codebase Patterns
+- E2E test servers follow the pattern in `e2e/test-server.ts`: listen on PORT=0, print "Listening on http://localhost:<port>" to stdout (parsed by `startServerProcess` in fixtures.ts)
+- E2E fixtures use `startServerProcess(entryFile, label)` factory to spawn test server subprocesses
+- The e2e-test plugin uses Zod v4 where `z.record()` requires two arguments: `z.record(keySchema, valueSchema)` — e.g., `z.record(z.string(), z.string())`
+- `ToolHandlerContext.fetchViaBackground(url, init?)` is injected by the adapter runtime — tool handlers must check `context?.fetchViaBackground` before using it
+- `FetchProxyResponse` type is exported from `@opentabs-dev/plugin-sdk` with fields: `status`, `statusText`, `headers`, `body`, `ok`
+
+## 2026-03-03 17:55 - US-001
+- Implemented cross-origin test server (`e2e/cross-origin-test-server.ts`) with endpoints: POST /api/echo-with-cookies, GET /api/simple, POST /control/set-cookie, GET /control/cookies, CORS preflight handling
+- Added `crossOriginServer` fixture to `e2e/fixtures.ts` using `startServerProcess` pattern
+- Created `sdk_fetch_via_background` tool in e2e-test plugin that calls `context.fetchViaBackground()` with url, method, headers, body
+- Created `sdk_fetch_via_background_concurrent` tool that makes N parallel `fetchViaBackground` calls
+- Registered both new tools in `plugins/e2e-test/src/index.ts`
+- Files changed: `e2e/cross-origin-test-server.ts` (new), `e2e/fixtures.ts`, `plugins/e2e-test/src/tools/sdk-fetch-via-background.ts` (new), `plugins/e2e-test/src/tools/sdk-fetch-via-background-concurrent.ts` (new), `plugins/e2e-test/src/index.ts`
+- **Learnings for future iterations:**
+  - Zod v4 has breaking changes from v3: `z.record(z.string())` is invalid, must use `z.record(z.string(), z.string())`
+  - The e2e-test plugin builds with `npm run build` which runs `tsc && opentabs-plugin build` — must build the plugin before running monorepo build
+  - The `startServerProcess` factory returns a `TestServer` with `.url`, `.port`, `.control()`, `.kill()` etc — same interface for all test servers
+- Playwright `context.addCookies()` with `sameSite: 'None'` and `secure: false` fails silently in Chrome — use `sameSite: 'Lax'` with `domain: 'localhost'` for HTTP test servers
+- For error tests (domain validation, network errors), use `mcpClient.callTool()` directly and check `result.isError === true` — `callToolExpectSuccess` throws on errors
+- Domain validation error messages contain "Fetch proxy denied" — stable string to assert on
+---
+
+## 2026-03-03 18:10 - US-002
+- Created `e2e/sdk-fetch-via-background.e2e.ts` with 7 comprehensive E2E tests for the fetchViaBackground cross-origin proxy chain
+- Tests cover: basic cross-origin fetch, HttpOnly cookies forwarding, custom headers forwarding, POST with JSON body, domain validation rejection, concurrent requests (5 parallel), and network error propagation
+- All 450 E2E tests pass (443 existing + 7 new), plus all Phase 1 checks (build, type-check, lint, knip, unit tests)
+- Files changed: `e2e/sdk-fetch-via-background.e2e.ts` (new)
+- **Learnings for future iterations:**
+  - Playwright's `context.addCookies()` with `sameSite: 'None'` and `secure: false` fails silently in Chrome — Chrome requires `Secure` flag for `SameSite=None` cookies. Use `sameSite: 'Lax'` with `domain: 'localhost'` for HTTP test servers.
+  - The `crossOriginServer` fixture is already defined in `e2e/fixtures.ts` and provides a `TestServer` instance — no need to create it.
+  - For error tests (domain validation, network errors), use `mcpClient.callTool()` directly and check `result.isError === true` and `result.content` — do not use `callToolExpectSuccess` which throws on errors.
+  - Domain validation error messages contain "Fetch proxy denied" — this is a stable string to assert on.
+  - `http://localhost:1/never` reliably triggers a network error since port 1 is virtually never open.
+---
