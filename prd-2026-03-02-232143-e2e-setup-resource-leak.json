@@ -1,0 +1,48 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix resource leaks on setup failure in E2E tests that allocate resources (MCP servers, test servers, browser contexts, temp directories) before the try/finally scope. If an intermediate setup step throws, earlier resources are never cleaned up — orphaning running processes and leaking temp directories.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix resource leak on setup failure in side-panel-icons.e2e.ts",
+      "description": "As a platform contributor, I want E2E test setup failures to clean up all partially-created resources so that orphaned server processes and Chromium instances do not accumulate during test runs.",
+      "acceptanceCriteria": [
+        "All 3 tests in 'Icon pipeline — side panel rendering' wrap resource creation in try/finally or try/catch so that if launchExtensionContext or setupAdapterSymlink throws, all previously-created resources (server, testServer, context) are killed/closed",
+        "The cleanup logic follows the established pattern from setupIsolatedIifeTest in e2e/helpers.ts — track resources as they are created and clean up on partial failure",
+        "All 3 existing tests still pass with no behavioral change",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: e2e/side-panel-icons.e2e.ts\n\nThree tests in the 'Icon pipeline — side panel rendering' describe block create resources sequentially before the try block:\n\n1. 'plugin with custom icon renders SVG' (lines 64-100): startMcpServer (line 75) then launchExtensionContext (line 76) then setupAdapterSymlink (line 77) — all before try at line 79. If launchExtensionContext throws, the MCP server process is orphaned. If setupAdapterSymlink throws, both the server and the Chromium browser context are orphaned.\n\n2. 'inactive icon differs from active icon' (lines 102-187): startMcpServer (line 113) then startTestServer (line 114) then launchExtensionContext (line 115) then setupAdapterSymlink (line 116) — all before try at line 118. Same issue but with an additional test server process at risk.\n\n3. 'plugin without icons renders letter avatar' (lines 189-250): startMcpServer (line 211) then launchExtensionContext (line 212) then setupAdapterSymlink (line 213) — all before try at line 215.\n\nThe correct pattern is already established in e2e/helpers.ts in the setupIsolatedIifeTest function (around line 393). It tracks resources as they are created and has a catch block that cleans up any successfully-created resources before re-throwing.\n\nThe fix for each test: either (a) wrap the entire resource creation sequence in its own try/catch that does partial cleanup, or (b) use the simpler approach of declaring resources as let variables at the top and moving all creation into the try block, with optional chaining (?.) in the finally block for cleanup (like discovery-edge-cases.e2e.ts does with `server?.kill()`). Approach (b) is simpler and already used in other test files.\n\nDo NOT change the test assertions or behavior — only restructure the setup/teardown lifecycle. The first test in the file ('Icon pipeline — health endpoint', line 31) already has the correct pattern and does not need changes."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix resource leak on setup failure in discovery-edge-cases.e2e.ts and config-watcher.e2e.ts",
+      "description": "As a platform contributor, I want E2E test setup failures to clean up all partially-created resources so that orphaned processes and temp directories do not accumulate.",
+      "acceptanceCriteria": [
+        "In discovery-edge-cases.e2e.ts, all 5 tests in the 'broken plugins' describe block have tmpDir and configDir creation inside the try block (or a wrapping try/finally), so that if any setup step throws, all resources are cleaned up",
+        "In config-watcher.e2e.ts, the 'adding a second plugin' test (3rd test) has server, client, tmpDir, and configDir creation inside the try block so partial failures clean up running processes",
+        "The server variable pattern uses `let server: McpServer | undefined` with `server?.kill()` in finally (already used in some tests in discovery-edge-cases.e2e.ts)",
+        "All existing tests still pass with no behavioral change",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Two files with the same pattern: resources allocated before try/finally scope.\n\n## e2e/discovery-edge-cases.e2e.ts\n\n5 tests in the 'Discovery edge cases — broken plugins' describe block:\n\n1. 'missing dist/tools.json' (line 96): tmpDir created at line 97, configDir at line 119, writeTestConfig at line 121 — all before try at line 123. If any filesystem op between mkdtempSync and try throws, tmpDir and configDir leak.\n\n2. 'invalid JSON in dist/tools.json' (line 146): same pattern, tmpDir at line 147, configDir at line 169, before try at line 173.\n\n3. 'missing dist/adapter.iife.js' (line 196): same pattern, tmpDir at line 197, configDir at line 219, before try at line 223.\n\n4. 'valid plugins still load when one is broken' (line 246): tmpDir at line 247, brokenDir setup and validDir creation (lines 250-270), configDir at line 272 — all before try at line 280. If createMinimalPlugin throws, tmpDir and configDir leak.\n\n5. 'fixing a broken plugin' (line 320): tmpDir at line 321, plugin dir setup (lines 324-341), configDir at line 343 — all before try at line 349.\n\nThese tests ALREADY use the `let server: McpServer | undefined` + `server?.kill()` pattern for the server variable. The fix is to also move tmpDir and configDir creation into the try block (or add an outer try/finally). The simplest approach: declare `let tmpDir: string | undefined` and `let configDir: string | undefined` at the top, move ALL setup code into the try block, and use conditional cleanup in the finally block (`if (tmpDir) fs.rmSync(tmpDir, ...)`). The tests at lines 96 and 246 already handle `server` this way.\n\n## e2e/config-watcher.e2e.ts\n\nThe 3rd test 'adding a second plugin via config.json' (line 144) is the problematic one:\n- configDir at line 153, writeTestConfig at line 154\n- server at line 156, client at line 157\n- tmpDir at line 160, createMinimalPlugin at line 161\n- try at line 166\n\nIf createMinimalPlugin throws, server and client are running processes that leak. The fix: move all resource creation into the try block with optional cleanup in finally.\n\nThe other 3 tests in this file (tests 1, 2, 4) have a simpler pattern where only configDir + server + client are created before try. Since createMcpClient is synchronous and server creation is the last step before try, the leak risk is minimal. However, for consistency, consider applying the same pattern to all 4 tests.\n\nDo NOT change any test assertions or behavior — only restructure setup/teardown lifecycle."
+    }
+  ]
+}
