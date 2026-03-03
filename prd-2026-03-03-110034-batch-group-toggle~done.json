@@ -16,7 +16,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "Add the new interface in platform/shared/src/index.ts after ConfigSetAllToolsEnabledParams (line 305). Follow the exact naming convention of the existing params types:\n\n```ts\n/** config.setToolsEnabled request params */\nexport interface ConfigSetToolsEnabledParams {\n  plugin: string;\n  tools: string[];\n  enabled: boolean;\n}\n```\n\nThis sits between ConfigSetToolEnabledParams (singular, one tool) and ConfigSetAllToolsEnabledParams (all tools). The new one targets a specific subset of tools by name."
@@ -42,7 +42,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Two files to modify:\n\n1. platform/mcp-server/src/extension-handlers.ts — Add handleConfigSetToolsEnabled after handleConfigSetAllToolsEnabled (line 414). Follow the exact same structure as handleConfigSetAllToolsEnabled (lines 374-414) but accept a `tools: string[]` array instead of iterating all plugin tools:\n\n```ts\nconst handleConfigSetToolsEnabled = (\n  state: ServerState,\n  params: Record<string, unknown> | undefined,\n  id: string | number,\n  callbacks: McpCallbacks,\n): void => {\n  // Validate params\n  // Verify plugin exists\n  // Verify all tool names exist in plugin (return error with the first missing tool name)\n  // Loop: state.toolConfig[prefixedToolName(pluginName, toolName)] = enabled\n  // One onToolConfigChanged(), one onToolConfigPersist()\n  // One plugins.changed broadcast, one { ok: true } response\n};\n```\n\nImport ConfigSetToolsEnabledParams from @opentabs-dev/shared at line 9-12 where the other ConfigSet*Params are imported. Add handleConfigSetToolsEnabled to the export block at the bottom (line 790-814).\n\n2. platform/mcp-server/src/extension-protocol.ts — Add routing for config.setToolsEnabled. After the config.setAllToolsEnabled routing (lines 422-425), add:\n\n```ts\nif (method === 'config.setToolsEnabled' && id !== undefined) {\n  handleConfigSetToolsEnabled(state, params, id, callbacks);\n  return;\n}\n```\n\nImport handleConfigSetToolsEnabled from './extension-handlers.js' where the other handlers are imported."
@@ -69,7 +69,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Four files to modify:\n\n1. platform/browser-extension/src/extension-messages.ts — Add after BgSetAllToolsEnabledMessage (line 133):\n\n```ts\n/** Side panel → Background: toggle a subset of tools for a plugin */\nexport interface BgSetToolsEnabledMessage {\n  type: 'bg:setToolsEnabled';\n  plugin: string;\n  tools: string[];\n  enabled: boolean;\n}\n```\n\nAdd BgSetToolsEnabledMessage to the InternalMessage union (line 179-204).\n\n2. platform/browser-extension/src/background-message-handlers.ts — Add handleBgSetToolsEnabled after handleBgSetAllToolsEnabled (line 421). Follow the same pattern as handleBgSetAllToolsEnabled (lines 372-421) but scope to the specified tool names:\n\n- Read `message.tools as string[]` for the tool name list\n- Capture original enabled states for only those tools (for surgical rollback)\n- Optimistically update only those tools in the cache\n- Use addPendingPluginAllToolsUpdate(plugin, toolNames, enabled) — this function already accepts an array of tool names, it's not all-tools-specific despite its name\n- Send one `sendServerRequest('config.setToolsEnabled', { plugin, tools: toolNames, enabled })`\n- On success: removePendingPluginAllToolsUpdate and sendResponse\n- On failure: removePendingPluginAllToolsUpdate, revert only the specified tools, sendResponse error\n\nRegister in the messageHandlers map (around line 556-559): `['bg:setToolsEnabled', handleBgSetToolsEnabled]`\n\nAdd to the export block at the bottom.\n\n3. platform/browser-extension/src/side-panel/bridge.ts — Add after setAllToolsEnabled (line 122):\n\n```ts\nconst setToolsEnabled = (plugin: string, tools: string[], enabled: boolean): Promise<unknown> =>\n  sendBgMessage({ type: 'bg:setToolsEnabled', plugin, tools, enabled });\n```\n\nAdd setToolsEnabled to the export object (around line 155-180)."
@@ -91,7 +91,7 @@
         "npm run test:e2e passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "One file to modify: platform/browser-extension/src/side-panel/components/PluginCard.tsx\n\nThe current handleToggleGroup (lines 88-101) does:\n```ts\nvoid Promise.all(groupTools.map(t => setToolEnabled(plugin.name, t.name, checked))).catch(...)\n```\n\nReplace with:\n```ts\nconst toolNames = groupTools.map(t => t.name);\nvoid setToolsEnabled(plugin.name, toolNames, checked).catch(...)\n```\n\nImport setToolsEnabled from '../bridge.js' — it should already be available after US-003 adds it. The bridge already exports it.\n\nThe optimistic UI update (lines 90-93) stays exactly the same — it updates the local state before the RPC fires. The rollback on catch stays the same too. Only the RPC call changes from N individual calls to one batch call.\n\nImportant: The `toolNames` Set construction on line 91 (`const toolNames = new Set(groupTools.map(t => t.name))`) is used for the optimistic update filter and should stay as-is. The new `toolNames` array for the RPC is a separate variable — use a different name or extract it differently to avoid shadowing. For example:\n\n```ts\nconst handleToggleGroup = (groupTools: WireToolDef[], checked: boolean) => {\n  const myVersion = ++toggleCounter.current;\n  const groupToolNames = new Set(groupTools.map(t => t.name));\n  updatePluginTools(prev => {\n    preToggleRef.current = prev;\n    return prev.map(t => (groupToolNames.has(t.name) ? { ...t, enabled: checked } : t));\n  });\n  void setToolsEnabled(plugin.name, groupTools.map(t => t.name), checked).catch(() => {\n    if (toggleCounter.current === myVersion) {\n      updatePluginTools(() => preToggleRef.current);\n    }\n    showToggleError('Failed to toggle group');\n  });\n};\n```"

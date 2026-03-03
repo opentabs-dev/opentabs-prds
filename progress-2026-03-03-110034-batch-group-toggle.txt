@@ -1,0 +1,62 @@
+## Codebase Patterns
+- Shared types live in platform/shared/src/index.ts; Config*Params interfaces are grouped together around line 295
+- ConfigSet*Params naming convention: singular (one tool) → subset (tools[]) → all (no tools param)
+- Build order: tsc --build → browser-tools-catalog → extension bundle → side-panel → icons → install-extension
+- Extension message flow: define interface in extension-messages.ts → add to InternalMessage union → add handler in background-message-handlers.ts → register in backgroundHandlers map + EXTENSION_ONLY_TYPES set → add bridge function in side-panel/bridge.ts
+- addPendingPluginAllToolsUpdate/removePendingPluginAllToolsUpdate accept an array of tool names — reusable for both all-tools and subset-of-tools operations
+- E2E selectors for tool names in the side panel must use `{ exact: true }` with getByText because ToolRow renders descriptions inline (visible)
+---
+
+# Ralph Progress Log
+PRD: prd-2026-03-03-110034-batch-group-toggle~running.json
+Started: Tue Mar  3 19:01:11 UTC 2026
+---
+
+## 2026-03-03 - US-001
+- Added ConfigSetToolsEnabledParams interface to platform/shared/src/index.ts between ConfigSetToolEnabledParams and ConfigSetAllToolsEnabledParams
+- Files changed: platform/shared/src/index.ts
+- **Learnings for future iterations:**
+  - The shared params types follow the pattern: one tool (plugin+tool+enabled), subset of tools (plugin+tools[]+enabled), all tools (plugin+enabled)
+  - Adding a new export to shared/src/index.ts automatically makes it available to all packages that import from @opentabs-dev/shared
+  - All Phase 1 checks passed on first run after the change
+---
+
+## 2026-03-03 - US-002
+- Added handleConfigSetToolsEnabled handler in platform/mcp-server/src/extension-handlers.ts after handleConfigSetAllToolsEnabled
+- Added config.setToolsEnabled route in platform/mcp-server/src/extension-protocol.ts after config.setAllToolsEnabled
+- Files changed: platform/mcp-server/src/extension-handlers.ts, platform/mcp-server/src/extension-protocol.ts
+- **Learnings for future iterations:**
+  - The handler follows the exact same structure as handleConfigSetAllToolsEnabled but accepts a `tools: string[]` array instead of iterating all plugin tools
+  - Validates each tool name exists in the plugin before mutating state (returns error on first missing tool)
+  - Uses a Set for O(1) tool name lookup when validating the tools array
+  - Calls onToolConfigChanged and onToolConfigPersist exactly once (not per tool)
+  - Sends one plugins.changed broadcast and one { ok: true } response
+  - The routing pattern in extension-protocol.ts is: check `method === 'config.setToolsEnabled' && id !== undefined`, then call handler
+  - All Phase 1 checks passed on first run
+---
+
+## 2026-03-03 - US-003
+- Added BgSetToolsEnabledMessage interface to extension-messages.ts and included it in InternalMessage union
+- Added handleBgSetToolsEnabled handler in background-message-handlers.ts following the same pattern as handleBgSetAllToolsEnabled
+- Registered handler in backgroundHandlers map and EXTENSION_ONLY_TYPES set
+- Added setToolsEnabled bridge function in side-panel/bridge.ts
+- Files changed: platform/browser-extension/src/extension-messages.ts, platform/browser-extension/src/background-message-handlers.ts, platform/browser-extension/src/side-panel/bridge.ts
+- **Learnings for future iterations:**
+  - The handler captures original states only for the specified tools (not all tools) for surgical rollback
+  - Uses a Set for O(1) tool name membership checks when optimistically updating the cache
+  - addPendingPluginAllToolsUpdate works for any array of tool names, not just "all tools" — the name is misleading but the function is general-purpose
+  - Bridge functions follow a consistent pattern: `const fn = (...args) => sendBgMessage({ type: 'bg:messageType', ...args })`
+  - All Phase 1 checks passed on first run
+---
+
+## 2026-03-03 - US-004
+- Replaced Promise.all of N individual setToolEnabled calls with a single setToolsEnabled batch RPC in handleToggleGroup
+- Imported setToolsEnabled from bridge.ts
+- Renamed local variable `toolNames` to `groupToolNames` to avoid shadowing with the array passed to setToolsEnabled
+- Fixed E2E tests where `getByText('Echo')` matched both the displayName and inline description by adding `{ exact: true }`
+- Files changed: platform/browser-extension/src/side-panel/components/PluginCard.tsx, e2e/side-panel-plugin-toggle.e2e.ts, e2e/side-panel-data-flow.e2e.ts
+- **Learnings for future iterations:**
+  - ToolRow renders description inline (visible text), not just in tooltip — E2E selectors using getByText for tool names must use `{ exact: true }` to avoid matching description text
+  - The `browser_execute_script › handles async code that rejects` E2E test is flaky under heavy parallel load (20 workers) — passes in isolation and on retry
+  - Phase 1 passed on first run; Phase 2 had pre-existing flaky test that passed on subsequent run
+---
