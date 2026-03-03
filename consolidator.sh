@@ -250,6 +250,68 @@ _push_main() {
   return 1
 }
 
+# Safely delete a remote ralph branch ONLY after verifying its tip commit is
+# reachable from origin/main. This prevents losing work if the merge or push
+# silently failed. Also cleans up the corresponding consumer worktree if it
+# still exists on this machine.
+#
+# Usage: _safe_delete_branch "$tag" "$branch_name"
+_safe_delete_branch() {
+  local tag="$1"
+  local branch_name="$2"
+
+  # Fetch latest remote state to ensure we have accurate refs
+  git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
+  git -C "$CODE_DIR" fetch origin "$branch_name" --quiet 2>/dev/null || true
+
+  local branch_tip remote_main
+  branch_tip=$(git -C "$CODE_DIR" rev-parse "origin/$branch_name" 2>/dev/null)
+  remote_main=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
+
+  if [ -z "$branch_tip" ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Remote branch already deleted.${RESET}"
+    return 0
+  fi
+
+  # Verify every commit on the branch is reachable from origin/main.
+  # merge-base --is-ancestor checks that the branch tip is an ancestor of main,
+  # which means all of its commits are included in main's history.
+  if ! git -C "$CODE_DIR" merge-base --is-ancestor "$branch_tip" "$remote_main" 2>/dev/null; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}SAFETY: Branch tip ($branch_tip) is NOT reachable from origin/main ($remote_main). Refusing to delete remote branch.${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Branch preserved: origin/$branch_name${RESET}"
+    return 1
+  fi
+
+  # Safe to delete — branch content is in main
+  if git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
+  else
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Failed to delete remote branch (may already be gone).${RESET}"
+  fi
+
+  # Clean up the consumer worktree if it exists on this machine.
+  # Consumer worktrees live at ~/.ralph-consumer/worktrees/<slug>.
+  local consumer_worktree_base="$HOME/.ralph-consumer/worktrees"
+  # Extract slug from branch name: ralph-YYYY-MM-DD-HHMMSS-slug → YYYY-MM-DD-HHMMSS-slug
+  local slug="${branch_name#ralph-}"
+  local worktree_path="$consumer_worktree_base/$slug"
+
+  if [ -d "$worktree_path" ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Cleaning up consumer worktree: $slug${RESET}"
+    # Use git worktree remove if the consumer's code repo is available
+    local consumer_code="$HOME/.ralph-consumer/code"
+    if [ -d "$consumer_code/.git" ]; then
+      git -C "$consumer_code" worktree remove --force "$worktree_path" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$worktree_path" 2>/dev/null || true
+  fi
+
+  # Clean up the local branch ref if it exists
+  git -C "$CODE_DIR" branch -D "$branch_name" 2>/dev/null || true
+
+  return 0
+}
+
 # Short model label for log tags: "claude-opus" → "opus", "claude-sonnet" → "sonnet"
 _model_label() {
   local m="$1"
@@ -409,9 +471,9 @@ merge_branch() {
   commit_count=$(git -C "$CODE_DIR" rev-list --count "HEAD..$remote_branch" 2>/dev/null || echo "0")
 
   if [ "$commit_count" -eq 0 ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}No commits to merge. Deleting remote branch.${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}No commits to merge.${RESET}"
     if [ "$DRY_RUN" = false ]; then
-      git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
+      _safe_delete_branch "$tag" "$branch_name"
     fi
     return 0
   fi
@@ -434,8 +496,7 @@ merge_branch() {
     # by rebasing onto the updated remote HEAD and retrying internally.
     if _push_main "$tag"; then
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main.${RESET}"
-      git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
+      _safe_delete_branch "$tag" "$branch_name"
       return 0
     fi
 
@@ -454,8 +515,7 @@ merge_branch() {
     git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
     if _push_main "$tag"; then
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI build fix).${RESET}"
-      git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
+      _safe_delete_branch "$tag" "$branch_name"
       return 0
     else
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push still failed after AI fix. Resetting to remote.${RESET}"
@@ -688,8 +748,7 @@ except: pass" 2>/dev/null)
       # rejections by rebasing and retrying internally.
       if _push_main "$tag"; then
         echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI-resolved merge).${RESET}"
-        git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
+        _safe_delete_branch "$tag" "$branch_name"
         return 0
       fi
 
@@ -700,8 +759,7 @@ except: pass" 2>/dev/null)
         git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
         if _push_main "$tag"; then
           echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI conflict + build fix).${RESET}"
-          git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
-          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
+          _safe_delete_branch "$tag" "$branch_name"
           return 0
         fi
       fi
