@@ -172,44 +172,82 @@ trap cleanup EXIT
 # the remote ref advanced, and logs diagnostics on failure. Returns 0 only
 # when the remote ref matches the local HEAD after push.
 #
+# If the push fails due to non-fast-forward (remote advanced while we were
+# merging), rebase our merge on top of the new remote HEAD and retry. This
+# prevents lost merges when multiple branches complete close together.
+#
 # Usage: _push_main "$tag"
 _push_main() {
   local tag="$1"
-  local local_sha push_stderr push_exit
+  local max_rebase_attempts=3
+  local attempt
 
-  local_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
+  for attempt in $(seq 1 $max_rebase_attempts); do
+    local local_sha push_output push_exit
 
-  push_stderr=$(git -C "$CODE_DIR" push origin main 2>&1 1>/dev/null)
-  push_exit=$?
+    local_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
 
-  if [ "$push_exit" -ne 0 ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}git push failed (exit $push_exit):${RESET}"
-    if [ -n "$push_stderr" ]; then
-      echo "$push_stderr" | while IFS= read -r line; do
+    # Capture both stdout and stderr for diagnostics
+    push_output=$(git -C "$CODE_DIR" push origin main 2>&1)
+    push_exit=$?
+
+    if [ "$push_exit" -ne 0 ]; then
+      # Check if this is a non-fast-forward rejection (remote advanced)
+      if echo "$push_output" | grep -qiE 'non-fast-forward|fetch first|cannot lock ref|failed to push'; then
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push rejected (non-fast-forward). Rebasing onto updated remote (attempt $attempt/$max_rebase_attempts)...${RESET}"
+
+        # Fetch the new remote HEAD
+        if ! git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null; then
+          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Fetch failed during rebase recovery.${RESET}"
+          return 1
+        fi
+
+        # Rebase our local commits on top of the new remote HEAD
+        if ! git -C "$CODE_DIR" rebase origin/main --quiet 2>/dev/null; then
+          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Rebase failed (conflicts). Aborting rebase.${RESET}"
+          git -C "$CODE_DIR" rebase --abort 2>/dev/null || true
+          return 1
+        fi
+
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Rebase succeeded. Retrying push...${RESET}"
+        continue
+      fi
+
+      # Some other push error (auth, network, etc.)
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}git push failed (exit $push_exit):${RESET}"
+      echo "$push_output" | while IFS= read -r line; do
         echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}  $line${RESET}"
       done
+      return 1
     fi
-    return 1
-  fi
 
-  # Verify the remote actually has our commit. The push may return 0 but
-  # silently no-op (e.g., if local main was already behind origin/main after
-  # a concurrent push, or if the pre-push hook output confused exit detection).
-  git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
-  local remote_sha
-  remote_sha=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
-
-  if [ "$local_sha" != "$remote_sha" ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push returned 0 but remote HEAD ($remote_sha) != local HEAD ($local_sha). Push was a no-op or lost.${RESET}"
-    if [ -n "$push_stderr" ]; then
-      echo "$push_stderr" | while IFS= read -r line; do
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}  $line${RESET}"
-      done
+    # Push returned 0. Verify the remote actually has our commit.
+    # Do NOT use || true — a failed fetch here means we cannot verify.
+    if ! git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Post-push fetch failed. Assuming push succeeded (exit was 0).${RESET}"
+      return 0
     fi
-    return 1
-  fi
 
-  return 0
+    local remote_sha
+    remote_sha=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
+    local_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
+
+    # The remote must contain our commit. After push, origin/main should be
+    # at our HEAD or ahead (if another push landed between our push and fetch).
+    # Check that our commit is an ancestor of origin/main.
+    if git -C "$CODE_DIR" merge-base --is-ancestor "$local_sha" "$remote_sha" 2>/dev/null; then
+      return 0
+    fi
+
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push returned 0 but local HEAD ($local_sha) is not an ancestor of remote HEAD ($remote_sha). Push was a no-op or lost.${RESET}"
+    echo "$push_output" | while IFS= read -r line; do
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}  $line${RESET}"
+    done
+    return 1
+  done
+
+  echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push failed after $max_rebase_attempts rebase attempts.${RESET}"
+  return 1
 }
 
 # Short model label for log tags: "claude-opus" → "opus", "claude-sonnet" → "sonnet"
@@ -392,27 +430,17 @@ merge_branch() {
   if merge_output=$(git -C "$CODE_DIR" merge --no-edit --allow-unrelated-histories "$remote_branch" 2>&1); then
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Merged successfully.${RESET}"
 
-    # Push main to remote — retry before giving up (preserves merge work)
-    local push_ok=false
-    for push_attempt in 1 2 3; do
-      if _push_main "$tag"; then
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main.${RESET}"
-        push_ok=true
-        break
-      fi
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push attempt $push_attempt failed. Retrying...${RESET}"
-      sleep 2
-    done
-
-    if [ "$push_ok" = true ]; then
-      # Delete the remote branch (it's merged)
+    # Push main to remote. _push_main handles non-fast-forward rejections
+    # by rebasing onto the updated remote HEAD and retrying internally.
+    if _push_main "$tag"; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main.${RESET}"
       git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
       return 0
     fi
 
-    # Push failed (likely pre-push hook build failure) — invoke AI to fix the build.
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed after 3 attempts. Invoking AI to fix build...${RESET}"
+    # Push failed — invoke AI to fix the build.
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed. Invoking AI to fix build...${RESET}"
 
     if ! _ai_fix_build "$tag"; then
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI build fix failed. Resetting to remote.${RESET}"
@@ -656,25 +684,16 @@ except: pass" 2>/dev/null)
     rm -f "$ai_result_file" "$ai_stderr_file"
 
     if [ "$ai_ok" = true ]; then
-      # Push the AI-resolved merge
-      local push_ok=false
-      for push_attempt in 1 2 3; do
-        if _push_main "$tag"; then
-          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI-resolved merge).${RESET}"
-          push_ok=true
-          break
-        fi
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push attempt $push_attempt failed. Retrying...${RESET}"
-        sleep 2
-      done
-
-      if [ "$push_ok" = true ]; then
+      # Push the AI-resolved merge. _push_main handles non-fast-forward
+      # rejections by rebasing and retrying internally.
+      if _push_main "$tag"; then
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI-resolved merge).${RESET}"
         git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null || true
         echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
         return 0
       fi
 
-      # Push failed (likely pre-push hook build failure) — try AI build fix
+      # Push failed — try AI build fix
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed after AI conflict resolution. Invoking AI to fix build...${RESET}"
       if _ai_fix_build "$tag"; then
         git -C "$CODE_DIR" add -A 2>/dev/null || true
@@ -770,12 +789,31 @@ while true; do
     while IFS= read -r remote_branch; do
       [ -z "$remote_branch" ] && continue
 
-      # Clean state before each merge — abort any stale merge/rebase from
-      # a previous branch's failed resolution, then reset to remote HEAD.
+      # Abort any stale merge/rebase from a previous branch's failed resolution.
       git -C "$CODE_DIR" merge --abort 2>/dev/null || true
       git -C "$CODE_DIR" rebase --abort 2>/dev/null || true
       git -C "$CODE_DIR" checkout main --quiet 2>/dev/null || true
-      git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
+
+      # Sync with remote — if the previous merge succeeded and pushed, our
+      # local main is already correct. If it failed and we reset, we need
+      # to be at origin/main. Fetch + fast-forward handles both cases
+      # without destroying local commits that haven't been pushed yet.
+      git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
+      local local_head remote_head
+      local_head=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
+      remote_head=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
+
+      if [ "$local_head" != "$remote_head" ]; then
+        # Local diverged from remote — check if we're ahead (unpushed merge)
+        # or behind (someone else pushed). Either way, reset to remote since
+        # unpushed merges should have been handled by merge_branch.
+        if ! git -C "$CODE_DIR" merge-base --is-ancestor "$remote_head" "$local_head" 2>/dev/null; then
+          # Local is not ahead of remote — reset to remote
+          git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
+        fi
+        # If local IS ahead, keep the local state (merge was pushed but
+        # remote fetch is slightly stale — this resolves on next fetch)
+      fi
 
       merge_branch "$remote_branch" || true
 
