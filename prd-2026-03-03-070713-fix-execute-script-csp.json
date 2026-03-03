@@ -1,0 +1,81 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix browser_execute_script to work on strict-CSP pages (like GitHub) by eliminating the new Function() eval that CSP blocks, and add comprehensive E2E tests covering CSP scenarios to prevent regressions.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Replace new Function() with inline code in the exec file wrapper to bypass CSP",
+      "description": "As an AI agent, I want browser_execute_script to work on pages with strict Content Security Policy (e.g., GitHub with script-src that disallows unsafe-eval) so that I can execute arbitrary JavaScript on any page regardless of CSP restrictions.",
+      "acceptanceCriteria": [
+        "The writeExecFile function in adapter-files.ts no longer uses new Function() to wrap user code",
+        "User code is placed inline in the wrapper IIFE body instead of being passed through new Function()",
+        "The wrapper still captures sync results, async (Promise) results, and errors into namespaced globalThis.__openTabs keys",
+        "The wrapper still prevents user code from breaking the IIFE structure (no wrapper breakout attacks)",
+        "The exec file is still a valid .js file that chrome.scripting.executeScript({ files }) can inject",
+        "All existing browser_execute_script E2E tests in e2e/browser-tools.e2e.ts still pass (return types, DOM access, async, errors, cleanup, concurrency, truncation)",
+        "All existing browser_execute_script unit tests in platform/mcp-server/src/browser-tools/execute-script.test.ts still pass",
+        "All existing extension-side unit tests in platform/browser-extension/src/browser-commands/extension-commands.test.ts still pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "ROOT CAUSE: The file at platform/mcp-server/src/adapter-files.ts line 183 wraps user code with `new Function(JSON.stringify(code))`. While the file-based injection via chrome.scripting.executeScript({ files }) bypasses page CSP, the new Function() call INSIDE the injected file is an eval-like construct that strict CSP blocks (pages with script-src that doesn't include 'unsafe-eval'). This means the wrapper IIFE runs fine but new Function() throws a CSP violation.\n\nTHE FIX: Place the user's code directly inline in the IIFE body instead of wrapping it in new Function(). The challenge is preventing IIFE wrapper breakout attacks — if user code contains `})();` it could close the wrapper prematurely. The solution: since we control the wrapper structure, use a technique that isolates user code syntactically without eval. Approaches to consider:\n\n1. **Direct inline with try/catch**: Place user code directly inside a try block. Since the code comes from the AI agent (trusted source), and the file is written atomically by the server, wrapper breakout is not a real attack vector — the AI agent already has full code execution capability. The previous new Function() isolation was defense-in-depth, not a security boundary. The inline approach is:\n```javascript\n(function() {\n  var __ot = globalThis.__openTabs = globalThis.__openTabs || {};\n  var __resultKey = \"__execResult_<uuid>\";\n  var __asyncKey = \"__execAsync_<uuid>\";\n  try {\n    var __r = (function() {\n      <USER_CODE_HERE>\n    })();\n    // ... async detection and result capture ...\n  } catch (e) {\n    __ot[__resultKey] = { error: ... };\n  }\n})();\n```\nThis wraps user code in an inner function expression called immediately. The user code executes in its own function scope. `return` statements in user code work because they return from the inner function. No eval is involved — the entire file is static JavaScript that Chrome injects as extension-origin code.\n\n2. Important: The user code string must NOT be JSON-escaped when placed inline. It must be placed as raw JavaScript source. The current approach JSON.stringify's the code for new Function() — the new approach writes raw code into the inner function body.\n\n3. Edge cases to handle:\n   - User code with `return document.title` — must work (the inner function provides a return context)\n   - User code with `throw new Error('test')` — caught by the outer try/catch\n   - User code that returns a Promise — async detection still works\n   - User code with syntax errors — causes a parse error at file injection time (chrome.scripting.executeScript will reject), which the extension handler already handles\n   - User code with unbalanced braces/quotes — causes a parse error at injection time, handled the same way\n\nFILES TO MODIFY:\n- platform/mcp-server/src/adapter-files.ts (writeExecFile function, lines 160-199) — change the wrapper template to use inline code instead of new Function()\n- Update the module-level comment in platform/mcp-server/src/browser-tools/execute-script.ts (lines 4-7) to remove the reference to new Function()\n- Update the comment in adapter-files.ts lines 172-176 about wrapper breakout attacks via new Function()\n\nFILES TO NOT MODIFY:\n- The extension-side handler (platform/browser-extension/src/browser-commands/extension-commands.ts) does NOT need changes — it already injects via files[] and polls for results via namespaced keys. The result format is unchanged.\n- The tool description in execute-script.ts already says 'Bypasses page Content-Security-Policy restrictions' — this becomes accurate after the fix.\n\nVERIFICATION: After the fix, manually run `npm run test:e2e -- --grep 'browser_execute_script'` to verify all 19+ existing E2E tests still pass. The tests exercise: string/number/boolean/null/object returns, DOM access, window.location, localStorage, throw errors, async Promises, async rejection, no-return, cleanup, non-existent tab, file cleanup, sequential no-leftover, concurrent tabs, large truncation."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E tests for browser_execute_script on strict-CSP pages",
+      "description": "As a platform developer, I want E2E tests that verify browser_execute_script works on pages with strict Content Security Policy so that CSP regressions are caught immediately and never reach production.",
+      "acceptanceCriteria": [
+        "A new test.describe block in e2e/strict-csp.e2e.ts (or a new dedicated file) tests browser_execute_script on the strict-CSP test server",
+        "Test: sync code execution returns correct result on strict-CSP page (e.g., return document.title)",
+        "Test: DOM access works on strict-CSP page (e.g., querySelectorAll count)",
+        "Test: async code (Promise) resolves correctly on strict-CSP page",
+        "Test: code that throws returns an error object on strict-CSP page (not a CSP violation)",
+        "Test: code with no return produces null on strict-CSP page",
+        "Test: sequential executions on strict-CSP page leave no leftover globalThis state",
+        "Test: concurrent executions on strict-CSP page do not collide",
+        "Test: the strict-CSP test page actually enforces CSP (verify that eval() or new Function() would fail if attempted directly — this validates the test environment is truly strict)",
+        "All tests pass with the CSP fix from US-001 applied",
+        "All existing strict-CSP E2E tests still pass",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "CONTEXT: The existing strict-CSP E2E tests (e2e/strict-csp.e2e.ts, 811 lines) test plugin adapter injection and plugin tool dispatch on strict-CSP pages, but they NEVER test browser_execute_script. The browser_execute_script E2E tests (e2e/browser-tools.e2e.ts, lines 382-831) only run against the regular test server with no CSP. This gap is exactly what allowed the new Function() CSP bug to exist undetected.\n\nWHERE TO ADD TESTS: Add a new test.describe('browser_execute_script on strict-CSP page') block to e2e/strict-csp.e2e.ts. The strict-CSP test server (e2e/strict-csp-test-server.ts) already exists and applies `Content-Security-Policy: script-src 'none'; default-src 'none'; connect-src 'self'` headers. The existing test fixtures already provide `strictCspServer` fixture.\n\nTEST INFRASTRUCTURE:\n- Use the same pattern as existing strict-CSP tests: start strictCspServer, open a tab to it, call browser_execute_script via mcpClient.callTool()\n- The existing helpers like openTestAppTab (e2e/helpers.ts) work with any test server URL — pass the strictCspServer URL\n- Use parseToolResult from e2e/helpers.ts to parse responses\n- For the 'CSP enforcement verification' test, use browser_execute_script itself to try `eval('1+1')` or `new Function('return 1')()` and verify it would fail (this validates the test environment)\n\nTEST PATTERNS TO MIRROR: The new tests should mirror the patterns in the existing browser_execute_script suite (e2e/browser-tools.e2e.ts lines 382-831) but run against the strict-CSP server instead of the regular test server. Key tests to replicate:\n1. Return types (string from document.title)\n2. DOM access (querySelectorAll count)\n3. Async/Promise resolution\n4. Error throwing (verify the error is from the user code, not CSP)\n5. No-return produces null\n6. Sequential cleanup (no leftover __execResult_ keys)\n7. Concurrent non-collision (Promise.all on the same strict-CSP tab)\n\nCRITICAL TEST — CSP enforcement verification:\nAdd a test that proves the strict-CSP page actually blocks eval-like constructs. Use browser_execute_script to run code that tries `eval('1')` — this should throw a CSP error. Then run normal code like `return 1+1` and verify it succeeds. This proves that our inline approach works while eval would fail. This test is the canary — if anyone reintroduces new Function() in the wrapper, this test will catch it.\n\nEXISTING FIXTURE REFERENCE:\n- e2e/fixtures.ts: startStrictCspServer() returns a TestServer with .port and .url\n- e2e/strict-csp.e2e.ts line 82 shows the pattern: fixtureTest('test name', async ({ mcpServer, strictCspServer, extensionContext, mcpClient }) => { ... })\n- e2e/helpers.ts: openTestAppTab() opens a tab and waits for it to load\n- The strict-CSP server serves at /strict-csp path — check strict-csp-test-server.ts for exact routes\n\nIMPORTANT: When opening a tab to the strict-CSP server, browser_execute_script won't work for the initial readyState poll (since the whole point is CSP was blocking it before the fix). Use browser_get_tab_info or a simple delay + browser_get_tab_content to verify the tab has loaded before running execute_script tests. Or, since US-001 fixes the CSP issue, execute_script polling should work — but be defensive in the test setup."
+    },
+    {
+      "id": "US-003",
+      "title": "Update build-plugin skill documentation to remove incorrect CSP warning about browser_execute_script",
+      "description": "As a plugin developer reading the build-plugin skill documentation, I want accurate information about browser_execute_script and CSP so that I don't avoid using the tool unnecessarily on strict-CSP pages.",
+      "acceptanceCriteria": [
+        "The build-plugin skill file (.claude/skills/build-plugin/__SKILL__.md) no longer warns that CSP may block browser_execute_script",
+        "The gotcha about CSP blocking browser_execute_script is updated to state that the tool bypasses page CSP via file-based injection",
+        "The auth discovery section no longer recommends avoiding browser_execute_script on CSP-strict pages",
+        "The documentation accurately reflects the post-fix behavior: browser_execute_script works on all pages regardless of CSP",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "This is a documentation-only change. The build-plugin skill file at .claude/skills/build-plugin/__SKILL__.md has two sections that incorrectly warn about CSP blocking browser_execute_script:\n\n1. Lines ~750 (Gotcha #11): 'CSP may block browser_execute_script — Sites with strict CSP (like GitHub: script-src github.githubassets.com) block eval/inline scripts. browser_execute_script runs in the MAIN world and is subject to the page's CSP.' — This was true before the fix but is now incorrect. Update to say browser_execute_script bypasses page CSP via file-based injection and works on all pages.\n\n2. Lines ~138-142 (Auth discovery): 'If CSP blocks browser_execute_script (check for script-src that doesn't include unsafe-eval), use DOM-based exploration' — Remove or update this conditional since browser_execute_script now works regardless of CSP.\n\nKeep the note that 'The adapter IIFE itself bypasses CSP because it's injected as a file URL' — this is still accurate and applies to both adapters and browser_execute_script.\n\nAlso update the module-level docstring in the skill file if it references CSP limitations for execute_script."
+    }
+  ]
+}
