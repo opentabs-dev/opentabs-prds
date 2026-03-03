@@ -222,10 +222,10 @@ _push_main() {
     fi
 
     # Push returned 0. Verify the remote actually has our commit.
-    # Do NOT use || true — a failed fetch here means we cannot verify.
+    # If fetch fails, we cannot verify — treat as push failure to be safe.
     if ! git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null; then
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Post-push fetch failed. Assuming push succeeded (exit was 0).${RESET}"
-      return 0
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Post-push fetch failed — cannot verify push landed. Treating as failure.${RESET}"
+      return 1
     fi
 
     local remote_sha
