@@ -1,0 +1,25 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-193236-data-flow-polish-4~running.json
+Started: Tue Mar  3 03:32:59 UTC 2026
+---
+
+## Codebase Patterns
+- MV3 service worker suspension resets all module-level variables to their initial values. Any flag persisted to session storage must be eagerly restored before being checked, not gated behind the check itself.
+- `loadServerStateCacheFromSession()` restores both the server state cache AND the `cachesInitialized` flag from session storage. Always call it before checking `getCachesInitialized()` on service worker wake.
+- `handleExtensionGetTabState` in message-router.ts already loads tab state eagerly from session when empty, without checking cachesInitialized — tab state is extension-owned, not dependent on sync.full.
+- Background message handler tests use `vi.hoisted()` for mock setup before dynamic `import()`, with `handleWsState({connected: false}, () => {})` + `vi.clearAllMocks()` in beforeEach to reset module-level wsConnected state.
+
+---
+
+## 2026-03-03 03:40 UTC - US-001
+- **Implemented**: Fixed chicken-and-egg bug in MV3 wake detection where `getCachesInitialized()` was checked before `loadServerStateCacheFromSession()` could restore it.
+- **Root cause**: In `handleBgGetFullState`, the wake detection condition included `getCachesInitialized()` in the gate, but after MV3 suspension `cachesInitialized` resets to `false` (module default). The session load that restores it was inside the gated branch — classic chicken-and-egg.
+- **Fix**: Removed `getCachesInitialized()` from the outer gate. Now eagerly calls `loadServerStateCacheFromSession()` when `wsConnected && caches empty`, then checks `getCachesInitialized()` after the session load to decide whether to also restore tab state.
+- **Files changed**:
+  - `platform/browser-extension/src/background-message-handlers.ts` — Restructured wake detection logic
+  - `platform/browser-extension/src/background-message-handlers.test.ts` — Updated 3 existing tests to reflect new flow: session load happens first, then cachesInitialized is checked
+- **Verified**: `handleExtensionGetTabState` in message-router.ts already uses correct pattern (eagerly loads when empty, no cachesInitialized gate) — no change needed.
+- **Learnings for future iterations:**
+  - When testing wake detection, mocks must simulate the session load restoring `cachesInitialized` (via `mockGetCachesInitialized.mockReturnValue(true)` inside the `mockLoadServerStateCacheFromSession` implementation), not setting it before the handler call.
+  - The connect-to-sync.full gap test now verifies that `loadServerStateCacheFromSession` IS called but `loadLastKnownStateFromSession` is NOT (since `cachesInitialized` stays false after the session load).
+---
