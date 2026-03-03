@@ -1,0 +1,175 @@
+## Codebase Patterns
+- `SpConfirmationRequestMessage` was the ONLY external use of the `SpConfirmationRequestMessage['data']` shape — when removing it, inline the data type directly in `ConfirmationDialog.tsx` and export it as `ConfirmationData` (the type is re-exported from there for consumers)
+- `extension-protocol.test.ts` tests for `config.setToolEnabled` and `config.setAllToolsEnabled` use `ws.sent[N]` indexing — when handlers send multiple messages (notification + result), update indices accordingly
+- The pattern for adding `plugins.changed` before a success result: `sendToExtension(state, { jsonrpc: '2.0', method: 'plugins.changed', params: { ...buildConfigStatePayload(state) } })` then the success response
+- `server-state-cache.ts` uses a module-level `persistTimer` and `schedulePersist()` for debounced 500ms writes; `clearServerStateCache()` does immediate session.remove (not debounced)
+- `tab-state.ts` uses a module-level `lastKnownStatePersistTimer` with same debounce pattern; `clearTabStateCache()` does immediate session.remove (not debounced)
+- `message-router.test.ts` mocks both `./server-state-cache.js` and `./tab-state.js` with vi.mock() factories — any new exports from those modules MUST be added to the mock factories
+- `background-message-handlers.test.ts` mocks `./server-state-cache.js` — new exports must also be added to its `vi.mock()` factory
+- `handleSyncFull` in `message-router.ts` calls `updateServerStateCache()` synchronously, then fires `sendTabSyncAll()` as a fire-and-forget `.then()` chain
+- `sendTabSyncAll()` takes O(N × round-trip) time because it probes every matching tab for readiness; any flush of `lastKnownState` must happen AFTER `sendTabSyncAll` completes, not before (calling flush before writes empty state overwriting good session data)
+- `cachesInitialized` flag in server-state-cache.ts distinguishes wake-from-suspension (flag=true) from connect-to-sync.full gap (flag=false); persisted alongside the server state cache in chrome.storage.session
+- `clearServerStateCache()` now removes both `serverStateCache` and `cachesInitialized` keys from session storage (array argument to `session.remove()`)
+---
+
+# Ralph Progress Log
+PRD: prd-2026-03-02-153510-data-flow-polish~running.json
+Started: Mon Mar  2 23:35:41 UTC 2026
+---
+
+## 2026-03-02 - US-001
+- Implemented immediate session flush functions to prevent MV3 service worker suspension from losing critical state
+- Added `flushServerStateCacheToSession()` to `platform/browser-extension/src/server-state-cache.ts` — cancels pending debounce timer and writes immediately
+- Added `flushLastKnownStateToSession()` to `platform/browser-extension/src/tab-state.ts` — same semantics
+- Called `flushServerStateCacheToSession()` in `handleSyncFull` (message-router.ts) after `updateServerStateCache()`, before forwarding `plugins.changed` to side panel
+- Called `flushLastKnownStateToSession()` in the `sendTabSyncAll().then()` callback in `handleSyncFull` (after tab state is populated, not before - calling before would overwrite session with empty map)
+- Updated `vi.mock()` factories in `message-router.test.ts` to include both new flush functions
+- Added unit tests in `server-state-cache.test.ts` and `tab-state.test.ts` verifying immediate write and debounce cancellation
+- **Learnings for future iterations:**
+  - The disconnect path (`clearServerStateCache`, `clearTabStateCache`) already does IMMEDIATE session.remove — no additional flush needed there
+  - `flushLastKnownStateToSession()` must NOT be called in `handleSyncFull` before `sendTabSyncAll` — at that point `lastKnownState` is empty, calling flush would overwrite session with `{}`, losing any previously persisted state
+  - All new exports from mocked modules (`server-state-cache.js`, `tab-state.js`) must be added to their `vi.mock()` factories in `message-router.test.ts` or the test will fail with "not a function"
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (2983 tests, 91 test files)
+---
+
+## 2026-03-02 - US-002
+- Fixed wake detection false positive when caches are empty between connect and sync.full
+- Added `cachesInitialized` flag to `server-state-cache.ts` — tracks whether sync.full has populated caches at least once in the current session
+- Flag is persisted to `chrome.storage.session` alongside the server state cache so it survives MV3 service worker suspension
+- `setCachesInitialized(true)` called in `handleSyncFull` (message-router.ts) after `updateServerStateCache()`, before flushing to session
+- `clearServerStateCache()` resets the flag to false and removes it from session storage
+- Updated `bg:getFullState` wake detection heuristic in `background-message-handlers.ts` to require `getCachesInitialized()` — prevents session restoration during the connect-to-sync.full gap
+- Updated all mock factories in `background-message-handlers.test.ts` and `message-router.test.ts` to include new exports
+- Added unit tests: cachesInitialized flag get/set/clear/persist/load in server-state-cache.test.ts; connect-to-sync.full gap (no restore) and post-sync.full wake (restore) in background-message-handlers.test.ts
+- Files changed: server-state-cache.ts, background-message-handlers.ts, message-router.ts, server-state-cache.test.ts, background-message-handlers.test.ts, message-router.test.ts
+- **Learnings for future iterations:**
+  - The `vi.hoisted()` destructuring AND the `vi.mock()` factory must both include new mock functions — missing from either causes TS errors or runtime failures
+  - `clearServerStateCache()` now uses `session.remove(['serverStateCache', 'cachesInitialized'])` (array argument) — existing tests checking the remove call need updating when new session keys are added
+  - When adding a boolean flag that must survive suspension, persist it in the same `session.set()` call as the cache to avoid split-brain (partially written state if SW suspends between two writes)
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (2992 tests, 91 test files)
+---
+
+## 2026-03-03 - US-004
+- Added `plugins.changed` notification to `handleConfigSetToolEnabled` and `handleConfigSetAllToolsEnabled` in `platform/mcp-server/src/extension-handlers.ts`, matching the pattern already used by `handleConfigSetBrowserToolEnabled` and `handleConfigSetAllBrowserToolsEnabled`
+- Notification is sent BEFORE the success `{ ok: true }` response, using `sendToExtension(state, { jsonrpc: '2.0', method: 'plugins.changed', params: { ...buildConfigStatePayload(state) } })`
+- Added `describe('handleConfigSetToolEnabled')` and `describe('handleConfigSetAllToolsEnabled')` test blocks in `extension-handlers.test.ts` with 7 tests each covering: valid toggle sends plugins.changed with full payload, sets toolConfig, calls callbacks, unknown plugin error, unknown tool error, missing params, invalid param types
+- Fixed 3 existing tests in `extension-protocol.test.ts` that expected `ws.sent[0]` to be the `{ ok: true }` result — updated to `ws.sent[1]` and (for the first test) updated `toHaveLength(1)` to `toHaveLength(2)` since the notification is now the first message
+- Files changed: extension-handlers.ts, extension-handlers.test.ts, extension-protocol.test.ts
+- **Learnings for future iterations:**
+  - `extension-protocol.test.ts` has integration-style tests for handlers that check `ws.sent[N]` directly — when adding notifications before results, update all tests that index into `ws.sent` for the result message
+  - The `plugins.changed` notification pattern: send notification BEFORE the success result (not after) — this ensures the side panel updates its state before receiving the confirmation
+  - `handleConfigSetBrowserToolEnabled` was the existing reference implementation for this pattern — always check it when adding notifications to other config handlers
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (3006 tests, 91 test files)
+---
+
+## 2026-03-02 - US-003
+- Updated `handlePluginUninstall` in `platform/browser-extension/src/message-router.ts` to call `getServerStateCache()` + `updateServerStateCache({ plugins: ... })` after `clearPluginTabState()`, filtering out the uninstalled plugin
+- Added `forwardToSidePanel({ type: 'sp:serverMessage', data: { jsonrpc: '2.0', method: 'plugins.changed' } })` after the cache update so the side panel removes the card immediately
+- Added unit test in `message-router.test.ts` verifying: cache updated to exclude uninstalled plugin, plugins.changed forwarded to side panel
+- Files changed: message-router.ts, message-router.test.ts
+- **Learnings for future iterations:**
+  - `getServerStateCache` and `updateServerStateCache` are already imported in message-router.ts — no new imports needed for this pattern
+  - `handlePluginUpdate` already used the same getServerStateCache/filter/updateServerStateCache pattern — follow it exactly
+  - Test assertions using `plugins[0]?.name` trigger `@typescript-eslint/no-unnecessary-condition` — use `toMatchObject([{ name: '...' }])` instead
+  - Optional chains like `?.data?.method` after a non-nullable type cast also trigger the same lint rule — remove the optional chains
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (2993 tests, 91 test files)
+---
+
+## 2026-03-03 - US-006
+- Fixed `loadLastKnownStateFromSession` in `tab-state.ts` to call `lastKnownState.clear()` before the `try` block, replacing Map contents instead of merging
+- This prevents stale entries from mixing with restored session data when the function is called on service worker wake
+- Added test in `tab-state.test.ts`: pre-populates `lastKnownState` with 'stale-plugin', calls `loadLastKnownStateFromSession` with different data ('new-plugin'), verifies 'stale-plugin' is gone and only session data remains
+- Files changed: tab-state.ts, tab-state.test.ts
+- **Learnings for future iterations:**
+  - The one-line fix: add `lastKnownState.clear();` before the `try` block in `loadLastKnownStateFromSession` — no other changes needed
+  - Existing tests all start from `clearTabStateCache()` in `beforeEach`, so they don't exercise the merge-vs-replace distinction — a new dedicated test was needed
+  - The `beforeEach` in `loadLastKnownStateFromSession` describe block calls `clearTabStateCache()`, so the new test must call `updateLastKnownState()` after `beforeEach` runs (inside the test body) to simulate the pre-existing stale state
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (3009 tests, 91 test files)
+---
+
+## 2026-03-03 - US-007
+- Changed `getServerStateCache` in `server-state-cache.ts` to return `structuredClone(cache)` instead of the live reference
+- Return type changed from `Readonly<ServerStateCache>` to `ServerStateCache` (deep copy already provides mutation safety; `Readonly<>` only prevented shallow mutations)
+- Added test in `server-state-cache.test.ts`: pushes element to returned plugins array, verifies internal cache still has original length
+- Files changed: server-state-cache.ts, server-state-cache.test.ts
+- **Learnings for future iterations:**
+  - `Readonly<T>` only prevents direct property reassignment — nested arrays/objects can still be mutated. `structuredClone` is the correct fix for deep protection.
+  - The return type change is safe: callers assigned to `const cache = getServerStateCache()` work identically since `ServerStateCache` is compatible with all usages of `Readonly<ServerStateCache>`
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (3010 tests, 91 test files)
+---
+
+## 2026-03-03 - US-005
+- Fixed optimistic rollback in `handleBgSetToolEnabled`: added `const originalPlugins = cache.plugins` before mutation; catch block now calls `updateServerStateCache({ plugins: originalPlugins })` instead of re-fetching and applying `!enabled`
+- Fixed optimistic rollback in `handleBgSetBrowserToolEnabled`: added `const originalBrowserTools = cache.browserTools` before mutation; catch block now calls `updateServerStateCache({ browserTools: originalBrowserTools })` instead of re-fetching and applying `!enabled`
+- Both now match the existing pattern in `handleBgSetAllToolsEnabled` and `handleBgSetAllBrowserToolsEnabled`
+- Added test: 'revert restores exact pre-mutation state, not toggled !enabled' for `handleBgSetToolEnabled` — sets up tool with `enabled: false`, calls with `enabled: false`, fails request, verifies revert is `false` (not `!false=true`)
+- Added test: 'reverts to exact pre-mutation state on server error' for `handleBgSetBrowserToolEnabled` — same edge case showing `!enabled` would incorrectly flip state
+- Files changed: background-message-handlers.ts, background-message-handlers.test.ts
+- **Learnings for future iterations:**
+  - The `!enabled` revert pattern silently fails when `enabled === original_state` (idempotent call) — `!enabled` would flip to the opposite instead of restoring original
+  - The correct pattern (used consistently in all 4 toggle handlers now): capture `originalX = cache.x` before mutation, use it directly in the catch block
+  - `handleBgSetAllToolsEnabled` and `handleBgSetAllBrowserToolsEnabled` were the reference implementations — always check them when fixing analogous single-item handlers
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (3008 tests, 91 test files)
+---
+
+## 2026-03-03 - US-009
+- Fixed stale comment in `bridge.ts` line 24: changed `(matches config.getState response)` to `(matches bg:getFullState response)`
+- Added defensive validation in `getAggregateState` (`tab-state.ts`): casts `parsed.state` to `string`, checks against a `Set<string>` of valid states, falls back to `'closed'` for any unexpected value
+- Fixed `consumeServerResponse` (`server-request.ts`): changed `if ('error' in data)` to `if (data.error !== undefined && data.error !== null)` — prevents false rejection when the response contains `{ error: undefined, result: 'ok' }` (the `'error' in data` check would trigger on the key's presence, ignoring the value)
+- Added try-catch around `handleServerMessage` call in `handleWsMessage` (`background-message-handlers.ts`): logs error with `console.error`, ensures `sendResponse({ ok: true })` is always called even if `handleServerMessage` throws
+- Added unit tests for `getAggregateState`: valid states return correctly, corrupted state value falls back to 'closed', number state falls back to 'closed', missing state field falls back to 'closed', invalid JSON falls back to 'closed'
+- Added unit test for `consumeServerResponse` with `{ id, error: undefined, result: 'ok' }`: verifies it resolves (not rejects)
+- Added `handleWsMessage` to destructured imports in `background-message-handlers.test.ts`; added two tests: relays to `handleServerMessage` + calls `sendResponse`, and calls `sendResponse` even when `handleServerMessage` throws
+- Files changed: bridge.ts, tab-state.ts, server-request.ts, background-message-handlers.ts, tab-state.test.ts, server-request.test.ts, background-message-handlers.test.ts
+- **Learnings for future iterations:**
+  - ESLint's `eqeqeq` rule disallows `!=` — use `!== undefined && !== null` instead of `!= null` when checking for both null and undefined
+  - `'error' in data` is a dangerous error-detection pattern for JSON-RPC because it triggers on key presence regardless of value — `data.error !== undefined && data.error !== null` is the correct check
+  - When adding a `Set` for validation, use `Set<string>` (not `Set<TabState>`) so `.has()` accepts the unvalidated input string without a type cast
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (3018 tests, 91 test files)
+---
+
+## 2026-03-03 - US-008
+- Removed `BgGetConnectionStateMessage` interface from `extension-messages.ts` and from the `InternalMessage` union — dead type, no sender remains
+- Removed `handleBgGetConnectionState` function from `background-message-handlers.ts` and its entry from `backgroundHandlers` map, `EXTENSION_ONLY_TYPES` set, and exports
+- Removed `describe('handleBgGetConnectionState')` test block and import from `background-message-handlers.test.ts`
+- Removed `SpConfirmationRequestMessage` interface from `extension-messages.ts` and from the `InternalMessage` union — confirmation requests reach the side panel via `sp:serverMessage` with method `confirmation.request`
+- Inlined the confirmation data type directly in `ConfirmationDialog.tsx` (removing the import of the now-deleted `SpConfirmationRequestMessage`); the `ConfirmationData` type is still exported from there for consumers
+- Removed `case 'bg:getConnectionState':` and `case 'sp:confirmationRequest':` from the offscreen/index.ts switch statement (the switch handles exhaustiveness; removing from `InternalMessage` union required removing them here too)
+- Removed `'tab.stateChanged'` from `SIDE_PANEL_METHODS` in `message-router.ts` — the server never sends this method to the extension; the extension sends it TO the server and directly to the side panel via `sendTabStateNotification`
+- Updated `message-router.test.ts` test from "forwards tab.stateChanged to side panel" to verify that `handleServerMessage` does NOT forward `tab.stateChanged` (since it's no longer in `SIDE_PANEL_METHODS`)
+- Files changed: extension-messages.ts, background-message-handlers.ts, background-message-handlers.test.ts, offscreen/index.ts, message-router.ts, message-router.test.ts, side-panel/components/ConfirmationDialog.tsx
+- **Learnings for future iterations:**
+  - When removing an interface from `extension-messages.ts`, search for usages of `InterfaceName['data']` (type-level property access) not just `InterfaceName` — `ConfirmationDialog.tsx` used `SpConfirmationRequestMessage['data']` as a structural type
+  - When `SpConfirmationRequestMessage` was removed, `ConfirmationData` in `ConfirmationDialog.tsx` needed to be inlined directly — the shape is `{ id, tool, domain, tabId, paramsPreview, timeoutMs, receivedAt }`
+  - Removing a type from `InternalMessage` union causes TS exhaustiveness errors in the offscreen/index.ts switch — must remove the corresponding `case` from the switch at the same time
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (3008 tests, 91 test files)
+---
+
+## 2026-03-03 - US-010
+- Added EXTENSION_ONLY_TYPES security guard tests in `background-message-handlers.test.ts`: (1) rejects extension-only messages from non-extension senders (sender.id !== chrome.runtime.id), (2) accepts messages from the extension itself
+- Added `sendConfirmationResponse` tests in `bridge.test.ts`: (1) sends sp:confirmationResponse with correct type and data, (2) includes scope when provided, (3) omits scope when not provided, (4) handles chrome.runtime.sendMessage rejection gracefully
+- Added `handleConfigSetAllBrowserToolsEnabled` tests in `extension-handlers.test.ts`: (1) valid toggle disables all browser tools and sends plugins.changed with full payload, (2) valid toggle enables all, (3) calls onToolConfigChanged and onBrowserToolPolicyPersist, (4) missing params returns -32602 error, (5) invalid param types return error
+- Note: consumeServerResponse with `{ error: undefined }` was already tested (added in US-009); getAggregateState corrupted state tests were also already comprehensive (added in US-009)
+- Files changed: background-message-handlers.test.ts, bridge.test.ts, extension-handlers.test.ts
+- **Learnings for future iterations:**
+  - `initBackgroundMessageHandlers` registers a `chrome.runtime.onMessage` listener — to test the security guard, mock `chrome.runtime.onMessage.addListener` to capture the registered listener, then invoke it directly with different sender contexts
+  - ESLint `no-non-null-assertion` rule applies in tests too — use `expect(arr).toHaveLength(1)` followed by `arr[0] as Type` instead of `arr[0]!`
+  - `sendConfirmationResponse` is fire-and-forget (void return, catches promise rejection) — test it by checking sendMessageCalls capture array, not by awaiting
+  - `handleConfigSetAllBrowserToolsEnabled` follows the exact same pattern as `handleConfigSetBrowserToolEnabled` but omits the `tool` param and the tool-existence check — loops over all `state.cachedBrowserTools`
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (3029 tests, 91 test files)
+---
+
+## 2026-03-03 - US-011
+- Scoped amber dot selector in auth test: changed `sidePanelPage.locator('.bg-primary.rounded-full').first()` to `e2ePluginCard.locator('.bg-primary.rounded-full')` — ensures the assertion targets the E2E Test plugin card specifically, not any amber dot on the page
+- Added disconnect state verification in reconnect test: after `triggerHotReload()`, asserts `Cannot Reach MCP Server` text becomes visible before checking recovery — ensures the test actually exercises the disconnect/reconnect path
+- Removed double-fire in config change tests: removed all `postReload()` calls from both the tool config change test and the browser tool policy change test, relying solely on the config file watcher for propagation — tests now cleanly exercise one mechanism
+- Removed the now-unused `postReload` helper function from the file
+- Files changed: e2e/side-panel-realtime-state.e2e.ts
+- **Learnings for future iterations:**
+  - The config file watcher alone is sufficient for E2E tests — `waitForLog(server, 'Config reload complete')` confirms the watcher detected the change and completed the reload
+  - `postReload` (POST /reload) triggers a full rediscovery cycle independent of the file watcher — having both in the same test creates a race condition where either mechanism could fire the side panel update, making the test non-deterministic about what it's testing
+  - The amber dot uses class `bg-primary rounded-full` (from `PluginIcon.tsx`), while the green dot uses `bg-success` — scoping to the plugin card locator prevents false positives from other plugin cards
+  - The `DisconnectedState` component renders "Cannot Reach MCP Server" text — this is a reliable selector for verifying disconnect state in E2E tests
+  - Phase 1 checks pass: build ✓, type-check ✓, lint ✓, knip ✓, test ✓ (3029 tests, 91 test files)
+  - Phase 2 checks pass: test:e2e ✓ (443 tests, all passed in ~1 minute)
+---

@@ -21,7 +21,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/server-state-cache.ts`, add `flushServerStateCacheToSession()`: cancel `persistTimer` if set, call `persistToSession()` immediately. Export it. In `platform/browser-extension/src/tab-state.ts`, add `flushLastKnownStateToSession()`: cancel the debounce timer if set, call the session write immediately. Export it. In `platform/browser-extension/src/message-router.ts` `handleSyncFull` (~line 367), after `updateServerStateCache(...)` and before the `forwardToSidePanel` call, add: `flushServerStateCacheToSession()`. Do NOT flush lastKnownState here because it's still empty at this point (sendTabSyncAll hasn't run yet). In `platform/browser-extension/src/background-message-handlers.ts` `handleWsState` disconnect path (~line 96-101), after `clearServerStateCache()` and `clearTabStateCache()` (which already clear session storage), no additional flush needed since clear already writes empty. Actually — `clearServerStateCache` already does `chrome.storage.session.remove()` and `clearTabStateCache` already clears session storage. So the flush is only needed after sync.full populates caches. Verify that `clearServerStateCache` and `clearTabStateCache` both immediately clear session storage (not debounced) — they do. The main value of this story is the post-sync.full flush."
@@ -43,7 +43,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "The core issue: in `platform/browser-extension/src/background-message-handlers.ts` line 135, the heuristic `wsConnected && tabStates.size === 0 && serverCache.plugins.length === 0` triggers both on real wake AND on the gap between WebSocket connect and sync.full arrival. Add a `cachesInitialized` flag. Where to set it: in `platform/browser-extension/src/message-router.ts` `handleSyncFull` after `updateServerStateCache` call (~line 367). Export a setter `setCachesInitialized(value: boolean)` from a suitable module (could be server-state-cache.ts since it manages server state). Reset it to false in `handleWsState` disconnect path in background-message-handlers.ts. For session persistence: include `cachesInitialized` in the session storage write for server-state-cache (or as a separate session key). In `loadServerStateCacheFromSession`, also restore the flag. In bg:getFullState: change the wake detection to `if (wsConnected && cachesInitialized && tabStates.size === 0 && serverCache.plugins.length === 0)`. When `cachesInitialized` is false (connect-to-sync.full gap), don't try to restore — just return empty/default state."
@@ -63,7 +63,7 @@
         "npm run test passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/message-router.ts`, `handlePluginUninstall` (line 436). After line 471 (`clearPluginTabState(pluginName)`), before sending the success response, add: (1) `const existingCache = getServerStateCache(); updateServerStateCache({ plugins: existingCache.plugins.filter(p => p.name !== pluginName) });` (2) `forwardToSidePanel({ type: 'sp:serverMessage', data: { jsonrpc: '2.0', method: 'plugins.changed' } });`. Import `getServerStateCache` and `updateServerStateCache` from `./server-state-cache.js` (already imported in this file for handleSyncFull and handlePluginUpdate). The server will also send its own `plugins.changed` after receiving the success response, which will be handled by handleServerMessage and update the cache again — this is fine (idempotent)."
@@ -84,7 +84,7 @@
         "npm run test passes"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/mcp-server/src/extension-handlers.ts`: (1) `handleConfigSetToolEnabled` (line 324): after `callbacks.onToolConfigPersist()` (line 359) and before the success response (line 361), add: `sendToExtension(state, { jsonrpc: '2.0', method: 'plugins.changed', params: { ...buildConfigStatePayload(state) } });`. (2) `handleConfigSetAllToolsEnabled` (line 368): after `callbacks.onToolConfigPersist()` (line 399) and before the success response (line 401), add the same line. This matches the pattern already used by `handleConfigSetBrowserToolEnabled` (line 437) and `handleConfigSetAllBrowserToolsEnabled` (line 471). In `platform/mcp-server/src/extension-handlers.test.ts`, find the tests for config.setToolEnabled (line ~1320) and config.setAllToolsEnabled (line ~1701). Add assertions that the `send` callback (which captures messages sent to the extension) includes a plugins.changed message with params containing plugins, failedPlugins, browserTools, serverVersion."
@@ -104,7 +104,7 @@
         "npm run test passes"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/background-message-handlers.ts`: (1) `handleBgSetToolEnabled` (line 294): Add `const originalPlugins = cache.plugins;` before `const updatedPlugins = ...` (line 301). In the catch block (line 314-326), change the revert to `updateServerStateCache({ plugins: originalPlugins })` instead of the current per-tool `!enabled` toggle logic. (2) `handleBgSetBrowserToolEnabled` (line 358): Add `const originalBrowserTools = cache.browserTools;` before `const updatedBrowserTools = ...` (line 364). In the catch block (line 371-378), change to `updateServerStateCache({ browserTools: originalBrowserTools })`. Note: `handleBgSetAllToolsEnabled` (line 330) and `handleBgSetAllBrowserToolsEnabled` (line 383) already correctly capture `originalPlugins`/`originalBrowserTools` — no change needed for those."
@@ -124,7 +124,7 @@
         "npm run test passes"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/tab-state.ts`, `loadLastKnownStateFromSession` (line 281). Add `lastKnownState.clear()` at the start of the function body, before the try block. This ensures that even if session storage read fails or returns empty data, the Map starts fresh. Currently the function adds entries to the existing Map via `lastKnownState.set(key, value)` without clearing first. If the Map was partially populated (e.g., a sync.full raced with session restoration), old entries and new entries would mix. In `platform/browser-extension/src/tab-state.test.ts`, add a test: pre-populate lastKnownState with an entry, call loadLastKnownStateFromSession with different data in session storage, verify the old entry is gone and only the session data entries remain."
@@ -143,7 +143,7 @@
         "npm run test passes"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "In `platform/browser-extension/src/server-state-cache.ts`, line 52: change `const getServerStateCache = (): Readonly<ServerStateCache> => cache;` to `const getServerStateCache = (): ServerStateCache => structuredClone(cache);`. Remove the `Readonly<>` wrapper since deep copy already protects against mutation. In `platform/browser-extension/src/server-state-cache.test.ts`, add a test: call getServerStateCache, mutate the returned plugins array (e.g., push a new element), call getServerStateCache again, verify the new element is NOT present."
@@ -168,7 +168,7 @@
         "npm run test passes"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "THREE dead code removals: (1) `bg:getConnectionState`: In `extension-messages.ts` remove the `BgGetConnectionStateMessage` interface (~line 51-53) and remove it from the `InternalMessage` union. In `background-message-handlers.ts` remove `handleBgGetConnectionState` function (~line 112-118) and remove `['bg:getConnectionState', handleBgGetConnectionState]` from the backgroundHandlers map. Remove 'bg:getConnectionState' from EXTENSION_ONLY_TYPES. Remove the case from offscreen/index.ts switch. (2) `sp:confirmationRequest`: In `extension-messages.ts` remove the `SpConfirmationRequestMessage` interface (~line 110-120) and remove from InternalMessage union. Remove from offscreen/index.ts switch (line 502). (3) `tab.stateChanged` in SIDE_PANEL_METHODS: In `message-router.ts` line 106, remove `'tab.stateChanged'` from the set. The server NEVER sends tab.stateChanged to the extension — the extension sends it TO the server and TO the side panel directly via `sendTabStateNotification` in messaging.ts. The `SIDE_PANEL_METHODS` check only applies to messages routed through `handleServerMessage` (server→extension), so this entry is unreachable."
@@ -191,7 +191,7 @@
         "npm run test passes"
       ],
       "priority": 9,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "Four small fixes: (1) `platform/browser-extension/src/side-panel/bridge.ts` line 24: change comment from 'matches config.getState response' to 'matches bg:getFullState response'. (2) `platform/browser-extension/src/tab-state.ts` `getAggregateState` (line 298-305): after `JSON.parse`, validate: `const validStates = new Set(['closed', 'unavailable', 'ready']); return validStates.has(parsed.state) ? parsed.state : 'closed';`. (3) `platform/browser-extension/src/server-request.ts` `consumeServerResponse` (line 73): change `if ('error' in data)` to `if (data.error != null)` — this correctly handles both `{ error: { message: '...' } }` (real error) and `{ error: undefined }` (should resolve, not reject). (4) `platform/browser-extension/src/background-message-handlers.ts` `handleWsMessage` (line 107-110): wrap `handleServerMessage(message.data)` in try-catch, log the error, and ensure `sendResponse({ ok: true })` is called in both success and error paths."
@@ -213,7 +213,7 @@
         "npm run test passes"
       ],
       "priority": 10,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Multiple test files need additions. (1) `platform/browser-extension/src/background-message-handlers.test.ts`: add a describe block for 'EXTENSION_ONLY_TYPES security'. Test that sending a message with type 'bg:setToolEnabled' from a MessageSender with a `tab` property (content script) is rejected (handler not called, or returns error). Test that the same message from a sender without `tab` (extension popup/page) is accepted. Look at how the existing listener registration uses `sender` in the actual code — `background-message-handlers.ts` line ~510-530 area. (2) `platform/browser-extension/src/side-panel/bridge.test.ts`: add test for sendConfirmationResponse — mock chrome.runtime.sendMessage, verify it's called with `{ type: 'sp:confirmationResponse', data: { id, decision, scope } }`. (3) `platform/mcp-server/src/extension-handlers.test.ts`: add tests for handleConfigSetAllBrowserToolsEnabled — follow the pattern of existing handleConfigSetBrowserToolEnabled tests. Verify valid toggle sends plugins.changed with full payload, invalid params return -32602 error. (4) Tests for consumeServerResponse and getAggregateState as described in US-009 acceptance criteria."
@@ -234,7 +234,7 @@
         "npm run test:e2e passes"
       ],
       "priority": 11,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "In `e2e/side-panel-realtime-state.e2e.ts`: (1) Find the amber dot assertion (~line 168). Currently: `sidePanelPage.locator('.bg-primary.rounded-full').first()`. Change to: `e2ePluginCard.locator('.bg-primary.rounded-full')` where e2ePluginCard is the scoped locator for the E2E Test plugin card (same pattern used for green dot assertions). (2) Find the reconnect/hot-reload test. It should assert that the plugin card disappears OR the 'Cannot Reach MCP Server' text appears during the disconnect window, THEN assert recovery. Without this intermediate assertion, the test passes even if no disconnect happened. (3) Find the config change test (~line 94-96). It both writes config AND calls POST /reload — two competing update mechanisms. Remove the POST /reload call and rely on the file watcher alone (this is what we're testing). If the file watcher path is too slow/unreliable in the test environment, reverse: keep POST /reload and remove the config file write. Read `e2e/CLAUDE.md` before making changes."
