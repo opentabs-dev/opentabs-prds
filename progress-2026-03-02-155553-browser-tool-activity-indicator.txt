@@ -1,0 +1,41 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-155553-browser-tool-activity-indicator~running.json
+Started: Mon Mar  2 23:56:20 UTC 2026
+---
+
+## Codebase Patterns
+- `handlePluginToolCall` in `mcp-tool-dispatch.ts` calls `sendInvocationStart` before the try block and `sendInvocationEnd` in the finally block — browser tools follow the same pattern with `plugin='browser'`
+- The test file for `mcp-tool-dispatch.ts` already mocks `sendInvocationStart` and `sendInvocationEnd` from `./extension-protocol.js` — new tests just call `vi.mocked()` on them
+- Browser tool invocation uses `toolName` directly (e.g., `'browser_list_tabs'`) as both the `plugin` and `tool` args... actually `plugin='browser'` and `tool=toolName`
+- Browser tools execute in milliseconds — use MutationObserver in `page.evaluate()` to detect brief CSS class appearances rather than Playwright's `toBeVisible` polling assertions
+- The side panel's "Browser" accordion is identified with `value="browser-tools"` and trigger text "Browser" in BrowserToolsCard.tsx
+- `getByText('List Tabs')` matches both "List Tabs" and "Plugin List Tabs" — use `{ exact: true }` for precise matching
+- Activity indicator pipeline: `sendInvocationStart` (WebSocket) → background `handleServerMessage` → `forwardToSidePanel` → `useServerNotifications` hook → `setActiveTools` → component re-render with `animate-activity-flash` class
+
+## 2026-03-03 - US-001
+- Added `sendInvocationStart(state, 'browser', toolName)` before the try block in `handleBrowserToolCall`
+- Added `sendInvocationEnd(state, 'browser', toolName, btDurationMs, btSuccess)` in the finally block, alongside `appendAuditEntry`
+- Extracted `btDurationMs` variable in the finally block (was previously computed inline for `appendAuditEntry`)
+- Added two unit tests to `mcp-tool-dispatch.test.ts`:
+  - `sendInvocationStart and sendInvocationEnd are called` (success case)
+  - `sendInvocationEnd reports success=false on error` (error case)
+- Files changed: `platform/mcp-server/src/mcp-tool-dispatch.ts`, `platform/mcp-server/src/mcp-tool-dispatch.test.ts`
+- **Learnings for future iterations:**
+  - The `sendInvocationStart/End` functions are already imported at the top of `mcp-tool-dispatch.ts` (lines 12-13), so no import changes needed
+  - `sendInvocationStart` is placed BEFORE `btStartTs = Date.now()` — same pattern as `handlePluginToolCall` where it's called before the startTs assignment
+  - All Phase 1 checks passed (build, type-check, lint, knip, test) — 2981 tests passing
+  - `e2eCheckpoint: false` for US-001, so no E2E run needed
+---
+
+## 2026-03-03 - US-002
+- Added new E2E test 'shows activity indicator on browser tool invocation' in the existing 'tool invocation animation' describe block in `e2e/side-panel-data-flow.e2e.ts`
+- Test uses a MutationObserver approach to detect the brief `animate-activity-flash` CSS class, since browser tools execute too quickly for Playwright polling assertions
+- Test flow: set up MCP server + extension + MCP client → open side panel → expand Browser accordion → install MutationObserver → call `browser_list_tabs` → verify observer saw `animate-activity-flash` → verify indicator disappears
+- No test server needed for browser tools (they execute server-side, not via adapters)
+- Files changed: `e2e/side-panel-data-flow.e2e.ts`
+- **Learnings for future iterations:**
+  - Browser tools are fast (milliseconds) — cannot rely on Playwright's `toBeVisible`/`toBeHidden` polling to catch brief UI states. MutationObserver is the reliable approach.
+  - `getByText('List Tabs')` ambiguously matches "List Tabs" and "Plugin List Tabs" — always use `{ exact: true }` for Playwright text locators when the text could be a substring of another element
+  - The E2E test doesn't need the test server at all for browser tools — only MCP server + extension + MCP client. This makes it simpler and faster than plugin tool tests.
+  - `e2eCheckpoint: true` for US-002 — full Phase 2 suite ran: all 444 E2E tests + 2981 unit tests pass
+---
