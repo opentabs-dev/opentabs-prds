@@ -18,7 +18,7 @@
         "npm run test passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "File: platform/browser-extension/src/network-capture.ts, around lines 305-312.\n\nThe Network.loadingFinished callback calls `getResponseBody` and then decodes the body:\n\n```ts\nconst body = responseData.base64Encoded\n  ? new TextDecoder().decode(Uint8Array.from(atob(responseData.body), c => c.charCodeAt(0)))\n  : responseData.body;\n```\n\n`atob()` throws a `DOMException` if the input contains characters outside the base64 alphabet. Every other failure mode in this callback is already guarded: `chrome.runtime.lastError`, missing result, missing body, evicted requests (via `pendingRequests` map lookup), and binary MIME type filtering. This is the one gap.\n\nThe fix is straightforward: wrap the base64 decode path in a try/catch. On failure, set body to a placeholder string like `'[base64 decode failed]'` and log a warning. Do NOT skip the entire response — still store the entry with the error placeholder so the capture timeline remains complete.\n\nDo not change the non-base64 path. Do not refactor surrounding code."
@@ -39,7 +39,7 @@
         "npm run test passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "File: platform/browser-extension/src/offscreen/index.ts, around lines 417-464 (the `case 'ws:setUrl':` handler).\n\nThe handler is an async IIFE `void (async () => { ... })()` that calls `fetchWsInfo(httpBase)` and then parses the response:\n\n```ts\nconst result = await fetchWsInfo(httpBase);\nif ('response' in result && result.response.ok) {\n  const wsInfo = (await result.response.json()) as { wsUrl?: string };\n```\n\nIf the server returns HTTP 200 with a non-JSON body (malformed, HTML error page, empty), `result.response.json()` throws a `SyntaxError`. Because the IIFE is `void`-ed, the rejection is swallowed. `sendResponse()` is never called, and Chrome keeps the message channel open until the sender times out. The URL change silently fails.\n\nThe fix: wrap the `result.response.json()` call (and the subsequent logic that uses `wsInfo`) in a try/catch. In the catch, call `sendResponse({ ok: false, reason: '...' })` and return.\n\nImportant: the async handler returns `true` at line 463 to tell Chrome to keep the message channel open for async sendResponse. This is correct and must be preserved. The fix must ensure sendResponse is called on ALL code paths within the IIFE, including the new catch.\n\nDo not refactor the overall structure of the handler. Do not change fetchWsInfo. Only add error handling around the JSON parse."

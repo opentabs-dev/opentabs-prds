@@ -1,0 +1,34 @@
+# Ralph Progress Log
+PRD: prd-2026-03-02-233541-extension-error-handling~running.json
+Started: Tue Mar  3 07:36:07 UTC 2026
+---
+
+## Codebase Patterns
+- Network capture (`platform/browser-extension/src/network-capture.ts`) uses Chrome DevTools Protocol via `chrome.debugger` APIs with async callbacks
+- The loadingFinished handler fetches response bodies asynchronously and has multiple guard clauses (lastError, missing result, evicted requests, binary MIME filtering)
+- Base64 response bodies are decoded via `atob()` + `Uint8Array` + `TextDecoder` (not bare `atob`) to handle non-ASCII characters correctly
+- Offscreen document (`platform/browser-extension/src/offscreen/index.ts`) uses async IIFEs inside `chrome.runtime.onMessage` handlers with `return true` to keep message channels open for async `sendResponse`
+- When adding error handling in async IIFE message handlers, every code path must call `sendResponse` to avoid leaking Chrome message channels
+
+## 2026-03-03 07:37 UTC - US-001
+- Wrapped `atob()` call in `Network.loadingFinished` handler in a try/catch
+- On decode failure, sets body to `'[base64 decode failed]'` placeholder and emits `console.warn` with requestId
+- Non-base64 path and all other existing behavior unchanged
+- Files changed: `platform/browser-extension/src/network-capture.ts`
+- **Learnings for future iterations:**
+  - The network-capture module uses Chrome extension callback-style APIs (`chrome.debugger.sendCommand` with callback), not promises
+  - All other failure modes in the loadingFinished callback were already guarded — this was the last gap
+  - The `requestId` variable is available in scope from the outer handler, useful for logging
+---
+
+## 2026-03-03 07:40 UTC - US-002
+- Wrapped `result.response.json()` call in the `ws:setUrl` handler's async IIFE in a try/catch
+- On JSON parse failure, calls `sendResponse({ ok: false, reason: 'Invalid /ws-info response' })` and returns early
+- The handler does not proceed to change `mcpServerUrl` on parse failure
+- Valid JSON responses continue to work correctly — the `wsInfo` variable is declared with `let` before the try/catch so it remains in scope for subsequent logic
+- Files changed: `platform/browser-extension/src/offscreen/index.ts`
+- **Learnings for future iterations:**
+  - The `ws:setUrl` handler uses `void (async () => { ... })()` pattern — unhandled rejections inside are silently swallowed, making try/catch essential for every throwing call
+  - `response.json()` throws `SyntaxError` on non-JSON bodies (HTML error pages, empty responses, malformed JSON)
+  - The `return true` at the end of the `case` block must be preserved — it tells Chrome to keep the message channel open for the async `sendResponse`
+---
