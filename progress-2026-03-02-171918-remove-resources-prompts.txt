@@ -1,0 +1,133 @@
+## Codebase Patterns
+- When removing exports from plugin-sdk, downstream packages (plugin-tools, browser-extension, mcp-server) immediately break at build time — must fix all consumers to keep `npm run build` green.
+- The build-e2e.test.ts tests run the actual plugin build via `opentabs-plugin build`, so the e2e-test plugin source must also be kept in sync when removing SDK exports.
+- create-plugin/src/index.test.ts scaffolds a plugin and builds it — update assertions that check manifest structure when fields are removed.
+- `plugins/e2e-test/src/index.ts` is the real plugin used by E2E tests AND by build-e2e.test.ts fixture tests — must be updated when SDK types change.
+- The PRD notes for each story list the exact line numbers to remove, but the actual file content may differ slightly (e.g., different string values in tests) — always read the file before editing.
+- US-002 (shared package) intentionally leaves the full build broken — only run `cd platform/shared && npm run build` for verification. Downstream consumers (plugin-tools, mcp-server, browser-extension) will be fixed in subsequent stories.
+
+# Ralph Progress Log
+PRD: prd-2026-03-02-171918-remove-resources-prompts~running.json
+Started: Tue Mar  3 01:19:47 UTC 2026
+---
+
+## 2026-03-03 - US-001
+- What was implemented: Removed all resource and prompt type definitions and factory functions from the plugin SDK.
+- Files changed:
+  - platform/plugin-sdk/src/index.ts: removed ResourceContent, ResourceDefinition, defineResource, ResourceContentType, PromptArgument, PromptMessage, PromptDefinition, TypedPromptConfig, DefinePrompt, definePrompt, and resources/prompts properties from OpenTabsPlugin
+  - platform/plugin-sdk/src/index.test.ts: removed describe('defineResource'), describe('definePrompt'), describe('ResourceContent type') blocks and their imports
+  - platform/plugin-tools/src/commands/build.ts: removed resource/prompt imports, validation sections, warnResourcesAndPrompts function, generateResourcesManifest, extractArgsFromSchema, generatePromptsManifest, and updated generateManifest and summary output
+  - platform/plugin-tools/src/commands/build.test.ts: removed resource/prompt test imports and test blocks
+  - platform/plugin-tools/src/commands/build-e2e.test.ts: removed resources/prompts type assertions
+  - plugins/e2e-test/src/index.ts: removed testResource, testPrompt, typedGreetPrompt definitions and resources/prompts class overrides
+  - platform/create-plugin/src/index.test.ts: removed resources/prompts manifest assertions
+- **Learnings for future iterations:**
+  - Removing SDK exports cascades immediately to plugin-tools which imports them — had to fix plugin-tools build.ts in the same story to keep build green
+  - The e2e-test plugin compiled output references removed SDK exports at runtime, so it must be updated alongside SDK changes
+  - US-003 (plugin-tools cleanup) work was partially done here to maintain green builds — the remaining cleanup for US-003 will be the tests and any other references not yet removed
+  - US-008 (e2e-test plugin cleanup) was partially done here — resources/prompts removed from the plugin class, but e2e/resources-prompts.e2e.ts and fixtures.ts still have resource/prompt references (those are for E2E tests)
+---
+
+## 2026-03-03 - US-002
+- What was implemented: Removed ManifestResource, ManifestPromptArgument, ManifestPrompt interfaces from the shared package and removed resources/prompts optional fields from PluginManifest.
+- Files changed:
+  - platform/shared/src/index.ts: removed ManifestResource, ManifestPromptArgument, ManifestPrompt interfaces; removed `resources?: ManifestResource[]` and `prompts?: ManifestPrompt[]` from PluginManifest
+  - platform/shared/src/constants.ts: updated comment "tool/resource/prompt manifest" → "tool manifest"
+- **Learnings for future iterations:**
+  - As noted in PRD, only `cd platform/shared && npm run build` was run for verification — the full monorepo build will fail at this stage because downstream consumers (plugin-tools, mcp-server, browser-extension) still reference ManifestResource/ManifestPrompt; those are fixed in US-003 through US-007
+  - The platform/shared package only has a `build` script (no separate `type-check`/`lint`) — `tsc --build` serves as type-check
+---
+
+## 2026-03-03 - US-003 through US-006
+- What was implemented: Restored a fully green build after US-002 broke all downstream consumers; simultaneously completed the resource/prompt removal across plugin-tools inspect command (US-004), MCP server state/registry/loader (US-005), and MCP handlers/notifications (US-006). US-003 (build command) was already complete from US-001.
+- Files changed:
+  - platform/plugin-tools/src/commands/inspect.ts: removed ManifestPrompt/ManifestResource imports, removed resources/prompts from ToolsJsonManifest interface, removed resource/prompt extraction and display sections
+  - platform/plugin-tools/src/commands/inspect.test.ts: removed JSON mode resources/prompts test, removed resources/prompts from summary count tests, removed describe('handleInspect — resources display') and describe('handleInspect — prompts display') blocks
+  - platform/mcp-server/src/state.ts: removed ManifestResource/ManifestPrompt imports, removed resources/prompts from RegisteredPlugin, removed ResourceLookupEntry/PromptLookupEntry interfaces, removed resourceLookup/promptLookup from PluginRegistry and EMPTY_REGISTRY, removed prefixedResourceUri/prefixedPromptName functions
+  - platform/mcp-server/src/registry.ts: removed all resource/prompt lookup code (getResource, getPrompt, listAllResources, listAllPrompts, ResourceLookupResult, PromptLookupResult, map building)
+  - platform/mcp-server/src/loader.ts: removed ManifestPrompt/ManifestPromptArgument/ManifestResource imports, removed resources/prompts from LoadedPlugin, removed validateResources/validatePrompts/validatePromptArguments functions, removed resource/prompt extraction in loadPlugin
+  - platform/mcp-server/src/file-watcher.ts: removed resource/prompt imports and ParsedManifest fields, removed pluginName param from parseToolsJson (unused after cleanup), updated handleToolsJsonChange
+  - platform/mcp-server/src/mcp-setup.ts: removed resources/list, resources/read, prompts/list, prompts/get handlers; removed resource/prompt capabilities; removed notifyResourceListChanged/notifyPromptListChanged; removed sendResourceListChanged/sendPromptListChanged from McpServerInstance
+  - platform/mcp-server/src/reload.ts: removed notifyResourceListChanged/notifyPromptListChanged imports and calls
+  - All test files (registry.test.ts, loader.test.ts, state.test.ts, mcp-setup.test.ts, mcp-setup-dispatch.test.ts, reload.test.ts, file-watcher.test.ts, http-routes.test.ts, extension-handlers.test.ts, extension-protocol.test.ts, version-check.test.ts): removed resource/prompt fixtures, mock methods, and test describe blocks
+- **Learnings for future iterations:**
+  - US-002 intentionally leaves the full monorepo build broken — the first story after it must fix all downstream consumers before committing (even if that spans multiple stories worth of scope)
+  - The `parseToolsJson` function in file-watcher.ts had a `pluginName` parameter that was only used for resource/prompt validation; removing that validation made the param unused — must also remove from the call site
+  - The reload.test.ts test counted 6 `setRequestHandler` calls (resources/list, resources/read, prompts/list, prompts/get, tools/list, tools/call); after removal, it's just 2
+---
+
+## 2026-03-03 - US-007
+- What was implemented: Removed all resource read and prompt get dispatch code from the browser extension.
+- Files changed:
+  - platform/browser-extension/src/resource-prompt-dispatch.ts: DELETED (285 lines)
+  - platform/browser-extension/src/resource-prompt-dispatch.test.ts: DELETED (530 lines)
+  - platform/browser-extension/src/known-methods.ts: removed 'resource.read' and 'prompt.get' from DISPATCH_METHODS
+  - platform/browser-extension/src/message-router.ts: removed handleResourceRead/handlePromptGet import and routing entries
+  - platform/browser-extension/src/dispatch-helpers.ts: updated JSDoc from "tool, resource, and prompt dispatches" to "tool dispatches"
+  - platform/browser-extension/src/dispatch-helpers.test.ts: updated 3 'resource read'/'prompt get' operationName strings to 'tool dispatch'
+  - platform/browser-extension/src/message-router.test.ts: removed all resource/prompt mocks, resets, default implementations, and describe blocks
+  - platform/browser-extension/src/known-methods.test.ts: removed vi.mock for resource-prompt-dispatch module
+- **Learnings for future iterations:**
+  - `dispatch-helpers.test.ts` uses 'resource read' and 'prompt get' as example operationName strings in tests that verify tab fallback behavior — these are not resource/prompt-specific tests, just need the operationName changed to a tool-related value
+  - The `known-methods.test.ts` imports message-router which transitively imports resource-prompt-dispatch, so the vi.mock there is needed to prevent import errors — removing the dispatch file requires removing these mocks too
+---
+
+## 2026-03-03 - US-008
+- What was implemented: Removed all resource and prompt definitions from the e2e-test plugin (done in US-001) and deleted the E2E test file for resources and prompts; cleaned up fixtures.ts.
+- Files changed:
+  - e2e/resources-prompts.e2e.ts: DELETED (339 lines)
+  - e2e/fixtures.ts: removed McpResource, McpResourceContent, McpPrompt, McpPromptMessage interfaces; removed listResources/readResource/listPrompts/getPrompt from McpClient interface and implementation; removed resources:[]/prompts:[] from createMinimalPlugin(); removed 4 type exports; updated comment
+  - e2e/npm-discovery.e2e.ts: removed resources:[]/prompts:[] from 2 manifest writes
+  - e2e/discovery-edge-cases.e2e.ts: removed resources:[]/prompts:[] from 2 manifest writes
+  - e2e/hot-reload-dynamic.e2e.ts: updated comment to reflect tools-only manifest format
+  - plugins/e2e-test/src/index.ts: already cleaned in US-001
+  - platform/create-plugin/src/index.test.ts: already cleaned in US-001
+- E2E tests: 432 passed
+- **Learnings for future iterations:**
+  - The e2e-test plugin source was already cleaned up in US-001 commit — no rebuild needed for US-008
+  - create-plugin/src/index.test.ts was also already cleaned in US-001
+---
+
+## 2026-03-03 - US-009
+- What was implemented: Removed commented-out resource and prompt boilerplate from the plugin scaffold template.
+- Files changed:
+  - platform/cli/src/scaffold.ts: removed commented-out "To add resources or prompts" import hint and "override readonly resources/prompts" boilerplate inside the class template body
+---
+
+## 2026-03-03 - US-010
+- What was implemented: Removed all resource and prompt documentation pages, navigation entries, and component references from the docs site.
+- Files changed:
+  - docs/content/docs/guides/resources-prompts.mdx: DELETED
+  - docs/content/docs/sdk/resources.mdx: DELETED
+  - docs/content/docs/sdk/prompts.mdx: DELETED
+  - docs/config/navigation.ts: removed Resources & Prompts guide nav entry and Resources/Prompts SDK refs
+  - docs/components/illustrations.tsx: removed DispatchFlow component (214 lines)
+  - docs/components/MDX.tsx: removed DispatchFlow import and registration
+  - docs/CLAUDE.md: removed DispatchFlow from illustrations table
+  - docs/content/docs/sdk/plugin-class.mdx: removed resources/prompts from class signature and properties table
+  - docs/content/docs/guides/plugin-development.mdx: removed resources/prompts paragraph and next steps link
+  - docs/content/docs/first-plugin.mdx: removed Resources & Prompts next steps entry
+  - docs/content/docs/reference/mcp-server.mdx: removed resource/prompt capabilities and WebSocket protocol rows
+  - docs/content/docs/reference/cli.mdx: removed resource/prompt counts from build/inspect descriptions
+  - docs/content/docs/contributing/architecture.mdx: updated registry maps, dispatch pipeline, and wire protocol table
+  - docs/content/docs/index.mdx: removed resources/prompts from How It Works overview
+- **Learnings for future iterations:**
+  - DispatchFlow was exclusively used by resources-prompts.mdx — safe to delete entirely when that page is removed
+  - The docs build (`cd docs && npm run build`) compiles Next.js pages; broken MDX links cause build failures
+---
+
+## 2026-03-03 - US-011
+- What was implemented: Updated all CLAUDE.md files to remove resource/prompt references and added a rationale section to plugin-sdk/CLAUDE.md.
+- Files changed:
+  - CLAUDE.md (root): removed resource/prompt dispatch from MCP server description, removed defineResource/definePrompt from SDK description, renamed "Tool and prompt name prefixing" to "Tool name prefixing", removed "Resource URI prefixing" concept
+  - platform/plugin-sdk/CLAUDE.md: removed defineResource/definePrompt references, added "## Why Resources and Prompts Are Not Supported" rationale section
+  - platform/mcp-server/CLAUDE.md: removed resource/prompt from capabilities, registry, dispatch descriptions; removed Resource and Prompt Dispatch subsection
+  - platform/browser-extension/CLAUDE.md: removed handleResourceRead/handlePromptGet dispatch documentation
+  - platform/plugin-tools/CLAUDE.md: removed resource/prompt metadata from build artifact description
+  - plugins/CLAUDE.md: removed "optionally define resources and prompts" step from plugin workflow
+---
+
+## COMPLETED: All 11 user stories from remove-resources-prompts PRD are done
+All commits pushed to branch ralph-2026-03-02-171918-remove-resources-prompts.
+PRD renamed to ~done.json.
+---
