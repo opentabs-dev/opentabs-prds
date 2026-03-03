@@ -1,0 +1,38 @@
+## Codebase Patterns
+- `chrome.scripting.executeScript` `func` runs in the browser context (isolated from Node.js module scope). To pass module-level constants into an injected script, add them to the `args` array — plain objects are JSON-serializable and can be received as extra function parameters.
+- `vi.hoisted()` is the required pattern for creating mock function references used in `vi.mock()` factories — avoids `@typescript-eslint/unbound-method` ESLint errors when accessing methods on mocked objects
+- Test mock function types in `vi.hoisted`: use `vi.fn<(arg?: unknown) => ReturnType>(() => default)` to properly type parameter and return shapes, enabling `mock.calls[0]?.[0]` access without TS errors
+- For object method mocks, always create standalone `vi.hoisted` references rather than accessing `vi.mocked(obj.method)` — the latter triggers unbound-method lint errors
+
+# Ralph Progress Log
+PRD: prd-2026-03-02-173806-extension-audit-fixes~running.json
+Started: Tue Mar  3 01:38:44 UTC 2026
+---
+
+## 2026-03-03 - US-001
+- Fixed `handleExtensionGetLogs` double-limiting bug in `platform/browser-extension/src/browser-commands/extension-commands.ts`
+- Added `const { limit: _, ...sourceOptions } = filterOptions;` to strip limit before querying each source
+- Changed `bgLogCollector.getEntries(filterOptions)` → `bgLogCollector.getEntries(sourceOptions)`
+- Changed offscreen `sendMessage` options to use `sourceOptions` instead of `filterOptions`
+- Final `merged.slice(0, limit)` after merging is unchanged (correct behavior)
+- Added `handleExtensionGetLogs` test suite in `extension-commands.test.ts` with 4 tests verifying: correct chronological merge with limit, limit not passed to bg source, limit not passed to offscreen source, default limit fallback
+- Refactored bg mock to use `vi.hoisted` pattern (`mockBgGetEntries`, `mockBgGetStats`) to avoid `@typescript-eslint/unbound-method` lint errors
+- **Learnings for future iterations:**
+  - The `@typescript-eslint/unbound-method` rule fires when you pass `object.method` as an argument (e.g., `vi.mocked(obj.method)`). Fix: use `vi.hoisted` to extract mock references as standalone variables
+  - When using `vi.fn<(...) => ...>()` with `vi.hoisted`, type the parameters explicitly to avoid TypeScript inferring an empty tuple type that causes `mock.calls[0]?.[0]` errors
+  - `handleExtensionGetLogs` offscreen path: `sendMessage` options are `undefined` when `Object.keys(sourceOptions).length === 0` (after stripping limit)
+---
+
+## 2026-03-03 - US-002
+- Fixed `deriveCode` function in `platform/browser-extension/src/browser-commands/key-press-command.ts` to produce correct `KeyboardEvent.code` values for punctuation characters
+- Added `SHIFTED_PUNCTUATION_CODES` map (21 entries: !, @, #, $, %, ^, &, *, (, ), _, +, {, }, |, :, ", <, >, ?, ~)
+- Added `UNSHIFTED_PUNCTUATION_CODES` map (11 entries: -, =, [, ], \, ;, ', ,, ., /, `)
+- Both maps exported at module level for testability
+- Passed both maps as additional `args` to `chrome.scripting.executeScript` (JSON-serializable plain objects)
+- Updated `func` signature to accept `shiftedPunct` and `unshiftedPunct` parameters
+- Updated `deriveCode` to use `shiftedPunct[k] ?? unshiftedPunct[k] ?? k` for unrecognized single characters
+- Added two test suites in `key-press-command.test.ts` verifying all shifted and unshifted punctuation entries
+- **Learnings for future iterations:**
+  - `chrome.scripting.executeScript` `func` is serialized and runs in an isolated browser context — it cannot access Node.js module scope. Avoid code duplication by passing module-level constants as `args` (plain objects are JSON-serializable)
+  - Prettier enforces that destructuring + `await import()` assignments fit on one line when possible: `const { a, b, c } = await import('./foo.js');` — don't wrap to multiple lines unless the line is too long
+---
