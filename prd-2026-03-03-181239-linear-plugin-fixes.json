@@ -1,0 +1,71 @@
+{
+  "project": "OpenTabs Plugin — linear",
+  "description": "Add null guards for GraphQL response fields across all Linear tools and fix Retry-After header parsing.",
+  "workingDirectory": "plugins/linear",
+  "qualityChecks": "cd plugins/linear && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add null guards for GraphQL query response fields in Linear tools",
+      "description": "As a user, I want Linear tools to return helpful ToolError.notFound errors instead of crashing with TypeError when a queried resource doesn't exist.",
+      "acceptanceCriteria": [
+        "list-comments.ts guards data.issue before accessing .comments, throwing ToolError.notFound if null",
+        "list-cycles.ts guards data.team before accessing .cycles, throwing ToolError.notFound if null",
+        "list-workflow-states.ts guards data.team before accessing .states, throwing ToolError.notFound if null",
+        "search-issues.ts guards data.searchIssues (line 71) and data.issues (line 98) before accessing .nodes",
+        "list-projects.ts guards data.projects before accessing .nodes",
+        "list-users.ts guards data.users before accessing .nodes",
+        "ToolError is imported from @opentabs-dev/plugin-sdk in all affected files",
+        "cd plugins/linear && npm run build passes",
+        "cd plugins/linear && npm run type-check passes",
+        "cd plugins/linear && npm run lint passes",
+        "cd plugins/linear && npm run format:check passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The Linear plugin uses a graphql() function that returns `result.data` as the typed T. However, GraphQL can return null for top-level fields when a resource doesn't exist (e.g., `{ data: { issue: null } }` when querying a deleted issue). The graphql() function only checks `if (!result.data)` but not inner fields.\n\nAll query tools access nested fields without null checks, which crashes with TypeError. Fix each by adding a guard after the graphql() call:\n\n1. plugins/linear/src/tools/list-comments.ts line 46:\n   `const result = data.issue.comments;` → add `if (!data.issue) throw ToolError.notFound('Issue not found');` before this line\n\n2. plugins/linear/src/tools/list-cycles.ts line 45:\n   `const result = data.team.cycles;` → add `if (!data.team) throw ToolError.notFound('Team not found');` before\n\n3. plugins/linear/src/tools/list-workflow-states.ts line 37:\n   `const nodes = data.team.states.nodes` → add `if (!data.team) throw ToolError.notFound('Team not found');` before\n\n4. plugins/linear/src/tools/search-issues.ts:\n   - Line 71: `const result = data.searchIssues;` → add `if (!data.searchIssues) throw ToolError.internal('Search returned no results object');`\n   - Line 98: `const result = data.issues;` → add `if (!data.issues) throw ToolError.internal('Issues query returned no results object');`\n\n5. plugins/linear/src/tools/list-projects.ts line 43:\n   `const result = data.projects;` → add `if (!data.projects) throw ToolError.internal('Projects query returned no results object');`\n\n6. plugins/linear/src/tools/list-users.ts line 40:\n   `const result = data.users;` → add `if (!data.users) throw ToolError.internal('Users query returned no results object');`\n\nFor entity-specific queries (issue, team), use ToolError.notFound. For collection queries (searchIssues, issues, projects, users), use ToolError.internal since these should always return a connection object."
+    },
+    {
+      "id": "US-002",
+      "title": "Add null guards for GraphQL mutation response fields in Linear tools",
+      "description": "As a user, I want Linear mutation tools to return helpful errors instead of crashing with TypeError when a mutation fails silently.",
+      "acceptanceCriteria": [
+        "create-issue.ts guards data.issueCreate before accessing .issue, throwing ToolError.internal if null",
+        "create-comment.ts guards data.commentCreate before accessing .comment, throwing ToolError.internal if null",
+        "update-issue.ts guards data.issueUpdate before accessing .issue, throwing ToolError.internal if null",
+        "delete-issue.ts guards data.issueDelete before accessing .success, throwing ToolError.internal if null",
+        "ToolError is imported from @opentabs-dev/plugin-sdk in all affected files",
+        "cd plugins/linear && npm run build passes",
+        "cd plugins/linear && npm run type-check passes",
+        "cd plugins/linear && npm run lint passes",
+        "cd plugins/linear && npm run format:check passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Same root cause as US-001 but for mutation tools. GraphQL mutations can return null for the mutation field if permissions fail silently or the operation is rejected without raising a GraphQL error.\n\n1. plugins/linear/src/tools/create-issue.ts line 72:\n   `return { issue: mapIssue(data.issueCreate.issue ...) };` → add `if (!data.issueCreate?.issue) throw ToolError.internal('Issue creation failed — no issue returned');` before\n\n2. plugins/linear/src/tools/create-comment.ts line 38:\n   `return { comment: mapComment(data.commentCreate.comment ...) };` → add `if (!data.commentCreate?.comment) throw ToolError.internal('Comment creation failed — no comment returned');` before\n\n3. plugins/linear/src/tools/update-issue.ts line 69:\n   `return { issue: mapIssue(data.issueUpdate.issue ...) };` → add `if (!data.issueUpdate?.issue) throw ToolError.internal('Issue update failed — no issue returned');` before\n\n4. plugins/linear/src/tools/delete-issue.ts line 29:\n   `return { success: data.issueDelete.success };` → add `if (!data.issueDelete) throw ToolError.internal('Issue deletion failed — no response');` before"
+    },
+    {
+      "id": "US-003",
+      "title": "Use SDK parseRetryAfterMs in Linear API caller",
+      "description": "As a plugin developer, I want the Linear plugin to correctly parse Retry-After headers in both seconds and HTTP-date formats so that AI agents receive valid retry timing metadata.",
+      "acceptanceCriteria": [
+        "Line ~192 in linear-api.ts uses parseRetryAfterMs from @opentabs-dev/plugin-sdk instead of `Number(retryAfter) * 1000`",
+        "The import for parseRetryAfterMs is added to the existing @opentabs-dev/plugin-sdk import line",
+        "HTTP-date format Retry-After values are correctly parsed instead of producing NaN",
+        "cd plugins/linear && npm run build passes",
+        "cd plugins/linear && npm run type-check passes",
+        "cd plugins/linear && npm run lint passes",
+        "cd plugins/linear && npm run format:check passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File: plugins/linear/src/linear-api.ts\n\nLines 191-192:\n```\nconst retryAfter = response.headers.get('Retry-After');\nconst retryMs = retryAfter ? Number(retryAfter) * 1000 : undefined;\n```\n\nReplace with:\n```\nconst retryAfter = response.headers.get('Retry-After');\nconst retryMs = retryAfter !== null ? parseRetryAfterMs(retryAfter) : undefined;\n```\n\nAdd `parseRetryAfterMs` to the import from '@opentabs-dev/plugin-sdk' at line 1 (currently only imports `ToolError`)."
+    }
+  ]
+}
