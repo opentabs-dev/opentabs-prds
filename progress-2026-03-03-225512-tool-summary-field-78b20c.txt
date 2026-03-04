@@ -1,0 +1,67 @@
+## Codebase Patterns
+- Optional fields in wire protocol use conditional spread: `...(value ? { key: value } : {})`
+- Validation of incoming wire payloads uses `typeof x === 'string'` checks before including optional fields
+- CachedBrowserTool in state.ts mirrors BrowserToolDefinition but with pre-computed JSON Schema; both need updating when adding new fields
+- The summary field flows: ToolDefinition (SDK) → tools.json (build) → ManifestTool (loader) → WireToolDef (extension-handlers) → message-router (extension)
+- For browser tools: BrowserToolDefinition → CachedBrowserTool → ConfigStateBrowserTool (extension-handlers buildConfigStatePayload)
+- Browser tool definitions place fields in order: name, description, summary, icon, group, input, handler
+- When adding a new browser tool, include a `summary` field for UI consistency with all existing tools
+
+# Ralph Progress Log
+PRD: prd-2026-03-03-225512-tool-summary-field-78b20c~running.json
+Started: Wed Mar  4 07:01:53 UTC 2026
+---
+
+## 2026-03-04 - US-003
+- Threaded the optional `summary` field through the entire pipeline: plugin build serialization, MCP server loader validation, extension wire protocol, browser tool definitions, cached browser tools, and browser extension message router
+- Files changed:
+  - `platform/plugin-tools/src/commands/build.ts` — serialize summary in generateToolsManifest
+  - `platform/mcp-server/src/loader.ts` — validate and pass through optional summary string
+  - `platform/mcp-server/src/extension-handlers.ts` — include summary in serializePluginForExtension and buildConfigStatePayload
+  - `platform/mcp-server/src/mcp-setup.ts` — include summary in rebuildCachedBrowserTools
+  - `platform/mcp-server/src/state.ts` — add summary to CachedBrowserTool interface
+  - `platform/mcp-server/src/browser-tools/definition.ts` — add summary to BrowserToolDefinition interface
+  - `platform/browser-extension/src/message-router.ts` — extract summary in validatePluginPayload
+- **Learnings for future iterations:**
+  - The conditional spread pattern `...(x ? { key: x } : {})` is used consistently for optional fields across the entire pipeline
+  - CachedBrowserTool in state.ts and BrowserToolDefinition in definition.ts must be kept in sync when adding new browser tool fields
+  - The config state builder in extension-handlers.ts handles browser tools separately from plugin tools — both paths need updating
+---
+
+## 2026-03-04 - US-004
+- Displayed the summary field in the side panel ToolRow component, using `summary ?? description` for both the inline text and tooltip, with graceful fallback when no summary is provided
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/ToolRow.tsx` — added optional `summary` prop, computed `displayDescription = summary ?? description`, used it for inline text and Tooltip.Content
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — passed `summary={tool.summary}` to ToolRow in both grouped and ungrouped tool renderings
+  - `platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx` — passed `summary={tool.summary}` to ToolRow in both grouped and ungrouped tool renderings
+  - `platform/browser-extension/src/side-panel/components/ToolRow.stories.tsx` — added `WithSummary` and `WithoutSummary` stories
+- **Learnings for future iterations:**
+  - BrowserToolState is a type alias for ConfigStateBrowserTool (from shared), so when shared types already have a field, the bridge types automatically carry it
+  - PluginCard and BrowserToolsCard both have two ToolRow render paths (grouped vs ungrouped) — both must be updated when adding new ToolRow props
+  - The nullish coalescing pattern `summary ?? description` is clean for optional-with-fallback UI fields
+---
+
+## 2026-03-04 - US-005
+- Added a `summary` field to all 40 browser tool definitions in `platform/mcp-server/src/browser-tools/`
+- Each summary is a concise, human-readable sentence under 80 characters describing the tool's purpose for UI display
+- The full AI-facing `description` field was left unchanged in all files
+- Files changed: all 40 browser tool `.ts` files in `platform/mcp-server/src/browser-tools/` (excluding definition.ts, index files, test files, and utility files)
+- **Learnings for future iterations:**
+  - The `summary` field is placed after `description` and before `icon` in the `defineBrowserTool({...})` call, matching the order in the BrowserToolDefinition interface
+  - When adding a new browser tool, remember to include a `summary` field for UI consistency
+  - The catalog generation script (`scripts/generate-browser-tools-catalog.ts`) needs separate updating to include summaries in the generated catalog — that happens in US-006
+---
+
+## 2026-03-04 - US-006
+- Updated the browser tools catalog generation script to extract and include the `summary` field from browser tool definitions
+- Regenerated the catalog file — all 40 tools now have `summary` entries in the generated output
+- Three changes to the script: (1) added `summary?: string` to the dynamic import type assertion, (2) included summary in the entries mapping via conditional spread, (3) added `if (entry.summary)` line in the codegen output
+- All Phase 1 and Phase 2 (E2E) checks pass — 451 E2E tests green
+- Files changed:
+  - `scripts/generate-browser-tools-catalog.ts` — extract and include summary in generation
+  - `platform/shared/src/generated/browser-tools-catalog.ts` — regenerated with summary entries for all 40 tools
+- **Learnings for future iterations:**
+  - The `npm run build` step automatically runs the catalog generation script, so changes to the script are reflected after a build
+  - The catalog generation script uses `existing === content` comparison to avoid unnecessary writes — if the file already matches, it reports "up to date"
+  - The conditional spread pattern `...(t.summary ? { summary: t.summary } : {})` works cleanly in the map step, and `if (entry.summary)` in the codegen conditionally emits the line
+---
