@@ -1,0 +1,38 @@
+# Ralph Progress Log
+PRD: prd-2026-03-03-161127-scaffolder-version-drift~running.json
+Started: Wed Mar  4 00:12:00 UTC 2026
+---
+
+## Codebase Patterns
+- The scaffolder in `platform/cli/src/scaffold.ts` is shared by both `opentabs plugin create` and `create-opentabs-plugin` (via `@opentabs-dev/cli/scaffold` export)
+- `generatePackageJson` is a synchronous function that accepts pre-resolved versions as a parameter
+- `resolvePluginSdkVersions()` returns a `ResolvedVersions` object with `openTabsVersion`, `zodVersion`, and `source` fields
+- The zod peer dependency version always comes from the local SDK (tracks API compatibility), even when the @opentabs-dev version comes from the npm registry
+- `platform/create-plugin/src/index.test.ts` has integration tests that run the scaffolder via subprocess
+
+## 2026-03-04 - US-001
+- Implemented npm registry query via `child_process.execFile('npm', ['view', ...])` with 5-second timeout as primary version source
+- Extracted existing `import.meta.resolve` logic into `readLocalSdkVersions()` as the offline fallback
+- Added `queryNpmRegistryVersion()` that returns the version string or null on failure
+- Refactored `resolvePluginSdkVersions()` to try registry first, fall back to local, returning a `source` field
+- Changed `generatePackageJson` from async (calling resolvePluginSdkVersions internally) to sync (accepting versions as parameter)
+- Added version source logging in `scaffoldPlugin()` before the "Creating..." message
+- Files changed: `platform/cli/src/scaffold.ts`
+- **Learnings for future iterations:**
+  - The `generatePackageJson` function was previously async only because it called `resolvePluginSdkVersions()` internally — moving version resolution to the caller made it synchronous
+  - `queryNpmRegistryVersion` and `readLocalSdkVersions` are not exported to avoid knip failures (US-002 tests should mock at the `node:child_process` level)
+  - The pre-commit hook runs lint-staged which stashes/pops — always verify unstaged changes survived after commit
+---
+
+## 2026-03-04 - US-002
+- Added version resolution tests to `platform/cli/src/scaffold.test.ts`
+- Added `vi.mock('node:child_process')` to mock `execFile` for controlling npm registry responses
+- Added `resolvePluginSdkVersions` unit tests: registry success, fallback on failure, valid semver caret range, never '*'
+- Added `scaffoldPlugin` integration tests: package.json uses registry version, falls back to local, plugin-sdk and plugin-tools get same version
+- Files changed: `platform/cli/src/scaffold.test.ts`
+- **Learnings for future iterations:**
+  - When mocking `execFile` from `node:child_process`, the callback-based overload needs `as unknown as typeof execFile` cast because the `__promisify__` property is missing on the mock function type
+  - The existing `vi.mock('node:fs/promises')` pattern in the test file already demonstrates the `importOriginal` approach for partial mocks — `node:child_process` follows the same pattern
+  - `resolvePluginSdkVersions` is exported, so it can be tested directly without going through `scaffoldPlugin`
+  - The local SDK fallback works in tests because `@opentabs-dev/plugin-sdk` is a workspace dependency, so `import.meta.resolve` finds it
+---
