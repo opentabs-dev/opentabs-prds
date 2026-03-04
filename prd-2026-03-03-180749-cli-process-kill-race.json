@@ -1,0 +1,26 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix process.kill ESRCH race conditions in CLI stop and update commands that crash the CLI when the target process exits between the alive check and the SIGTERM signal.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Wrap process.kill(pid, 'SIGTERM') in try/catch in stop.ts and update.ts",
+      "description": "As a CLI user, I want `opentabs stop` and `opentabs update` to handle the case where the server process exits between the health check and the SIGTERM signal, so that the CLI prints a clean message instead of crashing with an unhandled ESRCH exception.",
+      "acceptanceCriteria": [
+        "process.kill(pid, 'SIGTERM') at platform/cli/src/commands/stop.ts:95 is wrapped in a try/catch that handles ESRCH (process already exited) gracefully — prints 'Server stopped.' and cleans up the PID file",
+        "process.kill(pid, 'SIGTERM') at platform/cli/src/commands/update.ts:113 is wrapped in a try/catch that handles ESRCH gracefully — if the process already exited, continues with the restart flow as if it exited normally",
+        "Other errors from process.kill (e.g., EPERM) are still surfaced to the user, not silently swallowed",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Two files have the same bug — process.kill(pid, 'SIGTERM') without try/catch.\n\n**File 1: platform/cli/src/commands/stop.ts line 95**\nThe flow is: isProcessAlive check (line 68) → health check with 2s timeout (line 83) → process.kill(pid, 'SIGTERM') (line 95). If the server exits during the health check window, the kill throws ESRCH. Wrap line 95 in try/catch: on ESRCH, fall through to the PID file cleanup and print 'Server stopped.' (the server is already gone, which is the desired outcome). On any other error (e.g., EPERM), re-throw or print a warning.\n\n**File 2: platform/cli/src/commands/update.ts line 113 (inside restartBackgroundServer)**\nThe flow is: isProcessAlive check (line 105) → process.kill(pid, 'SIGTERM') (line 113) → waitForExit (line 114). If the process exits between lines 105 and 113, kill throws ESRCH. Wrap line 113 in try/catch: on ESRCH, skip waitForExit (process already exited) and proceed directly to restarting. On any other error, re-throw or print a warning.\n\nThe isProcessAlive helper (defined in both files) already uses try/catch around process.kill(pid, 0) — the SIGTERM calls should follow the same defensive pattern.\n\nDo NOT refactor the duplicated helpers (isProcessAlive, waitForExit) into a shared module — that is a separate concern and out of scope for this fix."
+    }
+  ]
+}
