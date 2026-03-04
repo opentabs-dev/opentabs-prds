@@ -1,0 +1,116 @@
+# Ralph Progress Log
+PRD: prd-2026-03-04-102222-config-schema-cleanup-d3124e~running.json
+Started: Wed Mar  4 18:22:59 UTC 2026
+---
+
+## Codebase Patterns
+- OpentabsConfig interface is in `platform/mcp-server/src/config.ts`, exported as a type
+- Config JSON key for permissions is now `permissions` (was `plugins`)
+- `parseConfigRecord` in config.ts normalizes raw JSON to OpentabsConfig
+- `savePluginPermissions` does a read-modify-write: reads config from disk, replaces the permissions field, writes back
+- Test fixtures in reload.test.ts write config.json directly via `writeFileSync` with JSON fixtures — these must match the config schema
+- `state.registry.plugins` and `state.pluginPermissions` are different things: registry.plugins is the plugin registry (Map), pluginPermissions is the permission config from config.json
+- The `isLocalPathEntry` helper was only used by legacy migration code and is now removed
+- The CLI config command (`platform/cli/src/commands/config.ts`) has its own raw `Record<string, unknown>` manipulation for `config.permissions` (via `ensurePluginEntry`, `pruneEmptyPluginEntries`, `normalizeConfigForDisplay`) — these are separate from the mcp-server's typed OpentabsConfig helpers
+- E2E `OpentabsConfig` in `e2e/fixtures.ts` is a separate type from the server's — must be kept in sync manually when schema changes
+- `HealthResponse.plugins` (and reload response `plugins: number`) is the loaded plugin count, NOT the config key — never rename it during config schema changes
+
+## 2026-03-04 - US-001
+- Renamed `OpentabsConfig.plugins` → `OpentabsConfig.permissions`
+- Updated `parseConfigRecord` to read `record.permissions` instead of `record.plugins`
+- Removed all legacy migration code: old tools/browserToolPolicy detection, legacy plugins array migration, npmPlugins migration
+- Removed `isLocalPathEntry` helper (only used by removed migration code)
+- Updated `savePluginPermissions` to write `permissions` key
+- Updated `loadConfig` default config to use `permissions: {}`
+- Updated doc comment on `savePluginPermissions`
+- Updated all config.test.ts fixtures from `plugins` to `permissions`
+- Removed 6 migration-specific tests (old-format, legacy plugins array, Windows paths, npmPlugins, deduplication)
+- Consolidated remaining tests: renamed "ignores absent plugins" → "ignores absent permissions", "default config has empty plugins" → "default config has empty permissions"
+- Also fixed downstream consumers: reload.ts lines 221/241 (`config.plugins` → `config.permissions`), reload.test.ts fixtures (3 JSON config fixtures)
+- Files changed: config.ts, config.test.ts, reload.ts, reload.test.ts
+- **Learnings for future iterations:**
+  - Renaming OpentabsConfig fields requires updating all JSON fixtures in test files that write config.json directly (not just TS code using the type)
+  - reload.test.ts has config JSON fixtures that must match the config.json schema exactly — they bypass parseConfigRecord and write raw JSON
+  - The `skipConfirmation` → `skipPermissions` backward compat in parseConfigRecord was kept (it's removed in US-002)
+---
+
+## 2026-03-04 - US-002
+- Removed `skipPermissions` field from `OpentabsConfig` interface
+- Removed `skipPermissions`/`skipConfirmation` parsing from `parseConfigRecord` — return is now `{ localPlugins, permissions }`
+- Removed `skipPermissions` preservation from `savePluginPermissions` read-modify-write
+- Cleaned up `skip-permissions.ts`: removed `--dangerously-skip-confirmation` CLI flag and `OPENTABS_SKIP_CONFIRMATION` env var, removed comments about legacy aliases and config.json field
+- Updated `reload.ts`: `newSkipPermissions` now computed solely from `isCliSkipPermissions()` (no `config.skipPermissions`)
+- Removed two tests from `config.test.ts`: "preserves skipPermissions flag" and "migrates skipConfirmation to skipPermissions"
+- Files changed: config.ts, skip-permissions.ts, reload.ts, config.test.ts
+- **Learnings for future iterations:**
+  - `state.skipPermissions` (on ServerState) is a runtime flag that STAYS — only the config.json path to set it was removed
+  - `isCliSkipPermissions()` in skip-permissions.ts evaluates once at module load time (startup) — it caches the result
+  - The `savePluginPermissions` function does a read-modify-write cycle, so any field removed from `OpentabsConfig` must also be removed from the reconstruction in that function
+---
+
+## 2026-03-04 - US-003
+- No new code changes required — US-001 already covered this story's scope
+- `reload.ts` line 221 already uses `config.permissions` (fixed in US-001)
+- `reload.test.ts` fixtures already use `permissions` key (fixed in US-001)
+- `http-routes.test.ts` line 450 `expect(body).not.toHaveProperty('plugins')` is about the health endpoint's `plugins: number` count field — not config.plugins — so no change needed
+- All Phase 1 checks pass: build, type-check, lint, knip, test
+- **Learnings for future iterations:**
+  - The `plugins: number` field in `HealthResponse` (http-routes.test.ts) is the count of loaded plugins in server state, completely separate from `config.plugins`/`config.permissions` — do not rename it
+  - When US-001 fixed reload.ts/reload.test.ts, it effectively pre-completed US-003
+---
+
+## 2026-03-04 - US-004
+- Updated `CANONICAL_CONFIG_SECTIONS` from `['localPlugins', 'plugins']` to `['localPlugins', 'permissions']`
+- Updated `normalizeConfigForDisplay` to use `config.permissions` and set `normalized.permissions`
+- Updated display branch `key === 'plugins'` to `key === 'permissions'` (and cyan label)
+- Updated `ensurePluginEntry`: `config.plugins` → `config.permissions`, local var `plugins` → `permissions`
+- Updated `pruneEmptyPluginEntries`: same renaming
+- Updated all `normalizeConfigForDisplay` tests in `config.test.ts`: `plugins` → `permissions` in test names, fixture keys, variable names, and property assertions
+- Files changed: `platform/cli/src/commands/config.ts`, `platform/cli/src/commands/config.test.ts`
+- **Learnings for future iterations:**
+  - The CLI config command works with raw `Record<string, unknown>` (not the typed `OpentabsConfig`) because it reads config as raw JSON for display and mutation — the `permissions` key manipulation is separate from the mcp-server's typed helpers
+  - All `normalizeConfigForDisplay` test names used the key name literally — must update both the test descriptions and assertions when renaming config keys
+---
+
+## 2026-03-04 - US-005
+- Renamed `OpentabsConfig.plugins` → `OpentabsConfig.permissions` in `e2e/fixtures.ts`
+- Updated `createTestConfigDir` default config from `plugins: {}` to `permissions: {}`
+- Updated all `config.plugins` → `config.permissions` across 5 E2E test files:
+  - `permissions.e2e.ts` (10 instances)
+  - `plugin-management.e2e.ts` (4 instances)
+  - `hot-reload-dynamic.e2e.ts` (5 `config.permissions` + 14 `writeTestConfig` calls)
+  - `side-panel-plugin-toggle.e2e.ts` (2 `config.permissions` + 5 `writeTestConfig` calls)
+  - `side-panel-realtime-state.e2e.ts` (9 `writeTestConfig` calls)
+- Removed outdated test "group headers contain a Switch toggle for bulk permission control" from `side-panel-plugin-tool-groups.e2e.ts` — UI no longer has Switch toggles in group headers (confirmed by passing test in side-panel-plugin-toggle.e2e.ts:567 that asserts zero Switch components exist)
+- Kept `tools?: Record<string, boolean>` legacy field on `OpentabsConfig` in fixtures.ts — still used by older E2E tests (tool-groups, icons, live-update, reload, etc.) that haven't been migrated to the permissions map
+- Verified no E2E tests set `skipPermissions` in config objects — all use `OPENTABS_SKIP_PERMISSIONS` env var
+- All Phase 1 and Phase 2 checks pass (454 E2E tests pass)
+- Files changed: `e2e/fixtures.ts`, `e2e/permissions.e2e.ts`, `e2e/plugin-management.e2e.ts`, `e2e/hot-reload-dynamic.e2e.ts`, `e2e/side-panel-plugin-toggle.e2e.ts`, `e2e/side-panel-realtime-state.e2e.ts`, `e2e/side-panel-plugin-tool-groups.e2e.ts`
+- **Learnings for future iterations:**
+  - The `OpentabsConfig` in `e2e/fixtures.ts` is a separate type from the server's `OpentabsConfig` — they must be kept in sync manually
+  - `writeTestConfig` calls pass object literals where property names must match the interface field names — both `config.permissions = ...` assignments AND `{ permissions: {} }` object literals need updating
+  - The `plugins: number` in `HealthResponse` and reload response bodies is the server's loaded plugin count, NOT the config key — do not rename it
+  - The `tools?: Record<string, boolean>` legacy field on the E2E `OpentabsConfig` is still needed by several tests (tool-groups, icons, live-update, reload, port-change, strict-csp, tab-state-sync) — removing it would break compilation for those tests
+  - The `side-panel-plugin-tool-groups.e2e.ts` Switch toggle test was outdated — the UI replaced Switch components with plain text group headers, but the test was never updated
+---
+
+## 2026-03-04 - US-006
+- Rewrote `docs/content/docs/reference/configuration.mdx`:
+  - Config table: removed `tools`, `browserToolPolicy`, old `permissions` (trustedDomains), `skipPermissions` rows; added new `permissions` row with `Record<string, PluginPermissionConfig>` type
+  - Example config: replaced old format with new `{ localPlugins, permissions: { slack: { permission, tools }, __browser__: { permission, tools } } }`
+  - Replaced old `### tools`, `### browserToolPolicy`, `### permissions` (trustedDomains/sensitiveDomains/toolPolicy/domainToolPolicy), `### skipPermissions` sections with new `### permissions` (PluginPermissionConfig) and `### Bypassing permissions` sections
+  - Updated `OPENTABS_SKIP_PERMISSIONS` env var description: removed config equivalent and legacy alias mentions
+  - Removed `## Legacy config migration` section
+- Updated `CLAUDE.md` line 93: `under the \`plugins\` map` → `under the \`permissions\` map`, removed `skipPermissions config flag` reference
+- Updated `docs/content/docs/contributing/architecture.mdx`: replaced old permission evaluation order (domainToolPolicy/sensitiveDomains/toolPolicy/trustedDomains) with new order (skipPermissions → per-tool override → plugin default → 'off'), removed `skipPermissions config flag` reference
+- Updated `docs/content/docs/reference/mcp-server.mdx`: `confirmationBypassed` description now references CLI flag / env var instead of `skipPermissions config`
+- Updated `.claude/skills/build-plugin/__SKILL__.md`: removed `skipPermissions: true` config option (now 2 ways instead of 3), changed `{ "plugins": { "browser": ... } }` → `{ "permissions": { "__browser__": ... } }`
+- Verified `docs/content/docs/reference/cli.mdx` — no changes needed (`--dangerously-skip-permissions` docs already correct)
+- Verified `platform/mcp-server/CLAUDE.md` — no references to `config.plugins` or `skipPermissions` in config
+- Files changed: `docs/content/docs/reference/configuration.mdx`, `docs/content/docs/contributing/architecture.mdx`, `docs/content/docs/reference/mcp-server.mdx`, `CLAUDE.md`, `.claude/skills/build-plugin/__SKILL__.md`
+- **Learnings for future iterations:**
+  - The old `permissions` config key (trustedDomains/sensitiveDomains/toolPolicy/domainToolPolicy) was a completely different feature from the new `permissions` key (PluginPermissionConfig) — both used the same JSON key name but had entirely different schemas
+  - Documentation for removed features exists in multiple places: reference docs, architecture docs, CLI docs, skill files, and CLAUDE.md — search all `*.md` and `*.mdx` files when removing a feature
+  - The `docs/content/docs/contributing/architecture.mdx` had the most detailed description of the old permission evaluation chain — needed updating even though it wasn't in the PRD's explicit file list
+  - CLI config set syntax (`tool-permission.<plugin>.<tool>`) has diverged from what's documented in cli.mdx (`tool.<plugin>_<tool>`) — this is a pre-existing documentation bug not in scope for this story
+---
