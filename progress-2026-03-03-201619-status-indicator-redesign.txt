@@ -1,0 +1,67 @@
+# Ralph Progress Log
+PRD: prd-2026-03-03-201619-status-indicator-redesign~running.json
+Started: Wed Mar  4 04:16:46 UTC 2026
+---
+
+## Codebase Patterns
+- PluginIcon uses `useSyncExternalStore` with a MutationObserver to subscribe to dark mode class changes on `<html>` — this pattern avoids stale dark mode state in the side panel.
+- CSS animations in `styles.css` use CSS custom property references (`var(--primary)`, `var(--border)`) so they automatically adapt to light/dark mode.
+- The side panel components use `cn()` (a `clsx`+`twMerge` wrapper) for conditional class composition.
+- Tailwind opacity modifiers like `border-border/30` work via the `@theme` bridge in `styles.css` — no custom CSS needed for opacity variants.
+- E2E CSS selectors for Tailwind opacity modifiers: `.border-border\/30` (CSS) → `'.border-border\\/30'` (JS string) → `page.locator('.border-border\\/30')` (Playwright). The `/` must be escaped.
+- CSS class `.border-border` does NOT match elements with class `border-border/30` — they are distinct class names. Use this to differentiate ready (`border-border`) from not-ready (`border-border/30`) states in E2E tests.
+- BrowserToolsCard always uses `tabState="ready"` for its PluginIcon → its icon always has class `border-border`. When scoping E2E selectors, always use the specific plugin card button as the root to avoid false matches from the Browser card.
+- Border animations (`animate-activity-border-flash/fade-out`) are applied as class toggles on always-present container elements. MutationObserver should use `attributes: true, attributeFilter: ['class']` only — NOT `childList` — since no nodes are added/removed.
+
+## 2026-03-04 - US-001
+- Implemented: Replaced PluginIcon StatusIndicator dot with border-based readiness and activity
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/PluginIcon.tsx` — Removed entire `StatusIndicator` component (77-137), removed `hasUpdate` from props, moved fade-out logic to PluginIcon, replaced `relative` wrapper with plain `shrink-0`, added dynamic border classes via `cn()` for ready/not-ready/active/fading-out states
+  - `platform/browser-extension/src/side-panel/styles.css` — Added `activity-border-flash` and `activity-border-fade-out` keyframes and animation classes
+  - `platform/browser-extension/src/side-panel/components/PluginIcon.stories.tsx` — Removed `ReadyWithUpdate` story, removed `hasUpdate` from Palette and argTypes, added `ActiveBorderFlash` story
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — Removed `hasUpdate={!!plugin.update}` from PluginIcon usage
+- **Learnings for future iterations:**
+  - The `ArrowUp` import from `lucide-react` was only used by StatusIndicator — removing StatusIndicator makes it unused, so remove the import too.
+  - The outer wrapper div for PluginIcon used `relative` for the absolute-positioned StatusIndicator dot. With the dot gone, `relative` is no longer needed.
+  - Existing `activity-flash` and `activity-fade-out` animations (opacity-based) are still in styles.css — ToolIcon (US-002) may still reference them. US-004 will clean up if unused.
+---
+
+## 2026-03-04 - US-002
+- Implemented: Replaced ToolIcon green activity dot with border-based activity flash
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/ToolIcon.tsx` — Removed the green dot element (absolute-positioned 8px circle at bottom-right). Removed `relative` from container div. Changed `cn()` call to conditionally apply border animation classes based on `enabled`, `active`, and `fadingOut` states: enabled+active gets `animate-activity-border-flash`, enabled+fading-out gets `animate-activity-border-fade-out`, enabled+idle gets `border-border`, disabled gets `border-border/40 bg-muted/40`.
+  - `platform/browser-extension/src/side-panel/components/ToolIcon.stories.tsx` — Removed `ActiveDisabled` story (disabled tools can't be active). Added `ActiveFadeOut` story with a timer that toggles active→inactive after 1.5s. Added `Disabled` story. Added `useEffect`/`useState` imports for the fade-out demo.
+- **Learnings for future iterations:**
+  - The `cn()` utility accepts arrays as arguments — useful for grouping conditional classes under a ternary branch (e.g., `enabled ? ['bg-primary', active && 'animate-...'] : 'bg-muted/40'`).
+  - The fade-out logic (useRef + useEffect tracking previous active state) is identical between PluginIcon and ToolIcon — both use the same 500ms timer pattern. US-004 cleanup may want to verify both are consistent.
+  - The `animate-activity-border-flash` and `animate-activity-border-fade-out` CSS classes were already added in US-001 and are reused here — no CSS changes needed for US-002.
+---
+
+## 2026-03-04 - US-003
+- Implemented: Added update notification badge to PluginMenu trigger button, removed update reference from PluginCard tooltip
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/PluginMenu.tsx` — Added `relative` to the trigger button, added conditional `div` dot (h-1.5 w-1.5 rounded-full border border-background bg-primary) at top-0 right-0 when `plugin.update` exists
+  - `platform/browser-extension/src/side-panel/components/PluginCard.tsx` — Removed the `{plugin.update && <> · Update: ...}` line from the PluginIcon tooltip content
+  - `platform/browser-extension/src/side-panel/components/PluginMenu.stories.tsx` — Added `WithUpdateBadge` story showing side-by-side comparison of the menu trigger with and without the update dot
+- **Learnings for future iterations:**
+  - The PluginMenu trigger button is inside `<Menu.Trigger asChild>` — the `relative` positioning for the dot goes on the `<button>` element itself since `asChild` merges into the child.
+  - The dot uses `border-background` (not `border-border`) for contrast against the background, matching the notification badge convention in the design system.
+  - The update menu item and separator inside the dropdown are unchanged — the badge only adds visual discoverability, the interaction remains in the menu.
+---
+
+## 2026-03-04 - US-004
+- Implemented: Cleaned up unused CSS animations and updated E2E tests for border-based status indicators
+- Files changed:
+  - `platform/browser-extension/src/side-panel/styles.css` — Removed old `activity-flash` and `activity-fade-out` keyframes and classes (opacity-based, ~26 lines). Confirmed via grep that no component references them after US-001/US-002 moved to border-based animations. The new `activity-border-flash` and `activity-border-fade-out` classes remain.
+  - `e2e/side-panel-data-flow.e2e.ts` — Updated all `.bg-success` checks to `.border-border` (ready state) and `.border-border\/30` (not-ready state). Changed `.animate-activity-flash` to `.animate-activity-border-flash`. Updated MutationObserver to watch for class attribute changes (not child node insertion) since border flash is a class toggle on an existing element.
+  - `e2e/side-panel-icons.e2e.ts` — Changed icon container locator to `.border-border\/30` for closed state (no tab open) and `.border-border` for ready state. Updated status checks throughout.
+  - `e2e/side-panel-instant-startup.e2e.ts` — Updated all 4 `.bg-success` checks to `.border-border` (solid border = ready state).
+  - `e2e/side-panel-plugin-toggle.e2e.ts` — Changed closed state check to `.border-border\/30` toBeVisible and ready state check to `.border-border` toBeVisible.
+  - `e2e/side-panel-realtime-state.e2e.ts` — Updated 8 checks: `.bg-success` → `.border-border`, `.bg-primary.rounded-full` (amber dot) → `.border-border\/30` (faded border for unavailable state).
+- **Learnings for future iterations:**
+  - In the new border-based design, `unavailable` and `closed` states are visually identical (both use `border-border/30`). E2E tests can only distinguish them via the server health endpoint, not via visual DOM checks.
+  - CSS selectors for Tailwind opacity modifiers: `.border-border\/30` is the CSS selector for elements with class `border-border/30`. In JavaScript strings: `'.border-border\\/30'`. In Playwright locators: `page.locator('.border-border\\/30')`.
+  - CSS class `.border-border` does NOT match elements with class `border-border/30` (the selector is exact). This means `.border-border` selects only the ready-idle state icon, not the not-ready state.
+  - The border animation (`animate-activity-border-flash`) is a CSS class toggled on an always-present container element (not a conditionally-rendered dot node). MutationObserver should watch `attributes` only (not `childList`) and `attributeFilter: ['class']`.
+  - When a plugin icon is in not-ready state (closed/unavailable) and no tab is open, `locator('.border-border').first()` will find the Browser tools card's icon instead (which always has `tabState="ready"` → `border-border`). Tests checking the e2e-test plugin's icon state MUST scope to the plugin card button: `e2ePluginCard.locator('.border-border\\/30')`.
+---
