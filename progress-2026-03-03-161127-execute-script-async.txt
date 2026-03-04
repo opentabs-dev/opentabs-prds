@@ -1,0 +1,38 @@
+# Ralph Progress Log
+PRD: prd-2026-03-03-161127-execute-script-async~running.json
+Started: Wed Mar  4 00:11:56 UTC 2026
+---
+
+## Codebase Patterns
+- The exec file wrapper in `adapter-files.ts` wraps user code in an async IIFE that writes results to `globalThis.__openTabs[key]`. The extension polls for the result key.
+- Thenable detection (`typeof __r.then === "function"`) handles both explicit Promises and async function returns. Since the wrapper is now async, all code paths go through the thenable branch.
+- Unit tests for `writeExecFile` in `adapter-files.test.ts` assert on the generated wrapper content (string matching on the IIFE structure).
+
+## 2026-03-04 - US-001
+- Made the inner function wrapper in `writeExecFile` async: `(function()` → `(async function()`
+- Updated the unit test assertion to match the new async wrapper string
+- Files changed:
+  - `platform/mcp-server/src/adapter-files.ts` (line 183: one-word change)
+  - `platform/mcp-server/src/adapter-files.test.ts` (line 78: updated string assertion)
+- **Learnings for future iterations:**
+  - The fix is a single-word change (`async` keyword) because the existing thenable detection and `.then()/.catch()` handlers already handle Promises correctly
+  - Synchronous code now returns a Promise (wrapped by async function), but the polling loop handles this transparently with ~50ms extra latency
+  - The `e2eCheckpoint` for this story is `false`, so Phase 2 (E2E) is deferred to US-002
+---
+
+## 2026-03-04 - US-002
+- Added 4 E2E tests for async `await` expressions in `browser_execute_script`
+- Tests added inside existing `test.describe('browser_execute_script')` block in `e2e/browser-tools.e2e.ts`:
+  1. `await expression returns resolved value` — `return await Promise.resolve("async-value")` → `"async-value"`
+  2. `multiple sequential await expressions` — two awaits summed → `3`
+  3. `await fetch returns HTTP status` — `await fetch(window.location.href)` → `200`
+  4. `await rejected Promise captures error` — `return await Promise.reject("async-fail")` → error containing `"async-fail"`
+- Sync regression already covered by existing test (`return document.title`)
+- Files changed:
+  - `e2e/browser-tools.e2e.ts` (added 89 lines of new tests)
+- All 450 E2E tests passed (including 4 new)
+- **Learnings for future iterations:**
+  - E2E browser_execute_script tests follow a consistent pattern: `initAndListTools` → `openTestServerTab` → `callTool` → `parseToolResult` → assert on `data.value.value` (for success) or `data.value.error` (for errors) → `browser_close_tab`
+  - The `openTestServerTab` helper polls `document.readyState === "complete"` before returning, ensuring the page is fully loaded
+  - For async rejection tests, the error value is accessed via `value.error` and may need `toContain` rather than `toBe` since the error string format may vary
+---
