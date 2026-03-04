@@ -1,0 +1,434 @@
+# Ralph Progress Log
+PRD: prd-2026-03-03-154119-permission-redesign~running.json
+Started: Tue Mar  3 23:41:51 UTC 2026
+---
+
+## Codebase Patterns
+- getAllToolsList() always returns every tool (no filtering) with description prefixes based on permission state
+- checkToolCallable() is a pure existence check; permission gating happens at dispatch time in handlePluginToolCall/handleBrowserToolCall
+- ToolPermission type ('off' | 'ask' | 'auto') replaces TrustTier and enabled boolean — all tools default to 'off'
+- WireToolDef, WirePluginPayload, ConfigStatePlugin, ConfigStateBrowserTool all use `permission: ToolPermission` field
+- Config param types renamed: ConfigSetTool*Enabled*Params → ConfigSetTool*Permission*Params (enabled→permission throughout)
+- OFFICIAL_SCOPE constant removed — use literal '@opentabs-dev' where the scope is needed
+- RegisteredPlugin no longer has trustTier; use `source: 'npm' | 'local'` to distinguish plugin origin
+- Extension message types renamed: BgSetToolEnabledMessage → BgSetToolPermissionMessage, bridge functions similarly renamed
+- ConfirmationRequest/ConfirmationResponse are new shared types for the simplified confirmation flow
+- serializePluginForExtension takes (state, plugin) and resolves permissions via getToolPermission()
+- OpentabsConfig now uses `plugins: Record<string, PluginPermissionConfig>` — no more `tools`, `browserToolPolicy`, `permissions` fields
+- savePluginPermissions() replaces saveToolConfig() and saveBrowserToolPolicy() — single read-modify-write
+- state.pluginPermissions stores per-plugin permissions from config; state.toolConfig/browserToolPolicy/permissions have been removed
+- PendingConfirmation.resolve accepts ConfirmationDecision {action: 'allow'|'deny', alwaysAllow: boolean}
+- sendConfirmationRequest signature: (state, tool, plugin, params) → Promise<ConfirmationDecision>
+- DispatchCallbacks interface has onToolConfigChanged, wired to server.sendToolListChanged in registerMcpHandlers
+- McpCallbacks uses onPluginPermissionsPersist (replaces onToolConfigPersist + onBrowserToolPolicyPersist)
+- handleConfigSetToolPermission is the unified handler for per-tool permissions (plugin tools + browser tools via plugin='browser')
+- handleConfigSetPluginPermission is the unified handler for plugin-level defaults (plugins + browser via plugin='browser')
+- Extension protocol method names: config.setToolPermission, config.setPluginPermission
+- Both handleBrowserToolCall and handlePluginToolCall accept DispatchCallbacks as last parameter
+- Browser tools use 'browser' as pluginName for permission resolution and confirmation requests
+- Plugin tools pass raw toolBaseName (unprefixed) to getToolPermission and sendConfirmationRequest
+- Browser pseudo-plugin permission is transmitted as ConfigStateResult.browserPermission (separate from plugins array)
+- pendingPluginPermissionUpdates in server-state-cache handles both plugin entries and browser pseudo-plugin (cache.browserPermission)
+- skipPermissions flows end-to-end: server state → ConfigStateResult → sync.full/plugins.changed → ServerStateCache → handleBgGetFullState → App.tsx → child components; when adding new fields to ConfigStateResult, update ServerStateCache + EMPTY_CACHE + loadServerStateCacheFromSession + sync.full/plugins.changed handlers in message-router.ts + handleBgGetFullState response
+
+## 2026-03-04 00:20 - US-001
+- Implemented: New ToolPermission, PluginPermissionConfig, ConfirmationRequest, ConfirmationResponse types in shared
+- Removed TrustTier type, OFFICIAL_SCOPE constant, npmTrustTier function, trustTierPrefix function
+- Updated WireToolDef, WirePluginPayload, ConfigStatePlugin, ConfigStateBrowserTool to use permission field
+- Renamed all ConfigSet*Enabled* param types to ConfigSet*Permission* equivalents
+- Fixed all 52 files across mcp-server, browser-extension, CLI importing or using removed/changed types
+- Files changed: 52 files across platform/shared, platform/mcp-server, platform/browser-extension, platform/cli
+- **Learnings for future iterations:**
+  - The trustTier field was used in file-watcher.ts and version-check.ts to filter local vs npm plugins — the `source` field on RegisteredPlugin already captures this distinction
+  - loadPlugin() lost its trustTier parameter (was 3 args, now 2) — file-watcher.ts also calls loadPlugin and needs updating
+  - Extension message types (BgSet*Enabled*Message) are defined in extension-messages.ts and referenced in background-message-handlers.ts, bridge.ts, offscreen/index.ts — all must be renamed in lockstep
+  - server-state-cache.ts has pending update maps that were Map<string, boolean> and needed changing to Map<string, ToolPermission>
+  - The default permission for new/missing tools should be 'off' per PRD, not 'auto' — message-router.ts defaults matter
+  - Test fixtures across ~30 files all had trustTier fields that needed removing
+---
+
+## 2026-03-04 00:32 - US-002
+- Rewrote config.ts for new plugin-centric permission model
+- OpentabsConfig now has `plugins: Record<string, PluginPermissionConfig>` replacing `tools`, `browserToolPolicy`, `permissions`
+- Removed from config.ts: old ToolPermission ('allow'|'ask'|'deny'), PermissionsConfig, defaultPermissions(), parsePermissionsConfig(), saveToolConfig(), saveBrowserToolPolicy()
+- Added: parsePluginsConfig(), parsePluginPermissionEntry(), savePluginPermissions()
+- Migration: old-format configs with tools/browserToolPolicy/permissions are detected and logged (old settings discarded, empty plugins map used)
+- Moved PermissionsConfig to state.ts with local LegacyPermission type (pending US-004 removal)
+- Added `pluginPermissions: Record<string, PluginPermissionConfig>` field to ServerState
+- Updated reload.ts to populate state.pluginPermissions instead of toolConfig/browserToolPolicy/permissions
+- Updated http-routes.ts: saveToolConfig/saveBrowserToolPolicy → savePluginPermissions
+- Updated permissions.ts to use local LegacyPermission type instead of shared ToolPermission
+- Rewrote config.test.ts with all new-shape tests
+- Fixed reload.test.ts to pre-populate state.toolConfig instead of expecting it from config
+- Files changed: config.ts, config.test.ts, state.ts, reload.ts, reload.test.ts, http-routes.ts, permissions.ts, permissions.test.ts
+- **Learnings for future iterations:**
+  - PermissionsConfig (trustedDomains/sensitiveDomains/toolPolicy/domainToolPolicy) is still used by permissions.ts and state.ts — defined in state.ts with LegacyPermission type pending US-004 deletion
+  - The old permission values ('allow'/'ask'/'deny') are completely different from the new ones ('off'/'ask'/'auto') — they cannot share the ToolPermission type
+  - reload.ts no longer populates state.toolConfig or state.browserToolPolicy from config — these fields remain on ServerState with empty defaults until removed in later stories
+  - state.pluginPermissions is the new field that stores the per-plugin permission config from disk
+  - savePluginPermissions() replaces both saveToolConfig() and saveBrowserToolPolicy() — single read-modify-write function
+  - Tests that relied on config.tools being loaded into state.toolConfig must be updated to pre-populate the state field directly
+---
+
+## 2026-03-04 - US-003
+- Rewrote state.ts for the new permission model
+- Removed: ToolConfig, PermissionsConfig, LegacyPermission, CONFIRMATION_TIMEOUT_MS, ConfirmationDecision, ConfirmationScope, SessionPermissionRule, isSessionAllowed, MAX_SESSION_PERMISSIONS, pushSessionPermission, isToolEnabled, isBrowserToolEnabled
+- Added: getToolPermission(state, pluginName, toolName) — resolves via skipPermissions → per-tool override → plugin default → 'off'
+- Simplified PendingConfirmation to {resolve, reject, tool, plugin, params} with 'allow'|'deny' decisions
+- Removed toolConfig, browserToolPolicy, permissions, sessionPermissions from ServerState
+- Bumped STATE_SCHEMA_VERSION to 5
+- Updated all call sites: mcp-setup.ts, mcp-tool-dispatch.ts, extension-protocol.ts, extension-handlers.ts, permissions.ts, reload.ts, http-routes.ts
+- Rewrote state.test.ts with comprehensive getToolPermission tests
+- Updated all test files: extension-handlers.test.ts, extension-protocol.test.ts, http-routes.test.ts, mcp-setup.test.ts, mcp-setup-dispatch.test.ts, mcp-tool-dispatch.test.ts, permissions.test.ts, reload.test.ts
+- Files changed: 17 files (297 insertions, 771 deletions)
+- **Learnings for future iterations:**
+  - The old permission system had state.toolConfig (prefixed names → boolean), state.browserToolPolicy (name → boolean), state.permissions (PermissionsConfig with domain/tool policies), and state.sessionPermissions (session-scoped rules). All replaced by state.pluginPermissions (Record<string, PluginPermissionConfig>).
+  - Browser tools use the pseudo-plugin name 'browser' in pluginPermissions. The pruneStaleState function in reload.ts must skip the 'browser' key.
+  - The default for all tools is now 'off' (disabled). Tests that previously relied on the old "enabled by default" behavior must explicitly set pluginPermissions.
+  - Tool names in pluginPermissions are RAW (unprefixed). E.g., 'send_message' not 'slack_send_message'.
+  - reloadCore replaces state.pluginPermissions atomically from config.plugins, so pruning tests must include keys in the config file to test pruning behavior.
+  - permissions.ts now uses a hardcoded DEFAULT_LEGACY_PERMISSIONS instead of state.permissions (pending full removal in US-004).
+  - PendingConfirmation no longer has timerId or domain fields — simplified to tool, plugin, params with 'allow'|'deny' resolve.
+---
+
+## 2026-03-04 - US-004
+- Deleted platform/mcp-server/src/permissions.ts and permissions.test.ts
+- Removed evaluatePermission import and all legacy permission evaluation code from mcp-tool-dispatch.ts (domain resolution, deny/ask/timeout flow)
+- Removed resolveToolDomain(), truncateParamsPreview(), DOMAIN_RESOLVE_TIMEOUT_MS from mcp-tool-dispatch.ts
+- Removed sendConfirmationRequest import from mcp-tool-dispatch.ts (no longer used after legacy flow removal)
+- Removed vi.mock('./permissions.js') and all evaluatePermission mock calls from mcp-tool-dispatch.test.ts
+- Removed 7 legacy permission tests (deny, ask->deny, ask->allow, timeout, confirmation error, domain in message, progressToken)
+- Removed truncateParamsPreview test block from mcp-tool-dispatch.test.ts
+- Removed stale permissions field from createMockState in test file
+- Prefixed unused `extra` param as `_extra` in handleBrowserToolCall (US-005 will restore usage)
+- Files changed: permissions.ts (deleted), permissions.test.ts (deleted), mcp-tool-dispatch.ts, mcp-tool-dispatch.test.ts
+- **Learnings for future iterations:**
+  - After deleting permissions.ts, the only files importing from it were mcp-tool-dispatch.ts and mcp-tool-dispatch.test.ts — config.ts had already been cleaned in US-002
+  - The legacy permission flow (evaluatePermission + domain resolution + confirmation timeout) was entirely within handleBrowserToolCall — removing it leaves the function doing: off check → validation → execution
+  - truncateParamsPreview was only used in the ask confirmation flow, not exported externally
+  - The `extra` parameter on handleBrowserToolCall becomes unused after removing the ask flow (which used it for progress notifications) — US-005 will re-use it
+---
+## 2026-03-04 - US-005
+- Rewrote handleBrowserToolCall to check off/ask/auto permission via getToolPermission before execution
+- Added permission check to handlePluginToolCall (off→error, ask→confirm, auto→proceed)
+- Implemented runAskFlow() helper: sends confirmation request, handles deny/allow/alwaysAllow
+- When alwaysAllow=true: persists tool permission to 'auto' via savePluginPermissions, calls onToolConfigChanged
+- Updated error message for 'off' state: "currently disabled. Ask the user to enable it in the OpenTabs side panel."
+- Added DispatchCallbacks interface with onToolConfigChanged, threaded through registerMcpHandlers via server.sendToolListChanged
+- Updated PendingConfirmation.resolve to accept ConfirmationDecision {action, alwaysAllow} (was plain 'allow'|'deny')
+- Updated handleConfirmationResponse to extract alwaysAllow from extension params
+- Updated sendConfirmationRequest signature: (state, tool, plugin, params) → Promise<ConfirmationDecision>
+- Added ConfirmationDecision interface to state.ts
+- Rewrote mcp-tool-dispatch.test.ts with 6 new browser permission tests (off, auto, ask-deny, ask-allow, ask-alwaysAllow, ask-progress, ask-disconnect) and 5 new plugin permission tests
+- Updated mcp-setup-dispatch.test.ts assertion for new "currently disabled" message
+- Updated extension-handlers.test.ts assertions for new ConfirmationDecision resolve shape
+- Files changed: mcp-tool-dispatch.ts, mcp-tool-dispatch.test.ts, mcp-setup.ts, mcp-setup-dispatch.test.ts, extension-protocol.ts, extension-handlers.ts, extension-handlers.test.ts, state.ts
+- **Learnings for future iterations:**
+  - PendingConfirmation.resolve shape change affects tests in extension-handlers.test.ts and any code that creates PendingConfirmation objects
+  - sendConfirmationRequest now takes (state, tool, plugin, params) instead of (state, tool, domain, tabId, paramsPreview)
+  - DispatchCallbacks.onToolConfigChanged is wired to server.sendToolListChanged in registerMcpHandlers
+  - The ask flow sends an MCP progress notification ("Waiting for user approval") when progressToken is available
+  - Browser tools use 'browser' as pluginName for both getToolPermission and sendConfirmationRequest
+  - Plugin tools pass the raw toolBaseName (not prefixed) to sendConfirmationRequest and getToolPermission
+---
+
+## 2026-03-04 - US-006
+- Verified: sendConfirmationRequest already correctly implemented in US-005 (no timeout, new {id, tool, plugin, params} payload, simplified PendingConfirmation)
+- Verified: handleConfirmationResponse already correctly resolves with {action, alwaysAllow}
+- Verified: rejectAllPendingConfirmations correctly rejects all pending promises on disconnect
+- Added comprehensive confirmation tests to extension-protocol.test.ts:
+  - sendConfirmationRequest: payload shape validation (no domain/tabId/paramsPreview/timeoutMs), resolve via confirmation.response, deny flow, reject when not connected, no timeout (no timerId on PendingConfirmation)
+  - rejectAllPendingConfirmations: rejects multiple pending confirmations, handles empty map
+  - confirmation.response routing: routes to handler correctly, ignores unknown id, ignores invalid decision, defaults alwaysAllow to false
+- Files changed: extension-protocol.test.ts (273 insertions, 1 deletion)
+- **Learnings for future iterations:**
+  - US-005 proactively implemented the sendConfirmationRequest changes that US-006 specified — the main gap was missing test coverage in extension-protocol.test.ts
+  - The PendingConfirmation interface no longer has timerId — use 'timerId' in check to verify the simplified shape
+  - Type-casting PendingConfirmation to Record<string, unknown> requires double-cast through unknown first
+---
+
+## 2026-03-04 01:35 - US-007
+- Rewrote serializePluginForExtension to accept (state, plugin) and resolve permissions via getToolPermission()
+- Plugin-level permission resolved from pluginPermissions[name]?.permission ?? 'off'
+- Per-tool permission resolved via getToolPermission(state, pluginName, toolName)
+- buildConfigStatePayload now resolves browser tool permissions via getToolPermission(state, 'browser', toolName)
+- Replaced 5 old config handlers with 2 unified handlers:
+  - handleConfigSetToolPermission: per-tool permission, works for both plugins (plugin=name) and browser (plugin='browser')
+  - handleConfigSetPluginPermission: plugin-level default, works for plugins and browser
+- Both handlers validate permission is valid ('off', 'ask', 'auto') with proper error messages
+- Replaced McpCallbacks: onToolConfigPersist + onBrowserToolPolicyPersist → onPluginPermissionsPersist
+- Updated extension-protocol.ts routing: config.setToolPermission, config.setPluginPermission
+- Removed unused shared types: ConfigSetToolsPermissionParams, ConfigSetBrowserToolPermissionParams, ConfigSetAllBrowserToolsPermissionParams
+- Added ConfigSetPluginPermissionParams to shared types
+- Rewrote extension-handlers.test.ts with 2 new test suites matching new handlers
+- Updated http-routes.ts, mcp-setup-dispatch.test.ts, extension-protocol.test.ts for new callback shape
+- Files changed: extension-handlers.ts, extension-handlers.test.ts, extension-protocol.ts, extension-protocol.test.ts, http-routes.ts, mcp-setup-dispatch.test.ts, shared/src/index.ts
+- **Learnings for future iterations:**
+  - handleConfigSetToolPermission is the unified handler for both plugin tools and browser tools (plugin='browser' for browser tools)
+  - handleConfigSetPluginPermission is the unified handler for setting plugin-level defaults (works for browser too)
+  - VALID_PERMISSIONS set used for validation: 'off', 'ask', 'auto'
+  - serializePluginForExtension now requires state as first argument — all call sites in extension-protocol.ts updated
+  - The 'browser' pseudo-plugin name is used throughout for browser tool permissions
+---
+
+## 2026-03-04 - US-008
+- Renamed getEnabledToolsList() to getAllToolsList() — no longer filters out disabled tools
+- All plugin tools and browser tools are always included in tools/list response regardless of permission state
+- Added description prefixes: '[Disabled] ' for 'off', '[Requires approval] ' for 'ask', no prefix for 'auto'
+- Added descriptionPrefix() helper that resolves permission via getToolPermission and returns the appropriate prefix
+- Simplified checkToolCallable() — now only checks tool existence in registry, no permission check (dispatch handles that)
+- trustTierPrefix() was already removed in earlier stories (no action needed)
+- Updated CLAUDE.md reference from getEnabledToolsList to getAllToolsList
+- Rewrote mcp-setup.test.ts: replaced filtering tests with inclusion tests + prefix verification tests
+- mcp-setup-dispatch.test.ts needed no changes — its "disabled" test still passes via handlePluginToolCall's own permission check
+- Files changed: mcp-setup.ts, mcp-setup.test.ts, platform/mcp-server/CLAUDE.md
+- **Learnings for future iterations:**
+  - checkToolCallable is now a pure existence check — the permission gate moved to handlePluginToolCall/handleBrowserToolCall at dispatch time
+  - getAllToolsList always returns every tool with description prefixes — no filtering
+  - The description prefix is computed lazily per-call, so permission changes are reflected immediately in the next tools/list response
+  - mcp-setup-dispatch.test.ts tests pass without changes because the "disabled" error now comes from handlePluginToolCall instead of checkToolCallable
+---
+
+## 2026-03-04 - US-009
+- Most of US-009's requirements were already satisfied by earlier stories (US-001 through US-008):
+  - reload.ts already loads pluginPermissions from config.plugins (done in US-002/US-003)
+  - reload.ts already prunes stale plugin-level pluginPermissions entries (done in US-003)
+  - sessionPermissions pruning already removed (done in US-003)
+  - http-routes.ts already uses single onPluginPermissionsPersist callback (done in US-007)
+  - health endpoint already has skipPermissions, no confirmationBypassed field (done in US-003/US-005)
+  - shutdown.ts and skip-permissions.ts unchanged (verified correct)
+  - reload.test.ts and http-routes.test.ts already use new shapes (done in US-002/US-003/US-007)
+- Added per-tool pruning within surviving plugin entries in pruneStaleState: removes tool overrides for tools no longer in the registry
+- Fixed stale JSDoc comment that referenced 'toolConfig' instead of 'pluginPermissions'
+- Added 2 new tests: per-tool pruning for plugins and for browser pseudo-plugin
+- Files changed: reload.ts, reload.test.ts
+- **Learnings for future iterations:**
+  - When earlier stories do incremental refactoring, later cleanup stories may already be largely satisfied — verify before implementing
+  - pruneStaleState now handles both plugin-level and per-tool pruning; browser pseudo-plugin ('browser') uses cachedBrowserTools for tool name validation
+  - The browser pseudo-plugin's tool names come from state.cachedBrowserTools, not from state.registry.plugins
+---
+
+## 2026-03-04 - US-010
+- Verified: discovery.ts, loader.ts, file-watcher.ts, version-check.ts already cleaned of trustTier/TrustTier/OFFICIAL_SCOPE by earlier stories (US-001 through US-003)
+- Verified: All test files (discovery.test.ts, loader.test.ts, file-watcher.test.ts, version-check.test.ts) already clean
+- Removed isOfficial field from PluginSearchResult in plugin-management.ts (interface + searchNpmPlugins return value)
+- Removed isOfficial from PluginSearchResult in browser-extension bridge.ts
+- Removed OFFICIAL badge rendering from NpmPluginCard.tsx
+- Updated bridge.test.ts, NpmPluginCard.stories.tsx, SidePanel.stories.tsx, SearchResults.stories.tsx, plugin-management.e2e.ts
+- Files changed: 8 files (2 insertions, 22 deletions)
+- **Learnings for future iterations:**
+  - Earlier stories (US-001-003) already removed all trustTier/TrustTier/OFFICIAL_SCOPE references from the mcp-server — US-010's main gap was the isOfficial field in plugin search results
+  - isOfficial was a client-facing field derived at search time (entry.name.startsWith('@opentabs-dev/')) — it was not stored in any config or state
+  - The PluginSearchResult type is duplicated in plugin-management.ts (server) and bridge.ts (extension) — both must be updated in lockstep
+  - NpmPluginCard.stories.tsx has an "Official" story variant that showed the OFFICIAL badge — after removal, the story remains but the visual distinction is gone
+---
+
+## 2026-03-04 - US-011
+- Most of US-011's requirements were already satisfied by earlier stories (US-001 through US-010):
+  - extension-messages.ts already had TrustTier import removed and PluginMeta.trustTier removed
+  - message-router.ts already had TrustTier import removed, ValidatedPluginPayload.trustTier removed, trust tier validation removed
+  - plugin-storage.ts already had VALID_TRUST_TIERS and trust tier validation removed (replaced with VALID_PERMISSIONS)
+  - known-methods.ts unchanged (confirmed confirmation.request still exists)
+  - confirmation.request handling in message-router.ts already works with new payload (no timeoutMs dependency)
+- Updated SpConfirmationResponseMessage: decision changed from 'allow_once' | 'allow_always' | 'deny' to 'allow' | 'deny', removed scope field, added alwaysAllow?: boolean
+- Removed SpConfirmationTimeoutMessage type and from InternalMessage union
+- Removed handleSpConfirmationTimeout handler from background-message-handlers.ts (handler, dispatch map entry, EXTENSION_ONLY_TYPES entry, export)
+- Removed 'sp:confirmationTimeout' case from offscreen/index.ts message switch
+- Removed handleSpConfirmationTimeout tests from background-message-handlers.test.ts
+- Files changed: extension-messages.ts, background-message-handlers.ts, background-message-handlers.test.ts, offscreen/index.ts
+- **Learnings for future iterations:**
+  - SpConfirmationTimeoutMessage was used by: background-message-handlers (handler + dispatch), offscreen/index.ts (switch case), useServerNotifications.ts (sends message), confirmation-badge.ts (comments only)
+  - useServerNotifications.ts still has a runtime `chrome.runtime.sendMessage({ type: 'sp:confirmationTimeout', ... })` call — Chrome API accepts any type so it doesn't cause build errors, but the message now has no handler. US-017 should clean this up.
+  - confirmation-badge.ts references sp:confirmationTimeout only in comments — US-012 should clean these up
+  - The old decision shape ('allow_once' | 'allow_always' | 'deny' + scope) maps to new ('allow' | 'deny' + alwaysAllow) — bridge.ts still sends the old shape, US-013 should update
+---
+
+## 2026-03-04 02:14 - US-012
+- Rewrote confirmation-badge.ts: removed all timeout logic (background timeouts, confirmationTimeouts map, clearedConfirmationIds set, clearConfirmationBackgroundTimeout). Updated PendingConfirmationParams to new shape: { id, tool, plugin, params, receivedAt }. Simplified notification logic.
+- Removed handleBgSetBrowserToolPermission, handleBgSetAllBrowserToolsPermission, handleBgSetToolsPermission from background-message-handlers.ts. Removed clearConfirmationBackgroundTimeout calls from handleSpConfirmationResponse. Updated dispatch map and exports.
+- Removed BgSetToolsPermissionMessage, BgSetBrowserToolPermissionMessage, BgSetAllBrowserToolsPermissionMessage from extension-messages.ts and InternalMessage union.
+- Updated offscreen/index.ts to remove references to deleted message types from exhaustive switch.
+- Updated bridge.ts: removed setBrowserToolPermission, setAllBrowserToolsPermission, setToolsPermission exports.
+- Updated BrowserToolsCard.tsx to use unified setToolPermission('browser', ...) and setAllToolsPermission('browser', ...).
+- Updated PluginCard.tsx to use Promise.all of setToolPermission calls instead of removed setToolsPermission.
+- Simplified getPluginLink in tool-dispatch.ts to use package name directly.
+- Rewrote confirmation-badge.test.ts and updated background-message-handlers.test.ts and bridge.test.ts.
+- Files changed: 11 files (confirmation-badge.ts, background-message-handlers.ts, extension-messages.ts, tool-dispatch.ts, offscreen/index.ts, bridge.ts, BrowserToolsCard.tsx, PluginCard.tsx, and their test files)
+- **Learnings for future iterations:**
+  - Removing message types from InternalMessage union causes cascading type errors in offscreen/index.ts (exhaustive switch), bridge.ts (sendBgMessage generic), and components that import removed bridge functions. Must update all downstream consumers.
+  - The browser tools permission handlers now use the unified plugin tool handlers with plugin='browser'. BrowserToolsCard.tsx calls setToolPermission('browser', ...) instead of setBrowserToolPermission(...).
+  - PluginCard.tsx's handleToggleGroup used setToolsPermission (batch subset). After removing it, replaced with Promise.all of individual setToolPermission calls.
+---
+
+## 2026-03-04 - US-013
+- Updated FullStateConfirmation in bridge.ts to new shape: {id, tool, plugin, params, receivedAt} — removed domain, tabId, paramsPreview, timeoutMs
+- Updated sendConfirmationResponse to send {decision: 'allow'|'deny', alwaysAllow?: boolean} instead of old {decision: 'allow_once'|'allow_always'|'deny', scope?}
+- Added skipPermissions?: boolean to FullStateResult
+- Updated bridge.test.ts with new confirmation response tests (allow, alwaysAllow, deny)
+- Updated App.tsx handleConfirmationRespond to translate old ConfirmationDialog decisions ('allow_once'→'allow', 'allow_always'→'allow'+alwaysAllow=true) to new bridge API
+- Updated useServerNotifications.ts: removed timeoutMs validation requirement, construct ConfirmationData with null domain and JSON-serialized params preview
+- Files changed: bridge.ts, bridge.test.ts, App.tsx, useServerNotifications.ts
+- **Learnings for future iterations:**
+  - ConfirmationData type is defined in ConfirmationDialog.tsx (not bridge.ts) — it still has old fields (domain, tabId, paramsPreview, timeoutMs) pending US-014 replacement
+  - App.tsx's handleConfirmationRespond acts as a translation layer between old ConfirmationDialog callbacks and new bridge API — US-014 will replace the dialog and remove this translation
+  - useServerNotifications.ts previously used timeoutMs for auto-removal timeouts — since confirmations no longer timeout, the timeout tracking is now just for duplicate detection
+  - The sp:confirmationTimeout message type was removed in US-011 but useServerNotifications.ts still had a chrome.runtime.sendMessage call for it — cleaned up in this story
+  - skipPermissions is defined in FullStateResult but not yet populated by the background's handleBgGetFullState — US-017/US-018 should wire this up
+---
+
+## 2026-03-04 - US-014
+- Rewrote ConfirmationDialog.tsx: replaced inline card with retro Dialog modal (Radix-based)
+- New Dialog has yellow bg-primary header with "Approve Tool" title, X button = deny
+- Body shows: tool name (font-mono), plugin name (font-sans), collapsible parameters (HTML details/summary, collapsed by default), "Always allow this tool" checkbox with "Sets permission to Auto" helper text
+- Footer has Deny (outline) and Allow (primary) buttons; prev/next navigation for multi-confirmation
+- onInteractOutside + onEscapeKeyDown prevented to avoid accidental dismissal
+- onOpenChange triggers deny when dialog closes (X button behavior)
+- Updated ConfirmationData type: removed domain, tabId, paramsPreview, timeoutMs, receivedAt; added plugin: string, params: Record<string, unknown>
+- Removed CountdownBar and AllowAlwaysButton (internal helper components), removed Decision/Scope types
+- Removed onDenyAll from ConfirmationDialogProps (individual deny per confirmation)
+- Updated useServerNotifications.ts: removed clearConfirmationTimeout, replaced timeout-based dedup with Set<string> (seenConfirmationIds), construct new ConfirmationData shape
+- Updated App.tsx: simplified handleConfirmationRespond to (id, decision, alwaysAllow?), removed handleDenyAll, removed clearConfirmationTimeout usage
+- Removed COUNTDOWN_POLL_INTERVAL_MS from constants.ts
+- Updated ConfirmationDialog.stories.tsx with new mockConfirmation shape and story variants
+- ConfirmationDialog.test.ts unchanged (resolveDisplayIndex tests still valid)
+- Files changed: ConfirmationDialog.tsx, ConfirmationDialog.stories.tsx, App.tsx, useServerNotifications.ts, constants.ts
+- **Learnings for future iterations:**
+  - The retro Dialog uses compound component pattern: Dialog, Dialog.Content, Dialog.Header, Dialog.Body, Dialog.Footer
+  - Dialog.Header has a built-in X close button from Radix DialogPrimitive.Close — use onOpenChange to handle close-as-deny
+  - Use onInteractOutside={e => e.preventDefault()} and onEscapeKeyDown similarly to prevent unintentional dismiss
+  - ConfirmationData is the shared type between useServerNotifications (creates entries), App.tsx (holds state), and ConfirmationDialog (renders)
+  - seenConfirmationIds (Set) replaces the old timeout-based Map for deduplication — simpler since confirmations no longer auto-expire
+  - FullStateConfirmation in bridge.ts still has receivedAt field — the hydration code passes it through but useServerNotifications ignores it
+---
+
+## 2026-03-04 - US-015
+- Replaced Switch toggle in ToolRow.tsx with a native <select> for 3-state permission (Off/Ask/Auto)
+- Changed props: `enabled` + `onToggle` → `permission` + `onPermissionChange`; added `disabled` prop for skipPermissions
+- Styled select with retro theme: rounded border-2 border-border bg-card font-mono text-xs, focus shadow
+- ToolIcon's `enabled` prop now derived from `permission !== 'off'` inside ToolRow
+- Updated BrowserToolsCard.tsx: handleToggleTool → handleToolPermissionChange (takes ToolPermission directly)
+- Updated PluginCard.tsx: same rename, updated both grouped and ungrouped ToolRow usages
+- Updated ToolRow.stories.tsx: Off/Ask/Auto/Active/Disabled/LongDescription/Interactive/ToolList stories
+- Files changed: ToolRow.tsx, ToolRow.stories.tsx, BrowserToolsCard.tsx, PluginCard.tsx
+- **Learnings for future iterations:**
+  - ToolRow now takes `permission: ToolPermission` and `onPermissionChange: (tool, permission) => void` — all consumers must pass the permission value, not a boolean
+  - The `disabled` prop on ToolRow reduces opacity and disables the select — used for skipPermissions mode
+  - BrowserToolsCard and PluginCard still use Switch for the toggle-all in the accordion header; only individual tool rows use the select
+  - Consumer components' handleToolPermissionChange now takes the new ToolPermission directly instead of deriving it from a boolean toggle
+---
+
+## 2026-03-04 - US-016
+- Replaced master Switch in PluginCard header with 3-state <select> (Off/Ask/Auto) calling setPluginPermission(plugin, permission)
+- Replaced master Switch in BrowserToolsCard header with 3-state <select> calling setPluginPermission('browser', permission)
+- Added full message plumbing for bg:setPluginPermission: extension-messages.ts (BgSetPluginPermissionMessage), background-message-handlers.ts (handleBgSetPluginPermission with optimistic update + rollback), bridge.ts (setPluginPermission), offscreen/index.ts (case routing)
+- Added pendingPluginPermissionUpdates to server-state-cache.ts for optimistic plugin-level permission updates, including browser pseudo-plugin reapplication to cache.browserPermission
+- Added browserPermission field to: ConfigStateResult (shared), ServerStateCache, FullStateResult (bridge), handleBgGetFullState response
+- Populated browserPermission from state.pluginPermissions.browser in buildConfigStatePayload (extension-handlers.ts)
+- Propagated browserPermission through sync.full and plugins.changed in message-router.ts
+- Added skipPermissions prop to PluginCard and BrowserToolsCard, passed through to ToolRow disabled and group Switch disabled
+- App.tsx: added browserPermission state, populated from getFullState result, passed to BrowserToolsCard
+- Added SkipPermissions story variant to both PluginCard.stories and BrowserToolsCard.stories
+- Added setPluginPermission tests to bridge.test.ts
+- Removed unused Switch import from BrowserToolsCard, removed setAllToolsPermission import from both cards
+- Files changed: 14 files (287 insertions, 44 deletions)
+- **Learnings for future iterations:**
+  - The browser pseudo-plugin's permission is stored server-side in pluginPermissions.browser but transmitted to the extension as a separate browserPermission field on ConfigStateResult (since browser tools are not in the plugins array)
+  - pendingPluginPermissionUpdates reapplication must handle both plugin entries (cache.plugins[].permission) and the browser pseudo-plugin (cache.browserPermission) separately
+  - BrowserToolsCard now takes browserPermission and onBrowserPermissionChange props from App.tsx, while PluginCard reads permission from plugin.permission directly
+  - The setAllToolsPermission bridge function is no longer used by any component (PluginCard group toggle uses Promise.all of individual setToolPermission calls, BrowserToolsCard uses setPluginPermission) but remains exported for potential future use
+  - Group-level Switch toggles in PluginCard's accordion content are retained (not replaced with selects) since they control batch on/off for a group of tools, not permission level
+---
+
+## 2026-03-04 - US-017
+- Most of US-017's requirements were already satisfied by earlier stories (US-010 cleaned isOfficial/OFFICIAL from NpmPluginCard/SearchResults, US-014 updated ConfirmationDialog/useServerNotifications/App.tsx for new confirmation shape)
+- Added `skipPermissions?: boolean` to ConfigStateResult (shared types) so the server transmits it to the extension
+- Added `skipPermissions: state.skipPermissions` to buildConfigStatePayload (extension-handlers.ts) so sync.full and plugins.changed include it
+- Added `skipPermissions?: boolean` to ServerStateCache (server-state-cache.ts) with session storage persistence
+- Updated message-router.ts to extract and cache skipPermissions from both sync.full and plugins.changed payloads
+- Updated handleBgGetFullState to include `skipPermissions` from server cache in its response to the side panel
+- Added `skipPermissions` state to App.tsx, populated from getFullState result, reset on disconnect
+- Passed `skipPermissions` to BrowserToolsCard, PluginList, and SearchResults from App.tsx
+- Added `skipPermissions?: boolean` prop to PluginList.tsx, forwarded to each PluginCard
+- Added `skipPermissions?: boolean` prop to SearchResultsProps, forwarded to BrowserToolsCard and PluginList within search results
+- Updated FullStateResponse interface in background-message-handlers.test.ts to include browserPermission and skipPermissions
+- Updated empty-state assertion in handleBgGetFullState test to include new fields
+- Files changed: 9 files (shared/src/index.ts, extension-handlers.ts, server-state-cache.ts, message-router.ts, background-message-handlers.ts, background-message-handlers.test.ts, App.tsx, PluginList.tsx, SearchResults.tsx)
+- **Learnings for future iterations:**
+  - skipPermissions flows: server state → buildConfigStatePayload → sync.full/plugins.changed → message-router (cache) → handleBgGetFullState → side panel App.tsx → child components
+  - The ServerStateCache mirrors ConfigStateResult from shared types — when adding a field to ConfigStateResult, also add to ServerStateCache, EMPTY_CACHE, loadServerStateCacheFromSession, and the plugins.changed/sync.full handlers in message-router.ts
+  - SearchResults has its own BrowserToolsCard and PluginList instances (separate from App.tsx's main view), so skipPermissions must be passed through SearchResults too
+  - PluginIcon.tsx and StatusIndicator never had trustTier — they use tabState for visual state
+---
+
+## 2026-03-04 - US-018
+- Added skip-permissions warning banner to App.tsx using retro Alert component with variant='solid' status='warning'
+- Banner renders above the search bar when skipPermissions is true, showing "PERMISSIONS BYPASSED" title, "All tools execute without approval." description, and "--dangerously-skip-permissions" in mono text
+- Banner is non-dismissible and pinned — always visible when skipPermissions is true
+- All permission selectors were already disabled by earlier stories (US-015, US-016, US-017): ToolRow select, PluginCard plugin-level select, BrowserToolsCard browser-level select, and group Switch toggles all receive disabled={skipPermissions}
+- Added SkipPermissionsBanner story to SidePanel.stories.tsx showing the banner with disabled plugin and browser tool selectors
+- Files changed: App.tsx, SidePanel.stories.tsx
+- **Learnings for future iterations:**
+  - The skipPermissions prop was already fully wired from server state → App.tsx → all child components (BrowserToolsCard, PluginList→PluginCard, SearchResults) by US-015/US-016/US-017 — US-018 only needed to add the visual banner
+  - Alert variant='solid' and status='warning' can be combined — status classes override variant classes in Tailwind; the result is a warning-colored banner
+  - Biome's useSortedClasses nursery rule enforces specific Tailwind class ordering (e.g., mt-2 before mb-2)
+---
+
+## 2026-03-04 - US-019
+- Updated CLI config display (`normalizeConfigForDisplay`, `handleConfigShow`) to show new `plugins` permission structure instead of old `tools`, `browserToolPolicy`, `permissions` sections
+- Replaced `handleSetTool` and `handleSetBrowserTool` with `handleSetToolPermission` and `handleSetPluginPermission` using new `config.plugins` map
+- New set command keys: `tool-permission.<plugin>.<tool>` (value: off/ask/auto) and `plugin-permission.<plugin>` (value: off/ask/auto)
+- Removed old `fetchToolNames`, `fetchBrowserToolNames`, `handleListTools`, `handleListBrowserTools`, `applyPolicyEntry` functions
+- Added `ensurePluginEntry`, `pruneEmptyPluginEntries`, `colorPermission` helpers
+- Removed `[official]`/`[community]` trust tier labels from `handlePluginSearch` output in plugin.ts
+- Verified `--dangerously-skip-permissions` flag in start.ts is unchanged and works correctly
+- Updated `KNOWN_KEYS` and `suggestKey` for new key format
+- Rewrote `config.test.ts` — removed `applyPolicyEntry` tests, updated `normalizeConfigForDisplay` and `suggestKey` tests for new config shape
+- Files changed: config.ts, config.test.ts, plugin.ts
+- **Learnings for future iterations:**
+  - The CLI's `readConfig` returns raw `Record<string, unknown>` — it does not parse into a typed OpentabsConfig. The config.ts command handlers work with the raw JSON directly.
+  - `pruneEmptyPluginEntries` removes plugin entries that have no permission and no tool overrides — prevents empty `{}` entries from cluttering the config file
+  - Setting a tool permission to 'off' removes the entry (same semantic as deleting the override) to keep the config file clean
+  - The `plugins` map key 'browser' is the pseudo-plugin for browser tools (same as server-side convention)
+---
+
+## 2026-03-04 - US-020
+- All Storybook stories were already updated by earlier stories (US-001 through US-019): PluginCard.stories.tsx, PluginList.stories.tsx, SidePanel.stories.tsx, SearchResults.stories.tsx, PluginMenu.stories.tsx, ToolRow.stories.tsx, BrowserToolsCard.stories.tsx, ConfirmationDialog.stories.tsx, NpmPluginCard.stories.tsx — all use new permission model with no trustTier, no isOfficial, no enabled booleans
+- ToolRow.stories.tsx already has Off/Ask/Auto/Active/Disabled/LongDescription/Interactive/ToolList stories showing all three permission states
+- Updated server-request.test.ts: replaced old JSON-RPC method names (config.setToolEnabled, config.setBrowserToolEnabled) with new names (config.setToolPermission) and replaced enabled boolean params with permission string params
+- Files changed: server-request.test.ts
+- **Learnings for future iterations:**
+  - When earlier stories proactively update story files during component changes, later cleanup stories may only need to fix non-component test files
+  - server-request.test.ts uses sendServerRequest as a generic JSON-RPC function — method names and params are arbitrary strings/objects, not type-checked against the actual protocol, so old names don't cause compile errors but should be updated for consistency
+  - All 7 story files listed in the acceptance criteria were already migrated by the stories that modified the corresponding components (US-014 for ConfirmationDialog, US-015 for ToolRow, US-016 for PluginCard/BrowserToolsCard, US-017 for SidePanel/SearchResults, etc.)
+---
+
+## 2026-03-04 - US-021
+- Updated all E2E test files for new 3-state permission model (off/ask/auto)
+- e2e/fixtures.ts: Added envOverrides param to startMcpServer for OPENTABS_SKIP_PERMISSIONS control, updated OpentabsConfig interface
+- e2e/permissions.e2e.ts: Complete rewrite — 12 tests covering off/ask/auto permissions, confirmation dialog (allow/deny/always-allow flows), badge lifecycle, late side panel open, tool description prefixes, skipPermissions bypass, plugin-level permission, per-tool override
+- e2e/hot-reload-dynamic.e2e.ts: Converted permission-related tests to standalone with own servers using OPENTABS_SKIP_PERMISSIONS='' to test real permission behavior
+- e2e/plugin-management.e2e.ts: Converted setPluginPermission/setToolPermission tests to standalone with disabled skipPermissions
+- e2e/side-panel-plugin-toggle.e2e.ts: Added OPENTABS_SKIP_PERMISSIONS='' for permission select interaction tests, updated initial configs with explicit plugin permissions
+- e2e/side-panel-realtime-state.e2e.ts: Fixed browser tool name selectors to use prefixed names, added OPENTABS_SKIP_PERMISSIONS='' for permission change tests
+- Minor updates to dev-proxy.e2e.ts, iife-injection.e2e.ts, strict-csp.e2e.ts for fixture signature changes
+- Files changed: e2e/fixtures.ts, e2e/permissions.e2e.ts, e2e/hot-reload-dynamic.e2e.ts, e2e/plugin-management.e2e.ts, e2e/side-panel-plugin-toggle.e2e.ts, e2e/side-panel-realtime-state.e2e.ts, e2e/dev-proxy.e2e.ts, e2e/iife-injection.e2e.ts, e2e/strict-csp.e2e.ts
+- All 443 E2E tests pass, all Phase 1 checks pass (build, type-check, lint, knip, unit tests)
+- **Learnings for future iterations:**
+  - Browser tool names in config keys MUST be prefixed (e.g., `browser_list_tabs` not `list_tabs`) — the server uses prefixed names everywhere including getToolPermission(), buildConfigStatePayload(), and tool dispatch
+  - ToolRow aria-label uses the full prefixed name for browser tools: `Permission for browser_list_tabs tool`
+  - ConfirmationDialog uses Radix Dialog with `role="dialog"` NOT `role="alertdialog"` — Radix Dialog vs AlertDialog use different roles
+  - Tests that verify permission behavior MUST disable OPENTABS_SKIP_PERMISSIONS (set to '' in envOverrides) because the default fixture sets it to '1', which makes getToolPermission() always return 'auto'
+  - Permission select elements in the side panel are disabled when skipPermissions=true — tests that interact with selects need skipPermissions disabled
+  - When checking `getByText('browser')` in a dialog that also contains `browser_list_tabs`, Playwright strict mode fails because both match — use `{ exact: true }` or remove ambiguous assertions
+  - Denial error message is "Tool X was denied by the user." not "PERMISSION_DENIED" — match actual server response text
+  - The "Permission: off" test doesn't need extension connection — just call the tool via MCP client and verify the error response
+---
+
+## 2026-03-04 - US-022
+- Updated root CLAUDE.md: removed "with trust tier" from discovery pipeline description, added new permission model description (off/ask/auto 3-state with resolution order)
+- Updated mcp-server/CLAUDE.md: removed "determine trust tier" from discovery pipeline, removed "observe tier (auto-allowed)" from plugin_list_tabs description
+- Updated build-plugin skill (__SKILL__.md): replaced countdown timeout references with new permission model language, updated Browser Tool Permissions section with 3-state model, updated Testing section's Browser Tool Confirmations, updated gotcha #10
+- CLI CLAUDE.md and browser-extension/CLAUDE.md needed no changes (no trust tier or countdown references)
+- Files changed: CLAUDE.md, platform/mcp-server/CLAUDE.md, .claude/skills/build-plugin/__SKILL__.md
+- All Phase 1 checks pass (build, type-check, lint, knip, unit tests)
+---
