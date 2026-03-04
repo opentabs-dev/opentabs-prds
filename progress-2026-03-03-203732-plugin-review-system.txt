@@ -1,0 +1,105 @@
+# Ralph Progress Log
+PRD: prd-2026-03-03-203732-plugin-review-system~running.json
+Started: Wed Mar  4 07:01:48 UTC 2026
+---
+
+## Codebase Patterns
+- US-001 code was implemented by a previous worker (auto-saved in WIP commit 3bee3edb) — the reviewedVersion field, config parsing, resetStaleReviewedVersions function, and tests were all already in place
+- `resetStaleReviewedVersions` runs after `pruneStaleState` in `reloadCore` — it iterates `state.pluginPermissions`, compares `reviewedVersion` against the registry's installed version, and resets to 'off' on mismatch
+- The config write mutex (`state.configWriteMutex`) serializes all config.json writes to prevent race conditions
+- `savePluginPermissions` does a read-modify-write on config.json to avoid clobbering externally-added plugins
+- The `config.setPluginPermission` server handler already accepts optional `reviewedVersion` param — no server changes needed to pass it through from the side panel
+- The background message handler (`handleBgSetPluginPermission`) needs to explicitly forward `reviewedVersion` from the message to the server request — it doesn't auto-forward unknown fields
+- Dialog pattern: use `Dialog open={boolean} onOpenChange={fn}` with `Dialog.Content onInteractOutside` to prevent dismiss-on-click-outside; use `Dialog.Close asChild` for cancel button
+- PluginCard uses optimistic UI updates with rollback-on-error via toggleCounter ref for race condition prevention
+- E2E tests that count "non-browser" tools must also exclude platform tools (plugin_inspect, plugin_mark_reviewed) — use `new Set([...BROWSER_TOOL_NAMES, 'plugin_inspect', 'plugin_mark_reviewed'])`
+- Off plugin tool error message is a review flow message ("has not been reviewed yet"), NOT "currently disabled" — only browser tools use the "currently disabled" message
+
+## 2026-03-04T07:04:00Z - US-001
+- All implementation already committed by previous worker iteration
+- Verified: PluginPermissionConfig.reviewedVersion in shared/src/index.ts (line 100)
+- Verified: config.ts parsePluginPermissionEntry parses reviewedVersion (lines 139-141)
+- Verified: reload.ts resetStaleReviewedVersions resets permission on version mismatch (lines 199-224)
+- Verified: reload.test.ts has 4 test cases covering version mismatch, version match, absent reviewedVersion, persistence, and browser pseudo-plugin exclusion (lines 588-719)
+- All Phase 1 checks pass: build, type-check, lint, knip, test (2982 tests passed)
+- **Learnings for future iterations:**
+  - Previous worker implemented US-001 but was shut down before marking it as passes:true — always check if code is already committed before re-implementing
+  - The WIP auto-save commits from consumer shutdown contain partial or complete implementations from interrupted workers
+---
+
+## 2026-03-04T07:14:00Z - US-007
+- Implemented unreviewed plugin confirmation dialog in PluginCard.tsx
+- Dialog appears when changing an unreviewed plugin's permission from 'off' to 'ask' or 'auto'
+- "Enable Anyway" sends both permission and reviewedVersion to mark plugin as user-accepted
+- "Cancel" closes dialog without making any changes
+- Dialog does NOT appear for: reviewed plugins, browser tools, changes to 'off', or changes between 'ask'/'auto'
+- Files changed:
+  - platform/browser-extension/src/side-panel/components/PluginCard.tsx — Added Dialog with pendingPermission state, split handlePluginPermissionChange into intercept + applyPluginPermission
+  - platform/browser-extension/src/side-panel/bridge.ts — Added optional reviewedVersion param to setPluginPermission
+  - platform/browser-extension/src/background-message-handlers.ts — Forward reviewedVersion from bg:setPluginPermission message to server request, optimistic reviewed:true on cache
+  - platform/browser-extension/src/side-panel/bridge.test.ts — Added tests for reviewedVersion inclusion/exclusion
+  - platform/browser-extension/src/side-panel/components/PluginCard.stories.tsx — Added UnreviewedWithDialog story
+- All Phase 1 checks pass: build, type-check, lint, knip, test (2984 tests passed)
+- **Learnings for future iterations:**
+  - The server-side `config.setPluginPermission` handler already supported optional `reviewedVersion` (added in a previous story) — only the bridge and background handler needed changes
+  - The background message handler (`handleBgSetPluginPermission`) manually destructures known fields from the message; new fields must be explicitly extracted and forwarded
+  - The Dialog was inlined in PluginCard rather than creating a separate component — the dialog is tightly coupled to PluginCard state and the PRD suggested this as an option
+---
+
+## 2026-03-04T07:30:00Z - US-008
+- Verified that plugin_inspect and plugin_mark_reviewed are already properly implemented as platform tools by previous stories (US-003, US-004)
+- Platform tools are defined in the `PLATFORM_TOOLS` constant in mcp-setup.ts with `PLATFORM_TOOL_NAMES` exported as a Set
+- They bypass permission checks via explicit early returns in the `tools/call` handler (before any permission logic)
+- They are excluded from `buildConfigStatePayload` — the side panel never receives them
+- They have no `[Disabled]` or `[Requires approval]` prefix in `getAllToolsList` (the `descriptionPrefix()` function is not called for them)
+- Added comprehensive tests for `plugin_mark_reviewed` to match existing `plugin_inspect` tests: included in tools list, no permission prefix, no tabId injection, in PLATFORM_TOOL_NAMES set
+- Added test verifying platform tools are excluded from `buildConfigStatePayload` output
+- Files changed:
+  - platform/mcp-server/src/mcp-setup.test.ts — Added 5 new tests for plugin_mark_reviewed and buildConfigStatePayload exclusion
+- All Phase 1 checks pass: build, type-check, lint, knip, test (2989 tests passed)
+- **Learnings for future iterations:**
+  - The platform tools architecture was well-designed from the start — three distinct categories (platform/browser/plugin) with clean separation in both dispatch and UI serialization paths
+  - Existing tests for plugin_inspect covered one platform tool but not the other; always check that all items in a category have symmetric test coverage
+  - `buildConfigStatePayload` is the key function that controls what the side panel sees — platform tools are simply never included in its output
+---
+
+## 2026-03-04T07:38:00Z - US-009
+- Created comprehensive E2E test file: e2e/plugin-review.e2e.ts (650+ lines, 16 test cases)
+- Tests use custom fixture with OPENTABS_SKIP_PERMISSIONS='' to enforce permissions
+- Full review flow cycle: off tool → error with instructions → plugin_inspect → plugin_mark_reviewed → tool succeeds
+- plugin_inspect tests: unknown plugin error, valid plugin returns source + token + guidance
+- Token validation: invalid token, no token (no inspect call), reused token, wrong plugin, wrong version, off permission rejected
+- Version reset: reviewedVersion mismatch triggers permission reset to off on hot reload
+- Side panel UI: unreviewed icon (ShieldQuestionMark) shown/hidden based on reviewed state
+- Side panel dialog: "Enable Anyway" sets permission + reviewedVersion, "Cancel" preserves off state
+- Reviewed plugin bypasses dialog on permission change
+- Platform tools visibility: not in side panel body text, present in MCP tools/list
+- Browser tools error message does not include review instructions
+- Fixed pre-existing E2E test breakages caused by the review system:
+  - e2e/config-watcher.e2e.ts — platform tools (plugin_inspect, plugin_mark_reviewed) now appear in tools/list alongside browser tools; updated filter to exclude them
+  - e2e/hot-reload-dynamic.e2e.ts — same platform tools filter fix
+  - e2e/plugin-management.e2e.ts — off plugin tool error changed from "disabled" to review flow message
+  - e2e/side-panel-plugin-toggle.e2e.ts — same error message update for disabled plugin tools
+- Added reviewedVersion to PluginPermissionConfig in e2e/fixtures.ts
+- All Phase 2 checks pass: build, type-check, lint, knip, test (2989 tests), test:e2e (467 passed)
+- **Learnings for future iterations:**
+  - When adding platform tools (always in tools/list), existing E2E tests that count "plugin tools" by excluding only browser tools will break — always search for `BROWSER_TOOL_NAMES` filter patterns and update them
+  - The error message for off plugin tools changed from "currently disabled" to review flow guidance — any test asserting "disabled" for plugin (non-browser) tools needs updating
+  - The full review flow E2E test should NOT use waitForToolResult with isError:false on an off plugin — the tool is off, so the result is always an error; wait for tab state via health endpoint or openTestAppTab instead
+  - resetStaleReviewedVersions clears reviewedVersion entirely (sets to undefined), so after a version mismatch reset, the error message says "has not been reviewed yet" not "has been updated"
+  - The e2e-test plugin version comes from plugins/e2e-test/package.json and is needed for reviewedVersion assertions
+---
+
+## 2026-03-04T07:45:00Z - US-010
+- Updated root CLAUDE.md Key Concepts with plugin review system entry: review flow, per-version tracking, platform tools, side panel UI
+- Updated platform/mcp-server/CLAUDE.md with new "Plugin Review System" section: platform tools (plugin_inspect, plugin_mark_reviewed), review tokens (generation, validation, consumption, TTL), version reset logic, off-plugin error messages
+- Updated platform/browser-extension/CLAUDE.md with "Plugin Review UI" subsection: unreviewed icon (ShieldQuestion), confirmation dialog behavior
+- Files changed:
+  - CLAUDE.md — Added Key Concepts entry for plugin review system
+  - platform/mcp-server/CLAUDE.md — Added Plugin Review System section (platform tools, review tokens, version reset, error messages)
+  - platform/browser-extension/CLAUDE.md — Added Plugin Review UI subsection (unreviewed icon, confirmation dialog)
+- All Phase 1 checks pass: build, type-check, lint, knip, test (2989 tests passed)
+- **Learnings for future iterations:**
+  - Documentation-only stories are straightforward — read existing CLAUDE.md structure, add sections in the appropriate places matching existing style
+  - Root CLAUDE.md should stay high-level and plugin-agnostic per its own guidelines — reference package-specific CLAUDE.md files for details
+---
