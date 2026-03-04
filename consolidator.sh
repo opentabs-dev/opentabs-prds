@@ -72,6 +72,10 @@ CODE_DIR="$CONSOLIDATOR_BASE/code"
 LOG_DIR="$CONSOLIDATOR_BASE/logs"
 CONFLICTS_DIR="$CONSOLIDATOR_BASE/conflicts"
 
+# Queue repo (opentabs-prds) — the directory this script lives in.
+# Contains done/archived PRDs with rich context for conflict resolution.
+QUEUE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 mkdir -p "$CONSOLIDATOR_BASE" "$LOG_DIR" "$CONFLICTS_DIR"
 chmod 700 "$CONSOLIDATOR_BASE" 2>/dev/null || true
 
@@ -415,11 +419,19 @@ merge_branch() {
   # PRD:    .ralph/prd-2026-03-03-225512-tool-summary-field-78b20c~running.json
   local work_slug="${work_branch#ralph-}"
 
-  # List recent PRD files (running + done) so AI understands the broader context
-  # of concurrent work — helps make better conflict resolution decisions.
+  # List recent PRD files from both the code repo and the queue repo so AI
+  # understands the broader context of concurrent/recent work.
   local prd_listing
-  prd_listing=$(ls -1 "$CODE_DIR/.ralph/"prd-*~running.json "$CODE_DIR/.ralph/"prd-*~done.json 2>/dev/null \
-    | xargs -I{} basename {} | head -20)
+  prd_listing=$(
+    # In-flight PRDs (in code repo .ralph/)
+    ls -1 "$CODE_DIR/.ralph/"prd-*~running.json "$CODE_DIR/.ralph/"prd-*~done.json 2>/dev/null \
+      | xargs -I{} basename {}
+    # Recently completed PRDs (in queue repo)
+    ls -1t "$QUEUE_DIR/"prd-*~done*.json "$QUEUE_DIR/archive/"*/prd-*.json 2>/dev/null \
+      | head -10 | xargs -I{} basename {}
+  ) 
+  # Deduplicate
+  prd_listing=$(echo "$prd_listing" | sort -u | head -20)
 
   local ai_prompt
   ai_prompt="You are merging a feature branch into main in a TypeScript monorepo.
@@ -433,16 +445,24 @@ $branch_log
 ### Step 0: Understand the branch's intent
 Read the PRD file for this branch to understand what it was trying to accomplish:
 \`\`\`bash
-cat .ralph/prd-${work_slug}~running.json 2>/dev/null || cat .ralph/prd-${work_slug}~done.json 2>/dev/null || echo 'PRD not found'
+cat .ralph/prd-${work_slug}~running.json 2>/dev/null || cat .ralph/prd-${work_slug}~done.json 2>/dev/null || echo 'PRD not found in code repo'
+\`\`\`
+If not found in the code repo, check the queue repo (recently completed PRDs):
+\`\`\`bash
+cat ${QUEUE_DIR}/prd-${work_slug}~done.json 2>/dev/null || cat ${QUEUE_DIR}/archive/prd-${work_slug}~done/prd-${work_slug}~done.json 2>/dev/null || echo 'PRD not found in queue repo either'
 \`\`\`
 The PRD contains a \`description\` and \`userStories\` that explain what this branch was doing.
 This context is critical for making correct conflict resolution decisions.
 
-Other PRDs currently in flight (for broader context on concurrent work):
+Other recent/in-flight PRDs (for broader context on concurrent work):
 ${prd_listing:-  (none found)}
 
-If conflicts touch code related to other in-flight PRDs, reading those PRDs too will
-help you understand the intent of the other side (HEAD/main).
+To read any of these PRDs for context, check:
+- Code repo: \`.ralph/<filename>\`
+- Queue repo: \`${QUEUE_DIR}/<filename>\` or \`${QUEUE_DIR}/archive/<basename>/<filename>\`
+
+If conflicts touch code related to other PRDs, reading those PRDs will help you
+understand the intent of the other side (HEAD/main).
 
 ### Step 1: Pull latest main and merge
 Always start from the latest remote state:
@@ -560,7 +580,10 @@ echo -e "$(ts)   Base dir:   ${CYAN}${CONSOLIDATOR_BASE}${RESET}"
 echo ""
 
 while true; do
-  # Clean state
+  # Pull latest queue repo (opentabs-prds) for fresh PRD context
+  git -C "$QUEUE_DIR" pull --quiet 2>/dev/null || true
+
+  # Clean state on code repo
   git -C "$CODE_DIR" merge --abort 2>/dev/null || true
   git -C "$CODE_DIR" rebase --abort 2>/dev/null || true
   git -C "$CODE_DIR" fetch origin --quiet --prune 2>/dev/null || true
