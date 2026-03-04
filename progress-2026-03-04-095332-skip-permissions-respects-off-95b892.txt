@@ -1,0 +1,66 @@
+# Ralph Progress Log
+PRD: prd-2026-03-04-095332-skip-permissions-respects-off-95b892~running.json
+Started: Wed Mar  4 17:54:03 UTC 2026
+---
+
+## Codebase Patterns
+- `getToolPermission` in `platform/mcp-server/src/state.ts` is the single source of truth for tool permission resolution
+- Browser tools use plugin name `'browser'` for permission lookups
+- Tests that need browser tools to be auto-permitted should set `state.pluginPermissions = { browser: { permission: 'auto' } }` instead of `state.skipPermissions = true`
+- `mcp-setup-dispatch.test.ts` tests browser tool dispatch paths; `mcp-setup.test.ts` tests tool listing with description prefixes
+- E2E `writeTestConfig` auto-populates `plugins: { <basename>: { permission: 'auto' } }` from `localPlugins` when `plugins` is not provided
+- Side panel components never receive `skipPermissions` — only App.tsx reads it from bridge state to control the banner
+---
+
+## 2026-03-04 - US-001
+- Changed `getToolPermission` to resolve permissions normally first, then convert 'ask' to 'auto' when skipPermissions is true ('off' passes through unchanged)
+- Updated JSDoc on `ServerState.skipPermissions` and `getToolPermission` to describe new semantics
+- Updated 2 existing tests in `state.test.ts` that assumed skipPermissions overrides everything to 'auto'
+- Added 3 new tests: skipPermissions + ask → auto, skipPermissions + auto → auto, skipPermissions + per-tool off with plugin ask → off
+- Fixed 2 tests in `mcp-setup-dispatch.test.ts` that used `skipPermissions=true` as convenience — changed to explicit `pluginPermissions`
+- Fixed 1 test and added 1 new test in `mcp-setup.test.ts` for new skipPermissions + off/ask behavior
+- Files changed: `platform/mcp-server/src/state.ts`, `platform/mcp-server/src/state.test.ts`, `platform/mcp-server/src/mcp-setup.test.ts`, `platform/mcp-server/src/mcp-setup-dispatch.test.ts`
+- **Learnings for future iterations:**
+  - `skipPermissions=true` was used as a test convenience in several places — after this change, tests that need auto-permitted tools must use explicit pluginPermissions instead
+  - The permission resolution chain is: per-tool override → plugin default → 'off', with skipPermissions only converting 'ask' → 'auto' at the end
+---
+
+## 2026-03-04 - US-002
+- Renamed `mcp-tool-dispatch.test.ts` test from 'skipPermissions=true overrides off to auto' to 'skipPermissions=true converts ask to auto (tool executes without prompt)' and updated comment
+- Added new test: 'skipPermissions=true with tool permission off returns disabled error' — verifies that 'off' is respected even with skipPermissions
+- `mcp-setup.test.ts` and `mcp-setup-dispatch.test.ts` were already updated in US-001 (those changes covered what US-002 required for those files)
+- Files changed: `platform/mcp-server/src/mcp-tool-dispatch.test.ts`
+- **Learnings for future iterations:**
+  - The dispatch test uses `vi.mocked(getToolPermission).mockReturnValue()` to control permission resolution — the test verifies dispatch behavior given a permission, not permission resolution itself
+  - When adding 'off' dispatch tests, verify both `isError: true` and the error message content ('currently disabled' + 'enable it in the OpenTabs side panel')
+---
+
+## 2026-03-04 - US-003
+- Updated `skip-permissions.ts` JSDoc to say "bypasses approval prompts for tools set to 'ask' mode" instead of "bypasses all browser tool permission prompts"
+- Updated `config.ts` JSDoc on `skipPermissions` field to say "skip approval prompts for ask-mode tools (off tools remain disabled)"
+- Updated `start.ts` CLI flag description to "Skip approval prompts for ask-mode tools (disabled tools stay disabled)"
+- Updated `start.ts` console.warn message to "Approval prompts for ask-mode tools are bypassed. Disabled (off) tools remain off."
+- Files changed: `platform/mcp-server/src/skip-permissions.ts`, `platform/mcp-server/src/config.ts`, `platform/cli/src/commands/start.ts`
+- **Learnings for future iterations:**
+  - skipPermissions documentation exists in 4 places: skip-permissions.ts (module JSDoc), config.ts (field JSDoc), start.ts (flag description + warning message)
+  - All user-facing text now consistently uses "approval prompts" and "ask-mode tools" terminology
+---
+
+## 2026-03-04 - US-004
+- Redesigned the skipPermissions banner in App.tsx: changed from `variant="solid"` Alert with "PERMISSIONS BYPASSED" to a `status="warning"` Alert with "Approval prompts bypassed" and "Ask-mode tools execute without confirmation. Disabled tools remain off."
+- Removed `skipPermissions` prop from BrowserToolsCard, PluginCard, PluginList, SearchResults, and App.tsx pass-throughs
+- Permission selects are now always interactive (disabled={false} for parent-level PermissionSelect, removed disabled prop from ToolRow)
+- Updated 3 storybook files (BrowserToolsCard.stories, PluginCard.stories, SidePanel.stories) to remove skipPermissions prop and update banner markup
+- Updated E2E test `side-panel-plugin-toggle.e2e.ts`: changed from checking selects are disabled to checking selects are enabled, updated banner text assertion from "PERMISSIONS BYPASSED" to "Approval prompts bypassed"
+- Updated E2E test `permissions.e2e.ts`: split skipPermissions test into two — one for ask→auto (tool executes) and one for off stays off (tool returns disabled error)
+- Updated E2E test `npm-discovery.e2e.ts`: added explicit `plugins` map with `permission: 'auto'` for npm-discovered plugin
+- Updated `e2e/fixtures.ts` `writeTestConfig`: auto-populates `plugins` with `permission: 'auto'` for all localPlugins when plugins map is not explicitly provided
+- Updated `e2e/fixtures.ts` `createTestConfigDir`: includes default `plugins` with `permission: 'auto'` for e2e-test and browser
+- Fixed pre-existing failing test `side-panel-plugin-tool-groups.e2e.ts`: changed test from expecting non-existent Switch components to verifying group headers are plain text dividers
+- Files changed: App.tsx, BrowserToolsCard.tsx/.stories.tsx, PluginCard.tsx/.stories.tsx, PluginList.tsx, SearchResults.tsx, SidePanel.stories.tsx, fixtures.ts, permissions.e2e.ts, npm-discovery.e2e.ts, side-panel-plugin-toggle.e2e.ts, side-panel-plugin-tool-groups.e2e.ts
+- **Learnings for future iterations:**
+  - E2E tests rely on `OPENTABS_SKIP_PERMISSIONS=1` as a convenience for all test servers (set in fixtures.ts startMcpServer). With new semantics, tests also need explicit `plugins` map with `permission: 'auto'` for tools to work
+  - `writeTestConfig` now auto-populates `plugins` from `localPlugins` directory basenames when not explicitly provided — most tests automatically get the right config
+  - Tests that explicitly provide `plugins` in writeTestConfig bypass the auto-population
+  - The side panel uses the `skipPermissions` state from `bridge.ts` FullStateResult purely for banner display — permission selects are always interactive
+---
