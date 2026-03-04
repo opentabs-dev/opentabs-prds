@@ -793,6 +793,16 @@ _run_worker_docker() {
   DOCKER_COMMON+=(-v "$CODE_DIR/.git:$CODE_DIR/.git")
   DOCKER_COMMON+=(--network host)
 
+  # Mount SSH agent socket so the worker can push to remote from inside Docker.
+  # Without this, git push fails silently (no SSH credentials available).
+  if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
+    DOCKER_COMMON+=(-v "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK" -e "SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+  fi
+  # Mount SSH known_hosts so git doesn't prompt for host verification
+  if [ -f "$HOME/.ssh/known_hosts" ]; then
+    DOCKER_COMMON+=(-v "$HOME/.ssh/known_hosts:/tmp/worker/.ssh/known_hosts:ro")
+  fi
+
   if [ -f "$HOME/.npmrc" ]; then
     DOCKER_COMMON+=(-v "$HOME/.npmrc:/tmp/staging/.npmrc:ro")
   fi
