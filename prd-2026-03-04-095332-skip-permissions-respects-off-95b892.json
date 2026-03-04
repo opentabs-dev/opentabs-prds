@@ -1,0 +1,100 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Make skipPermissions respect 'off' tools — only bypass 'ask' prompts, not disabled tools. Update server logic, tests, UI banner, CLI docs, and code comments to reflect the new semantics.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Change getToolPermission to respect 'off' when skipPermissions is true",
+      "description": "As a platform operator, I want tools set to 'off' to remain disabled even when --dangerously-skip-permissions is active, so that I can still control which tools are available while bypassing approval prompts.",
+      "acceptanceCriteria": [
+        "getToolPermission returns 'off' when skipPermissions is true AND the resolved permission is 'off' (either from plugin default, per-tool override, or no config)",
+        "getToolPermission returns 'auto' when skipPermissions is true AND the resolved permission is 'ask'",
+        "getToolPermission returns 'auto' when skipPermissions is true AND the resolved permission is 'auto' (no change)",
+        "Existing tests in state.test.ts updated to match new behavior",
+        "New test: skipPermissions=true with permission='ask' returns 'auto'",
+        "New test: skipPermissions=true with permission='off' returns 'off'",
+        "New test: skipPermissions=true with no plugin config returns 'off'",
+        "New test: skipPermissions=true with per-tool override='off' returns 'off' even if plugin default is 'ask'",
+        "JSDoc on getToolPermission updated to describe new resolution: resolve permission normally, then if skipPermissions convert 'ask' to 'auto'",
+        "JSDoc on ServerState.skipPermissions updated to say 'bypasses approval prompts' not 'bypasses all permissions'",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "The core change is in platform/mcp-server/src/state.ts:362-369. Current code:\n\n```\nexport const getToolPermission = (state, pluginName, toolName) => {\n  if (state.skipPermissions) return 'auto';\n  const pluginConfig = state.pluginPermissions[pluginName];\n  if (!pluginConfig) return 'off';\n  return pluginConfig.tools?.[toolName] ?? pluginConfig.permission ?? 'off';\n};\n```\n\nNew logic: resolve the permission normally (lines 366-368), THEN if skipPermissions is true, convert 'ask' to 'auto'. 'off' and 'auto' pass through unchanged. This is a 3-line change to the function body.\n\nExisting tests in platform/mcp-server/src/state.test.ts lines 80-92 need updating:\n- Line 81-85: 'returns auto when skipPermissions is true' — no plugin config means 'off' default, should now return 'off'\n- Line 87-92: 'returns auto when skipPermissions is true even with plugin config' — plugin permission is 'off', should now return 'off'\n\nAdd new tests covering:\n- skipPermissions=true + permission='ask' → 'auto'\n- skipPermissions=true + per-tool override='off' with plugin default='ask' → 'off'\n- skipPermissions=true + permission='auto' → 'auto' (unchanged)\n\nAlso update JSDoc:\n- state.ts:285-286 ServerState.skipPermissions: change 'permission prompts are bypassed' to 'approval prompts for ask-mode tools are bypassed (off tools remain disabled)'\n- state.ts:362-363 getToolPermission: update resolution order description"
+    },
+    {
+      "id": "US-002",
+      "title": "Update mcp-tool-dispatch and mcp-setup tests for new skipPermissions semantics",
+      "description": "As a developer, I want the tool dispatch and tool listing tests to reflect that skipPermissions only bypasses 'ask' prompts, so tests accurately document the system's behavior.",
+      "acceptanceCriteria": [
+        "mcp-tool-dispatch.test.ts test at ~line 659 updated: rename from 'overrides off to auto' to reflect new behavior, update comment and mock to show skipPermissions converts 'ask' to 'auto'",
+        "New test in mcp-tool-dispatch.test.ts: skipPermissions=true with tool permission 'off' returns disabled error",
+        "mcp-setup.test.ts test at ~line 413 updated: with plugin permissions set to 'off', tools still show [Disabled] prefix even with skipPermissions=true",
+        "New test in mcp-setup.test.ts: skipPermissions=true with 'ask' permission shows no prefix (auto)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Three test files need updating:\n\n1. platform/mcp-server/src/mcp-tool-dispatch.test.ts lines 659-682:\n   - Current test name: 'skipPermissions=true overrides off to auto (tool executes)'\n   - Rename to something like: 'skipPermissions=true converts ask to auto (tool executes without prompt)'\n   - Change the mock: `vi.mocked(getToolPermission).mockReturnValue('auto')` stays (because ask→auto), but update the comment\n   - Add a NEW test: 'skipPermissions=true with tool permission off still returns disabled error' — mock getToolPermission to return 'off', verify the error response\n\n2. platform/mcp-server/src/mcp-setup.test.ts lines 413-428:\n   - Current test: 'skipPermissions=true makes all tools auto (no prefixes)' with permission='off'\n   - This test should now EXPECT [Disabled] prefix since 'off' is respected\n   - Rename test to reflect new behavior\n   - Add a NEW test: skipPermissions=true with permission='ask' → no prefix (auto)\n\n3. Also check platform/mcp-server/src/mcp-setup-dispatch.test.ts — some tests use `state.skipPermissions = true` as a convenience to make browser tools 'auto'. These need to instead set pluginPermissions to 'auto' directly since skipPermissions no longer overrides 'off'."
+    },
+    {
+      "id": "US-003",
+      "title": "Update skip-permissions.ts, config.ts, and CLI help text to describe new semantics",
+      "description": "As a user reading CLI help or code comments, I want accurate documentation that skipPermissions only bypasses approval prompts for ask-mode tools, not that it enables all tools.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/skip-permissions.ts JSDoc updated: 'bypasses approval prompts for ask-mode tools' instead of 'bypasses all browser tool permission prompts'",
+        "platform/mcp-server/src/config.ts JSDoc on skipPermissions field updated: 'bypasses approval prompts' not 'skip all permission prompts'",
+        "platform/cli/src/commands/start.ts flag description updated: conveys that approval prompts are skipped but disabled tools stay disabled",
+        "platform/cli/src/commands/start.ts warning message updated to match new semantics",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Four locations to update:\n\n1. platform/mcp-server/src/skip-permissions.ts lines 4-5:\n   Current: 'The --dangerously-skip-permissions flag ... bypasses all browser tool permission prompts.'\n   New: Should say it bypasses approval prompts (ask→auto) but does not enable disabled (off) tools.\n\n2. platform/mcp-server/src/config.ts line 47-48:\n   Current: '/** Whether to skip all permission prompts (dangerous — disables human-in-the-loop) */'\n   New: Should clarify it skips approval prompts, not all permissions.\n\n3. platform/cli/src/commands/start.ts line 449-452 (flag description):\n   Current: 'Bypass all browser tool confirmation dialogs (WARNING: sensitive operations execute without human approval)'\n   New: Should say something like 'Skip approval prompts for tools set to ask mode (disabled tools stay disabled)'\n\n4. platform/cli/src/commands/start.ts lines 318-324 (console.warn):\n   Current: 'WARNING: All browser tool confirmations are bypassed. Sensitive operations will execute without human approval.'\n   New: Should clarify that only ask→auto is bypassed, off tools remain off."
+    },
+    {
+      "id": "US-004",
+      "title": "Redesign the side panel skipPermissions banner and re-enable permission selects",
+      "description": "As a side panel user, I want the skipPermissions banner to clearly explain that approval prompts are bypassed but disabled tools remain off, and I want the permission selects to remain interactive so I can still toggle tools on/off.",
+      "acceptanceCriteria": [
+        "Banner uses the warning Alert style from the retro design system: bg-accent background, border-accent-foreground border, font-mono uppercase text",
+        "Banner text clearly states that approval prompts are bypassed and disabled tools remain off",
+        "Banner includes the --dangerously-skip-permissions flag name for searchability",
+        "Banner fits the retro brutalist theme (sharp corners, no blur shadows, theme tokens only)",
+        "Banner is compact — does not dominate the panel or push content excessively",
+        "Permission selects are NO LONGER disabled when skipPermissions is true — users can toggle tools on/off",
+        "The disabled prop is no longer passed from skipPermissions to PluginCard, BrowserToolsCard, or ToolRow",
+        "ToolRow opacity is not dimmed by skipPermissions (only by the tool's own enabled state)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Two changes in the side panel:\n\n**1. Banner redesign** in platform/browser-extension/src/side-panel/App.tsx lines 348-355:\n\nThe current banner is a minimal strip with ShieldOff icon. Redesign it to use the warning/alerting theme. Use the Alert component with status='warning' or manually style with bg-accent, border-2 border-accent-foreground. The banner should:\n- Use an alerting color scheme (bg-accent with border-accent-foreground gives a yellow-with-black-border warning look)\n- Have compact but informative text explaining the new semantics: approval prompts are bypassed, disabled tools stay off\n- Include the flag name --dangerously-skip-permissions in font-mono\n- Use ShieldOff or AlertTriangle icon from lucide-react\n- Stay compact — use tight padding (py-1.5 to py-2), single or two-line layout\n- Use mx-4 mt-2 placement (between top edge and search bar) OR edge-to-edge with border-b-2\n\nThe retro theme tokens to use: bg-accent (#fae583), text-accent-foreground (#000), border-accent-foreground (#000), font-mono, font-head. The design must have border-2 and rounded (which is 0 in this theme) per the card recipe.\n\n**2. Remove disabled prop propagation** from skipPermissions:\n\nCurrently skipPermissions flows as disabled={skipPermissions} to:\n- BrowserToolsCard → PermissionSelect (disabled={skipPermissions ?? false}) at platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx line 168\n- BrowserToolsCard → ToolRow (disabled={skipPermissions}) at lines 204, 218\n- PluginCard → PermissionSelect (disabled={skipPermissions ?? false}) at platform/browser-extension/src/side-panel/components/PluginCard.tsx line 187\n- PluginCard → ToolRow (disabled={skipPermissions}) at lines 226, 242\n\nRemove the skipPermissions prop from BrowserToolsCard and PluginCard entirely (they no longer need it). Remove it from PluginList.tsx (line 180) and SearchResults.tsx (lines 99, 113). Remove it from App.tsx where it's passed to these components. Clean up the prop types.\n\nThe selects should remain fully interactive — users can still change permissions. The banner explains what skipPermissions does; the selects reflect the actual configured state."
+    }
+  ]
+}
