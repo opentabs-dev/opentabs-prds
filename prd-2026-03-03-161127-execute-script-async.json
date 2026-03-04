@@ -1,0 +1,54 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix browser_execute_script silently dropping async/await results. The inner function wrapper is non-async, causing await expressions to produce a syntax error that chrome.scripting.executeScript swallows silently, resulting in 'No result captured' instead of the actual value.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Make execute_script wrapper async to support await expressions",
+      "description": "As a developer using browser_execute_script, I want await expressions in my code to work correctly so that I can use fetch() and other async APIs without falling back to synchronous XMLHttpRequest.",
+      "acceptanceCriteria": [
+        "The inner function wrapper in writeExecFile uses 'async function' instead of 'function'",
+        "Code with await expressions returns the correct value (e.g., 'return await Promise.resolve(42)' returns 42)",
+        "Code with await fetch() returns the fetched data correctly",
+        "Code with multiple await expressions works (sequential awaits in one script)",
+        "Synchronous code continues to work correctly (return document.title, return 1+1, etc.)",
+        "Async rejections are captured as errors (return await Promise.reject('fail') returns {error: 'fail'})",
+        "Thrown errors inside async code are captured (await something; throw new Error('boom') returns {error: 'boom'})",
+        "The existing 10-second async timeout still applies to long-running async operations",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "File: platform/mcp-server/src/adapter-files.ts, line 183.\n\nThe root cause: the user's code is wrapped in a non-async IIFE:\n  var __r = (function() { <user code> })();\n\nWhen user code contains 'await', this is a syntax error (await is only valid in async functions). The .js file fails to parse entirely, so chrome.scripting.executeScript silently succeeds with undefined result. The polling loop in extension-commands.ts:450 finds neither __execResult_ nor __execAsync_ keys and returns {error: 'No result captured'}.\n\nThe fix is a one-word change on line 183:\n  var __r = (async function() { <user code> })();\n\nSince async function always returns a Promise, the thenable detection on line 186 will always trigger. The existing .then()/.catch() handlers and polling loop already handle Promises correctly.\n\nTradeoff: synchronous code like 'return document.title' will now return a Promise (wrapped by async function), adding one extra polling cycle (~50ms). This is negligible and the tool description already claims async support.\n\nThe 'No result captured' error at extension-commands.ts:450 is the symptom, not the cause — do NOT change that code. The fix is entirely in adapter-files.ts.\n\nCheck the writeExecFile function carefully — the line numbers may have shifted. Search for '(function()' in the exec file template to find the exact location."
+    },
+    {
+      "id": "US-002",
+      "title": "Add E2E tests for async browser_execute_script",
+      "description": "As a platform maintainer, I want E2E test coverage for async code execution in browser_execute_script so that async support is verified and regressions are caught.",
+      "acceptanceCriteria": [
+        "E2E test: 'return await Promise.resolve(\"async-value\")' returns {value: 'async-value'}",
+        "E2E test: multiple sequential awaits work ('const a = await Promise.resolve(1); const b = await Promise.resolve(2); return a + b' returns {value: 3})",
+        "E2E test: await fetch() works (fetches the current page URL and returns the HTTP status code 200)",
+        "E2E test: async rejection is captured ('return await Promise.reject(\"async-fail\")' returns an error containing 'async-fail')",
+        "E2E test: sync code still works as a regression check ('return document.title' returns the page title)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes",
+        "npm run test:e2e passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "E2E tests go in the e2e/ directory. Look at existing browser_execute_script tests to follow the same pattern — there should be existing tests in e2e/tests/ that exercise browser tools.\n\nThe E2E test framework uses Playwright and the MCP server. Look at how other browser tool tests call browser_execute_script and check the result.\n\nThe test tab should be the e2e-test tab (localhost:6006 or similar test server) that's already used in existing E2E tests. Use whatever tab setup pattern the existing tests use.\n\nKey test cases:\n1. Basic await: return await Promise.resolve('value')\n2. Multiple awaits: const a = await ...; const b = await ...; return a + b\n3. await fetch: const r = await fetch(window.location.href); return r.status\n4. Async rejection: return await Promise.reject('fail') — should be an error\n5. Regression: return document.title — sync still works\n\nDo NOT test the 10-second timeout in E2E (too slow). That can be a unit test."
+    }
+  ]
+}
