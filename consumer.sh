@@ -681,18 +681,23 @@ run_worker() {
   local commit_count
   commit_count=$(git -C "$worktree_dir" rev-list --count "origin/main..$branch_name" 2>/dev/null || echo "0")
   if [ "$commit_count" -gt 0 ]; then
-    local push_attempts=3
-    for pa in $(seq 1 $push_attempts); do
-      if git -C "$worktree_dir" push origin "$branch_name" 2>&1; then
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Branch pushed: $branch_name ($commit_count commits)${RESET}"
-        touch "$worktree_dir/.ralph/.push-ok"
-        break
-      fi
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push attempt $pa/$push_attempts failed. Retrying...${RESET}"
+    # Try normal push first, then escalate to --force-with-lease on retry.
+    # The worker is the sole writer to its branch, so force-push is safe
+    # when non-fast-forward rejection occurs (e.g., branch was manually touched
+    # during recovery). --force-with-lease is preferred over --force because it
+    # still protects against truly unexpected remote state.
+    if git -C "$worktree_dir" push origin "$branch_name" 2>&1; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Branch pushed: $branch_name ($commit_count commits)${RESET}"
+      touch "$worktree_dir/.ralph/.push-ok"
+    else
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Normal push failed. Retrying with --force-with-lease...${RESET}"
       sleep 2
-    done
-    if [ ! -f "$worktree_dir/.ralph/.push-ok" ]; then
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Failed to push branch after $push_attempts attempts. Worktree preserved at: $worktree_dir${RESET}"
+      if git -C "$worktree_dir" push origin "$branch_name" --force-with-lease 2>&1; then
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Branch force-pushed: $branch_name ($commit_count commits)${RESET}"
+        touch "$worktree_dir/.ralph/.push-ok"
+      else
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Failed to push branch (even with --force-with-lease). Worktree preserved at: $worktree_dir${RESET}"
+      fi
     fi
   else
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}No commits to push.${RESET}"
