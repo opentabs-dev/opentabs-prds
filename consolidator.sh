@@ -11,22 +11,19 @@
 #   --dry-run            Show what would be merged without doing it
 #   --model <model>      AI model for conflict resolution (default: claude-opus)
 #
-# The consolidator:
-#   1. Fetches all remote branches matching ralph-*
-#   2. Attempts to merge each into main (oldest first, by branch creation time)
-#   3. If a merge conflicts, invokes AI (Claude) to resolve; falls back to breadcrumb if AI fails
-#   4. Pushes main to remote after each successful merge
-#
-# This is the single serialization point for code merges. Only one consolidator
-# should run at a time (enforced by a lock file). Workers push branches to
-# the remote; the consolidator merges them into main.
+# Design:
+#   The shell loop is intentionally minimal. For each branch it:
+#     1. Tries fast-forward merge + push (up to 3 attempts)
+#     2. If that fails, hands EVERYTHING to AI — merge, conflict resolution,
+#        build fixing, committing, and pushing. The shell just watches for
+#        the <promise>MERGED</promise> quit signal.
+#   This avoids the combinatorial explosion of shell-side error handling that
+#   plagued the previous version (misdiagnosing non-ff as build failure,
+#   wasted AI calls, infinite retry loops).
 
 # NOTE: set -e is intentionally NOT used.
 
 # --- Ensure user-local npm binaries are on PATH ---
-# Claude CLI may be installed in ~/.npm-global/bin or similar user-local prefix.
-# Non-login shells (cron, systemd, tmux new-session) don't source ~/.bashrc,
-# so we add common user-local bin paths explicitly.
 for _p in "$HOME/.npm-global/bin" "$HOME/.local/bin" "$HOME/bin"; do
   [ -d "$_p" ] && case ":$PATH:" in *":$_p:"*) ;; *) PATH="$_p:$PATH" ;; esac
 done
@@ -96,7 +93,6 @@ PIDFILE="$CONSOLIDATOR_BASE/.consolidator.pid"
 if [ -f "$PIDFILE" ]; then
   EXISTING_PID=$(cat "$PIDFILE")
   if kill -0 "$EXISTING_PID" 2>/dev/null; then
-    # Verify the PID is actually a consolidator (not a recycled PID)
     if ps -p "$EXISTING_PID" -o command= 2>/dev/null | grep -q 'consolidator\.sh'; then
       echo "Error: consolidator.sh is already running (PID $EXISTING_PID)."
       echo "Kill it first: kill $EXISTING_PID"
@@ -136,7 +132,6 @@ else
   git clone "$CODE_REPO" "$CODE_DIR" --quiet
 fi
 
-# Set git identity for all consolidator commits (merges, conflict resolutions)
 git -C "$CODE_DIR" config user.name "Ralph Wiggum"
 git -C "$CODE_DIR" config user.email "ralph@opentabs.dev"
 
@@ -146,9 +141,7 @@ if command -v claude &>/dev/null; then
   CLAUDE_BIN=$(command -v claude)
   echo -e "$(ts) ${DIM}Claude CLI: $CLAUDE_BIN ($(claude --version 2>/dev/null | head -1))${RESET}"
 else
-  echo -e "$(ts) ${YELLOW}Warning: 'claude' CLI not found in PATH. AI conflict resolution will be unavailable.${RESET}"
-  echo -e "$(ts) ${YELLOW}Install: npm install -g @anthropic-ai/claude-code${RESET}"
-  echo -e "$(ts) ${YELLOW}PATH=$PATH${RESET}"
+  echo -e "$(ts) ${YELLOW}Warning: 'claude' CLI not found in PATH. AI merge will be unavailable.${RESET}"
 fi
 
 # --- Cleanup ---
@@ -156,10 +149,7 @@ fi
 cleanup() {
   echo ""
   echo -e "$(ts) ${YELLOW}Shutting down consolidator...${RESET}"
-
-  # Abort any in-progress merge
   git -C "$CODE_DIR" merge --abort 2>/dev/null || true
-
   rm -f "$PIDFILE"
   echo -e "$(ts) ${GREEN}Consolidator stopped.${RESET}"
 }
@@ -168,159 +158,8 @@ trap cleanup EXIT
 
 # --- Helper Functions ---
 
-# Push main to origin with proper error handling. Captures stderr, verifies
-# the remote ref advanced, and logs diagnostics on failure. Returns 0 only
-# when the remote ref matches the local HEAD after push.
-#
-# If the push fails due to non-fast-forward (remote advanced while we were
-# merging), rebase our merge on top of the new remote HEAD and retry. This
-# prevents lost merges when multiple branches complete close together.
-#
-# Usage: _push_main "$tag"
-_push_main() {
-  local tag="$1"
-  local max_rebase_attempts=3
-  local attempt
-
-  for attempt in $(seq 1 $max_rebase_attempts); do
-    local local_sha push_output push_exit
-
-    local_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
-
-    # Capture both stdout and stderr for diagnostics
-    push_output=$(git -C "$CODE_DIR" push origin main 2>&1)
-    push_exit=$?
-
-    if [ "$push_exit" -ne 0 ]; then
-      # Check if this is a non-fast-forward rejection (remote advanced)
-      if echo "$push_output" | grep -qiE 'non-fast-forward|fetch first|cannot lock ref|failed to push'; then
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push rejected (non-fast-forward). Rebasing onto updated remote (attempt $attempt/$max_rebase_attempts)...${RESET}"
-
-        # Fetch the new remote HEAD
-        if ! git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null; then
-          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Fetch failed during rebase recovery.${RESET}"
-          return 1
-        fi
-
-        # Rebase our local commits on top of the new remote HEAD
-        if ! git -C "$CODE_DIR" rebase origin/main --quiet 2>/dev/null; then
-          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Rebase failed (conflicts). Aborting rebase.${RESET}"
-          git -C "$CODE_DIR" rebase --abort 2>/dev/null || true
-          return 1
-        fi
-
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Rebase succeeded. Retrying push...${RESET}"
-        continue
-      fi
-
-      # Some other push error (auth, network, etc.)
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}git push failed (exit $push_exit):${RESET}"
-      echo "$push_output" | while IFS= read -r line; do
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}  $line${RESET}"
-      done
-      return 1
-    fi
-
-    # Push returned 0. Verify the remote actually has our commit.
-    # If fetch fails, we cannot verify — treat as push failure to be safe.
-    if ! git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null; then
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Post-push fetch failed — cannot verify push landed. Treating as failure.${RESET}"
-      return 1
-    fi
-
-    local remote_sha
-    remote_sha=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
-    local_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
-
-    # The remote must contain our commit. After push, origin/main should be
-    # at our HEAD or ahead (if another push landed between our push and fetch).
-    # Check that our commit is an ancestor of origin/main.
-    if git -C "$CODE_DIR" merge-base --is-ancestor "$local_sha" "$remote_sha" 2>/dev/null; then
-      return 0
-    fi
-
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push returned 0 but local HEAD ($local_sha) is not an ancestor of remote HEAD ($remote_sha). Push was a no-op or lost.${RESET}"
-    echo "$push_output" | while IFS= read -r line; do
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}  $line${RESET}"
-    done
-    return 1
-  done
-
-  echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push failed after $max_rebase_attempts rebase attempts.${RESET}"
-  return 1
-}
-
-# Delete the -merge-ready branch after verifying the merge landed on origin/main.
-# ONLY deletes the -merge-ready signal branch. The work branch is NEVER deleted.
-#
-# Usage: _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$merge_sha"
-_delete_merge_ready_branch() {
-  local tag="$1"
-  local merge_ready_branch="$2"
-  local merge_sha="${3:-}"
-
-  # Fetch latest remote state
-  git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
-
-  local remote_main
-  remote_main=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
-
-  # Verify the merge actually landed on main before deleting the signal branch
-  local verified=false
-  if [ -n "$merge_sha" ]; then
-    if git -C "$CODE_DIR" merge-base --is-ancestor "$merge_sha" "$remote_main" 2>/dev/null; then
-      verified=true
-    fi
-  fi
-
-  if [ "$verified" = false ]; then
-    # Fallback: check if the branch tip is an ancestor of main
-    local branch_tip
-    branch_tip=$(git -C "$CODE_DIR" rev-parse "origin/$merge_ready_branch" 2>/dev/null || true)
-    if [ -n "$branch_tip" ] && git -C "$CODE_DIR" merge-base --is-ancestor "$branch_tip" "$remote_main" 2>/dev/null; then
-      verified=true
-    fi
-  fi
-
-  if [ "$verified" = false ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}SAFETY: Merge not verified on origin/main. Keeping -merge-ready branch.${RESET}"
-    return 1
-  fi
-
-  # Delete only the -merge-ready signal branch
-  if git -C "$CODE_DIR" push origin --delete "$merge_ready_branch" 2>/dev/null; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted -merge-ready signal branch.${RESET}"
-  else
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Failed to delete -merge-ready branch (may already be gone).${RESET}"
-  fi
-
-  # Clean up the local branch ref if it exists
-  git -C "$CODE_DIR" branch -D "$merge_ready_branch" 2>/dev/null || true
-
-  # Clean up consumer worktree for the work branch
-  local work_branch
-  work_branch=$(_work_branch_from_ready "$merge_ready_branch")
-  local consumer_worktree_base="$HOME/.ralph-consumer/worktrees"
-  local slug="${work_branch#ralph-}"
-  local worktree_path="$consumer_worktree_base/$slug"
-
-  if [ -d "$worktree_path" ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Cleaning up consumer worktree: $slug${RESET}"
-    local consumer_code="$HOME/.ralph-consumer/code"
-    if [ -d "$consumer_code/.git" ]; then
-      git -C "$consumer_code" worktree remove --force "$worktree_path" >/dev/null 2>&1 || true
-    fi
-    rm -rf "$worktree_path" 2>/dev/null || true
-  fi
-
-  return 0
-}
-
-# Short model label for log tags: "claude-opus" → "opus", "claude-sonnet" → "sonnet"
+# Short model label for log tags: "claude-opus" → "opus"
 _model_label() {
-  local m="$1"
-  # Strip common prefixes to get a short label
-  m="${m##*-}"    # claude-opus-4-20250514 → 20250514? No — take last meaningful segment
   case "$1" in
     *opus*)   echo "opus" ;;
     *sonnet*) echo "sonnet" ;;
@@ -336,24 +175,18 @@ MODEL_LABEL=$(_model_label "$CONSOLIDATOR_MODEL")
 _branch_objective() {
   local name="${1#origin/}"
   name="${name#ralph-}"
-  # Strip -merge-ready suffix
   name="${name%-merge-ready}"
-  # Strip timestamp prefix (YYYY-MM-DD-HHMMSS-)
   local after_ts="${name:18}"
-  # Strip content hash suffix (last 7 chars: -XXXXXX)
   echo "${after_ts%-??????}"
 }
 
 # Derive the work branch name from a -merge-ready branch.
-# ralph-2026-...-slug-a1b2c3-merge-ready → ralph-2026-...-slug-a1b2c3
 _work_branch_from_ready() {
   local name="${1#origin/}"
   echo "${name%-merge-ready}"
 }
 
 # Find all remote ralph-*-merge-ready branches, sorted by committer date (oldest first).
-# Only -merge-ready branches are picked up for merging. Work branches (without the
-# suffix) are never touched or deleted by the consolidator.
 find_ralph_branches() {
   git -C "$CODE_DIR" for-each-ref \
     --format='%(committerdate:unix) %(refname:short)' \
@@ -363,62 +196,67 @@ find_ralph_branches() {
     | awk '{print $2}'
 }
 
-# Invoke AI to fix a build failure after a clean merge.
-# The merged code is on HEAD; the build (pre-push hook) failed.
-# AI reads the error, fixes the code, and runs the build again.
-# Returns 0 if the build passes after AI fix, 1 otherwise.
-_ai_fix_build() {
+# Delete the -merge-ready signal branch after verifying the merge landed.
+# ONLY deletes the signal branch. The work branch is NEVER deleted.
+_delete_merge_ready_branch() {
   local tag="$1"
+  local merge_ready_branch="$2"
 
-  if [ -z "$CLAUDE_BIN" ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Skipping AI build fix: 'claude' CLI not found.${RESET}"
+  # Fetch latest remote state
+  git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
+
+  local remote_main
+  remote_main=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
+
+  # Verify the branch tip is an ancestor of main (i.e., merged)
+  local branch_tip
+  branch_tip=$(git -C "$CODE_DIR" rev-parse "origin/$merge_ready_branch" 2>/dev/null || true)
+  if [ -n "$branch_tip" ] && git -C "$CODE_DIR" merge-base --is-ancestor "$branch_tip" "$remote_main" 2>/dev/null; then
+    : # verified
+  else
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}SAFETY: Merge not verified on origin/main. Keeping -merge-ready branch.${RESET}"
     return 1
   fi
 
-  # Capture the actual build error so AI has context
-  local build_output
-  build_output=$(git -C "$CODE_DIR" --no-pager diff --stat HEAD~1 2>/dev/null | head -40)
-  local build_error
-  build_error=$(cd "$CODE_DIR" && npm run build 2>&1 | tail -60)
+  # Delete the signal branch (retry once on failure)
+  if ! git -C "$CODE_DIR" push origin --delete "$merge_ready_branch" 2>/dev/null; then
+    sleep 2
+    git -C "$CODE_DIR" push origin --delete "$merge_ready_branch" 2>/dev/null || \
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Failed to delete -merge-ready branch (may already be gone).${RESET}"
+  fi
 
-  local ai_prompt="You are fixing a build failure in a TypeScript monorepo after merging a branch into main.
+  git -C "$CODE_DIR" branch -D "$merge_ready_branch" 2>/dev/null || true
 
-The merge itself succeeded (no conflicts), but the build fails. Your job:
-1. Read the build error below and identify the root cause
-2. Fix the source code so the build passes
-3. Run: npm run build
-4. If the build still fails, keep fixing until it passes
-5. Do NOT commit. Just leave the fixed files staged/unstaged — the consolidator will commit.
+  # Clean up consumer worktree
+  local work_branch
+  work_branch=$(_work_branch_from_ready "$merge_ready_branch")
+  local slug="${work_branch#ralph-}"
+  local worktree_path="$HOME/.ralph-consumer/worktrees/$slug"
 
-## Files changed in this merge:
-$build_output
+  if [ -d "$worktree_path" ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Cleaning up consumer worktree: $slug${RESET}"
+    local consumer_code="$HOME/.ralph-consumer/code"
+    if [ -d "$consumer_code/.git" ]; then
+      git -C "$consumer_code" worktree remove --force "$worktree_path" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$worktree_path" 2>/dev/null || true
+  fi
 
-## Build error output (last 60 lines):
-$build_error
+  return 0
+}
 
-IMPORTANT: Focus only on fixing the build error. Do not refactor or change unrelated code."
+# Stream filter: parse claude's stream-json output and log progress.
+# Also writes text content to $1 so we can detect <promise>MERGED</promise>.
+_stream_filter() {
+  local result_file="$1"
+  local tag="$2"
 
-  local ai_result_file ai_stderr_file
-  ai_result_file=$(mktemp) && chmod 600 "$ai_result_file"
-  ai_stderr_file=$(mktemp) && chmod 600 "$ai_stderr_file"
-  local ai_exit=0
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    local msg=""
 
-  echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Running AI to fix build...${RESET}"
-
-  timeout 600 env PATH="$PATH" bash -c '
-    set -o pipefail
-    echo "$1" | (cd "$2" && claude \
-      --dangerously-skip-permissions \
-      --print \
-      --model "$3" \
-      --verbose \
-      --output-format stream-json \
-    ) 2>"$5" | tee "$4"
-  ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" \
-    2>&1 | while IFS= read -r line; do
-      local msg=""
-      if echo "$line" | grep -q '"type":"tool_use"' 2>/dev/null; then
-        msg=$(echo "$line" | python3 -c "
+    if echo "$line" | grep -q '"type":"tool_use"' 2>/dev/null; then
+      msg=$(echo "$line" | python3 -c "
 import sys,json
 try:
   d=json.load(sys.stdin)
@@ -435,8 +273,32 @@ try:
       else:
         print(f'Tool: {name}')
 except: pass" 2>/dev/null)
-      elif echo "$line" | grep -q '"type":"result"' 2>/dev/null; then
-        msg=$(echo "$line" | python3 -c "
+    elif echo "$line" | grep -q '"type":"text"' 2>/dev/null; then
+      # Extract text and check for quit signal
+      local text_content
+      text_content=$(echo "$line" | python3 -c "
+import sys,json
+try:
+  d=json.load(sys.stdin)
+  for c in d.get('message',{}).get('content',[]):
+    if c.get('type')=='text':
+      print(c['text'])
+except: pass" 2>/dev/null)
+
+      if [ -n "$text_content" ] && [ "$text_content" != "null" ]; then
+        # Log a truncated version
+        local display_text
+        display_text=$(echo "$text_content" | head -3 | tr '\n' ' ')
+        if [ ${#display_text} -gt 120 ]; then
+          display_text="${display_text:0:120}..."
+        fi
+        msg="$display_text"
+
+        # Write to result file for quit signal detection
+        echo "$text_content" >> "$result_file"
+      fi
+    elif echo "$line" | grep -q '"type":"result"' 2>/dev/null; then
+      msg=$(echo "$line" | python3 -c "
 import sys,json
 try:
   d=json.load(sys.stdin)
@@ -446,38 +308,22 @@ try:
   status=d.get('subtype','')
   print(f'Result: {status} ({turns} turns, {dur/1000:.1f}s, \${cost:.2f})')
 except: pass" 2>/dev/null)
-      fi
-      if [ -n "$msg" ]; then
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}${msg}${RESET}"
-      fi
-    done
-  ai_exit=${PIPESTATUS[0]}
+    fi
 
-  rm -f "$ai_result_file" "$ai_stderr_file"
-
-  if [ "$ai_exit" -eq 124 ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI build fix timed out.${RESET}"
-    return 1
-  elif [ "$ai_exit" -ne 0 ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI build fix failed (exit $ai_exit).${RESET}"
-    return 1
-  fi
-
-  # Verify the build passes now
-  if (cd "$CODE_DIR" && npm run build) &>/dev/null; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Build passes after AI fix.${RESET}"
-    return 0
-  else
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Build still fails after AI fix.${RESET}"
-    return 1
-  fi
+    if [ -n "$msg" ]; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}${msg}${RESET}"
+    fi
+  done
 }
 
-# Attempt to merge a -merge-ready branch into main and push.
-# The actual merge is done from the work branch (without -merge-ready suffix).
-# On success, only the -merge-ready signal branch is deleted. The work branch
-# is NEVER deleted — it serves as a permanent record.
-# Returns 0 on success, 1 on conflict.
+# --- merge_branch: the core logic ---
+#
+# Strategy:
+#   1. Try fast-forward merge + push up to 3 times (pure shell, no AI)
+#   2. If ff fails (conflicts or push race), hand everything to AI
+#   3. AI merges, resolves conflicts, fixes build, commits, pushes
+#   4. Shell watches for <promise>MERGED</promise> quit signal
+
 merge_branch() {
   local remote_branch="$1"
   local merge_ready_branch="${remote_branch#origin/}"
@@ -486,26 +332,21 @@ merge_branch() {
   local objective
   objective=$(_branch_objective "$merge_ready_branch")
   local tag="M:${objective:0:20}:${MODEL_LABEL}"
-
-  # The -merge-ready branch points at the same commit as the work branch.
-  # Merge from the work branch (which has the actual commits).
   local work_remote="origin/$work_branch"
 
-  # Verify the work branch exists on remote
+  # Verify the work branch exists
   if ! git -C "$CODE_DIR" rev-parse "$work_remote" &>/dev/null; then
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Work branch $work_branch not found on remote. Skipping.${RESET}"
     return 1
   fi
 
-  # Count commits to merge
+  # Count commits
   local commit_count
   commit_count=$(git -C "$CODE_DIR" rev-list --count "HEAD..$work_remote" 2>/dev/null || echo "0")
 
   if [ "$commit_count" -eq 0 ]; then
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}No commits to merge.${RESET}"
-    if [ "$DRY_RUN" = false ]; then
-      _delete_merge_ready_branch "$tag" "$merge_ready_branch"
-    fi
+    [ "$DRY_RUN" = false ] && _delete_merge_ready_branch "$tag" "$merge_ready_branch"
     return 0
   fi
 
@@ -516,335 +357,192 @@ merge_branch() {
     return 0
   fi
 
-  # Attempt the merge from the work branch
-  local merge_output
-  if merge_output=$(git -C "$CODE_DIR" merge --no-edit --allow-unrelated-histories "$work_remote" 2>&1); then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Merged successfully.${RESET}"
+  # --- Phase 1: Try fast-forward merge + push (3 attempts, no AI) ---
+  local ff_succeeded=false
 
-    # Push main to remote
-    if _push_main "$tag"; then
-      local pushed_sha
-      pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main.${RESET}"
-      _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$pushed_sha"
-      return 0
+  for attempt in 1 2 3; do
+    # Always start from clean remote HEAD
+    git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
+    git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
+
+    # Try the merge
+    if ! git -C "$CODE_DIR" merge --no-edit "$work_remote" 2>/dev/null; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Merge has conflicts — handing to AI.${RESET}"
+      git -C "$CODE_DIR" merge --abort 2>/dev/null || true
+      break
     fi
 
-    # Push failed — invoke AI to fix the build.
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed. Invoking AI to fix build...${RESET}"
-
-    if ! _ai_fix_build "$tag"; then
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI build fix failed. Resetting to remote.${RESET}"
-      git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
-      git -C "$CODE_DIR" reset --hard origin/main --quiet
-      return 1
+    # Merge succeeded — try push
+    local push_output
+    push_output=$(git -C "$CODE_DIR" push origin main 2>&1)
+    if [ $? -eq 0 ]; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Fast-forward merged and pushed (attempt $attempt).${RESET}"
+      ff_succeeded=true
+      break
     fi
 
-    # AI fixed the build — amend the merge commit and push
-    git -C "$CODE_DIR" add -A 2>/dev/null || true
-    git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
-    if _push_main "$tag"; then
-      local pushed_sha
-      pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI build fix).${RESET}"
-      _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$pushed_sha"
-      return 0
-    else
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push still failed after AI fix. Resetting to remote.${RESET}"
-      git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
-      git -C "$CODE_DIR" reset --hard origin/main --quiet
-      return 1
-    fi
-  else
-    # Merge conflict — use AI to resolve
-    # Use ls-files --unmerged for reliable conflict detection (catches rename/rename,
-    # tree conflicts, etc. that --diff-filter=U can miss).
-    local conflicted_files
-    conflicted_files=$(git -C "$CODE_DIR" ls-files --unmerged 2>/dev/null | awk '{print $4}' | sort -u)
-    if [ -z "$conflicted_files" ]; then
-      # Fallback: diff --name-only --diff-filter=U
-      conflicted_files=$(git -C "$CODE_DIR" diff --name-only --diff-filter=U 2>/dev/null)
-    fi
-    local conflict_count=0
-    if [ -n "$conflicted_files" ]; then
-      conflict_count=$(echo "$conflicted_files" | wc -l | tr -d ' ')
-    fi
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed (attempt $attempt/3). Retrying...${RESET}"
+    sleep 2
+  done
 
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}MERGE CONFLICT ($conflict_count file(s))${RESET}"
-    if [ -n "$conflicted_files" ]; then
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Conflicted: $(echo "$conflicted_files" | tr '\n' ' ')${RESET}"
-    fi
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Merge output: $(echo "$merge_output" | head -5)${RESET}"
+  if [ "$ff_succeeded" = true ]; then
+    _delete_merge_ready_branch "$tag" "$merge_ready_branch"
+    return 0
+  fi
 
-    # If no conflicted files detected, the merge failed for a non-content reason
-    # (e.g., tree conflict, permission issue). Abort and write breadcrumb.
-    if [ "$conflict_count" -eq 0 ]; then
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}No conflicted files — merge failed for a non-content reason.${RESET}"
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Aborting merge. Branch preserved for manual resolution.${RESET}"
-      git -C "$CODE_DIR" merge --abort 2>/dev/null || git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
+  # --- Phase 2: Hand everything to AI ---
 
-      local breadcrumb="$CONFLICTS_DIR/${work_branch}.merge-conflict.txt"
-      {
-        echo "MERGE FAILED — non-content conflict, manual resolution required"
-        echo "================================================================="
-        echo ""
-        echo "Branch:    $work_branch"
-        echo "Commits:   $commit_count"
-        echo "Timestamp: $(date)"
-        echo ""
-        echo "Merge output:"
-        echo "$merge_output"
-        echo ""
-        echo "To resolve:"
-        echo "  cd $CODE_DIR"
-        echo "  git fetch origin"
-        echo "  git checkout main && git reset --hard origin/main"
-        echo "  git merge origin/$work_branch"
-        echo "  # Fix issues, then: git add . && git commit && git push origin main"
-        echo "  # Then delete the signal branch: git push origin --delete $merge_ready_branch"
-      } > "$breadcrumb"
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Wrote: $breadcrumb${RESET}"
-      return 1
-    fi
+  if [ -z "$CLAUDE_BIN" ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Claude CLI not found. Cannot resolve. Skipping.${RESET}"
+    git -C "$CODE_DIR" merge --abort 2>/dev/null || true
+    git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
+    return 1
+  fi
 
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} Invoking AI to resolve..."
+  # Reset to clean state before AI takes over
+  git -C "$CODE_DIR" merge --abort 2>/dev/null || true
+  git -C "$CODE_DIR" rebase --abort 2>/dev/null || true
+  git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
+  git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
 
-    # Build context for AI: branch commits, conflicted file contents, PRD description
-    local branch_log
-    branch_log=$(git -C "$CODE_DIR" log --oneline "HEAD..$remote_branch" 2>/dev/null | head -20)
+  echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${BOLD}Invoking AI to merge, resolve, and push...${RESET}"
 
-    local conflict_diff
-    conflict_diff=$(git -C "$CODE_DIR" diff 2>/dev/null | head -500)
+  local branch_log
+  branch_log=$(git -C "$CODE_DIR" log --oneline "HEAD..$work_remote" 2>/dev/null | head -20)
 
-    local ai_prompt
-    ai_prompt="You are resolving a git merge conflict. A branch is being merged into main.
+  # Derive the PRD slug from the work branch so AI can find its PRD file.
+  # Branch: ralph-2026-03-03-225512-tool-summary-field-78b20c
+  # PRD:    .ralph/prd-2026-03-03-225512-tool-summary-field-78b20c~running.json
+  local work_slug="${work_branch#ralph-}"
 
-## Branch: $work_branch
+  # List recent PRD files (running + done) so AI understands the broader context
+  # of concurrent work — helps make better conflict resolution decisions.
+  local prd_listing
+  prd_listing=$(ls -1 "$CODE_DIR/.ralph/"prd-*~running.json "$CODE_DIR/.ralph/"prd-*~done.json 2>/dev/null \
+    | xargs -I{} basename {} | head -20)
+
+  local ai_prompt
+  ai_prompt="You are merging a feature branch into main in a TypeScript monorepo.
+
+## Branch to merge: origin/$work_branch
 ## Commits on this branch:
 $branch_log
 
-## Conflicted files:
-$conflicted_files
+## Your task — do ALL of these steps:
 
-## Current conflict markers (git diff, first 500 lines):
-$conflict_diff
+### Step 0: Understand the branch's intent
+Read the PRD file for this branch to understand what it was trying to accomplish:
+\`\`\`bash
+cat .ralph/prd-${work_slug}~running.json 2>/dev/null || cat .ralph/prd-${work_slug}~done.json 2>/dev/null || echo 'PRD not found'
+\`\`\`
+The PRD contains a \`description\` and \`userStories\` that explain what this branch was doing.
+This context is critical for making correct conflict resolution decisions.
 
-## Your task:
-1. For each conflicted file, read the full file content (it contains conflict markers)
-2. Understand the INTENT of both sides:
-   - HEAD (main): the current state of main, which may include recent merges from other branches
-   - The branch: changes from a specific PRD task (check the commit messages to understand what it was doing)
-3. Resolve each conflict by keeping BOTH sets of changes where they don't contradict, or choosing the correct version when they do
-4. Common patterns:
-   - If both sides added different items to the same list/array/config: keep both
-   - If the branch changed a function that main also changed: prefer main's structure, incorporate the branch's fix/feature
-   - If it's a comment or documentation conflict: merge the text sensibly
-   - If it's a package.json or lock file conflict: prefer main's version and re-add the branch's additions
-5. After resolving ALL conflicts, stage the files with git add
-6. Verify the resolution compiles: run npm run build && npm run type-check
-7. If build fails, fix the issue
-8. Do NOT commit. Just stage the resolved files. The consolidator will commit.
+Other PRDs currently in flight (for broader context on concurrent work):
+${prd_listing:-  (none found)}
 
-IMPORTANT: Do not be lazy. Read each conflicted file, understand both sides, and produce a correct merge. Do not just pick one side."
+If conflicts touch code related to other in-flight PRDs, reading those PRDs too will
+help you understand the intent of the other side (HEAD/main).
 
-    # Run Claude to resolve the conflict.
-    # Claude runs in --print mode with tool execution enabled. It reads the
-    # conflicted files (which have conflict markers), edits them to resolve,
-    # stages with git add, and verifies the build compiles.
-    # Timeout: 10 minutes. Most conflicts resolve in 2-5 minutes.
-    local ai_result_file
-    ai_result_file=$(mktemp) && chmod 600 "$ai_result_file"
-    local ai_stderr_file
-    ai_stderr_file=$(mktemp) && chmod 600 "$ai_stderr_file"
-    local ai_ok=false
-    local ai_exit=0
+### Step 1: Pull latest main and merge
+Always start from the latest remote state:
+\`\`\`bash
+git fetch origin main
+git reset --hard origin/main
+git merge --no-edit origin/$work_branch
+\`\`\`
 
-    # Check that claude CLI is available before attempting AI resolution
-    if [ -z "$CLAUDE_BIN" ]; then
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Skipping AI resolution: 'claude' CLI not found.${RESET}"
-      ai_exit=127
-    else
-      # Run with timeout to prevent indefinite hangs.
-      # Pass PATH explicitly so the subshell can find claude + node.
-      # Stream stdout through a timestamped prefixer so progress is visible
-      # in the log (like consumer workers). Also tee to result file for
-      # post-processing. Stderr goes to a separate file.
-      timeout 600 env PATH="$PATH" bash -c '
-        set -o pipefail
-        echo "$1" | (cd "$2" && claude \
-          --dangerously-skip-permissions \
-          --print \
-          --model "$3" \
-          --verbose \
-          --output-format stream-json \
-        ) 2>"$5" | tee "$4"
-      ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" \
-        2>&1 | while IFS= read -r line; do
-          # Parse stream-json: extract text content, tool use, and results.
-          # Skip raw JSON noise — only show meaningful progress lines.
-          local msg=""
-          if echo "$line" | grep -q '"type":"tool_use"' 2>/dev/null; then
-            msg=$(echo "$line" | python3 -c "
-import sys,json
-try:
-  d=json.load(sys.stdin)
-  for c in d.get('message',{}).get('content',[]):
-    if c.get('type')=='tool_use':
-      name=c.get('name','')
-      inp=c.get('input',{})
-      if name in ('Edit','Write'):
-        print(f'Tool: {name} → {inp.get(\"filePath\",inp.get(\"file_path\",\"\"))[:80]}')
-      elif name=='Bash':
-        print(f'Tool: {name} → {inp.get(\"command\",\"\")[:80]}')
-      elif name=='Read':
-        print(f'Tool: {name} → {inp.get(\"filePath\",inp.get(\"file_path\",\"\"))[:80]}')
-      else:
-        print(f'Tool: {name}')
-except: pass" 2>/dev/null)
-          elif echo "$line" | grep -q '"type":"text"' 2>/dev/null; then
-            msg=$(echo "$line" | python3 -c "
-import sys,json
-try:
-  d=json.load(sys.stdin)
-  for c in d.get('message',{}).get('content',[]):
-    if c.get('type')=='text':
-      text=c['text'].strip().replace('\n',' ')
-      # Show first meaningful line, truncated
-      if len(text)>120: text=text[:120]+'…'
-      if text: print(f'✦ {text}')
-except: pass" 2>/dev/null)
-          elif echo "$line" | grep -q '"type":"result"' 2>/dev/null; then
-            msg=$(echo "$line" | python3 -c "
-import sys,json
-try:
-  d=json.load(sys.stdin)
-  cost=d.get('total_cost_usd',0)
-  dur=d.get('duration_ms',0)
-  turns=d.get('num_turns',0)
-  status=d.get('subtype','')
-  print(f'Result: {status} ({turns} turns, {dur/1000:.1f}s, \${cost:.2f})')
-except: pass" 2>/dev/null)
-          fi
-          if [ -n "$msg" ]; then
-            echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}${msg}${RESET}"
-          fi
-        done
-      ai_exit=${PIPESTATUS[0]}
-    fi
+### Step 2: If there are merge conflicts, resolve them
+- Read each conflicted file (they contain conflict markers)
+- Use the PRD description + commit messages to understand the INTENT of the branch's changes
+- HEAD (main) = current state, may include recent merges from other concurrent branches
+- The branch = changes from a specific PRD task
+- Common patterns:
+  - Both sides added different items to a list/array/config → keep both
+  - Both sides changed the same function → prefer main's structure, incorporate the branch's feature/fix
+  - If it's a comment or documentation conflict → merge the text sensibly
+  - package.json / lock file conflicts → prefer main's versions, re-add the branch's new dependencies
+- Stage resolved files with \`git add\`
 
-    if [ "$ai_exit" -eq 124 ]; then
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI timed out after 10 minutes.${RESET}"
-    elif [ "$ai_exit" -ne 0 ]; then
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI invocation failed (exit $ai_exit).${RESET}"
-    else
-      # Check if there are still unresolved conflicts (files with conflict markers)
-      local remaining_conflicts
-      remaining_conflicts=$(git -C "$CODE_DIR" diff --name-only --diff-filter=U 2>/dev/null | wc -l | tr -d ' ')
+### Step 3: Verify the build passes
+Run: \`npm run build && npm run type-check\`
+- If the build fails, fix the source code and re-run until it passes
+- Also run: \`npm run build:plugins\` (if it exists — ignore if command not found)
 
-      # Also check for leftover conflict markers in tracked files
-      local marker_files
-      marker_files=$(git -C "$CODE_DIR" grep -l '<<<<<<<' -- '*.ts' '*.tsx' '*.json' '*.md' 2>/dev/null | head -5)
+### Step 4: Commit the merge
+- If the merge is still in progress (MERGE_HEAD exists): \`git commit --no-edit\`
+- If you had to fix build issues after committing: \`git add -A && git commit --amend --no-edit\`
 
-      if [ "$remaining_conflicts" -eq 0 ] && [ -z "$marker_files" ]; then
-        # AI resolved all conflicts — commit the merge
-        # First check if Claude already committed (despite being told not to)
-        local merge_in_progress
-        merge_in_progress=$(git -C "$CODE_DIR" rev-parse -q --verify MERGE_HEAD 2>/dev/null && echo "yes" || echo "no")
+### Step 5: Push to remote
+Run: \`git push origin main\`
+- If the push is rejected (non-fast-forward — remote advanced while you were working):
+  \`\`\`bash
+  git fetch origin main
+  git rebase origin/main
+  git push origin main
+  \`\`\`
+- If rebase has conflicts, resolve them, \`git rebase --continue\`, then push
+- Retry push up to 3 times if needed
 
-        if [ "$merge_in_progress" = "yes" ]; then
-          # Merge still in progress — we need to commit
-          if git -C "$CODE_DIR" commit --no-edit 2>/dev/null; then
-            echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}AI resolved conflict successfully.${RESET}"
-            ai_ok=true
-          else
-            echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI staged files but commit failed.${RESET}"
-          fi
-        else
-          # Claude already committed — check if HEAD advanced past the merge base
-          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}AI resolved conflict and committed.${RESET}"
-          ai_ok=true
-        fi
-      else
-        if [ -n "$marker_files" ]; then
-          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI left conflict markers in: $(echo "$marker_files" | tr '\n' ' ')${RESET}"
-        else
-          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI left $remaining_conflicts unresolved conflicts.${RESET}"
-        fi
-      fi
-    fi
+### Step 6: Signal completion
+When the push succeeds, output exactly:
+<promise>MERGED</promise>
 
-    rm -f "$ai_result_file" "$ai_stderr_file"
+## Rules:
+- Do NOT refactor or change unrelated code
+- Do NOT delete any branches
+- Focus only on getting this merge landed on main
+- If you truly cannot resolve (e.g., the branch is fundamentally incompatible), just stop without outputting the promise"
 
-    if [ "$ai_ok" = true ]; then
-      # Push the AI-resolved merge. _push_main handles non-fast-forward
-      # rejections by rebasing and retrying internally.
-      if _push_main "$tag"; then
-        local pushed_sha
-        pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
-        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI-resolved merge).${RESET}"
-        _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$pushed_sha"
-        return 0
-      fi
+  local ai_result_file ai_stderr_file
+  ai_result_file=$(mktemp) && chmod 600 "$ai_result_file"
+  ai_stderr_file=$(mktemp) && chmod 600 "$ai_stderr_file"
 
-      # Push failed — try AI build fix
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Push failed after AI conflict resolution. Invoking AI to fix build...${RESET}"
-      if _ai_fix_build "$tag"; then
-        git -C "$CODE_DIR" add -A 2>/dev/null || true
-        git -C "$CODE_DIR" commit --amend --no-edit --quiet 2>/dev/null || true
-        if _push_main "$tag"; then
-          local pushed_sha
-          pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
-          echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI conflict + build fix).${RESET}"
-          _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$pushed_sha"
-          return 0
-        fi
-      fi
+  # Run AI with 15-minute timeout (it now handles everything including push retries)
+  timeout 900 env PATH="$PATH" bash -c '
+    set -o pipefail
+    echo "$1" | (cd "$2" && claude \
+      --dangerously-skip-permissions \
+      --print \
+      --model "$3" \
+      --verbose \
+      --output-format stream-json \
+    ) 2>"$5" | tee "$4"
+  ' _ "$ai_prompt" "$CODE_DIR" "$CONSOLIDATOR_MODEL" "$ai_result_file" "$ai_stderr_file" \
+    2>&1 | _stream_filter "$ai_result_file" "$tag"
+  local ai_exit=${PIPESTATUS[0]}
 
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push still failed. Resetting to remote.${RESET}"
-      git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
-      git -C "$CODE_DIR" reset --hard origin/main --quiet
-      return 1
-    fi
-
-    # AI failed to resolve — clean up and fall back to breadcrumb file
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}AI resolution failed. Writing breadcrumb.${RESET}"
-    git -C "$CODE_DIR" merge --abort 2>/dev/null || git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
-
-    local breadcrumb="$CONFLICTS_DIR/${work_branch}.merge-conflict.txt"
-    {
-      echo "MERGE CONFLICT — AI resolution failed, manual resolution required"
-      echo "================================================================="
-      echo ""
-      echo "Branch:    $work_branch"
-      echo "Commits:   $commit_count"
-      echo "Timestamp: $(date)"
-      echo ""
-      echo "To resolve:"
-      echo "  cd $CODE_DIR"
-      echo "  git fetch origin"
-      echo "  git checkout main && git reset --hard origin/main"
-      echo "  git merge origin/$work_branch"
-      echo "  # Fix conflicts, then:"
-      echo "  git add <resolved files>"
-      echo "  git commit"
-      echo "  git push origin main"
-      echo "  # Then delete the signal branch: git push origin --delete $merge_ready_branch"
-      echo ""
-      echo "Conflicted files:"
-      if [ -n "$conflicted_files" ]; then
-        echo "$conflicted_files" | while IFS= read -r f; do echo "  - $f"; done
-      else
-        echo "  (could not determine — run the merge to see)"
-      fi
-      echo ""
-      echo "Merge output:"
-      echo "$merge_output"
-    } > "$breadcrumb"
-
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Wrote: $breadcrumb${RESET}"
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Work branch preserved: origin/$work_branch${RESET}"
-    return 1
+  # Check for the quit signal
+  local merged=false
+  if grep -q '<promise>MERGED</promise>' "$ai_result_file" 2>/dev/null; then
+    merged=true
   fi
+
+  rm -f "$ai_result_file" "$ai_stderr_file"
+
+  if [ "$merged" = true ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}AI merged and pushed successfully.${RESET}"
+    _delete_merge_ready_branch "$tag" "$merge_ready_branch"
+    return 0
+  fi
+
+  # AI did not signal success
+  if [ "$ai_exit" -eq 124 ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI timed out (15 min).${RESET}"
+  elif [ "$ai_exit" -ne 0 ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI failed (exit $ai_exit).${RESET}"
+  else
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}AI finished without signaling MERGED.${RESET}"
+  fi
+
+  # Reset to clean state
+  git -C "$CODE_DIR" merge --abort 2>/dev/null || true
+  git -C "$CODE_DIR" rebase --abort 2>/dev/null || true
+  git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
+  git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
+
+  echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Branch preserved for next attempt: origin/$work_branch${RESET}"
+  return 1
 }
 
 # --- Main ---
@@ -862,18 +560,14 @@ echo -e "$(ts)   Base dir:   ${CYAN}${CONSOLIDATOR_BASE}${RESET}"
 echo ""
 
 while true; do
-  # Ensure clean state — abort any stale merge from a previous iteration crash
+  # Clean state
   git -C "$CODE_DIR" merge --abort 2>/dev/null || true
   git -C "$CODE_DIR" rebase --abort 2>/dev/null || true
-
-  # Fetch all remote branches
   git -C "$CODE_DIR" fetch origin --quiet --prune 2>/dev/null || true
-
-  # Reset main to remote HEAD (consolidator doesn't have local commits)
   git -C "$CODE_DIR" checkout main --quiet 2>/dev/null || true
   git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
 
-  # Find ralph-* branches
+  # Find branches
   RALPH_BRANCHES=$(find_ralph_branches)
 
   if [ -n "$RALPH_BRANCHES" ]; then
@@ -883,38 +577,16 @@ while true; do
     while IFS= read -r remote_branch; do
       [ -z "$remote_branch" ] && continue
 
-      # Abort any stale merge/rebase from a previous branch's failed resolution.
+      # Reset to remote before each branch
       git -C "$CODE_DIR" merge --abort 2>/dev/null || true
       git -C "$CODE_DIR" rebase --abort 2>/dev/null || true
-      git -C "$CODE_DIR" checkout main --quiet 2>/dev/null || true
-
-      # Sync with remote — if the previous merge succeeded and pushed, our
-      # local main is already correct. If it failed and we reset, we need
-      # to be at origin/main. Fetch + fast-forward handles both cases
-      # without destroying local commits that haven't been pushed yet.
       git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
-      local_head=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
-      remote_head=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
-
-      if [ "$local_head" != "$remote_head" ]; then
-        # Local diverged from remote — check if we're ahead (unpushed merge)
-        # or behind (someone else pushed). Either way, reset to remote since
-        # unpushed merges should have been handled by merge_branch.
-        if ! git -C "$CODE_DIR" merge-base --is-ancestor "$remote_head" "$local_head" 2>/dev/null; then
-          # Local is not ahead of remote — reset to remote
-          git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
-        fi
-        # If local IS ahead, keep the local state (merge was pushed but
-        # remote fetch is slightly stale — this resolves on next fetch)
-      fi
+      git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
 
       merge_branch "$remote_branch" || true
 
-      # Re-fetch after each merge — another worker may have pushed a new branch
-      # or main may have advanced.
-      if [ "$DRY_RUN" = false ]; then
-        git -C "$CODE_DIR" fetch origin --quiet --prune 2>/dev/null || true
-      fi
+      # Re-fetch after each merge
+      [ "$DRY_RUN" = false ] && git -C "$CODE_DIR" fetch origin --quiet --prune 2>/dev/null || true
     done <<< "$RALPH_BRANCHES"
   fi
 
