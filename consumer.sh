@@ -675,15 +675,9 @@ run_worker() {
   fi
   local exit_code=$?
 
-  # Push the branch to code repo remote.
-  # Safe — each worker pushes to its own uniquely-named branch (no other writer).
-  # Uses plain push (not --force-with-lease) because this is the first push of a
-  # new branch — there's no remote tracking ref for force-with-lease to compare.
-  #
-  # A sentinel file ($worktree_dir/.ralph/.push-ok) signals to reap_workers that
-  # the push succeeded. Without it, reap_workers preserves the worktree and branch
-  # so the commits aren't lost.
-  echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Worker finished (exit $exit_code). Pushing branch...${RESET}"
+  # Final push — safety net for any commits the worker didn't push incrementally.
+  # The worker pushes after each iteration, but this catches the final state.
+  echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Worker finished (exit $exit_code). Final push...${RESET}"
   local commit_count
   commit_count=$(git -C "$worktree_dir" rev-list --count "origin/main..$branch_name" 2>/dev/null || echo "0")
   if [ "$commit_count" -gt 0 ]; then
@@ -703,6 +697,21 @@ run_worker() {
   else
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}No commits to push.${RESET}"
     touch "$worktree_dir/.ralph/.push-ok"
+  fi
+
+  # If the worker succeeded (exit 0) and push succeeded, create a -merge-ready
+  # branch pointing at the same commit. The consolidator only merges branches
+  # with the -merge-ready suffix, preventing it from touching in-progress work.
+  if [ "$exit_code" -eq 0 ] && [ -f "$worktree_dir/.ralph/.push-ok" ] && [ "$commit_count" -gt 0 ]; then
+    local merge_ready_branch="${branch_name}-merge-ready"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Creating merge-ready branch...${RESET}"
+    # Create the branch locally pointing at current HEAD, then push it
+    git -C "$worktree_dir" branch "$merge_ready_branch" HEAD 2>/dev/null || true
+    if git -C "$worktree_dir" push origin "$merge_ready_branch" 2>/dev/null; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Merge-ready: $merge_ready_branch${RESET}"
+    else
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Failed to push merge-ready branch. Consolidator will not pick up this work automatically.${RESET}"
+    fi
   fi
 
   return $exit_code

@@ -250,93 +250,68 @@ _push_main() {
   return 1
 }
 
-# Safely delete a remote ralph branch ONLY after verifying its content is in
-# origin/main. This prevents losing work if the merge or push silently failed.
-# Also cleans up the corresponding consumer worktree if it still exists.
+# Delete the -merge-ready branch after verifying the merge landed on origin/main.
+# ONLY deletes the -merge-ready signal branch. The work branch is NEVER deleted.
 #
-# The caller passes the SHA of the merge commit that was pushed to main. This
-# is necessary because after a rebase, the original branch commits have
-# different SHAs than the rebased ones — a simple ancestor check on the branch
-# tip would fail even though the work is in main.
-#
-# Verification strategy:
-#   1. Confirm the merge_sha is an ancestor of origin/main (push landed)
-#   2. Confirm the branch's tree diff against its merge base with main is empty
-#      when compared to origin/main (all changes incorporated)
-#   Fallback: if merge_sha is not provided (e.g., 0-commit branch), use the
-#   branch tip ancestor check directly.
-#
-# Usage: _safe_delete_branch "$tag" "$branch_name" ["$merge_sha"]
-_safe_delete_branch() {
+# Usage: _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$merge_sha"
+_delete_merge_ready_branch() {
   local tag="$1"
-  local branch_name="$2"
+  local merge_ready_branch="$2"
   local merge_sha="${3:-}"
 
-  # Fetch latest remote state to ensure we have accurate refs
+  # Fetch latest remote state
   git -C "$CODE_DIR" fetch origin main --quiet 2>/dev/null || true
-  git -C "$CODE_DIR" fetch origin "$branch_name" --quiet 2>/dev/null || true
 
-  local branch_tip remote_main
-  branch_tip=$(git -C "$CODE_DIR" rev-parse "origin/$branch_name" 2>/dev/null)
+  local remote_main
   remote_main=$(git -C "$CODE_DIR" rev-parse origin/main 2>/dev/null)
 
-  if [ -z "$branch_tip" ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Remote branch already deleted.${RESET}"
-    return 0
-  fi
-
-  # Verify the work is in main using the best available method.
+  # Verify the merge actually landed on main before deleting the signal branch
   local verified=false
-
   if [ -n "$merge_sha" ]; then
-    # Caller provided the merge commit SHA. Verify it's in origin/main.
-    # This handles the rebase case where original branch commits have
-    # different SHAs than what ended up in main.
     if git -C "$CODE_DIR" merge-base --is-ancestor "$merge_sha" "$remote_main" 2>/dev/null; then
       verified=true
-    else
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}SAFETY: Merge commit ($merge_sha) is NOT reachable from origin/main ($remote_main). Refusing to delete.${RESET}"
     fi
   fi
 
   if [ "$verified" = false ]; then
-    # Fallback: check if branch tip is directly an ancestor of main.
-    # This works for standard merges (no rebase) and 0-commit branches.
-    if git -C "$CODE_DIR" merge-base --is-ancestor "$branch_tip" "$remote_main" 2>/dev/null; then
+    # Fallback: check if the branch tip is an ancestor of main
+    local branch_tip
+    branch_tip=$(git -C "$CODE_DIR" rev-parse "origin/$merge_ready_branch" 2>/dev/null || true)
+    if [ -n "$branch_tip" ] && git -C "$CODE_DIR" merge-base --is-ancestor "$branch_tip" "$remote_main" 2>/dev/null; then
       verified=true
-    else
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}SAFETY: Branch tip ($branch_tip) is NOT reachable from origin/main ($remote_main). Refusing to delete remote branch.${RESET}"
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Branch preserved: origin/$branch_name${RESET}"
-      return 1
     fi
   fi
 
-  # Safe to delete — branch content is in main
-  if git -C "$CODE_DIR" push origin --delete "$branch_name" 2>/dev/null; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted remote branch.${RESET}"
-  else
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Failed to delete remote branch (may already be gone).${RESET}"
+  if [ "$verified" = false ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}SAFETY: Merge not verified on origin/main. Keeping -merge-ready branch.${RESET}"
+    return 1
   fi
 
-  # Clean up the consumer worktree if it exists on this machine.
-  # Consumer worktrees live at ~/.ralph-consumer/worktrees/<slug>.
+  # Delete only the -merge-ready signal branch
+  if git -C "$CODE_DIR" push origin --delete "$merge_ready_branch" 2>/dev/null; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Deleted -merge-ready signal branch.${RESET}"
+  else
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Failed to delete -merge-ready branch (may already be gone).${RESET}"
+  fi
+
+  # Clean up the local branch ref if it exists
+  git -C "$CODE_DIR" branch -D "$merge_ready_branch" 2>/dev/null || true
+
+  # Clean up consumer worktree for the work branch
+  local work_branch
+  work_branch=$(_work_branch_from_ready "$merge_ready_branch")
   local consumer_worktree_base="$HOME/.ralph-consumer/worktrees"
-  # Extract slug from branch name: ralph-YYYY-MM-DD-HHMMSS-slug → YYYY-MM-DD-HHMMSS-slug
-  local slug="${branch_name#ralph-}"
+  local slug="${work_branch#ralph-}"
   local worktree_path="$consumer_worktree_base/$slug"
 
   if [ -d "$worktree_path" ]; then
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}Cleaning up consumer worktree: $slug${RESET}"
-    # Use git worktree remove if the consumer's code repo is available
     local consumer_code="$HOME/.ralph-consumer/code"
     if [ -d "$consumer_code/.git" ]; then
       git -C "$consumer_code" worktree remove --force "$worktree_path" >/dev/null 2>&1 || true
     fi
     rm -rf "$worktree_path" 2>/dev/null || true
   fi
-
-  # Clean up the local branch ref if it exists
-  git -C "$CODE_DIR" branch -D "$branch_name" 2>/dev/null || true
 
   return 0
 }
@@ -357,20 +332,32 @@ _model_label() {
 MODEL_LABEL=$(_model_label "$CONSOLIDATOR_MODEL")
 
 # Extract short objective from branch name.
-# ralph-2026-02-17-143000-improve-sdk → improve-sdk
+# ralph-2026-02-17-143000-improve-sdk-a1b2c3-merge-ready → improve-sdk
 _branch_objective() {
   local name="${1#origin/}"
   name="${name#ralph-}"
+  # Strip -merge-ready suffix
+  name="${name%-merge-ready}"
   # Strip timestamp prefix (YYYY-MM-DD-HHMMSS-)
-  echo "${name:18}"
+  local after_ts="${name:18}"
+  # Strip content hash suffix (last 7 chars: -XXXXXX)
+  echo "${after_ts%-??????}"
 }
 
-# Find all remote ralph-* branches, sorted by committer date (oldest first).
-# This ensures branches are merged in the order they were completed.
+# Derive the work branch name from a -merge-ready branch.
+# ralph-2026-...-slug-a1b2c3-merge-ready → ralph-2026-...-slug-a1b2c3
+_work_branch_from_ready() {
+  local name="${1#origin/}"
+  echo "${name%-merge-ready}"
+}
+
+# Find all remote ralph-*-merge-ready branches, sorted by committer date (oldest first).
+# Only -merge-ready branches are picked up for merging. Work branches (without the
+# suffix) are never touched or deleted by the consolidator.
 find_ralph_branches() {
   git -C "$CODE_DIR" for-each-ref \
     --format='%(committerdate:unix) %(refname:short)' \
-    'refs/remotes/origin/ralph-*' \
+    'refs/remotes/origin/ralph-*-merge-ready' \
     2>/dev/null \
     | sort -n \
     | awk '{print $2}'
@@ -486,48 +473,60 @@ except: pass" 2>/dev/null)
   fi
 }
 
-# Attempt to merge a single branch into main and push.
+# Attempt to merge a -merge-ready branch into main and push.
+# The actual merge is done from the work branch (without -merge-ready suffix).
+# On success, only the -merge-ready signal branch is deleted. The work branch
+# is NEVER deleted — it serves as a permanent record.
 # Returns 0 on success, 1 on conflict.
 merge_branch() {
   local remote_branch="$1"
-  local branch_name="${remote_branch#origin/}"
+  local merge_ready_branch="${remote_branch#origin/}"
+  local work_branch
+  work_branch=$(_work_branch_from_ready "$merge_ready_branch")
   local objective
-  objective=$(_branch_objective "$branch_name")
+  objective=$(_branch_objective "$merge_ready_branch")
   local tag="M:${objective:0:20}:${MODEL_LABEL}"
+
+  # The -merge-ready branch points at the same commit as the work branch.
+  # Merge from the work branch (which has the actual commits).
+  local work_remote="origin/$work_branch"
+
+  # Verify the work branch exists on remote
+  if ! git -C "$CODE_DIR" rev-parse "$work_remote" &>/dev/null; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Work branch $work_branch not found on remote. Skipping.${RESET}"
+    return 1
+  fi
 
   # Count commits to merge
   local commit_count
-  commit_count=$(git -C "$CODE_DIR" rev-list --count "HEAD..$remote_branch" 2>/dev/null || echo "0")
+  commit_count=$(git -C "$CODE_DIR" rev-list --count "HEAD..$work_remote" 2>/dev/null || echo "0")
 
   if [ "$commit_count" -eq 0 ]; then
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}No commits to merge.${RESET}"
     if [ "$DRY_RUN" = false ]; then
-      _safe_delete_branch "$tag" "$branch_name"
+      _delete_merge_ready_branch "$tag" "$merge_ready_branch"
     fi
     return 0
   fi
 
-  echo -e "$(ts) ${CYAN}[${tag}]${RESET} Merging $branch_name ($commit_count commits)"
+  echo -e "$(ts) ${CYAN}[${tag}]${RESET} Merging $work_branch ($commit_count commits)"
 
   if [ "$DRY_RUN" = true ]; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}[dry-run] Would merge $branch_name${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${DIM}[dry-run] Would merge $work_branch${RESET}"
     return 0
   fi
 
-  # Attempt the merge
-  # --allow-unrelated-histories handles branches created from a different root
-  # commit (e.g., after a repo re-init). Safe because content is the same codebase.
+  # Attempt the merge from the work branch
   local merge_output
-  if merge_output=$(git -C "$CODE_DIR" merge --no-edit --allow-unrelated-histories "$remote_branch" 2>&1); then
+  if merge_output=$(git -C "$CODE_DIR" merge --no-edit --allow-unrelated-histories "$work_remote" 2>&1); then
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Merged successfully.${RESET}"
 
-    # Push main to remote. _push_main handles non-fast-forward rejections
-    # by rebasing onto the updated remote HEAD and retrying internally.
+    # Push main to remote
     if _push_main "$tag"; then
       local pushed_sha
       pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main.${RESET}"
-      _safe_delete_branch "$tag" "$branch_name" "$pushed_sha"
+      _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$pushed_sha"
       return 0
     fi
 
@@ -548,7 +547,7 @@ merge_branch() {
       local pushed_sha
       pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI build fix).${RESET}"
-      _safe_delete_branch "$tag" "$branch_name" "$pushed_sha"
+      _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$pushed_sha"
       return 0
     else
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Push still failed after AI fix. Resetting to remote.${RESET}"
@@ -584,12 +583,12 @@ merge_branch() {
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Aborting merge. Branch preserved for manual resolution.${RESET}"
       git -C "$CODE_DIR" merge --abort 2>/dev/null || git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
 
-      local breadcrumb="$CONFLICTS_DIR/${branch_name}.merge-conflict.txt"
+      local breadcrumb="$CONFLICTS_DIR/${work_branch}.merge-conflict.txt"
       {
         echo "MERGE FAILED — non-content conflict, manual resolution required"
         echo "================================================================="
         echo ""
-        echo "Branch:    $branch_name"
+        echo "Branch:    $work_branch"
         echo "Commits:   $commit_count"
         echo "Timestamp: $(date)"
         echo ""
@@ -600,9 +599,9 @@ merge_branch() {
         echo "  cd $CODE_DIR"
         echo "  git fetch origin"
         echo "  git checkout main && git reset --hard origin/main"
-        echo "  git merge origin/$branch_name"
+        echo "  git merge origin/$work_branch"
         echo "  # Fix issues, then: git add . && git commit && git push origin main"
-        echo "  git push origin --delete $branch_name"
+        echo "  # Then delete the signal branch: git push origin --delete $merge_ready_branch"
       } > "$breadcrumb"
       echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Wrote: $breadcrumb${RESET}"
       return 1
@@ -620,7 +619,7 @@ merge_branch() {
     local ai_prompt
     ai_prompt="You are resolving a git merge conflict. A branch is being merged into main.
 
-## Branch: $branch_name
+## Branch: $work_branch
 ## Commits on this branch:
 $branch_log
 
@@ -783,7 +782,7 @@ except: pass" 2>/dev/null)
         local pushed_sha
         pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
         echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI-resolved merge).${RESET}"
-        _safe_delete_branch "$tag" "$branch_name" "$pushed_sha"
+        _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$pushed_sha"
         return 0
       fi
 
@@ -796,7 +795,7 @@ except: pass" 2>/dev/null)
           local pushed_sha
           pushed_sha=$(git -C "$CODE_DIR" rev-parse HEAD 2>/dev/null)
           echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Pushed main (AI conflict + build fix).${RESET}"
-          _safe_delete_branch "$tag" "$branch_name" "$pushed_sha"
+          _delete_merge_ready_branch "$tag" "$merge_ready_branch" "$pushed_sha"
           return 0
         fi
       fi
@@ -811,12 +810,12 @@ except: pass" 2>/dev/null)
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}AI resolution failed. Writing breadcrumb.${RESET}"
     git -C "$CODE_DIR" merge --abort 2>/dev/null || git -C "$CODE_DIR" reset --hard origin/main --quiet 2>/dev/null || true
 
-    local breadcrumb="$CONFLICTS_DIR/${branch_name}.merge-conflict.txt"
+    local breadcrumb="$CONFLICTS_DIR/${work_branch}.merge-conflict.txt"
     {
       echo "MERGE CONFLICT — AI resolution failed, manual resolution required"
       echo "================================================================="
       echo ""
-      echo "Branch:    $branch_name"
+      echo "Branch:    $work_branch"
       echo "Commits:   $commit_count"
       echo "Timestamp: $(date)"
       echo ""
@@ -824,12 +823,12 @@ except: pass" 2>/dev/null)
       echo "  cd $CODE_DIR"
       echo "  git fetch origin"
       echo "  git checkout main && git reset --hard origin/main"
-      echo "  git merge origin/$branch_name"
+      echo "  git merge origin/$work_branch"
       echo "  # Fix conflicts, then:"
       echo "  git add <resolved files>"
       echo "  git commit"
       echo "  git push origin main"
-      echo "  git push origin --delete $branch_name"
+      echo "  # Then delete the signal branch: git push origin --delete $merge_ready_branch"
       echo ""
       echo "Conflicted files:"
       if [ -n "$conflicted_files" ]; then
@@ -843,7 +842,7 @@ except: pass" 2>/dev/null)
     } > "$breadcrumb"
 
     echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Wrote: $breadcrumb${RESET}"
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Branch preserved: origin/$branch_name${RESET}"
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Work branch preserved: origin/$work_branch${RESET}"
     return 1
   fi
 }

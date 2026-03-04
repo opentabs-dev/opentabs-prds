@@ -115,13 +115,16 @@ for prd_file in "$@"; do
 
   base=$(basename "$prd_file")
 
-  # If it's a ~draft file, rename with timestamp
+  # If it's a ~draft file, rename with timestamp and content hash
   if [[ "$base" == *"~draft"* ]]; then
     # Extract the slug: prd-my-feature~draft.json → my-feature
     slug="${base#prd-}"
     slug="${slug%~draft.json}"
     timestamp=$(date '+%Y-%m-%d-%H%M%S')
-    ready_name="prd-${timestamp}-${slug}.json"
+    # Content hash (first 6 chars of SHA-256) ensures unique branch names
+    # even if the same slug is used for different PRDs
+    content_hash=$(sha256sum "$prd_file" 2>/dev/null | head -c 6 || shasum -a 256 "$prd_file" 2>/dev/null | head -c 6)
+    ready_name="prd-${timestamp}-${slug}-${content_hash}.json"
 
     # Move/rename the file and remove the draft from git index
     if [ "$(dirname "$prd_file")" = "." ] || [ "$(dirname "$prd_file")" = "$SCRIPT_DIR" ]; then
