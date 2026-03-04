@@ -1,0 +1,73 @@
+# Ralph Progress Log
+PRD: prd-2026-03-03-220413-permission-ui-simplification-38d494~running.json
+Started: Wed Mar  4 06:17:36 UTC 2026
+---
+
+## Codebase Patterns
+- PermissionSelect component is co-located in ToolRow.tsx and exported alongside ToolRow for reuse across PluginCard and BrowserToolsCard
+- RetroUI Select is at `platform/browser-extension/src/side-panel/components/retro/Select.tsx`, imported as `./retro/Select.js`
+- The `disabled` prop on ToolRow is optional (`boolean | undefined`), but PermissionSelect requires `boolean` — use `disabled ?? false` when bridging
+- Radix Select in Playwright: locate trigger by `[aria-label="..."]`, click trigger, click `[role="option"]` with matching text. Verify value with `toContainText('Auto')` on trigger (NOT `toHaveValue`)
+- The `sync.full` WebSocket message must include `skipPermissions` from `configState` — without it, the side panel never receives the flag and cannot render disabled selects
+- E2E config verification: use `readTestConfig(configDir)` from fixtures to read back config.json and verify per-tool overrides or their absence
+
+## 2026-03-04 06:19 - US-002
+- Replaced native `<select>` in ToolRow with PermissionSelect (the RetroUI Select wrapper created in US-001)
+- Files changed: `platform/browser-extension/src/side-panel/components/ToolRow.tsx`
+- Stories already covered all three permission states (Off, Ask, Auto) plus Disabled and Interactive — no story changes needed since ToolRow now uses PermissionSelect internally
+- **Learnings for future iterations:**
+  - PermissionSelect accepts `onValueChange` (not `onChange`) — bridge with `p => onPermissionChange(name, p)`
+  - The ToolRow `disabled` prop is optional but PermissionSelect requires a boolean, so use `?? false` coercion
+  - Stories don't need updating when the internal implementation changes but the component API stays the same
+---
+
+## 2026-03-04 06:22 - US-003
+- Replaced native `<select>` in PluginCard header with `PermissionSelect` (imported from `./ToolRow.js`)
+- Removed `Switch` import from `./retro/Switch.js` (no longer used anywhere in side panel)
+- Removed `handleToggleGroup` function entirely
+- Replaced group header `<Switch>` with plain text divider (just the group name label with `bg-muted/20` styling)
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginCard.tsx`
+- **Learnings for future iterations:**
+  - PermissionSelect's trigger already has `onClick stopPropagation`, so the wrapper div with manual stopPropagation handlers is unnecessary when using it
+  - `skipPermissions` prop is `boolean | undefined` on PluginCard but PermissionSelect requires `boolean` — use `?? false`
+  - Stories didn't need changes because they render PluginCard as a whole — internal component swap (native select → PermissionSelect, Switch → plain div) doesn't affect story props
+---
+
+## 2026-03-04 06:25 - US-004
+- Replaced native `<select>` in BrowserToolsCard header with `PermissionSelect` (imported from `./ToolRow.js`)
+- Removed manual `onClick`/`onKeyDown` stopPropagation wrapper div — PermissionSelect's trigger already handles `onClick stopPropagation`
+- Used `skipPermissions ?? false` to coerce the optional `boolean | undefined` prop to `boolean` for PermissionSelect's `disabled` prop
+- Files changed: `platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx`
+- Stories did not need changes — all stories already pass correct `browserPermission` and `onBrowserPermissionChange` props
+- **Learnings for future iterations:**
+  - BrowserToolsCard follows the same pattern as PluginCard for the permission select swap: import PermissionSelect, replace native select, use `?? false` for optional boolean props
+  - The wrapper div with manual stopPropagation handlers is unnecessary when using PermissionSelect since its trigger already has `onClick stopPropagation`
+---
+
+## 2026-03-04 06:28 - US-005
+- Implemented smart tool-level permission cleanup in `handleConfigSetToolPermission`: when a tool permission is set to the same value as the plugin default (`pConfig.permission ?? 'off'`), the per-tool override is deleted from `tools` instead of stored
+- When the `tools` map becomes empty after cleanup, it is removed entirely from the `PluginPermissionConfig`
+- Added 4 unit tests covering: removal when matching default, creation when differing, empty tools map cleanup, and browser tool override cleanup
+- Updated 2 existing tests (extension-handlers.test.ts, extension-protocol.test.ts) that expected a per-tool override to be stored when the permission matched the plugin default — changed them to use a non-default permission
+- Files changed: `platform/mcp-server/src/extension-handlers.ts`, `platform/mcp-server/src/extension-handlers.test.ts`, `platform/mcp-server/src/extension-protocol.test.ts`
+- **Learnings for future iterations:**
+  - The plugin default permission is `pConfig.permission ?? 'off'` — matches the resolution in `getToolPermission` in state.ts
+  - When changing behavior of `handleConfigSetToolPermission`, also check `extension-protocol.test.ts` which has integration-level tests for the same handler via `handleExtensionMessage`
+  - `PluginPermissionConfig.tools` is `Record<string, ToolPermission> | undefined` — delete it when empty rather than leaving an empty object
+---
+
+## 2026-03-04 06:50 - US-006
+- Updated all E2E tests in `side-panel-plugin-toggle.e2e.ts` to use Radix Select interaction patterns instead of native `<select>` selectors
+- Updated `side-panel-realtime-state.e2e.ts` to use Radix Select trigger selectors (`[aria-label="..."]`) and `toContainText` instead of `toHaveValue`
+- Added `selectPermission` helper function for Radix Select dropdown interaction (click trigger → click option)
+- Added smart cleanup E2E test: verifies config.json removes per-tool override when tool permission is set back to plugin default
+- Added skipPermissions E2E test: verifies all PermissionSelect triggers are disabled when `skipPermissions=true`
+- Added group header assertion: verifies no `[role="switch"]` elements exist in expanded plugin cards
+- Fixed bug: `sync.full` WebSocket message in `extension-protocol.ts` was missing `skipPermissions` field from `configState`, causing the side panel to never receive the flag
+- Files changed: `e2e/side-panel-plugin-toggle.e2e.ts`, `e2e/side-panel-realtime-state.e2e.ts`, `platform/mcp-server/src/extension-protocol.ts`
+- **Learnings for future iterations:**
+  - Radix Select renders a `<button role="combobox">` as trigger — use `[aria-label]` selector, NOT `select[aria-label]`
+  - `toHaveValue` doesn't work on Radix Select triggers (they're buttons, not form controls) — use `toContainText` instead
+  - The `sync.full` message must include ALL fields from `configState` that the side panel needs (including `skipPermissions`) — `plugins.changed` already includes them via `buildConfigStatePayload` spread, but `sync.full` cherry-picks fields and can miss new ones
+  - Playwright's `click()` auto-waits for Radix Select portal options to appear, no explicit waits needed between trigger click and option click
+---
