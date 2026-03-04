@@ -612,7 +612,7 @@ setup_worktree() {
   # Update code repo to latest main
   git -C "$CODE_DIR" fetch origin --quiet
 
-  # Clean up stale worktree/branch
+  # Clean up stale local worktree/branch
   if [ -d "$worktree_dir" ]; then
     remove_worktree "$worktree_dir"
   fi
@@ -620,17 +620,62 @@ setup_worktree() {
     git -C "$CODE_DIR" branch -D "$branch_name" 2>/dev/null || true
   fi
 
-  # Create worktree from latest main
-  if ! git -C "$CODE_DIR" worktree add "$worktree_dir" -b "$branch_name" origin/main >/dev/null 2>&1; then
-    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Failed to create worktree. Aborting.${RESET}"
-    return 1
+  # Check if a remote branch with prior work exists. If so, resume from it
+  # instead of starting fresh from main. This preserves progress when the
+  # consumer is restarted mid-PRD (the worker pushes incrementally, so the
+  # remote branch has commits from completed stories).
+  local remote_branch_exists=false
+  if git -C "$CODE_DIR" rev-parse --verify "origin/$branch_name" >/dev/null 2>&1; then
+    remote_branch_exists=true
   fi
 
-  # Copy PRD into worktree's .ralph/ directory
-  mkdir -p "$worktree_dir/.ralph"
-  cp "$QUEUE_DIR/$running_basename" "$worktree_dir/.ralph/"
+  if [ "$remote_branch_exists" = true ]; then
+    echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Resuming from existing remote branch: $branch_name${RESET}"
+    if ! git -C "$CODE_DIR" worktree add "$worktree_dir" -b "$branch_name" "origin/$branch_name" >/dev/null 2>&1; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Failed to create worktree from remote branch. Aborting.${RESET}"
+      return 1
+    fi
 
-  # Copy progress file if it exists
+    # Copy the PRD from queue into the worktree
+    mkdir -p "$worktree_dir/.ralph"
+    cp "$QUEUE_DIR/$running_basename" "$worktree_dir/.ralph/"
+
+    # Infer which stories already passed by scanning commit messages on the branch.
+    # Each completed story has a commit like "feat: US-001 - ..." or "fix: US-001 - ...".
+    # Parse these to restore passes flags so the worker doesn't redo completed work.
+    local completed_ids
+    completed_ids=$(git -C "$CODE_DIR" log --oneline "origin/main..origin/$branch_name" 2>/dev/null \
+      | grep -oE 'US-[0-9]+' | sort -u | tr '\n' '|' | sed 's/|$//')
+    if [ -n "$completed_ids" ]; then
+      local count
+      count=$(echo "$completed_ids" | tr '|' '\n' | wc -l | tr -d ' ')
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Restored $count completed story/stories from branch history${RESET}"
+      # Update PRD passes flags using jq — set passes=true for stories whose id matches
+      local wt_prd="$worktree_dir/.ralph/$running_basename"
+      local tmp_prd="${wt_prd}.tmp"
+      if jq --arg ids "$completed_ids" '
+        .userStories |= map(
+          if (.id | test($ids)) then .passes = true else . end
+        )' "$wt_prd" > "$tmp_prd" 2>/dev/null; then
+        mv "$tmp_prd" "$wt_prd"
+      else
+        rm -f "$tmp_prd"
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Failed to restore passes from branch history (jq error). Starting fresh.${RESET}"
+      fi
+    fi
+  else
+    # Fresh start from latest main
+    if ! git -C "$CODE_DIR" worktree add "$worktree_dir" -b "$branch_name" origin/main >/dev/null 2>&1; then
+      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Failed to create worktree. Aborting.${RESET}"
+      return 1
+    fi
+
+    # Copy PRD into worktree's .ralph/ directory
+    mkdir -p "$worktree_dir/.ralph"
+    cp "$QUEUE_DIR/$running_basename" "$worktree_dir/.ralph/"
+  fi
+
+  # Copy progress file if it exists (used for both fresh and resumed runs)
   local progress_basename="progress-${slug}.txt"
   if [ -f "$QUEUE_DIR/$progress_basename" ]; then
     cp "$QUEUE_DIR/$progress_basename" "$worktree_dir/.ralph/"
