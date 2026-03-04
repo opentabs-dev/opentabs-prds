@@ -419,6 +419,9 @@ merge_branch() {
   # PRD:    .ralph/prd-2026-03-03-225512-tool-summary-field-78b20c~running.json
   local work_slug="${work_branch#ralph-}"
 
+  # Extract date from slug for archive path: 2026-03-03-225512-tool-summary-... → 2026-03-03
+  local work_date="${work_slug:0:10}"
+
   # List recent PRD files from both the code repo and the queue repo so AI
   # understands the broader context of concurrent/recent work.
   local prd_listing
@@ -426,8 +429,8 @@ merge_branch() {
     # In-flight PRDs (in code repo .ralph/)
     ls -1 "$CODE_DIR/.ralph/"prd-*~running.json "$CODE_DIR/.ralph/"prd-*~done.json 2>/dev/null \
       | xargs -I{} basename {}
-    # Recently completed PRDs (in queue repo)
-    ls -1t "$QUEUE_DIR/"prd-*~done*.json "$QUEUE_DIR/archive/"*/prd-*.json 2>/dev/null \
+    # Recently completed PRDs (in queue repo, organized by date)
+    ls -1t "$QUEUE_DIR/"prd-*~done*.json "$QUEUE_DIR/archive/"*/*/prd-*.json 2>/dev/null \
       | head -10 | xargs -I{} basename {}
   ) 
   # Deduplicate
@@ -449,7 +452,7 @@ cat .ralph/prd-${work_slug}~running.json 2>/dev/null || cat .ralph/prd-${work_sl
 \`\`\`
 If not found in the code repo, check the queue repo (recently completed PRDs):
 \`\`\`bash
-cat ${QUEUE_DIR}/prd-${work_slug}~done.json 2>/dev/null || cat ${QUEUE_DIR}/archive/prd-${work_slug}~done/prd-${work_slug}~done.json 2>/dev/null || echo 'PRD not found in queue repo either'
+cat ${QUEUE_DIR}/prd-${work_slug}~done.json 2>/dev/null || cat ${QUEUE_DIR}/archive/${work_date}/prd-${work_slug}~done/prd-${work_slug}~done.json 2>/dev/null || echo 'PRD not found in queue repo either'
 \`\`\`
 The PRD contains a \`description\` and \`userStories\` that explain what this branch was doing.
 This context is critical for making correct conflict resolution decisions.
@@ -459,7 +462,7 @@ ${prd_listing:-  (none found)}
 
 To read any of these PRDs for context, check:
 - Code repo: \`.ralph/<filename>\`
-- Queue repo: \`${QUEUE_DIR}/<filename>\` or \`${QUEUE_DIR}/archive/<basename>/<filename>\`
+- Queue repo: \`${QUEUE_DIR}/<filename>\` or \`${QUEUE_DIR}/archive/YYYY-MM-DD/<prd-folder>/<filename>\`
 
 If conflicts touch code related to other PRDs, reading those PRDs will help you
 understand the intent of the other side (HEAD/main).

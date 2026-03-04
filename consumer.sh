@@ -552,7 +552,10 @@ archive_and_push() {
     return 0
   fi
 
-  local archive_dir="$QUEUE_DIR/archive/${done_basename%.json}"
+  # Extract date from PRD name: prd-YYYY-MM-DD-... → YYYY-MM-DD
+  local date_part
+  date_part=$(echo "$done_basename" | sed 's/^prd-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\)-.*/\1/')
+  local archive_dir="$QUEUE_DIR/archive/${date_part}/${done_basename%.json}"
   mkdir -p "$archive_dir"
 
   # Move PRD into archive

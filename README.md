@@ -37,7 +37,7 @@ prd-<slug>~draft.json           → Producer is writing (not committed)
 prd-<ts>-<slug>.json            → Ready for pickup (committed + pushed)
 prd-<ts>-<slug>~running.json   → Claimed by a worker (atomic via git push)
 prd-<ts>-<slug>~done.json      → Completed
-→ archive/                       → Final resting place
+→ archive/YYYY-MM-DD/            → Final resting place (organized by date)
 ```
 
 ## Atomicity
@@ -101,7 +101,7 @@ opentabs-prds/
 ├── prd-*~running.json    # PRDs being executed
 ├── prd-*~done.json       # Completed PRDs (pre-archive)
 ├── progress-*.txt        # Worker progress logs
-├── archive/              # Completed and archived PRDs
+├── archive/              # Completed PRDs organized by date (YYYY-MM-DD/)
 └── README.md
 ```
 
