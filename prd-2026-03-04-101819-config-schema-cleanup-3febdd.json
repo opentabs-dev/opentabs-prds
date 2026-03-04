@@ -1,0 +1,177 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Clean up config.json schema: rename the 'plugins' permission map key to 'permissions' (eliminating confusion with localPlugins), remove skipPermissions from config.json (keep only CLI flag and env var), and remove all legacy aliases (skipConfirmation, --dangerously-skip-confirmation, OPENTABS_SKIP_CONFIRMATION).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Rename config key 'plugins' to 'permissions' in types and parsing",
+      "description": "As a platform developer, I want the config.json permission map key renamed from 'plugins' to 'permissions' so that the config schema clearly distinguishes plugin discovery (localPlugins) from plugin authorization (permissions).",
+      "acceptanceCriteria": [
+        "OpentabsConfig interface in platform/mcp-server/src/config.ts uses 'permissions: Record<string, PluginPermissionConfig>' instead of 'plugins'",
+        "parseConfigRecord reads from 'record.permissions' as the primary key, with 'record.plugins' accepted as a legacy fallback (logged as migration notice)",
+        "savePluginPermissions writes the 'permissions' key (not 'plugins') when saving config.json",
+        "loadConfig default config uses 'permissions: {}' instead of 'plugins: {}'",
+        "The legacy Array.isArray(record.plugins) migration path still works (extracts local paths into localPlugins)",
+        "The old 'permissions' key with trustedDomains/sensitiveDomains/toolPolicy/domainToolPolicy is still recognized as a legacy field and discarded during migration (it was already discarded — make sure the rename doesn't resurrect it; the new 'permissions' is a Record<string, PluginPermissionConfig>, not the old browser-tool-confirmation object)",
+        "All config.test.ts tests updated and passing",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Key files:\n- platform/mcp-server/src/config.ts: OpentabsConfig interface (line 42-49), parseConfigRecord (line 164-237), savePluginPermissions (line 303-392), loadConfig default (line 262).\n\nThe rename affects the JSON key in config.json ('plugins' -> 'permissions'), the TypeScript interface field name, and all internal references to config.plugins.\n\nIMPORTANT: The old config format had a 'permissions' key with {trustedDomains, sensitiveDomains, toolPolicy, domainToolPolicy} — this is a DIFFERENT thing that gets discarded during migration (line 175-183). The new 'permissions' key is a Record<string, PluginPermissionConfig>. The migration code must distinguish between:\n1. Old 'permissions' object (has trustedDomains etc.) → discard with migration notice (existing behavior)\n2. New 'permissions' object (has plugin names as keys with {permission?, tools?}) → use as the permission map\n3. Old 'plugins' as Record → accept as legacy fallback with migration notice\n4. Old 'plugins' as Array → extract local paths (existing behavior)\n\nA reasonable approach: check if 'permissions' exists and is a non-array object. If it has trustedDomains/sensitiveDomains/toolPolicy/domainToolPolicy keys, treat it as the old format and discard. Otherwise treat it as the new permission map. Fall back to 'plugins' (non-array object) if 'permissions' is absent.\n\nThe state field 'state.pluginPermissions' does NOT need renaming — it's already well-named. Only the config JSON key and the OpentabsConfig TypeScript field change.\n\nDo NOT touch reload.ts, state.ts, extension-handlers.ts, mcp-tool-dispatch.ts, http-routes.ts, CLI, E2E, or browser extension code in this story — those are handled in subsequent stories."
+    },
+    {
+      "id": "US-002",
+      "title": "Update reload.ts and server-side consumers of config.plugins to config.permissions",
+      "description": "As a platform developer, I want all server-side code that reads config.plugins updated to read config.permissions so the codebase is consistent after the config key rename.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/reload.ts references config.permissions instead of config.plugins (lines 221, 241)",
+        "All reload.test.ts test fixtures use 'permissions' key in config JSON",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Mechanical rename. In platform/mcp-server/src/reload.ts:\n- Line 221: `const newPluginPermissions = { ...config.plugins };` → `{ ...config.permissions };`\n- Line 241: `Object.keys(config.plugins).length` → `Object.keys(config.permissions).length`\n\nIn platform/mcp-server/src/reload.test.ts: update all test config JSON objects that write `\"plugins\": { ... }` to use `\"permissions\": { ... }` instead. Search for '\"plugins\"' in the file — lines around 169-171, 176, 202, 225, 231.\n\nThe state field `state.pluginPermissions` stays the same — do NOT rename it."
+    },
+    {
+      "id": "US-003",
+      "title": "Update CLI config commands to use 'permissions' key",
+      "description": "As a platform developer, I want the CLI config commands to read and write the 'permissions' key instead of 'plugins' so that the CLI is consistent with the new config schema.",
+      "acceptanceCriteria": [
+        "CANONICAL_CONFIG_SECTIONS in platform/cli/src/commands/config.ts lists 'permissions' instead of 'plugins'",
+        "normalizeConfigForDisplay uses config.permissions instead of config.plugins",
+        "ensurePluginEntry accesses config.permissions",
+        "pruneEmptyPluginEntries accesses config.permissions",
+        "Display labels updated: pc.cyan('permissions') instead of pc.cyan('plugins')",
+        "All CLI config.test.ts tests updated with 'permissions' key and passing",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Mechanical rename in platform/cli/src/commands/config.ts:\n- Line 54: CANONICAL_CONFIG_SECTIONS = ['localPlugins', 'permissions']\n- Line 58: comment update\n- Line 71: normalized.permissions = config.permissions ?? {}\n- Lines 124, 126: key === 'permissions' and pc.cyan('permissions')\n- Lines 195-224: ensurePluginEntry and pruneEmptyPluginEntries — change all config.plugins to config.permissions\n\nAlso update platform/cli/src/commands/config.test.ts — all test fixtures that reference the 'plugins' key should use 'permissions'."
+    },
+    {
+      "id": "US-004",
+      "title": "Update E2E test fixtures and tests to use 'permissions' config key",
+      "description": "As a platform developer, I want E2E tests to use the new 'permissions' config key so tests pass against the updated config schema.",
+      "acceptanceCriteria": [
+        "e2e/fixtures.ts OpentabsConfig interface uses 'permissions' instead of 'plugins'",
+        "All E2E test files that set config.plugins updated to config.permissions",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Mechanical rename across E2E files. Key files:\n- e2e/fixtures.ts: line 195 (interface field), line 200 and 239 (defaults)\n- e2e/permissions.e2e.ts: ~10 instances of config.plugins\n- e2e/plugin-management.e2e.ts: ~4 instances\n- e2e/hot-reload-dynamic.e2e.ts: ~5 instances\n- e2e/side-panel-plugin-toggle.e2e.ts: ~2 instances\n\nSearch for 'config.plugins' and '.plugins' across all e2e/ files and replace with 'config.permissions' / '.permissions'.\n\nDo NOT rename state.pluginPermissions or any runtime state fields — only the config JSON key."
+    },
+    {
+      "id": "US-005",
+      "title": "Update mcp-server test files for 'permissions' config key in fixtures",
+      "description": "As a platform developer, I want all remaining mcp-server test fixtures that reference config.plugins updated to use config.permissions.",
+      "acceptanceCriteria": [
+        "All test files in platform/mcp-server/src/ that write config JSON with 'plugins' key updated to 'permissions'",
+        "This includes http-routes.test.ts line 450 assertion (not.toHaveProperty check)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Mechanical rename in test fixtures. The config.test.ts tests were already updated in US-001. This story handles the remaining test files that write config JSON to disk or mock config objects:\n- platform/mcp-server/src/http-routes.test.ts: line 450 has `expect(body).not.toHaveProperty('plugins')` — this may need updating to 'permissions' OR the assertion may be about the HTTP response not leaking config, in which case it stays. Read the test context to decide.\n\nNote: Test files that only set `state.pluginPermissions` (the runtime state field) do NOT need changes — only tests that write JSON config with the 'plugins' key need updating."
+    },
+    {
+      "id": "US-006",
+      "title": "Remove skipPermissions from OpentabsConfig and config.json",
+      "description": "As a platform maintainer, I want skipPermissions removed from the config file schema so that permission bypass can only be enabled via the ephemeral --dangerously-skip-permissions CLI flag or the OPENTABS_SKIP_PERMISSIONS=1 env var, preventing persistent security holes.",
+      "acceptanceCriteria": [
+        "OpentabsConfig interface no longer has skipPermissions field",
+        "parseConfigRecord no longer reads or returns skipPermissions (or skipConfirmation)",
+        "savePluginPermissions no longer preserves skipPermissions when saving config",
+        "loadConfig default config does not include skipPermissions",
+        "reload.ts computes skipPermissions from isCliSkipPermissions() only (no config.skipPermissions)",
+        "If a config.json contains 'skipPermissions: true', it is silently ignored (not an error)",
+        "All config.test.ts tests for skipPermissions/skipConfirmation parsing removed or updated",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Key changes:\n\n1. platform/mcp-server/src/config.ts:\n   - Remove 'skipPermissions?: boolean' from OpentabsConfig (line 48)\n   - Remove the skipPermissions/skipConfirmation parsing block (lines 228-234)\n   - Remove skipPermissions from the return statement (line 236)\n   - Remove 'skipPermissions: current.skipPermissions' from savePluginPermissions (line 330)\n\n2. platform/mcp-server/src/reload.ts:\n   - Line 224: Change from `isCliSkipPermissions() || config.skipPermissions === true` to just `isCliSkipPermissions()`\n   - Line 249: state.skipPermissions assignment stays (it's still set from CLI/env)\n\n3. platform/mcp-server/src/config.test.ts:\n   - Remove or update the 'preserves skipPermissions flag' test (around line 217)\n   - Remove or update the 'migrates legacy skipConfirmation to skipPermissions' test (around line 229)\n   - Update any test that checks config.skipPermissions in its assertions\n\n4. state.skipPermissions, isCliSkipPermissions(), and all runtime skip logic STAYS — only the config file path is removed.\n\n5. The config parser should silently ignore a 'skipPermissions' key if present in an existing config.json (just don't read it). No migration notice needed — it just becomes a no-op key."
+    },
+    {
+      "id": "US-007",
+      "title": "Remove legacy aliases: skipConfirmation, --dangerously-skip-confirmation, OPENTABS_SKIP_CONFIRMATION",
+      "description": "As a platform maintainer, I want all legacy permission-bypass aliases removed so there is exactly one CLI flag (--dangerously-skip-permissions) and one env var (OPENTABS_SKIP_PERMISSIONS) for skipping permissions.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/skip-permissions.ts no longer checks for --dangerously-skip-confirmation or OPENTABS_SKIP_CONFIRMATION",
+        "Comments in skip-permissions.ts updated to remove legacy alias references",
+        "No references to 'skipConfirmation' remain in platform/mcp-server/src/ (the config migration was already removed in US-006)",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Mechanical cleanup in platform/mcp-server/src/skip-permissions.ts (entire file, 24 lines):\n- Remove line 19: `process.argv.includes('--dangerously-skip-confirmation') ||`\n- Remove line 21: `process.env.OPENTABS_SKIP_CONFIRMATION === '1';`\n- Remove line 10: comment about legacy aliases\n- Update the JSDoc comment to only mention --dangerously-skip-permissions and OPENTABS_SKIP_PERMISSIONS\n\nAlso verify no other files in platform/mcp-server/src/ still reference skipConfirmation (the config.ts references were already removed in US-006)."
+    },
+    {
+      "id": "US-008",
+      "title": "Update documentation for config schema changes",
+      "description": "As a user reading the docs, I want the configuration reference to accurately describe the current config schema with 'permissions' key and no skipPermissions config option.",
+      "acceptanceCriteria": [
+        "docs/content/docs/reference/configuration.mdx shows 'permissions' as the config key for plugin permission map (not 'plugins')",
+        "The skipPermissions row in the config table is removed",
+        "The example config uses 'permissions' key",
+        "The 'skipPermissions' env var documentation still mentions OPENTABS_SKIP_PERMISSIONS and --dangerously-skip-permissions but NOT the config file option",
+        "Legacy alias mentions (skipConfirmation, --dangerously-skip-confirmation, OPENTABS_SKIP_CONFIRMATION) are removed from docs",
+        "CLAUDE.md updated: permission model description says 'permissions' map instead of 'plugins' map",
+        "npm run build passes",
+        "npm run type-check passes",
+        "npm run lint passes",
+        "npm run knip passes",
+        "npm run test passes"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Key files:\n\n1. docs/content/docs/reference/configuration.mdx:\n   - The config table (around line 46-62): rename 'plugins' row to 'permissions', remove 'skipPermissions' row, remove the old 'permissions' row (trustedDomains etc. — that's a dead legacy field)\n   - Example config (lines 68-97): change 'plugins' to 'permissions', remove skipPermissions\n   - The '### permissions' section (line 169-230): This section describes the OLD browser-tool-confirmation permissions object with trustedDomains etc. This entire section should be removed or replaced with documentation of the NEW permissions key (plugin permission map with {permission?, tools?})\n   - Line 241-243: Remove reference to skipPermissions in config, keep env var and CLI flag references\n   - Line 286-288: Update env var table — remove 'Equivalent to skipPermissions: true in config' wording, remove OPENTABS_SKIP_CONFIRMATION legacy alias mention\n   - Line 337: mentions the legacy 'permissions' field — remove\n\n2. CLAUDE.md (root):\n   - Line 93: Change 'under the `plugins` map' to 'under the `permissions` map'\n\n3. docs/content/docs/reference/cli.mdx:\n   - Line 73: Keep --dangerously-skip-permissions documentation, just remove any mention of config file equivalent\n\n4. platform/mcp-server/CLAUDE.md: Check if it mentions 'plugins' config key — update if so.\n\nNote: The docs site has its own build system. The acceptance criterion 'npm run build passes' here means the root monorepo build (since this PRD targets the root project). The docs build can be checked with 'cd docs && npm run build' but is not required for this PRD's qualityChecks."
+    }
+  ]
+}
