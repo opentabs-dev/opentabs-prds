@@ -1,0 +1,87 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two confirmed permission bugs (resetStaleReviewedVersions not clearing per-tool overrides, SearchResults missing browserPermission props) and add comprehensive E2E test coverage for browser tool permission flows, Restore approvals button, and config.json verification.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Clear per-tool overrides in resetStaleReviewedVersions on plugin version update",
+      "description": "resetStaleReviewedVersions resets permission to 'off' and clears reviewedVersion when a plugin updates, but does not clear the tools map. Per-tool overrides survive the version reset and take precedence in getConfiguredToolPermission, bypassing the re-review requirement.",
+      "acceptanceCriteria": [
+        "resetStaleReviewedVersions sets config.tools to undefined when resetting a stale reviewedVersion",
+        "After a plugin version update, getConfiguredToolPermission returns 'off' for all tools (no surviving per-tool overrides)",
+        "Unit test verifies per-tool overrides are cleared on version mismatch",
+        "Unit test verifies config.json reflects cleared tools after version reset"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/reload.ts (resetStaleReviewedVersions function)\n- platform/mcp-server/src/reload.test.ts (reviewedVersion reset describe block)\n\nContext:\n`resetStaleReviewedVersions` (reload.ts:198-223) iterates `state.pluginPermissions` and resets plugins whose `reviewedVersion` doesn't match the installed version. Currently it sets `config.permission = 'off'` and `config.reviewedVersion = undefined` but does NOT clear `config.tools`.\n\nThe bug: `getConfiguredToolPermission` (state.ts:383) resolves as `pluginConfig.tools?.[toolName] ?? pluginConfig.permission ?? 'off'`. If a tool has `tools: { send_message: 'auto' }` and the plugin updates, the per-tool override survives and the tool resolves to 'auto' despite the plugin being reset to 'off'.\n\nChanges:\nIn `resetStaleReviewedVersions` (reload.ts:212-213), add `delete config.tools;` (or `config.tools = undefined;`) after `config.reviewedVersion = undefined;`:\n```\nconfig.permission = 'off';\nconfig.reviewedVersion = undefined;\n// ADD THIS LINE:\ndelete config.tools;\n```\n\nNote: `config` is typed as `PluginPermissionConfig` which has `tools?: Record<string, ToolPermission>`. Using `delete config.tools` or assigning `undefined` both work — use `delete` to match the pattern used in handleConfigSetPluginPermission.\n\nFor tests, add to the 'reviewedVersion reset on plugin update' describe block in reload.test.ts:\n1. A test with `permissions: { 'my-plugin': { permission: 'auto', tools: { test_tool: 'auto' }, reviewedVersion: '0.9.0' } }` that verifies after reload both `permission` is 'off' and `tools` is undefined.\n2. A test verifying the persisted config.json also has no `tools` key after version reset.\n\nThe existing test 'version mismatch resets permission to off and clears reviewedVersion' (reload.test.ts:634) can serve as a template — it already uses `createPluginDir` and `writeFileSync` to set up the scenario.\n\nConstraints:\n- Do NOT change handleConfigSetPluginPermission — it already clears tools via destructuring (`const { tools: _cleared, ...rest } = pConfig`).\n- Do NOT change getConfiguredToolPermission or getToolPermission.\n- The 'browser' pseudo-plugin skip at line 202 must remain."
+    },
+    {
+      "id": "US-002",
+      "title": "Pass browserPermission and onBrowserPermissionChange to BrowserToolsCard in SearchResults",
+      "description": "SearchResults renders BrowserToolsCard without passing browserPermission or onBrowserPermissionChange. This causes the browser plugin-level select to show 'Off' during search regardless of actual state, and plugin-level permission changes are silently dropped because the callback is undefined.",
+      "acceptanceCriteria": [
+        "SearchResultsProps includes browserPermission and onBrowserPermissionChange fields",
+        "SearchResults forwards browserPermission and onBrowserPermissionChange to BrowserToolsCard",
+        "App.tsx passes browserPermission and setBrowserPermission to SearchResults",
+        "Browser plugin-level select in search results reflects the actual configured permission"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/SearchResults.tsx (add props, forward to BrowserToolsCard)\n- platform/browser-extension/src/side-panel/App.tsx (pass new props to SearchResults)\n\nContext:\nApp.tsx renders SearchResults at line 405 without browserPermission or setBrowserPermission. In the non-search path (line 428), BrowserToolsCard receives both props correctly. SearchResults.tsx renders BrowserToolsCard at line 91-97 without these props, causing BrowserToolsCard to default browserPermission to 'off' and onBrowserPermissionChange to undefined.\n\nChanges:\n1. In SearchResults.tsx, add to SearchResultsProps interface (after line 16):\n```\nbrowserPermission: ToolPermission;\nonBrowserPermissionChange: (permission: ToolPermission) => void;\n```\nImport ToolPermission: `import type { ToolPermission } from '@opentabs-dev/shared';`\n\n2. In the SearchResults component destructuring (line 40-58), add the new props.\n\n3. In the BrowserToolsCard JSX (lines 91-97), add:\n```\nbrowserPermission={browserPermission}\nonBrowserPermissionChange={onBrowserPermissionChange}\n```\n\n4. In App.tsx (lines 405-423), add to the SearchResults JSX:\n```\nbrowserPermission={browserPermission}\nonBrowserPermissionChange={setBrowserPermission}\n```\n\nConstraints:\n- Do NOT change BrowserToolsCard.tsx — it already handles these props correctly with defaults.\n- The ToolPermission type import in SearchResults.tsx must use the type-only form to avoid CSP issues (see CLAUDE.md 'Side Panel Import Constraints')."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: browser plugin-level permission change via side panel",
+      "description": "Add an E2E test that changes the browser card's plugin-level permission via the side panel PermissionSelect and verifies all individual tool descriptions update in MCP tools/list and config.json is persisted correctly.",
+      "acceptanceCriteria": [
+        "E2E test changes browser plugin-level permission from 'auto' to 'off' via the side panel",
+        "Test verifies all browser tools gain '[Disabled]' prefix in MCP tools/list",
+        "E2E test changes browser plugin-level permission back to 'auto'",
+        "Test verifies all browser tools lose '[Disabled]' prefix",
+        "Test verifies config.json reflects the permission change"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-plugin-toggle.e2e.ts (add new test)\n\nContext:\nThe existing 'plugin permission select changes the default for all tools' test (line 402) only covers the e2e-test plugin, NOT browser tools. Browser tools use a different card component (BrowserToolsCard) with a different handler path (setPluginPermission('browser', ...)).\n\nChanges:\nAdd a new test.describe block 'Side panel — browser tool plugin-level permission' with a test that:\n1. Creates a config with `browser: { permission: 'auto' }` and the e2e-test plugin with `permission: 'auto', reviewedVersion: pluginVersion`\n2. Starts MCP server with `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''`\n3. Opens side panel, verifies browser card visible\n4. Uses `selectPermission(sidePanelPage, 'Permission for browser plugin', 'Off')` to change browser to off\n5. Verifies via `mcpClient.listTools()` that browser tools have '[Disabled]' prefix\n6. Uses `readTestConfig(configDir)` to verify `config.permissions.browser.permission === 'off'`\n7. Changes back to 'auto' and verifies tools work again\n\nThe aria-label for the browser plugin-level select is 'Permission for browser plugin' (see BrowserToolsCard.tsx:168).\n\nUse the existing `selectPermission` helper from helpers.ts. Use the `BROWSER_TOOL_NAMES` constant from helpers.ts to check a subset of browser tools.\n\nTemplate: follow the pattern of the 'plugin permission select changes the default for all tools' test at line 402 — same fixture setup pattern with `fs.mkdtempSync`, `writeTestConfig`, `startMcpServer`, `launchExtensionContext`, `setupAdapterSymlink`.\n\nConstraints:\n- Use `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''` to disable skipPermissions so selects are interactive.\n- Do NOT test individual browser tool permission changes in this story — that's a separate story."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: individual browser tool permission change via side panel",
+      "description": "Add an E2E test that changes an individual browser tool's permission via the side panel and verifies the change is reflected in MCP tools/list and config.json.",
+      "acceptanceCriteria": [
+        "E2E test expands the browser card and changes one tool from 'auto' to 'off'",
+        "Test verifies the specific tool gains '[Disabled]' prefix in MCP tools/list while others remain enabled",
+        "Test verifies config.json has a per-tool override for the disabled tool",
+        "E2E test changes the tool back to 'auto' (matching plugin default) and verifies the per-tool override is removed from config.json (smart cleanup)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-plugin-toggle.e2e.ts (add new test)\n\nContext:\nNo E2E test exercises individual browser tool permission changes. BrowserToolsCard.tsx:91-103 handles this via `handleToolPermissionChange` which calls `setToolPermission('browser', toolName, permission)`. The server handler `handleConfigSetToolPermission` has smart cleanup that removes per-tool overrides matching the plugin default.\n\nChanges:\nAdd a test in a new describe block 'Side panel — individual browser tool permission change' that:\n1. Creates config with `browser: { permission: 'auto' }` and e2e-test plugin with `permission: 'auto', reviewedVersion: pluginVersion`\n2. Starts MCP server with `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''`\n3. Opens side panel, expands browser card by clicking accordion trigger\n4. Uses `selectPermission(sidePanelPage, 'Permission for browser_list_tabs tool', 'Off')` to disable one tool\n5. Verifies via `mcpClient.listTools()` that `browser_list_tabs` has '[Disabled]' prefix but other browser tools don't\n6. Reads `readTestConfig(configDir)` and verifies `config.permissions.browser.tools.browser_list_tabs === 'off'`\n7. Changes the tool back to 'auto' via selectPermission\n8. Verifies the per-tool override is removed from config (smart cleanup): `config.permissions.browser.tools` should be undefined or not contain `browser_list_tabs`\n\nThe aria-label for individual browser tools follows the pattern `Permission for <tool_name> tool` (see ToolRow.tsx:100).\n\nTo expand the browser card, click the accordion trigger: `sidePanelPage.locator('button[aria-expanded]').filter({ hasText: 'Browser' }).click()`\n\nConstraints:\n- Pick `browser_list_tabs` as the test tool — it's a simple read-only tool unlikely to cause side effects.\n- Browser tools card does NOT have an unreviewed dialog, so no special handling needed."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: Restore approvals button click persists across permission changes",
+      "description": "Add an E2E test that clicks the 'Restore approvals' button and verifies skipPermissions stays off even after subsequent permission changes trigger hot reloads.",
+      "acceptanceCriteria": [
+        "E2E test starts with skipPermissions enabled (banner visible)",
+        "Test clicks 'Restore approvals' and verifies the banner disappears",
+        "Test changes a plugin permission and verifies the banner does NOT reappear",
+        "Test verifies permission selects remain interactive after restoring approvals"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-plugin-toggle.e2e.ts (add new test, ideally in the existing 'skipPermissions mode and group headers' describe block)\n\nContext:\nThe existing skipPermissions test (line 531) verifies the banner appears and selects are interactive, but does NOT test the 'Restore approvals' button. The button calls `bridgeSetSkipPermissions(false)` (App.tsx:361). A prior bug caused the banner to reappear after permission changes because `performReload` re-read the env var — this was fixed (reload.ts now preserves `state.skipPermissions`), but no E2E test guards against regression.\n\nChanges:\nAdd a new test in the 'skipPermissions mode and group headers' describe block (or a sibling describe) that:\n1. Creates config with e2e-test plugin at 'auto' (reviewed) and browser at 'auto'\n2. Starts MCP server WITH `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: '1'` (skipPermissions enabled)\n3. Opens side panel, verifies the 'Approvals skipped' banner is visible\n4. Clicks 'Restore approvals' button: `sidePanelPage.getByRole('button', { name: 'Restore approvals' }).click()`\n5. Verifies the banner disappears: `await expect(sidePanelPage.getByText('Approvals skipped')).toBeHidden({ timeout: 5_000 })`\n6. Changes browser permission to 'off' via selectPermission\n7. Waits briefly (1-2 seconds) for any plugins.changed to propagate\n8. Verifies the banner is still hidden (skipPermissions wasn't re-enabled)\n9. Optionally: changes the permission back and verifies selects still work\n\nConstraints:\n- The banner text is 'Approvals skipped' (App.tsx:351).\n- The button text is 'Restore approvals' (App.tsx:359-362).\n- This test MUST use `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: '1'` (not '') to enable the banner.\n- After restoring, permission changes trigger hot reload in dev mode. The test must verify skipPermissions survives this reload.\n- Mark this as e2eCheckpoint: true since it's the final story that touches browser behavior."
+    }
+  ]
+}
