@@ -801,9 +801,10 @@ _run_worker_docker() {
   if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
     DOCKER_COMMON+=(-v "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK" -e "SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
   fi
-  # Mount SSH known_hosts so git doesn't prompt for host verification
+  # Mount SSH known_hosts into staging (not directly into /tmp/worker, which
+  # would create that directory as root and break the ubuntu user's writes).
   if [ -f "$HOME/.ssh/known_hosts" ]; then
-    DOCKER_COMMON+=(-v "$HOME/.ssh/known_hosts:/tmp/worker/.ssh/known_hosts:ro")
+    DOCKER_COMMON+=(-v "$HOME/.ssh/known_hosts:/tmp/staging/known_hosts:ro")
   fi
 
   if [ -f "$HOME/.npmrc" ]; then
@@ -814,9 +815,10 @@ _run_worker_docker() {
   fi
 
   local CONTAINER_INIT
-  CONTAINER_INIT="mkdir -p /tmp/worker/.claude"
+  CONTAINER_INIT="mkdir -p /tmp/worker/.claude /tmp/worker/.ssh"
   CONTAINER_INIT="$CONTAINER_INIT && cp /tmp/staging/.npmrc /tmp/worker/.npmrc 2>/dev/null"
   CONTAINER_INIT="$CONTAINER_INIT; cp /tmp/staging/claude-settings.json /tmp/worker/.claude/settings.json 2>/dev/null"
+  CONTAINER_INIT="$CONTAINER_INIT; cp /tmp/staging/known_hosts /tmp/worker/.ssh/known_hosts 2>/dev/null"
   CONTAINER_INIT="$CONTAINER_INIT; true"
 
   # Setup: install + build
