@@ -796,13 +796,26 @@ _run_worker_docker() {
   DOCKER_COMMON+=(-v "$CODE_DIR/.git:$CODE_DIR/.git")
   DOCKER_COMMON+=(--network host)
 
-  # Mount SSH agent socket so the worker can push to remote from inside Docker.
-  # Without this, git push fails silently (no SSH credentials available).
+  # Mount SSH credentials into staging so they can be copied into /tmp/worker/.ssh/
+  # during CONTAINER_INIT (avoids Docker creating /tmp/worker as root).
+  # Prefer agent forwarding if available; fall back to mounting config + key directly.
   if [ -n "${SSH_AUTH_SOCK:-}" ] && [ -S "$SSH_AUTH_SOCK" ]; then
     DOCKER_COMMON+=(-v "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK" -e "SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
   fi
-  # Mount SSH known_hosts into staging (not directly into /tmp/worker, which
-  # would create that directory as root and break the ubuntu user's writes).
+  if [ -f "$HOME/.ssh/config" ]; then
+    DOCKER_COMMON+=(-v "$HOME/.ssh/config:/tmp/staging/ssh_config:ro")
+  fi
+  # Mount all private keys referenced in ssh config (IdentityFile lines)
+  if [ -f "$HOME/.ssh/config" ]; then
+    while IFS= read -r keyfile; do
+      keyfile="${keyfile/#\~/$HOME}"
+      if [ -f "$keyfile" ]; then
+        local keyname
+        keyname=$(basename "$keyfile")
+        DOCKER_COMMON+=(-v "$keyfile:/tmp/staging/ssh_key_$keyname:ro")
+      fi
+    done < <(grep -i '^\s*IdentityFile' "$HOME/.ssh/config" | awk '{print $2}')
+  fi
   if [ -f "$HOME/.ssh/known_hosts" ]; then
     DOCKER_COMMON+=(-v "$HOME/.ssh/known_hosts:/tmp/staging/known_hosts:ro")
   fi
@@ -819,6 +832,10 @@ _run_worker_docker() {
   CONTAINER_INIT="$CONTAINER_INIT && cp /tmp/staging/.npmrc /tmp/worker/.npmrc 2>/dev/null"
   CONTAINER_INIT="$CONTAINER_INIT; cp /tmp/staging/claude-settings.json /tmp/worker/.claude/settings.json 2>/dev/null"
   CONTAINER_INIT="$CONTAINER_INIT; cp /tmp/staging/known_hosts /tmp/worker/.ssh/known_hosts 2>/dev/null"
+  CONTAINER_INIT="$CONTAINER_INIT; cp /tmp/staging/ssh_config /tmp/worker/.ssh/config 2>/dev/null"
+  # Copy SSH private keys and fix permissions (SSH requires 600)
+  CONTAINER_INIT="$CONTAINER_INIT; for f in /tmp/staging/ssh_key_*; do [ -f \"\$f\" ] && cp \"\$f\" /tmp/worker/.ssh/\$(basename \"\$f\" | sed 's/^ssh_key_//') && chmod 600 /tmp/worker/.ssh/\$(basename \"\$f\" | sed 's/^ssh_key_//'); done"
+  CONTAINER_INIT="$CONTAINER_INIT; chmod 700 /tmp/worker/.ssh 2>/dev/null"
   CONTAINER_INIT="$CONTAINER_INIT; true"
 
   # Setup: install + build
