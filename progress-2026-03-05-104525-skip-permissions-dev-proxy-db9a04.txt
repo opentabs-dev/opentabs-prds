@@ -1,0 +1,40 @@
+# Ralph Progress Log
+PRD: prd-2026-03-05-104525-skip-permissions-dev-proxy-db9a04~running.json
+Started: Thu Mar  5 18:45:53 UTC 2026
+---
+
+## Codebase Patterns
+- The worker communicates with the dev proxy via IPC using `process.send({ type: string, ... })` and the proxy listens via `child.on('message', ...)`.
+- The guard pattern for IPC sends is `process.env.OPENTABS_PROXY === '1' && process.send`.
+- `handleConfigSetSkipPermissions` in extension-handlers.ts is the only place where `state.skipPermissions` changes at runtime.
+- The existing IPC pattern in index.ts sends `{ type: 'ready', port }` — new message types follow the same structure.
+
+## 2026-03-05 - US-001
+- Added IPC notification from worker to dev proxy when skipPermissions changes at runtime
+- Files changed: platform/mcp-server/src/extension-handlers.ts
+- **Learnings for future iterations:**
+  - The IPC send uses try/catch for fire-and-forget semantics — process.send can throw if the channel is closed
+  - The IPC message is placed after state mutation but before sendToExtension calls, matching the logical flow
+  - The guard `process.env.OPENTABS_PROXY === '1' && process.send` ensures the IPC is only attempted when running behind the dev proxy
+---
+
+## 2026-03-05 - US-002
+- Dev proxy now tracks skipPermissions state changes from the worker via IPC and passes the override to new workers via env var
+- Files changed: platform/mcp-server/src/dev-proxy.ts
+- **Learnings for future iterations:**
+  - The `skipPermissionsOverride` variable is module-scoped (not inside `startWorker`) so it persists across worker restarts
+  - When override is `null` (never set), the env var passes through from `process.env` preserving existing behavior
+  - When override is `false`, `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS` is set to `''` (empty string, falsy in the worker's truthy check)
+  - The IPC message handler was added as an `else if` branch in the existing `child.on('message')` callback — refactored from nested-if to early-return + type extraction for clarity
+  - The SIGUSR1 and file-watcher handlers did not need changes — they already call `startWorker()` which picks up the env override
+---
+
+## 2026-03-05 - US-003
+- Added E2E test verifying skipPermissions restored state survives dev proxy hot reload (worker restart)
+- Files changed: e2e/side-panel-plugin-toggle.e2e.ts
+- **Learnings for future iterations:**
+  - The hot reload pattern is: `server.logs.length = 0` → `server.triggerHotReload()` → `waitForLog(server, 'Hot reload complete', 20_000)` → `waitForExtensionConnected(server, 30_000)` → `waitForLog(server, 'Sent sync.full to extension', 15_000)`
+  - Clearing `server.logs.length = 0` before hot reload avoids matching stale log entries from previous lifecycle phases
+  - The e2e-test plugin was configured with `permission: 'ask'` to meaningfully verify that ask tools are NOT auto-promoted (description does NOT start with `[Auto]`) after skipPermissions is restored
+  - The `browser_execute_script › handles async code (Promises)` test is known to be flaky under full parallel suite load — passes consistently in isolation
+---
