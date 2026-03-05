@@ -14,7 +14,7 @@
         "Request with Host: [::1]:PORT succeeds"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/security.e2e.ts (new file)\n\nContext:\nhttp-routes.ts lines 536-543 validates the Host header:\n```typescript\nif (!hostHeader || !isLocalhostHost(hostHeader)) {\n  return new Response('Forbidden: invalid Host header', { status: 403 });\n}\n```\n\n`isLocalhostHost` (line 121) checks against LOCALHOST_HOSTS set: `localhost`, `127.0.0.1`, `[::1]`, `[::ffff:127.0.0.1]` — with or without port suffix.\n\nUnit tests exist at http-routes.test.ts line 834 but use mocked requests. This E2E test sends real HTTP requests.\n\nTest approach — use `fetch` with custom Host header:\n```typescript\n// 403 for evil host\nconst res1 = await fetch(`http://127.0.0.1:${server.port}/health`, {\n  headers: { Host: 'evil.com' },\n});\nexpect(res1.status).toBe(403);\nexpect(await res1.text()).toContain('invalid Host header');\n\n// 200/401 for localhost\nconst res2 = await fetch(`http://127.0.0.1:${server.port}/health`, {\n  headers: { Host: `localhost:${server.port}` },\n});\nexpect([200, 401]).toContain(res2.status); // depends on auth\n```\n\nNote: Node.js `fetch` allows overriding the Host header. Some HTTP clients strip it — verify that the test framework supports this.\n\nConstraints:\n- Use the standard mcpServer fixture.\n- Test at least 3 evil hosts and 3 valid localhost hosts.\n- The /health endpoint without auth returns 200 with minimal response — use it for the valid host tests."
@@ -30,7 +30,7 @@
         "Request with no Origin header succeeds (MCP clients are not browsers)"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/security.e2e.ts (same file as US-001)\n\nContext:\nhttp-routes.ts lines 546-562:\n```typescript\n// --- CORS protection ---\nconst origin = req.headers.get('Origin');\nif (origin) {\n  // Chrome extension requests carry an Origin of `chrome-extension://...`\n  if (!origin.startsWith('chrome-extension://')) {\n    return new Response('Forbidden: browser cross-origin request', { status: 403 });\n  }\n  // Set CORS headers for valid extension requests\n  headers['Access-Control-Allow-Origin'] = origin;\n  headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS';\n  headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization';\n}\n```\n\nTest approach:\n```typescript\n// 403 for browser origin\nconst res1 = await fetch(`http://localhost:${server.port}/health`, {\n  headers: { Origin: 'https://evil.com' },\n});\nexpect(res1.status).toBe(403);\nexpect(await res1.text()).toContain('cross-origin');\n\n// OK for chrome-extension origin\nconst res2 = await fetch(`http://localhost:${server.port}/health`, {\n  headers: { Origin: 'chrome-extension://abcdefghijk' },\n});\nexpect(res2.status).toBe(200);\n\n// OK for no origin (MCP client)\nconst res3 = await fetch(`http://localhost:${server.port}/health`);\nexpect(res3.status).toBe(200);\n```"
@@ -46,7 +46,7 @@
         "Concurrent calls to different plugins do not interfere with each other"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/security.e2e.ts (same file)\n\nContext:\nmcp-tool-dispatch.ts line 34: `const MAX_CONCURRENT_DISPATCHES_PER_PLUGIN = 5;`\nLine 363-368:\n```typescript\nif (currentDispatches >= MAX_CONCURRENT_DISPATCHES_PER_PLUGIN) {\n  return { content: [{ type: 'text', text: `Too many concurrent dispatches for plugin \"${pluginName}\" (limit: ${MAX_CONCURRENT_DISPATCHES_PER_PLUGIN}). Wait for in-flight requests to complete.` }], isError: true };\n}\n```\n\nThe concurrency is per-plugin, tracked in `state.pluginDispatchCounts`.\n\nTest approach: Use the e2e-test plugin's `slow_with_progress` tool which takes time to complete. Fire 6 concurrent calls:\n```typescript\nconst calls = Array.from({ length: 6 }, () =>\n  mcpClient.callTool('e2e_test_slow_with_progress', { durationMs: 5000 }, { timeout: 30_000 })\n);\nconst results = await Promise.all(calls);\n\n// 5 should succeed, 1 should fail with concurrency error\nconst successes = results.filter(r => !r.isError);\nconst failures = results.filter(r => r.isError);\nexpect(successes.length).toBe(5);\nexpect(failures.length).toBe(1);\nexpect(failures[0].content).toContain('Too many concurrent dispatches');\n```\n\nNote: The e2e-test plugin needs a matching tab that is ready (adapter injected). Use the standard test server setup.\n\nAlternatively, use browser tools with 'auto' permission — `browser_list_tabs` is fast so 5 might complete before the 6th arrives. Use a slow browser tool or add a brief delay. Actually, the race is tricky. A more reliable approach: use `browser_execute_script` with a script that sleeps, keeping all 5 dispatches alive while sending the 6th.\n\nOr simpler: use the e2e-test plugin's `slow_with_progress` tool with `{ durationMs: 10000 }` — each call holds a dispatch slot for 10 seconds, plenty of time to fire the 6th.\n\nConstraints:\n- This test needs the e2e-test plugin with a ready tab.\n- Use test.slow() since multiple concurrent long-running dispatches are involved.\n- The `slow_with_progress` tool needs the e2e-test adapter injected into a matching tab."
@@ -63,7 +63,7 @@
         "After reconnecting, the system recovers and new calls work"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/security.e2e.ts (same file)\n\nContext:\nextension-handlers.ts `rejectAllPendingConfirmations` (line ~339 per unit test reference) is called when the extension WebSocket disconnects. It rejects all pending confirmation promises, which causes the MCP tool call to return an error.\n\nhttp-routes.ts line 636-638 (approximate — on extension disconnect, calls `rejectAllPendingConfirmations`).\n\nTest approach:\n1. Set browser permission to 'ask'\n2. Open side panel, wait for connected\n3. Call `browser_list_tabs` — confirmation dialog appears\n4. Instead of clicking Allow/Deny, close the extension context (or navigate away from the extension page)\n5. Verify the MCP client receives an error quickly\n\nClosing the extension context should disconnect the WebSocket. Use:\n```typescript\nconst [result] = await Promise.all([\n  mcpClient.callTool('browser_list_tabs', {}, { timeout: 35_000 }),\n  (async () => {\n    // Wait for confirmation to arrive (badge shows '1')\n    const sw = await getBackgroundWorker(extensionContext);\n    await waitFor(async () => (await getBadgeText(sw)) === '1', 15_000, 200, 'badge === 1');\n\n    // Disconnect the extension by closing the context\n    await extensionContext.close();\n  })(),\n]);\n\nexpect(result.isError).toBe(true);\n// Error should mention extension disconnect, not timeout\n```\n\nNote: After closing the context, the server should detect the WebSocket close and reject pending confirmations. The MCP client should get the error much faster than the 30s dispatch timeout.\n\nConstraints:\n- This test destroys the extension context, so it should be the last test or use its own isolated setup.\n- Cannot verify recovery in the same test since the context is gone — that can be a separate test."
@@ -78,7 +78,7 @@
         "Response includes Retry-After header"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/security.e2e.ts (same file)\n\nContext:\nThe rate limiting is implemented in http-routes.ts. The exact limit may vary — check the code for the specific limit constant.\n\nTest approach:\n```typescript\nconst url = `http://localhost:${server.port}/reload`;\nconst headers = { Authorization: `Bearer ${server.secret}` };\n\n// Fire requests rapidly\nconst responses = [];\nfor (let i = 0; i < 12; i++) {\n  const res = await fetch(url, { method: 'POST', headers });\n  responses.push(res.status);\n}\n\n// First N should succeed, then 429\nconst successes = responses.filter(s => s === 200);\nconst rateLimited = responses.filter(s => s === 429);\nexpect(successes.length).toBeGreaterThanOrEqual(5);\nexpect(rateLimited.length).toBeGreaterThan(0);\n```\n\nNote: The exact rate limit threshold needs to be read from the source code. The test should be parameterized based on the actual limit.\n\nConstraints:\n- Requests must be sequential (not concurrent) to reliably hit the limit.\n- The rate limit window is 60s — this test should complete well within that."
@@ -95,7 +95,7 @@
         "GET /health with invalid Bearer returns 401"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/security.e2e.ts (same file)\n\nContext:\nhttp-routes.ts serves /health for both authenticated and unauthenticated requests. Unauthenticated gets minimal response, authenticated gets full details.\n\nTest approach:\n```typescript\n// Unauthenticated — minimal\nconst res1 = await fetch(`http://localhost:${server.port}/health`);\nexpect(res1.status).toBe(200);\nconst body1 = await res1.json();\nexpect(body1.status).toBe('ok');\nexpect(body1.plugins).toBeUndefined();\nexpect(body1.pluginDetails).toBeUndefined();\nexpect(res1.headers.get('X-Server-Version')).toBeTruthy();\n\n// Authenticated — full\nconst res2 = await fetch(`http://localhost:${server.port}/health`, {\n  headers: { Authorization: `Bearer ${server.secret}` },\n});\nexpect(res2.status).toBe(200);\nconst body2 = await res2.json();\nexpect(typeof body2.plugins).toBe('number');\nexpect(Array.isArray(body2.pluginDetails)).toBe(true);\n\n// Invalid auth — 401\nconst res3 = await fetch(`http://localhost:${server.port}/health`, {\n  headers: { Authorization: 'Bearer wrong-secret' },\n});\nexpect(res3.status).toBe(401);\n```"
@@ -111,7 +111,7 @@
         "Enabling network capture on a new tab succeeds (not blocked by stale state)"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/security.e2e.ts (same file)\n\nContext:\nNetwork capture uses Chrome's debugger API. When a tab closes, the debugger session is automatically detached by Chrome. The extension needs to clean up its internal `activeCaptures` map.\n\n`extension-commands.ts` line 77-93 includes `networkCaptures` in the state response from `extension_get_state`.\n\nTest approach:\n1. Open a tab\n2. Call `browser_enable_network_capture` with the tab's ID\n3. Verify capture is active (call `extension_get_state` or `browser_get_network_requests`)\n4. Close the tab\n5. Call `extension_get_state` — verify no active captures for that tab ID\n6. Open a new tab, enable capture — should succeed\n\nConstraints:\n- Need 'auto' permission for browser tools.\n- The tab ID must be discovered via `browser_list_tabs` or known from the open step."
@@ -126,7 +126,7 @@
         "No changes are lost or overwritten by concurrent writes"
       ],
       "priority": 8,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "Files:\n- e2e/security.e2e.ts (same file)\n\nContext:\nstate.ts `configWriteMutex` serializes config writes. Without it, concurrent `setToolPermission` calls could read-modify-write the config.json file simultaneously, causing lost updates.\n\nTest approach: Use the WebSocket JSON-RPC protocol to send 5 concurrent `config.setToolPermission` calls:\n```typescript\nconst { sendRequest, close } = await connectWs(server.port, server.secret);\n\n// 5 concurrent permission changes for different browser tools\nconst results = await Promise.all([\n  sendRequest('config.setToolPermission', { plugin: 'browser', tool: 'browser_list_tabs', permission: 'auto' }),\n  sendRequest('config.setToolPermission', { plugin: 'browser', tool: 'browser_open_tab', permission: 'ask' }),\n  sendRequest('config.setToolPermission', { plugin: 'browser', tool: 'browser_close_tab', permission: 'off' }),\n  sendRequest('config.setToolPermission', { plugin: 'browser', tool: 'browser_screenshot_tab', permission: 'auto' }),\n  sendRequest('config.setToolPermission', { plugin: 'browser', tool: 'browser_click_element', permission: 'ask' }),\n]);\n\n// All should succeed\nfor (const r of results) {\n  expect(r.error).toBeUndefined();\n}\n\n// Verify config.json has all 5 changes\nconst config = readTestConfig(configDir);\nexpect(config.permissions.browser.tools.browser_list_tabs).toBe('auto');\nexpect(config.permissions.browser.tools.browser_open_tab).toBe('ask');\nexpect(config.permissions.browser.tools.browser_close_tab).toBe('off');\nexpect(config.permissions.browser.tools.browser_screenshot_tab).toBe('auto');\nexpect(config.permissions.browser.tools.browser_click_element).toBe('ask');\n```\n\nNote: This uses the same WebSocket JSON-RPC pattern from plugin-management.e2e.ts.\n\nConstraints:\n- Need to read config.json after all writes complete to verify correctness.\n- The config.setToolPermission method is the extension protocol method, not an MCP method. Use the connectWs helper from plugin-management.e2e.ts."
