@@ -1,0 +1,125 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add comprehensive E2E tests for the permission confirmation dialog system covering all untested critical and high-severity scenarios: multiple pending confirmations with prev/next navigation, dialog persistence across side panel close/reopen, escape/outside-click blocking, parameters display, plugin tool confirmation (not just browser tools), Always Allow switch reset behavior, and badge count for multiple confirmations.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "E2E test: multiple pending confirmations with prev/next navigation",
+      "description": "Test that when multiple 'ask' tools are called concurrently, the dialog shows 'X of Y' counter, prev/next buttons work correctly, and approving/denying individual items updates the counter and resolves only that specific tool call.",
+      "acceptanceCriteria": [
+        "Two concurrent tool calls with 'ask' permission trigger a dialog showing '1 of 2'",
+        "Clicking 'next' navigates to the second confirmation ('2 of 2')",
+        "Clicking 'prev' navigates back to the first confirmation ('1 of 2')",
+        "'prev' button is disabled when at index 0",
+        "'next' button is disabled when at the last index",
+        "Clicking 'Allow' on one confirmation resolves that specific tool call and updates the counter",
+        "After approving the first, the dialog shows the remaining confirmation without 'X of Y' (count=1)",
+        "Approving the second confirmation resolves the remaining tool call and closes the dialog",
+        "Badge shows '2' during both pending, then '1', then clears"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/permissions.e2e.ts (add new test)\n\nContext:\nThe ConfirmationDialog component (ConfirmationDialog.tsx) manages multiple confirmations via:\n- `confirmations` array prop (line 14)\n- `currentIndex` state (line 27) — tracks which confirmation is displayed\n- `resolveDisplayIndex` (line 24) — clamps index when items are removed\n- Lines 55-58: counter display `{safeIndex + 1} of {count}` when `count > 1`\n- Lines 91-107: prev/next buttons, disabled at bounds\n\nNone of this multi-confirmation UI is exercised in E2E tests. Only the `resolveDisplayIndex` pure function has 5 trivial unit tests.\n\nThe existing test pattern for 'ask' tools uses `Promise.all` to send the MCP call and interact with the dialog concurrently. For multiple concurrent calls, send two calls in parallel:\n```typescript\nconst [result1, result2] = await Promise.all([\n  mcpClient.callTool('browser_list_tabs', {}, { timeout: 35_000 }),\n  mcpClient.callTool('browser_screenshot_tab', { tabId: 0 }, { timeout: 35_000 }),\n  (async () => {\n    // Wait for the dialog to show '1 of 2'\n    await waitForConfirmationDialog(sidePanel);\n    const dialog = sidePanel.locator('[role=\"dialog\"]');\n    await expect(dialog.getByText('1 of 2')).toBeVisible();\n\n    // Verify prev disabled, next enabled\n    const prevBtn = dialog.getByRole('button', { name: 'prev' });\n    const nextBtn = dialog.getByRole('button', { name: 'next' });\n    await expect(prevBtn).toBeDisabled();\n    await expect(nextBtn).toBeEnabled();\n\n    // Navigate to second\n    await nextBtn.click();\n    await expect(dialog.getByText('2 of 2')).toBeVisible();\n    await expect(prevBtn).toBeEnabled();\n    await expect(nextBtn).toBeDisabled();\n\n    // Navigate back\n    await prevBtn.click();\n    await expect(dialog.getByText('1 of 2')).toBeVisible();\n\n    // Allow the first tool\n    await sidePanel.getByRole('button', { name: 'Allow' }).click();\n\n    // Now only 1 confirmation remains — no 'X of Y' shown\n    await expect(dialog.getByText('of')).toBeHidden({ timeout: 5_000 });\n\n    // Allow the second\n    await sidePanel.getByRole('button', { name: 'Allow' }).click();\n  })(),\n]);\n```\n\nNote: `browser_screenshot_tab` also needs 'ask' permission. Set browser plugin-level to 'ask' so all browser tools inherit it. Both tools need to be valid calls — `browser_list_tabs` is the easiest (no params), and for a second tool use `browser_list_tabs` again (the server creates separate confirmation IDs for each call). Actually, two calls to the same tool work fine — each gets its own UUID.\n\nThe prev/next buttons are plain `<button>` elements (not retro Button components) with text 'prev' and 'next' (lines 93-105). Use `getByRole('button', { name: 'prev' })` and `getByRole('button', { name: 'next' })`.\n\nConstraints:\n- Add the test inside a new `test.describe('Confirmation dialog — multiple pending')` block in permissions.e2e.ts.\n- Use the existing fixture pattern (mcpServer, extensionContext, mcpClient).\n- Set browser permission to 'ask' via config.\n- Use two concurrent `mcpClient.callTool('browser_list_tabs', ...)` calls."
+    },
+    {
+      "id": "US-002",
+      "title": "E2E test: confirmation dialog survives side panel close and reopen",
+      "description": "Test that closing the side panel while a confirmation dialog is showing, then reopening the side panel, correctly re-hydrates the pending confirmation from the background script.",
+      "acceptanceCriteria": [
+        "Tool call with 'ask' permission triggers the dialog",
+        "Side panel is closed (page.close())",
+        "Side panel is reopened (openSidePanel)",
+        "The confirmation dialog reappears with the correct tool info",
+        "Clicking Allow in the reopened dialog resolves the original tool call",
+        "The MCP client receives the tool result successfully"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/permissions.e2e.ts (add new test)\n\nContext:\nThe existing 'late side panel open' test at line 555 covers the case where the panel is opened AFTER the confirmation arrives. The untested case is: panel is OPEN, dialog is SHOWING, panel is CLOSED, then REOPENED.\n\nWhen the side panel closes, the React tree unmounts and all component state is destroyed. When it reopens, App.tsx calls `getFullState()` (line 233 of App.tsx) which sends `bg:getFullState` to the background. The background handler in `background-message-handlers.ts` returns `pendingConfirmations` from `getPendingConfirmations()` (confirmation-badge.ts). The side panel hydrates the confirmations from this response.\n\nThe flow:\n1. MCP client calls tool with 'ask' → server sends `confirmation.request` → extension stores in `pendingConfirmations` map → side panel receives via notification and shows dialog\n2. Close side panel → React unmounts → dialog state gone\n3. Reopen side panel → `getFullState()` → background returns `pendingConfirmations` array → App.tsx sets `pendingConfirmations` state → ConfirmationDialog renders\n4. User clicks Allow → response sent → tool completes\n\n```typescript\ntest('dialog reappears after side panel close and reopen', async ({\n  mcpServer, extensionContext, mcpClient,\n}) => {\n  // Setup: browser permission to 'ask'\n  const config = readTestConfig(mcpServer.configDir);\n  config.permissions = { browser: { permission: 'ask' } };\n  writeTestConfig(mcpServer.configDir, config);\n  mcpServer.logs.length = 0;\n  mcpServer.triggerHotReload();\n  await waitForLog(mcpServer, 'Hot reload complete', 20_000);\n  await waitForExtensionConnected(mcpServer);\n  await waitForLog(mcpServer, 'tab.syncAll received');\n\n  let sidePanel = await openSidePanel(extensionContext);\n\n  const [result] = await Promise.all([\n    mcpClient.callTool('browser_list_tabs', {}, { timeout: 60_000 }),\n    (async () => {\n      // Wait for dialog to appear\n      await waitForConfirmationDialog(sidePanel);\n      const dialog = sidePanel.locator('[role=\"dialog\"]');\n      await expect(dialog.getByText('browser_list_tabs')).toBeVisible();\n\n      // Close the side panel\n      await sidePanel.close();\n      await new Promise(r => setTimeout(r, 500));\n\n      // Reopen the side panel\n      sidePanel = await openSidePanel(extensionContext);\n\n      // Dialog should reappear from hydrated state\n      await waitForConfirmationDialog(sidePanel, 20_000);\n      const dialog2 = sidePanel.locator('[role=\"dialog\"]');\n      await expect(dialog2.getByText('browser_list_tabs')).toBeVisible();\n      await expect(dialog2.getByText('Approve Tool')).toBeVisible();\n\n      // Allow and verify tool completes\n      await sidePanel.getByRole('button', { name: 'Allow' }).click();\n    })(),\n  ]);\n\n  expect(result.isError).toBe(false);\n});\n```\n\nConstraints:\n- Use a longer tool call timeout (60s) since the close/reopen adds latency.\n- Add in a new `test.describe('Confirmation dialog — close/reopen persistence')` block."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: escape key and outside click do not dismiss the confirmation dialog",
+      "description": "Test that pressing Escape or clicking outside the confirmation dialog does NOT dismiss it, verifying the preventDefault handlers on onEscapeKeyDown and onInteractOutside.",
+      "acceptanceCriteria": [
+        "Pressing Escape while the dialog is open does NOT close it",
+        "The dialog remains visible after Escape",
+        "The tool call is still pending (not denied) after Escape",
+        "Clicking outside the dialog does NOT close it",
+        "The dialog must still be manually Allow-ed or Deny-ed"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/permissions.e2e.ts (add new test)\n\nContext:\nConfirmationDialog.tsx line 52:\n```tsx\n<Dialog.Content onInteractOutside={e => e.preventDefault()} onEscapeKeyDown={e => e.preventDefault()}>\n```\n\nIf these handlers break (e.g., Radix Dialog update changes behavior), Escape would dismiss the dialog. Radix Dialog's `onOpenChange(false)` handler at line 50 calls `handleDeny()`, which would send a Deny response — silently denying the tool call without the user's explicit consent.\n\n```typescript\ntest('Escape key and outside click do not dismiss the dialog', async ({\n  mcpServer, extensionContext, mcpClient,\n}) => {\n  // Setup: browser permission to 'ask'\n  // ... standard setup ...\n\n  const sidePanel = await openSidePanel(extensionContext);\n\n  const [result] = await Promise.all([\n    mcpClient.callTool('browser_list_tabs', {}, { timeout: 35_000 }),\n    (async () => {\n      await waitForConfirmationDialog(sidePanel);\n\n      // Press Escape — dialog should stay open\n      await sidePanel.keyboard.press('Escape');\n      await expect(sidePanel.locator('[role=\"dialog\"]')).toBeVisible({ timeout: 2_000 });\n\n      // Click outside the dialog — click on the main content area behind the overlay\n      // The dialog overlay covers the full viewport, so click at (0, 0) which is outside the dialog content\n      await sidePanel.mouse.click(5, 5);\n      await expect(sidePanel.locator('[role=\"dialog\"]')).toBeVisible({ timeout: 2_000 });\n\n      // Dialog is still open — Allow it to complete the test\n      await sidePanel.getByRole('button', { name: 'Allow' }).click();\n    })(),\n  ]);\n\n  expect(result.isError).toBe(false);\n});\n```\n\nConstraints:\n- Add in the existing or a new `test.describe('Confirmation dialog — dismiss resistance')` block.\n- The click outside test needs to target a point outside the dialog content but still inside the viewport. `(5, 5)` should work — it's above/left of the centered dialog."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: confirmation dialog shows parameters and they are expandable",
+      "description": "Test that when a tool is called with parameters, the confirmation dialog shows an expandable 'Parameters' details element containing the correct JSON-formatted params.",
+      "acceptanceCriteria": [
+        "Tool call with parameters triggers dialog showing 'Parameters' summary",
+        "Clicking the 'Parameters' summary expands the details element",
+        "The expanded content shows the correct JSON-formatted params",
+        "Tool calls without parameters do NOT show the Parameters section"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/permissions.e2e.ts (add new test)\n\nContext:\nConfirmationDialog.tsx lines 72-79:\n```tsx\n{current.params && Object.keys(current.params).length > 0 && (\n  <details className=\"mt-2\">\n    <summary className=\"cursor-pointer text-xs\">Parameters</summary>\n    <pre className=\"mt-1 max-h-40 overflow-auto rounded border border-border bg-card px-2 py-1 font-mono text-xs leading-tight\">\n      {JSON.stringify(current.params, null, 2)}\n    </pre>\n  </details>\n)}\n```\n\nThe params display only appears when `Object.keys(current.params).length > 0`.\n\nFor a tool WITH params, use `browser_open_tab` which requires `{ url: string }`. Set it to 'ask' permission.\nFor a tool WITHOUT params, use `browser_list_tabs` which has no required params.\n\n```typescript\ntest('dialog shows expandable parameters for tools with params', async ({\n  mcpServer, extensionContext, mcpClient,\n}) => {\n  // Setup: browser permission to 'ask'\n  // ... standard setup ...\n  const sidePanel = await openSidePanel(extensionContext);\n\n  const [result] = await Promise.all([\n    mcpClient.callTool('browser_open_tab', { url: 'https://example.com' }, { timeout: 35_000 }),\n    (async () => {\n      await waitForConfirmationDialog(sidePanel);\n      const dialog = sidePanel.locator('[role=\"dialog\"]');\n\n      // Parameters summary should be visible\n      const summary = dialog.getByText('Parameters');\n      await expect(summary).toBeVisible();\n\n      // Click to expand\n      await summary.click();\n\n      // Pre should show the JSON params\n      const pre = dialog.locator('pre');\n      await expect(pre).toBeVisible();\n      const text = await pre.textContent();\n      expect(text).toContain('https://example.com');\n\n      await sidePanel.getByRole('button', { name: 'Allow' }).click();\n    })(),\n  ]);\n\n  expect(result.isError).toBe(false);\n});\n\ntest('dialog does not show Parameters section for tools without params', async ({\n  mcpServer, extensionContext, mcpClient,\n}) => {\n  // ... standard setup ...\n  const sidePanel = await openSidePanel(extensionContext);\n\n  const [result] = await Promise.all([\n    mcpClient.callTool('browser_list_tabs', {}, { timeout: 35_000 }),\n    (async () => {\n      await waitForConfirmationDialog(sidePanel);\n      const dialog = sidePanel.locator('[role=\"dialog\"]');\n\n      // Parameters section should NOT be present\n      await expect(dialog.getByText('Parameters')).toBeHidden({ timeout: 2_000 });\n\n      await sidePanel.getByRole('button', { name: 'Allow' }).click();\n    })(),\n  ]);\n\n  expect(result.isError).toBe(false);\n});\n```\n\nConstraints:\n- `browser_open_tab` opens a tab — make sure this doesn't break subsequent assertions. The Allow click executes the tool, which opens a new tab. This is fine for the test."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: plugin tool confirmation dialog (not just browser tools)",
+      "description": "Test that the confirmation dialog works correctly for plugin tools (e.g., e2e-test plugin), not just browser tools, verifying the plugin dispatch path handles 'ask' permission correctly.",
+      "acceptanceCriteria": [
+        "Setting e2e-test plugin permission to 'ask' triggers a confirmation dialog when calling e2e_test_echo",
+        "The dialog shows the correct tool name (e2e_test_echo) and plugin name",
+        "Clicking Allow completes the tool and returns the correct result",
+        "Clicking Deny returns PERMISSION_DENIED error"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/permissions.e2e.ts (add new test)\n\nContext:\nAll existing confirmation dialog E2E tests use browser tools (`browser_list_tabs`). Browser tools use `handleBrowserToolCall` in `mcp-tool-dispatch.ts`, while plugin tools use `handlePluginToolCall`. Both call the shared `runAskFlow`, but the surrounding dispatch logic differs — plugin tools require an active tab with a ready adapter.\n\nTo test plugin tools, the e2e-test plugin must have a matching tab that is ready. The test needs:\n1. Start the test-server (provides the matching web page)\n2. Open a tab navigating to the test-server URL\n3. Wait for the e2e-test plugin to become ready\n4. Set e2e-test plugin permission to 'ask'\n5. Call `e2e_test_echo` with params\n6. Dialog should appear — Allow or Deny\n\nThe existing `testServer` fixture starts a test server. Use it along with the e2e-test plugin.\n\nSet permissions:\n```json\n{\n  \"e2e-test\": { \"permission\": \"ask\" }\n}\n```\n\nCall the tool:\n```typescript\nmcpClient.callTool('e2e_test_echo', { message: 'hello' }, { timeout: 35_000 })\n```\n\nThe dialog should show:\n- Tool: `e2e_test_echo`\n- Plugin: `E2E Test` (or `e2e-test`)\n- Parameters: `{ \"message\": \"hello\" }`\n\nFor the Allow test, verify the result contains the echoed message.\nFor the Deny test, verify the error contains 'denied by the user'.\n\nThis test needs the test server + tab navigation, which is more involved than the browser tool tests. Follow the pattern from `side-panel-data-flow.e2e.ts` for the test server setup.\n\nConstraints:\n- Use the existing `testServer` fixture from the PermissionFixtures.\n- Navigate a tab to the test server URL to make the plugin ready.\n- Wait for the plugin to reach 'ready' state before calling the tool.\n- Add in a new `test.describe('Confirmation dialog — plugin tools')` block."
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: Always Allow switch resets after each Allow/Deny decision",
+      "description": "Test that the 'Always allow this tool' switch resets to unchecked (false) after each Allow or Deny action, so the next confirmation in the queue starts fresh.",
+      "acceptanceCriteria": [
+        "After clicking Allow (without toggling Always Allow), the switch is unchecked for the next confirmation",
+        "After toggling Always Allow and clicking Allow, the switch is unchecked for the next confirmation",
+        "After clicking Deny, the switch is unchecked for the next confirmation"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/permissions.e2e.ts (add new test)\n\nContext:\nConfirmationDialog.tsx lines 34-43:\n```tsx\nconst handleAllow = () => {\n  if (!current) return;\n  onRespond(current.id, 'allow', alwaysAllow || undefined);\n  setAlwaysAllow(false);  // resets to false\n};\n\nconst handleDeny = () => {\n  if (!current) return;\n  onRespond(current.id, 'deny');\n  setAlwaysAllow(false);  // resets to false\n};\n```\n\nThe code resets `alwaysAllow` to false after each action. This test verifies the reset is visible in the UI.\n\nThis test naturally combines with US-001 (multiple confirmations):\n1. Send two concurrent 'ask' tool calls\n2. Toggle the Always Allow switch ON for the first confirmation\n3. Click Allow\n4. Verify the switch is OFF (unchecked) for the second confirmation\n5. Click Deny on the second\n6. Verify first tool succeeded, second was denied\n\n```typescript\nconst dialog = sidePanel.locator('[role=\"dialog\"]');\nconst alwaysAllowSwitch = dialog.getByRole('switch', { name: 'Always allow this tool' });\n\n// Toggle on\nawait alwaysAllowSwitch.click();\nawait expect(alwaysAllowSwitch).toHaveAttribute('data-state', 'checked');\n\n// Allow first confirmation\nawait sidePanel.getByRole('button', { name: 'Allow' }).click();\n\n// Switch should be unchecked for the second confirmation\nawait expect(alwaysAllowSwitch).toHaveAttribute('data-state', 'unchecked', { timeout: 5_000 });\n```\n\nConstraints:\n- This can be combined with the US-001 test or be a separate test — either is fine.\n- The Radix Switch uses `data-state='checked'` / `data-state='unchecked'` attributes."
+    },
+    {
+      "id": "US-007",
+      "title": "E2E test: badge count for multiple pending confirmations",
+      "description": "Test that the Chrome extension badge correctly shows the count for 2+ pending confirmations, increments and decrements as confirmations are resolved.",
+      "acceptanceCriteria": [
+        "Badge shows '2' when two 'ask' tool calls are pending",
+        "After Allow-ing one, badge shows '1'",
+        "After Allow-ing the second, badge clears to ''",
+        "Badge shows '3' when three 'ask' tool calls are pending simultaneously"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/permissions.e2e.ts (add new test)\n\nContext:\nThe existing badge test at line 513 only tests badge with a single confirmation (shows '1', then clears). The confirmation-badge.ts has thorough unit tests for counting, but the E2E integration (badge visible in real Chrome) is only tested for count=1.\n\n```typescript\ntest('badge shows correct count for multiple pending confirmations', async ({\n  mcpServer, extensionContext, mcpClient,\n}) => {\n  // Setup: browser permission to 'ask'\n  // ... standard setup ...\n  const sw = await getBackgroundWorker(extensionContext);\n  const sidePanel = await openSidePanel(extensionContext);\n\n  // Three concurrent 'ask' calls\n  const [r1, r2, r3] = await Promise.all([\n    mcpClient.callTool('browser_list_tabs', {}, { timeout: 60_000 }),\n    mcpClient.callTool('browser_list_tabs', {}, { timeout: 60_000 }),\n    mcpClient.callTool('browser_list_tabs', {}, { timeout: 60_000 }),\n    (async () => {\n      // Wait for badge to show '3'\n      await waitFor(async () => (await getBadgeText(sw)) === '3', 15_000, 200, 'badge text === \"3\"');\n\n      // Allow first\n      await waitForConfirmationDialog(sidePanel);\n      await sidePanel.getByRole('button', { name: 'Allow' }).click();\n      await waitFor(async () => (await getBadgeText(sw)) === '2', 10_000, 200, 'badge text === \"2\"');\n\n      // Allow second\n      await sidePanel.getByRole('button', { name: 'Allow' }).click();\n      await waitFor(async () => (await getBadgeText(sw)) === '1', 10_000, 200, 'badge text === \"1\"');\n\n      // Allow third\n      await sidePanel.getByRole('button', { name: 'Allow' }).click();\n      await waitFor(async () => (await getBadgeText(sw)) === '', 10_000, 200, 'badge text === \"\"');\n    })(),\n  ]);\n\n  expect(r1.isError).toBe(false);\n  expect(r2.isError).toBe(false);\n  expect(r3.isError).toBe(false);\n});\n```\n\nNote: Three concurrent calls to the same tool is valid — each gets a unique dispatch ID and confirmation ID. The badge count may not reach '3' simultaneously if the first call's confirmation arrives and is displayed before the third call reaches the server. Use `waitFor` with a generous timeout.\n\nConstraints:\n- Use three concurrent tool calls, not two — tests the 3+ case which is more thorough.\n- Use generous timeouts for badge assertions since the confirmations arrive asynchronously."
+    }
+  ]
+}
