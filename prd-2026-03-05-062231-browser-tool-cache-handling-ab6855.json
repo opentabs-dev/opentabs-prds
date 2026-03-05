@@ -1,0 +1,40 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix background cache handlers to correctly handle browser tool permission changes. handleBgSetToolPermission and handleBgSetAllToolsPermission search cache.plugins for 'browser' which doesn't exist — browser tools live in cache.browserTools. The pending optimistic update infrastructure (addPendingBrowserToolUpdate, reapplyPendingOptimisticUpdates) already exists but is never used by these handlers.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix handleBgSetToolPermission to handle plugin='browser' via cache.browserTools",
+      "description": "handleBgSetToolPermission searches cache.plugins for 'browser', finds nothing, and the optimistic cache update, pending overlay, and error rollback are all no-ops. Add a conditional branch for plugin='browser' that operates on cache.browserTools and uses addPendingBrowserToolUpdate/removePendingBrowserToolUpdate.",
+      "acceptanceCriteria": [
+        "handleBgSetToolPermission for plugin='browser' captures the original permission from cache.browserTools",
+        "handleBgSetToolPermission for plugin='browser' optimistically updates cache.browserTools",
+        "handleBgSetToolPermission for plugin='browser' uses addPendingBrowserToolUpdate and removePendingBrowserToolUpdate",
+        "handleBgSetToolPermission for plugin='browser' error rollback reverts cache.browserTools to the original permission",
+        "Existing plugin tool permission handling (plugin!='browser') is unchanged"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/background-message-handlers.ts (handleBgSetToolPermission, lines 320-361)\n\nContext:\n`handleBgSetToolPermission` (line 320) currently handles ALL plugins uniformly by searching `cache.plugins`. Browser tools are NOT in `cache.plugins` — they're in `cache.browserTools`. The `server-state-cache.ts` already has the full browser tool pending update infrastructure:\n- `addPendingBrowserToolUpdate(tool, permission)` (line 145)\n- `removePendingBrowserToolUpdate(tool)` (line 150)\n- `reapplyPendingOptimisticUpdates()` (lines 83-91) already applies `pendingBrowserToolUpdates` to `cache.browserTools`\n\nBut `handleBgSetToolPermission` never calls these functions — it uses `addPendingPluginToolUpdate` (line 338) which stores in the wrong map.\n\nChanges:\nAdd a conditional branch at the top of `handleBgSetToolPermission` (after extracting plugin/tool/permission) for `plugin === 'browser'`:\n\n```typescript\nif (plugin === 'browser') {\n  const cache = getServerStateCache();\n  const originalPermission = cache.browserTools.find(t => t.name === tool)?.permission ?? 'auto';\n\n  const updatedBrowserTools = cache.browserTools.map(t =>\n    t.name === tool ? { ...t, permission } : t,\n  );\n  addPendingBrowserToolUpdate(tool, permission);\n  updateServerStateCache({ browserTools: updatedBrowserTools });\n\n  sendServerRequest('config.setToolPermission', { plugin, tool, permission })\n    .then((result: unknown) => {\n      removePendingBrowserToolUpdate(tool);\n      sendResponse(result);\n    })\n    .catch((err: unknown) => {\n      removePendingBrowserToolUpdate(tool);\n      const currentCache = getServerStateCache();\n      const revertedBrowserTools = currentCache.browserTools.map(t =>\n        t.name === tool ? { ...t, permission: originalPermission } : t,\n      );\n      updateServerStateCache({ browserTools: revertedBrowserTools });\n      sendResponse({ error: err instanceof Error ? err.message : String(err) });\n    });\n  return;\n}\n```\n\nThen wrap the existing code in an implicit else (it already handles the non-browser case correctly).\n\nImport `addPendingBrowserToolUpdate` and `removePendingBrowserToolUpdate` from `./server-state-cache.js`. Check the existing imports at the top of the file — they already import `addPendingPluginToolUpdate`, so add the browser variants to the same import statement.\n\nConstraints:\n- Do NOT change handleBgSetPluginPermission — it already has special handling for 'browser' via `addPendingPluginPermissionUpdate('browser', ...)` and the `reapplyPendingOptimisticUpdates` browser permission overlay (lines 79-82 of server-state-cache.ts).\n- Do NOT change server-state-cache.ts — the infrastructure is already complete.\n- Do NOT change BrowserToolsCard.tsx — its React-level optimistic update remains as a defense-in-depth layer."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix handleBgSetAllToolsPermission to handle plugin='browser' via cache.browserTools",
+      "description": "handleBgSetAllToolsPermission has the same structural issue as handleBgSetToolPermission for plugin='browser'. Add a conditional branch that operates on cache.browserTools and uses addPendingAllBrowserToolsUpdate/removePendingAllBrowserToolsUpdate.",
+      "acceptanceCriteria": [
+        "handleBgSetAllToolsPermission for plugin='browser' captures original permissions from cache.browserTools",
+        "handleBgSetAllToolsPermission for plugin='browser' optimistically updates all browser tools in cache.browserTools",
+        "handleBgSetAllToolsPermission for plugin='browser' uses addPendingAllBrowserToolsUpdate and removePendingAllBrowserToolsUpdate",
+        "handleBgSetAllToolsPermission for plugin='browser' error rollback reverts cache.browserTools to original permissions",
+        "Existing plugin all-tools permission handling (plugin!='browser') is unchanged"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/background-message-handlers.ts (handleBgSetAllToolsPermission, lines 363-413)\n\nContext:\nSame structural issue as handleBgSetToolPermission. `cache.plugins.find(p => p.name === 'browser')` returns undefined, making optimistic update, pending registration, and rollback all no-ops.\n\nThe `server-state-cache.ts` already exports:\n- `addPendingAllBrowserToolsUpdate(toolNames, permission)` (line 155)\n- `removePendingAllBrowserToolsUpdate(toolNames)` (line 162)\n\nChanges:\nAdd a conditional branch at the top of `handleBgSetAllToolsPermission` (after extracting plugin/permission) for `plugin === 'browser'`:\n\n```typescript\nif (plugin === 'browser') {\n  const cache = getServerStateCache();\n  const toolNames = cache.browserTools.map(t => t.name);\n  const originalToolStates = new Map<string, ToolPermission>();\n  for (const t of cache.browserTools) {\n    originalToolStates.set(t.name, t.permission);\n  }\n\n  const updatedBrowserTools = cache.browserTools.map(t => ({ ...t, permission }));\n  addPendingAllBrowserToolsUpdate(toolNames, permission);\n  updateServerStateCache({ browserTools: updatedBrowserTools });\n\n  sendServerRequest('config.setAllToolsPermission', { plugin, permission })\n    .then((result: unknown) => {\n      removePendingAllBrowserToolsUpdate(toolNames);\n      sendResponse(result);\n    })\n    .catch((err: unknown) => {\n      removePendingAllBrowserToolsUpdate(toolNames);\n      const currentCache = getServerStateCache();\n      const revertedBrowserTools = currentCache.browserTools.map(t => ({\n        ...t,\n        permission: originalToolStates.get(t.name) ?? t.permission,\n      }));\n      updateServerStateCache({ browserTools: revertedBrowserTools });\n      sendResponse({ error: err instanceof Error ? err.message : String(err) });\n    });\n  return;\n}\n```\n\nImport `addPendingAllBrowserToolsUpdate` and `removePendingAllBrowserToolsUpdate` from `./server-state-cache.js`.\n\nConstraints:\n- Same constraints as US-001.\n- This story is marked as e2eCheckpoint since it completes the browser cache fix — E2E tests from the companion PRD (browser tool permission changes) will exercise both paths end-to-end."
+    }
+  ]
+}
