@@ -1,0 +1,90 @@
+# Ralph Progress Log
+PRD: prd-2026-03-05-124859-permission-dialog-e2e-a79de7~running.json
+Started: Thu Mar  5 20:49:33 UTC 2026
+---
+
+## Codebase Patterns
+- Permission E2E tests use the shared `PermissionFixtures` fixture that starts the MCP server with `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS=''` to disable the bypass
+- For concurrent 'ask' confirmations, use `Promise.all` with multiple `mcpClient.callTool` calls plus an async IIFE for dialog interaction
+- Wait for badge text via `waitFor(async () => (await getBadgeText(sw)) === '<count>')` before asserting dialog state — this ensures all confirmations have arrived
+- The ConfirmationDialog uses plain `<button>` elements (not retro Button) for prev/next with text 'prev'/'next' — use `getByRole('button', { name: 'prev' })` to locate them
+- The counter display is `{safeIndex + 1} of {count}` and only shows when `count > 1`
+- Plugin tool permission tests need a two-phase setup: first get plugin ready with 'auto' permission (open tab, wait for `e2e-test_get_status`), then switch to 'ask' via config write + hot reload
+- The confirmation dialog shows base tool name for plugins (`echo`) but full prefixed name for browser tools (`browser_list_tabs`)
+- After hot reload, ALWAYS wait for `waitForExtensionConnected` + `waitForLog(mcpServer, 'tab.syncAll received')` before calling tools — the WebSocket reconnection takes time and skipping it causes flaky timeouts
+
+## 2026-03-05 - US-001
+- Implemented E2E test for multiple pending confirmations with prev/next navigation
+- Files changed: e2e/permissions.e2e.ts
+- **Learnings for future iterations:**
+  - Two concurrent calls to the same tool (`browser_list_tabs`) work fine — each gets its own UUID confirmation ID
+  - Use badge text as a sync point: wait for badge to show '2' before asserting dialog counter, to avoid race conditions where one confirmation arrives before the other
+  - After allowing one of two confirmations, the 'X of Y' counter disappears (count=1), so check for `getByText('of').toBeHidden()` to verify
+---
+
+## 2026-03-05 - US-002
+- Implemented E2E test for confirmation dialog persistence across side panel close/reopen
+- Files changed: e2e/permissions.e2e.ts
+- **Learnings for future iterations:**
+  - Closing the side panel with `page.close()` destroys the React tree, but pending confirmations survive in the background script's `pendingConfirmations` map
+  - When the side panel reopens, `getFullState()` hydrates the confirmations from the background, so the dialog reappears automatically
+  - Use `let sidePanel` (not `const`) since the variable must be reassigned after close/reopen
+  - A 500ms wait after `page.close()` before reopening gives the background time to process the disconnection
+  - Use longer tool call timeout (60s) for close/reopen tests since the close+wait+reopen+hydration adds latency
+---
+
+## 2026-03-05 - US-003
+- Implemented E2E test for escape key and outside click not dismissing the confirmation dialog
+- Files changed: e2e/permissions.e2e.ts
+- **Learnings for future iterations:**
+  - ConfirmationDialog uses `onEscapeKeyDown={e => e.preventDefault()}` and `onInteractOutside={e => e.preventDefault()}` on the Radix Dialog.Content to prevent dismissal
+  - Pressing Escape or clicking outside would trigger `onOpenChange(false)` → `handleDeny()`, silently denying the tool — these handlers prevent that
+  - Use `sidePanel.keyboard.press('Escape')` and `sidePanel.mouse.click(5, 5)` to test dismiss resistance — (5,5) is outside the centered dialog content but inside the viewport
+  - After each dismiss attempt, assert `toBeVisible({ timeout: 2_000 })` — a short timeout is sufficient since we're checking the dialog is STILL present, not waiting for it to appear
+---
+
+## 2026-03-05 - US-004
+- Implemented E2E tests for confirmation dialog parameters display
+- Two tests added: one for tools with params (browser_open_tab with url), one for tools without params (browser_list_tabs)
+- Files changed: e2e/permissions.e2e.ts
+- **Learnings for future iterations:**
+  - `browser_open_tab` requires `{ url: string }` param — good for testing parameter display since it will show the URL in the JSON
+  - `browser_list_tabs` takes no required params, so when called with `{}` the Parameters section is hidden
+  - The `<details>` element with `<summary>Parameters</summary>` is collapsed by default — click the summary to expand and reveal the `<pre>` with JSON-formatted params
+  - Use `dialog.getByText('Parameters')` to locate the summary, and `dialog.locator('pre')` for the expanded content
+---
+
+## 2026-03-05 - US-005
+- Implemented E2E tests for plugin tool confirmation dialog (Allow and Deny flows)
+- Two tests: Allow completes tool and returns result, Deny returns PERMISSION_DENIED error
+- Files changed: e2e/permissions.e2e.ts
+- **Learnings for future iterations:**
+  - Plugin tool tests need a ready adapter tab — start with 'auto' permission, open test server tab, wait for `e2e-test_get_status` to succeed, then switch to 'ask' via config write + hot reload
+  - For plugin tools, the confirmation dialog shows the **base tool name** (`echo`), not the prefixed name (`e2e-test_echo`) — `runAskFlow` receives `toolBaseName`
+  - The plugin field in the dialog shows the slug (`e2e-test`), not a display name
+  - The tool is called with the full prefixed name (`e2e-test_echo`) on the MCP client, but the dialog strips the prefix
+  - Added imports for `openTestAppTab` and `waitForToolResult` from helpers.js which were not previously used in permissions.e2e.ts
+---
+
+## 2026-03-05 - US-006
+- Implemented E2E test for Always Allow switch reset behavior after each Allow/Deny decision
+- Test sends two concurrent 'ask' tool calls, toggles Always Allow ON for the first, clicks Allow, then verifies the switch is unchecked for the second confirmation before clicking Deny
+- Files changed: e2e/permissions.e2e.ts
+- **Learnings for future iterations:**
+  - The Radix Switch uses `data-state='checked'` / `data-state='unchecked'` attributes — use `toHaveAttribute('data-state', 'unchecked')` to verify state
+  - Use `getByRole('switch', { name: 'Always allow this tool' })` to locate the switch
+  - After allowing one of two confirmations, re-locate the dialog and switch from the fresh DOM since React may re-render the component
+  - The `setAlwaysAllow(false)` call in both `handleAllow` and `handleDeny` ensures the switch resets — this test guards against regressions
+---
+
+## 2026-03-05 - US-007
+- Implemented E2E test for badge count with multiple (3) pending confirmations
+- Badge asserted at each step: '3' → Allow → '2' → Allow → '1' → Allow → ''
+- Also fixed pre-existing flake in US-005 plugin tool tests: added missing `waitForExtensionConnected` + `tab.syncAll` after hot reload
+- Files changed: e2e/permissions.e2e.ts
+- **Learnings for future iterations:**
+  - Three concurrent calls to the same tool (`browser_list_tabs`) work fine — each gets its own UUID confirmation ID, badge counts correctly
+  - Use `waitFor` on badge text as a sync point before interacting with the dialog — this ensures all confirmations have arrived before you start clicking Allow
+  - Re-invoke `waitForConfirmationDialog` between each Allow click to ensure the dialog is stable after the state transition
+  - After hot reload, ALWAYS add `waitForExtensionConnected` + `waitForLog(mcpServer, 'tab.syncAll received')` — the US-005 tests were flaky because they skipped this, causing the tool call to fire before the WebSocket reconnected
+---
