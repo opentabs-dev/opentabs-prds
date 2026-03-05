@@ -1,0 +1,50 @@
+# Ralph Progress Log
+PRD: prd-2026-03-05-063202-persist-accordion-state-d23c57~running.json
+Started: Thu Mar  5 14:33:28 UTC 2026
+---
+
+## Codebase Patterns
+- chrome.storage interactions follow `.then(success, failure)` pattern (not `.catch()`), see `hooks/useTheme.ts`
+- Use `chrome.storage.session` for UI state that should persist within a browser session but reset on Chrome quit
+- Use `chrome.storage.local` for state that should persist across browser restarts (e.g., theme)
+- React 19 `useRef` requires an explicit initial value argument (e.g., `useRef<T | undefined>(undefined)`)
+- Do NOT debounce chrome.storage writes that need to survive page close — chrome.storage.session.set() is async and cannot complete during unmount/beforeunload. Write immediately instead.
+
+---
+
+## 2026-03-05 - US-001
+- Implemented accordion state persistence in PluginList.tsx using chrome.storage.session
+- Added `ACCORDION_STORAGE_KEY` constant, hydration on mount, and debounced (300ms) write effect
+- Persistence skipped when filtering (search active) — uncontrolled accordion path
+- collapseTransitioningItems state changes automatically trigger the persist effect
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginList.tsx`
+- **Learnings for future iterations:**
+  - `useRef<T>()` without argument causes TS2554 in strict mode — must pass initial value
+  - The lint-staged formatter may reformat lines (e.g., collapsing multi-line type assertions to single line) — this is expected and harmless
+  - Worktree may not have `node_modules` pre-installed — run `npm ci` if `npm run build` fails with `tsc: not found`
+---
+
+## 2026-03-05 - US-002
+- Converted BrowserToolsCard's parent Accordion from uncontrolled to controlled mode in App.tsx
+- Added `browserToolsOpen` state (boolean, default false) hydrated from `chrome.storage.session` on mount
+- Writes to `chrome.storage.session` directly on `onValueChange` (no debounce — single toggle)
+- Disconnect handler does NOT reset `browserToolsOpen` — accordion state is a UI preference, not server state
+- Files changed: `platform/browser-extension/src/side-panel/App.tsx`
+- **Learnings for future iterations:**
+  - BrowserToolsCard renders `<Accordion.Item value="browser-tools">` — the parent controls via `['browser-tools']` or `[]`
+  - For single-toggle accordions, write directly on change instead of debouncing — simpler and no risk of losing state on unmount
+  - Storage key is `'browserToolsOpen'` (boolean) — distinct from the plugin accordion key `'accordionState'` (object with arrays)
+---
+
+## 2026-03-05 - US-003
+- Created E2E test `e2e/side-panel-accordion-persist.e2e.ts` verifying accordion state persistence across side panel close/reopen
+- Test covers: expand both cards → close → reopen → verify expanded; collapse one → close → reopen → verify only that one collapsed
+- Fixed bug in US-001: removed debounce from PluginList accordion persistence — `chrome.storage.session.set()` is async and could not reliably complete during React cleanup / page unload
+- Changed persist effect to write immediately on every state change (negligible overhead for small arrays)
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginList.tsx`, `e2e/side-panel-accordion-persist.e2e.ts` (new)
+- **Learnings for future iterations:**
+  - Debounced writes to chrome.storage are unreliable when the page can close — React cleanup fires but the async Chrome IPC may not complete before page destruction
+  - For small state objects, writing immediately is more reliable than debouncing + flush-on-unmount
+  - E2E accordion persistence test doesn't need a test server (no matching tab required) — plugin cards appear regardless of tab state
+  - Use `{ timeout: 10_000 }` on expanded-state assertions after reopen to allow time for storage read + React state update
+---
