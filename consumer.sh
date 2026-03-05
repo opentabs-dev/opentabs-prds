@@ -836,6 +836,9 @@ _run_worker_docker() {
   # Copy SSH private keys and fix permissions (SSH requires 600)
   CONTAINER_INIT="$CONTAINER_INIT; for f in /tmp/staging/ssh_key_*; do [ -f \"\$f\" ] && cp \"\$f\" /tmp/worker/.ssh/\$(basename \"\$f\" | sed 's/^ssh_key_//') && chmod 600 /tmp/worker/.ssh/\$(basename \"\$f\" | sed 's/^ssh_key_//'); done"
   CONTAINER_INIT="$CONTAINER_INIT; chmod 700 /tmp/worker/.ssh 2>/dev/null"
+  # SSH resolves ~ from /etc/passwd (e.g. /home/ubuntu), not $HOME.
+  # Symlink so SSH finds config/keys/known_hosts regardless of which path it uses.
+  CONTAINER_INIT="$CONTAINER_INIT; ln -sfn /tmp/worker/.ssh \$(getent passwd \$(id -u) | cut -d: -f6)/.ssh 2>/dev/null"
   CONTAINER_INIT="$CONTAINER_INIT; true"
 
   # Setup: install + build
