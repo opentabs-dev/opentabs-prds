@@ -1,0 +1,52 @@
+# Ralph Progress Log
+PRD: prd-2026-03-05-142928-e2e-plugin-update-flow-0434d5~running.json
+Started: Thu Mar  5 22:29:55 UTC 2026
+---
+
+## Codebase Patterns
+- E2E tests use dev-only `POST /__test/set-outdated` endpoint to inject fake outdated plugin data into MCP server state for testing update UI
+- E2E tests use dev-only `POST /__test/simulate-update` endpoint to simulate a successful plugin update by mutating the version in the registry
+- The `buildConfigStatePayload` in `extension-handlers.ts` maps `state.outdatedPlugins` entries to plugin `update` fields using `npmPackageName` as the join key
+- Local plugins DO have `npmPackageName` (from `pkg.name` in package.json), so they can be matched against `outdatedPlugins` entries
+- E2E test cleanup uses `finally` blocks; `cleanupDir` from `launchExtensionContext` must be checked for truthiness before `rmSync`
+- Clicking Update on a local plugin fails because `npm update -g` can't find the package globally — this naturally tests the error path
+- The error alert on a plugin card uses `[role="alert"]` and appears when `actionError` prop is set via `pluginErrors` map in App.tsx
+- The PluginRegistry is "immutable" by convention but the JavaScript objects inside are mutable — test endpoints can mutate `plugin.version` directly
+
+## 2026-03-05 - US-001
+- Implemented E2E test for plugin update available indicator and menu item visibility
+- Added dev-only `POST /__test/set-outdated` endpoint to MCP server's `http-routes.ts` (gated behind `isDev()`, requires auth)
+- Created `e2e/side-panel-plugin-update.e2e.ts` with test that:
+  - Verifies no update dot/menu item when no update is available
+  - Injects fake outdated plugin data via the test endpoint
+  - Verifies update dot appears on menu button and "Update to v99.0.0" menu item is visible
+  - Clears outdated plugins and verifies dot/menu item disappear
+- Files changed:
+  - `platform/mcp-server/src/http-routes.ts` (added test endpoint + route)
+  - `e2e/side-panel-plugin-update.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - The `__test/set-outdated` endpoint sends `plugins.changed` notification to extension, which triggers side panel re-render
+  - The update dot locator is `menuButton.locator('div.rounded-full')` (the bg-primary dot inside the menu trigger button)
+  - The update menu item matches `[role="menuitem"]` with `hasText: /^Update to v/`
+  - `server.secret` is `string | undefined` in test fixtures — use a guard + throw pattern instead of `!` non-null assertion to satisfy Biome's `noNonNullAssertion` rule
+---
+
+## 2026-03-05 - US-002
+- Implemented E2E tests for the plugin update flow (clicking Update and verifying UI response)
+- Added dev-only `POST /__test/simulate-update` endpoint to MCP server's `http-routes.ts` that:
+  - Mutates the plugin's version in the registry
+  - Clears matching outdated entry by npm package name
+  - Sends `plugins.changed` notification to the extension
+- Added two new E2E tests in `e2e/side-panel-plugin-update.e2e.ts`:
+  1. **Error case**: Injects fake outdated data → clicks "Update to v99.0.0" → verifies error alert appears (npm update -g fails for local plugins)
+  2. **Success case**: Injects fake outdated data → simulates successful update via test endpoint → verifies update dot disappears, Update menu item is gone, plugin still exists on server
+- Files changed:
+  - `platform/mcp-server/src/http-routes.ts` (added `handleTestSimulateUpdate` endpoint + route)
+  - `e2e/side-panel-plugin-update.e2e.ts` (added `simulateUpdate` helper + 2 new tests in "plugin update flow" describe block)
+- All Phase 1 (build, type-check, lint, knip, test) and Phase 2 (E2E) checks pass (494 E2E tests, 0 failures)
+- **Learnings for future iterations:**
+  - The `simulateUpdate` helper calls `/__test/simulate-update` to change the plugin version and clear outdated in one atomic operation
+  - Error alerts use `[role="alert"]` selector — the Alert retro component renders with this role
+  - The update flow error timeout needs 30s because npm update -g can take time to fail
+  - The registry is immutable by convention but test endpoints can cast and mutate `plugin.version` directly since JS objects are reference types
+---
