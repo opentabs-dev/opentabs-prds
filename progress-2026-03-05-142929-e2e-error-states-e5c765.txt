@@ -1,0 +1,61 @@
+# Ralph Progress Log
+PRD: prd-2026-03-05-142929-e2e-error-states-e5c765~running.json
+Started: Thu Mar  5 22:30:04 UTC 2026
+---
+
+## Codebase Patterns
+- Failed plugin data flows: discovery errors → state.discoveryErrors → buildConfigStatePayload → sync.full → side panel failedPlugins state → FailedPluginCard
+- discoveryErrors has shape `{ specifier: string; error: string }[]` — specifier is the raw path from localPlugins config
+- FailedPluginCard shows "Show more"/"Show less" toggle when error.length > 100
+- E2E tests for side panel use manual setup (not fixtures) when custom config is needed: createTestConfigDir/writeTestConfig → startMcpServer → launchExtensionContext → setupAdapterSymlink → waitForExtensionConnected → openSidePanel
+- To create a broken plugin for testing: make a directory with valid package.json (opentabs field) but missing or corrupted dist/ artifacts
+- Optimistic rollback (PluginCard.tsx) cannot be triggered in E2E: server disconnect wipes all state before the rollback error can be observed. Test via component tests instead.
+- Permission change flow: side panel → bridge.setToolPermission → bg:setToolPermission → sendServerRequest (WebSocket) → server config.setToolPermission → config.json write + plugins.changed notification
+- `createMinimalPlugin` from fixtures creates a discoverable plugin with tools but `isReady: false` — sufficient for permission/config tests without a test server
+- Disconnect/reconnect E2E pattern: save `server.port`, `server.kill()`, then `startMcpServer(configDir, true, serverPort)` to restart on the same port
+- `browserToolsOpen` persists in `chrome.storage.session` across disconnect/reconnect; `searchQuery` and npm results are wiped by App.tsx disconnect handler
+- Use `{ exact: true }` with `getByText()` when the text appears in both a specifier element and an error message element (error messages embed file paths)
+
+## 2026-03-05 - US-001
+- Implemented E2E tests for FailedPluginCard rendering in side panel
+- Two tests: basic broken plugin card (missing dist/) and Show more/less toggle for long errors
+- Files added: e2e/side-panel-error-states.e2e.ts
+- **Learnings for future iterations:**
+  - Plugin load errors propagate through discoveryErrors, not registry.failures, to the side panel
+  - The specifier shown in FailedPluginCard is the raw localPlugins path (not the plugin name)
+  - To guarantee error > 100 chars for Show more toggle, use a long directory name — the error message includes the full path
+  - Tailwind CSS class selectors with `/` need escaping in Playwright: `.bg-destructive\\/10`
+  - afterEach cleanup patterns are fragile with uninitialized vars; try/finally per test is more robust
+---
+
+## 2026-03-05 - US-002
+- Implemented E2E test for permission change positive path alongside broken plugin error states
+- Test creates both a broken plugin (FailedPluginCard) and a working minimal plugin, then verifies:
+  - Plugin permission change from 'off' to 'auto' via Radix Select
+  - UI immediately reflects new value (optimistic update)
+  - config.json persists the new permission
+  - MCP tools/list removes [Disabled] prefix
+  - Broken plugin error card remains visible throughout
+- Documented optimistic rollback gap: cannot be triggered in E2E (server disconnect wipes state first)
+- Files modified: e2e/side-panel-error-states.e2e.ts
+- **Learnings for future iterations:**
+  - The only way to make `setToolPermission` fail is server disconnect, but the App-level disconnect handler wipes all plugin state before the per-tool rollback error can be observed
+  - `rejectAllPendingServerRequests()` fires on WebSocket close, rejecting all in-flight bridge calls with "Server disconnected", but the side panel's `ws:state` disconnect handler runs concurrently and clears plugins[] first
+  - `createMinimalPlugin` creates a plugin with `isReady: false` adapter — tools show in the side panel and MCP tools/list but cannot be dispatched
+  - `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''` (empty string) disables skipPermissions so Selects are interactive
+  - Plugin-level permission aria-label pattern: `Permission for <pluginName> plugin`
+---
+
+## 2026-03-05 - US-003
+- Implemented E2E test for connection loss state behavior
+- Test verifies: disconnect wipes transient state (search query) but preserves persisted state (Browser accordion expand via chrome.storage.session)
+- Test flow: connect → expand Browser accordion → type search query → kill server → verify disconnect screen → restart server on same port → verify search bar empty + accordion still expanded
+- Also fixed pre-existing strict mode violation: `getByText(brokenPath)` matched 2 elements (specifier + error message), added `{ exact: true }`
+- Files modified: e2e/side-panel-error-states.e2e.ts
+- **Learnings for future iterations:**
+  - The disconnect handler in App.tsx wipes `searchQuery` to `''` (not just npm results). The search bar itself is hidden during disconnect (`showSearchBar = connected && !loading`) so the cleared value is only observable after reconnection.
+  - `browserToolsOpen` is stored in `chrome.storage.session` which is NOT affected by the App-level disconnect handler — it persists across disconnect/reconnect cycles
+  - Follow the pattern from `side-panel-data-flow.e2e.ts`: kill server, save port, restart on same port with `startMcpServer(configDir, true, serverPort)`
+  - When `getByText()` matches error messages that embed file paths, use `{ exact: true }` to avoid strict mode violations from matching both the specifier div and the error message div
+  - The reconnection timeout should be generous (45s) due to exponential backoff in the offscreen WebSocket reconnect logic
+---
