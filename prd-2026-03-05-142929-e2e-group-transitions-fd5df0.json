@@ -1,0 +1,55 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add E2E tests for plugin group transitions in the side panel: plugins moving between ready and not-ready groups when tabs open/close, the 'NOT CONNECTED' label visibility, and accordion auto-collapse during group transitions.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "E2E test: plugin moves from NOT CONNECTED to ready group when matching tab opens",
+      "description": "Test that when a tab matching a plugin's URL pattern opens and the adapter becomes ready, the plugin card moves from the not-connected section to the ready section at the top of the list.",
+      "acceptanceCriteria": [
+        "With no matching tab, the plugin card appears in the not-connected section",
+        "The 'NOT CONNECTED' label is visible above the not-connected section",
+        "Opening a matching tab and waiting for ready state moves the card to the top section",
+        "The card in the ready section has full opacity (not dimmed)",
+        "The card in the not-connected section had reduced opacity"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-group-transitions.e2e.ts (new file)\n\nContext:\nPluginList.tsx renders two separate Accordion components:\n- Line 198: Ready plugins accordion (full opacity)\n- Line 209: Not-ready plugins accordion (with 'NOT CONNECTED' label)\n\nThe 'NOT CONNECTED' label at line 203:\n```tsx\n{notReadyPlugins.length > 0 && (\n  <div className=\"...\">\n    <span className=\"...\">NOT CONNECTED</span>\n  </div>\n)}\n```\n\nPluginCard.tsx line 168-176 applies `opacity-70` for inactive (not-ready) plugins.\n\nThe `useGroupTransitions` hook (line 23) detects plugins moving between groups and applies animation classes.\n\nTest approach:\n1. Start with the e2e-test plugin but NO matching tab open → plugin in not-connected section\n2. Open a tab navigating to the test server URL → adapter injects → plugin becomes ready\n3. Verify the plugin card moved to the ready section (above 'NOT CONNECTED' label)\n\nFor step 1, verify:\n```typescript\n// NOT CONNECTED label visible\nawait expect(sidePanel.getByText('NOT CONNECTED')).toBeVisible({ timeout: 15_000 });\n// Plugin card has reduced opacity\nconst pluginCard = sidePanel.locator('[data-radix-accordion-item]').filter({ hasText: 'E2E Test' });\nawait expect(pluginCard).toHaveClass(/opacity-70/);\n```\n\nFor step 3, after opening the tab:\n```typescript\n// Wait for plugin to become ready\nawait waitForLog(server, 'tab.stateChanged: e2e-test → ready', 15_000);\n// Plugin card should no longer have reduced opacity\nawait expect(pluginCard).not.toHaveClass(/opacity-70/, { timeout: 10_000 });\n```\n\nUse the standard test server fixture + e2e-test plugin.\n\nConstraints:\n- The group transition animation (200ms) is too fast to reliably catch in E2E — test the end state, not the animation itself.\n- Use `waitForLog` for tab state changes to avoid race conditions."
+    },
+    {
+      "id": "US-002",
+      "title": "E2E test: plugin moves from ready to NOT CONNECTED group when tab closes",
+      "description": "Test that when the last matching tab for a ready plugin is closed, the plugin card moves from the ready section to the not-connected section.",
+      "acceptanceCriteria": [
+        "Plugin is initially ready (matching tab open)",
+        "Closing the matching tab triggers the plugin to move to not-connected section",
+        "The 'NOT CONNECTED' label appears (or remains)",
+        "The plugin card gets reduced opacity in the not-connected section"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-group-transitions.e2e.ts (same file)\n\nContext:\nThis is the reverse of US-001. Start with a matching tab open (plugin ready), close the tab, verify the plugin moves to the not-connected group.\n\n```typescript\n// Start with matching tab open\nconst tab = await context.newPage();\nawait tab.goto(testServerUrl);\nawait waitForLog(server, 'tab.stateChanged: e2e-test → ready', 15_000);\n\n// Verify plugin is in ready section\nawait expect(sidePanel.locator('[data-radix-accordion-item]').filter({ hasText: 'E2E Test' })).not.toHaveClass(/opacity-70/);\n\n// Close the tab\nawait tab.close();\n\n// Wait for state change\nawait waitForLog(server, 'tab.stateChanged: e2e-test → closed', 15_000);\n\n// Verify plugin moved to not-connected section\nawait expect(sidePanel.getByText('NOT CONNECTED')).toBeVisible({ timeout: 10_000 });\nawait expect(sidePanel.locator('[data-radix-accordion-item]').filter({ hasText: 'E2E Test' })).toHaveClass(/opacity-70/, { timeout: 10_000 });\n```\n\nConstraints:\n- Use the same test file and fixtures as US-001.\n- Can be combined with US-001 into a single test (open tab → verify ready → close tab → verify not-connected)."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: accordion auto-collapses during group transition",
+      "description": "Test that when a plugin moves between ready and not-ready groups, its accordion card is automatically collapsed in the new group (collapseTransitioningItems behavior).",
+      "acceptanceCriteria": [
+        "Expand a plugin card in the ready section",
+        "Close the matching tab so the plugin transitions to not-connected",
+        "After transition, the plugin card is collapsed in the not-connected section",
+        "The collapse happens automatically (user did not click the card)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-group-transitions.e2e.ts (same file)\n\nContext:\nPluginList.tsx lines 138-142:\n```tsx\nuseEffect(() => {\n  if (animating.size === 0) return;\n  setOpenReady(prev => collapseTransitioningItems(prev, animating));\n  setOpenNotReady(prev => collapseTransitioningItems(prev, animating));\n}, [animating]);\n```\n\nWhen a plugin transitions between groups, `collapseTransitioningItems` removes it from the open arrays, collapsing the accordion.\n\nTest:\n1. Open a matching tab → plugin becomes ready\n2. Expand the plugin card (click to open accordion)\n3. Verify `aria-expanded='true'`\n4. Close the matching tab → plugin transitions to not-connected\n5. Verify the card is now collapsed (`aria-expanded='false'`) in the not-connected section\n\n```typescript\n// Expand the plugin card\nconst trigger = sidePanel.locator('button[aria-expanded]').filter({ hasText: 'E2E Test' });\nawait trigger.click();\nawait expect(trigger).toHaveAttribute('aria-expanded', 'true');\n\n// Close matching tab\nawait tab.close();\nawait waitForLog(server, 'tab.stateChanged: e2e-test → closed', 15_000);\n\n// Card should be collapsed after transition\nawait expect(trigger).toHaveAttribute('aria-expanded', 'false', { timeout: 10_000 });\n```\n\nConstraints:\n- The transition animation is 200ms — wait for it to complete before asserting.\n- Use { timeout: 10_000 } on the assertion to account for state propagation delay."
+    }
+  ]
+}
