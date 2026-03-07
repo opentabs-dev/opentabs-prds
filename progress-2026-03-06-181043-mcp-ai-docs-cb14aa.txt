@@ -1,0 +1,104 @@
+# Ralph Progress Log
+PRD: prd-2026-03-06-181043-mcp-ai-docs-cb14aa~running.json
+Started: Sat Mar  7 02:11:12 UTC 2026
+---
+
+## Codebase Patterns
+- MCP handler patterns: `server.setRequestHandler(Schema, handler)` in `registerMcpHandlers()`. New capabilities must also be added to the `ServerModuleShape` interface and the `createMcpServer` capabilities object.
+- Resource pattern mirrors prompts: `RESOURCES` array, `RESOURCE_MAP` for O(1) lookup, `getAllResources(state)` for list, `resolveResource(state, uri)` for read.
+- Two tests track handler count: `mcp-setup.test.ts` ("handler count" describe) and `reload.test.ts` ("re-registers MCP handlers"). Both must be updated when adding new handlers.
+- Static resource content: `CONTENT_MAP` (Map<string, string>) maps URIs to content constants. Add new entries when writing content for a resource. `resolveResource` checks status URI → CONTENT_MAP → placeholder fallback.
+
+## 2026-03-07 - US-001
+- Implemented MCP resources capability and handler infrastructure
+- Files changed:
+  - platform/mcp-server/src/mcp-resources.ts (new) — ResourceDefinition/ResolvedResource interfaces, RESOURCES array (7 entries), RESOURCE_MAP, getAllResources(), resolveResource(), buildStatusResource()
+  - platform/mcp-server/src/mcp-setup.ts — Added ListResourcesRequestSchema/ReadResourceRequestSchema imports, mcp-resources.js import, resources: {} capability, resources/list and resources/read handlers
+  - platform/mcp-server/src/mcp-setup.test.ts — Updated handler count from 4 to 6
+  - platform/mcp-server/src/reload.test.ts — Updated handler count from 4 to 6
+- **Learnings for future iterations:**
+  - The `ServerModuleShape` interface constrains the capabilities type — adding a new capability requires updating this interface too
+  - Static resources return placeholder content; the dynamic `opentabs://status` resource builds JSON from ServerState at read time
+  - The MCP SDK exports both `ListResourcesRequestSchema` and `ReadResourceRequestSchema` from `@modelcontextprotocol/sdk/types.js`
+---
+
+## 2026-03-07 - US-002
+- Wrote AI-optimized quick-start guide content for `opentabs://guide/quick-start` resource
+- Files changed:
+  - platform/mcp-server/src/mcp-resources.ts — Added `QUICK_START_CONTENT` string (~210 lines of markdown), `CONTENT_MAP` for URI→content lookup, updated `resolveResource` to check `CONTENT_MAP` before falling back to placeholder
+- Content covers: what OpenTabs is, installation, server startup, Chrome extension loading, MCP client config (Claude Code, Cursor, Windsurf, OpenCode), plugin installation, review flow, permission model (off/ask/auto), tool categories (plugin/browser/extension), multi-tab targeting, setup verification
+- **Learnings for future iterations:**
+  - The `CONTENT_MAP` pattern (Map<string, string> mapping URIs to content constants) is how static resource content is stored — future stories should add entries to this map
+  - `resolveResource` checks: status URI → CONTENT_MAP → placeholder fallback
+  - MCP client config JSON differs per client: Claude Code uses `"type": "streamable-http"`, Cursor uses `"type": "http"`, Windsurf uses `"serverUrl"` instead of `"url"`, OpenCode uses `"type": "remote"` under an `"mcp"` key instead of `"mcpServers"`
+---
+
+## 2026-03-07 - US-003
+- Wrote AI-optimized plugin development guide content for `opentabs://guide/plugin-development` resource
+- Files changed:
+  - platform/mcp-server/src/mcp-resources.ts — Added `PLUGIN_DEVELOPMENT_CONTENT` string (~370 lines of markdown), added entry to `CONTENT_MAP`
+- Content covers: architecture (browser page context execution), plugin structure (package.json opentabs field), OpenTabsPlugin base class (all required members + tab state machine), defineTool factory (all fields), SDK utilities reference tables (DOM, Fetch, Storage, Page State, Timing, Logging with accurate signatures from source), ToolError factories (all 6 with signatures), Zod schema rules, lifecycle hooks, isReady() polling patterns, auth extraction strategies (globals, localStorage, cookies, globalThis caching), build/test workflow, scaffolding, publishing, common patterns (API wrapper, state waiting, retry)
+- **Learnings for future iterations:**
+  - `plugin.ts` and `sdk.ts` do not exist as separate files — the plugin class is in `index.ts` and SDK utilities are split across `dom.ts`, `fetch.ts`, `storage.ts`, `page-state.ts`, `timing.ts`, `log.ts`
+  - Fetch utilities have overloaded signatures supporting optional Zod schema validation as the last argument
+  - Storage utilities include `removeLocalStorage` and `removeSessionStorage` (not listed in CLAUDE.md's summary but exported from the SDK)
+---
+
+## 2026-03-07 - US-004
+- Wrote content for 4 remaining static resources: troubleshooting guide, SDK API reference, CLI reference, and browser tools reference
+- Files changed:
+  - platform/mcp-server/src/mcp-resources.ts — Added `TROUBLESHOOTING_CONTENT`, `SDK_API_CONTENT`, `CLI_CONTENT`, `BROWSER_TOOLS_CONTENT` string constants; added all 4 entries to `CONTENT_MAP`
+- Content details:
+  - **Troubleshooting** (~130 lines): Quick diagnosis commands, 11 error scenarios with exact error messages/causes/resolution steps, diagnostic tools reference table
+  - **SDK API** (~170 lines): OpenTabsPlugin class, defineTool, ToolDefinition, ToolHandlerContext, DOM/Fetch/Storage/PageState/Timing/Logging utilities with signatures, ToolError factories, lifecycle hooks, re-exports from @opentabs-dev/shared
+  - **CLI** (~160 lines): All opentabs commands (start/stop/status/logs/audit/doctor/update), config subcommands (show/set/path/reset/rotate-secret) with correct key formats, plugin subcommands (search/list/install/remove/create), opentabs-plugin CLI (build/inspect), file paths
+  - **Browser tools** (~120 lines): All 41 tools organized by 7 categories (Tabs 6, Page Interaction 7, Page Inspection 10, Storage & Cookies 5, Network 5, Extension 6, Plugins 2), plus 2 platform tools
+- **Learnings for future iterations:**
+  - The actual tool count is 41 (not 40 as mentioned in some parts of the codebase) — the browser-tools-catalog.ts generated file has all entries
+  - Browser tool categories come from the `group` field in tool definitions and match the BROWSER_TOOLS_CATALOG generated catalog
+  - The SDK exports ~69 items total including re-exports from @opentabs-dev/shared (ManifestTool, Manifest, validatePluginName, validateUrlPattern, NAME_REGEX, RESERVED_NAMES, LucideIconName, LUCIDE_ICON_NAMES)
+  - CLI `config set` key formats: `tool-permission.<plugin>.<tool>`, `plugin-permission.<plugin>`, `port`, `localPlugins.add`, `localPlugins.remove`
+---
+
+## 2026-03-07 - US-005
+- Verified dynamic opentabs://status resource implementation (already complete from US-001)
+- No code changes needed — `buildStatusResource` at mcp-resources.ts:1443 already builds the full JSON payload from ServerState
+- All acceptance criteria verified:
+  - Returns valid JSON with mimeType `application/json`
+  - JSON includes: extensionConnected, plugins (name, displayName, toolCount, tools, tabState, tabs), failedPlugins, browserToolCount, pluginToolCount, skipPermissions, uptime
+  - Per-plugin tab info includes tabId, url, title, ready
+  - No sensitive data (no secrets, no IIFE source, no audit entries)
+- Phase 1 checks all pass (build, type-check, lint, knip, test)
+- **Learnings for future iterations:**
+  - US-001 proactively implemented the full `buildStatusResource` function, so US-005 required only verification
+  - When implementing infrastructure stories, check if the dynamic resource implementation was already done as part of the initial handler setup
+---
+
+## 2026-03-07 - US-006
+- Added two new MCP prompts: `troubleshoot` and `setup_plugin`
+- Files changed:
+  - platform/mcp-server/src/mcp-prompts.ts — Added prompt definitions to PROMPTS array, updated resolvePrompt to use switch statement, added `resolveTroubleshoot`/`troubleshootPromptText` and `resolveSetupPlugin`/`setupPluginPromptText` resolver functions
+- Content details:
+  - **troubleshoot** (~120 lines): 8-step debugging workflow (extension connectivity, plugin state, permissions, timeout, rate limiting, tool not found, server/extension logs, browser-level diagnostics), includes specific tool calls at each step, quick reference error table with 9 common errors
+  - **setup_plugin** (~130 lines): 7-step setup workflow (search, install, open web app, verify loaded, review flow, test tool, configure permissions), dynamically derives `pluginName` and `packageName` from input, includes correct `config set` key formats
+- **Learnings for future iterations:**
+  - The `resolvePrompt` function was converted from if/else to switch for cleaner multi-prompt dispatch
+  - Prompt resolver functions follow a consistent pattern: `resolve<Name>(args)` returns `PromptResult`, delegates to `<name>PromptText(...)` for the text body
+  - The `setup_plugin` prompt derives both the npm package name and short plugin name from the input to handle both `slack` and `@opentabs-dev/opentabs-plugin-slack` formats
+---
+
+## 2026-03-07 - US-007
+- Enhanced SERVER_INSTRUCTIONS to reference available MCP resources and prompts
+- Files changed:
+  - platform/mcp-server/src/mcp-setup.ts — Added "Resources" and "Prompts" sections to SERVER_INSTRUCTIONS; tightened existing tool category descriptions and security rule wording to stay under 6000 char limit
+- Content details:
+  - **Resources section** (~11 lines): Lists all 7 resource URIs with 1-line descriptions, recommends fetching `opentabs://status` first
+  - **Prompts section** (~5 lines): Lists all 3 prompts (build_plugin, troubleshoot, setup_plugin) with argument signatures and descriptions
+  - Final string: 93 lines, 5911 characters (under the 120 lines / 6000 chars constraint)
+- Existing sections preserved: tool categories, security rules, plugin review flow, multi-tab targeting, permission states, error handling
+- Phase 1 (build, type-check, lint, knip, test) and Phase 2 (E2E: 529 passed) both green
+- **Learnings for future iterations:**
+  - The SERVER_INSTRUCTIONS string has a character budget (~6000 chars) — when adding new sections, tighten existing wording to stay within budget rather than simply appending
+  - Existing tool category and security rule descriptions had significant redundancy that could be trimmed without losing meaning
+  - E2E tests (529) are not affected by SERVER_INSTRUCTIONS changes — they test tool dispatch and extension behavior, not the instructions text
+---
