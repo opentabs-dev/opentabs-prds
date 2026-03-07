@@ -1,0 +1,101 @@
+## Codebase Patterns
+- ConfigStatePlugin (shared/src/index.ts) is the canonical type for plugin state flowing to the side panel. Fields added here auto-flow through bridge.ts PluginState via Omit<ConfigStatePlugin, 'tools'>.
+- Tab state is cached as serialized JSON (PluginTabStateInfo: { state, tabs }) in the lastKnownState map. Parse it in handleBgGetFullState to extract both aggregate state and per-tab details.
+- The PluginTabInfo type (shared/src/index.ts) already existed for tab.stateChanged/tab.syncAll messages.
+- Background message handlers follow the `MessageHandler` type pattern: `(message, sendResponse) => void`, with async work wrapped in `(async () => { ... })().then(result => sendResponse(result)).catch(...)`.
+- New message types require: (1) interface in extension-messages.ts, (2) add to InternalMessage union, (3) handler in background-message-handlers.ts, (4) register in dispatch map + EXTENSION_ONLY_TYPES, (5) bridge function in bridge.ts.
+- `findAllMatchingTabs(meta)` returns tabs sorted by rank (active+focused first). Import from `./tab-matching.js`.
+- `getPluginMeta(name)` reads PluginMeta from in-memory cache backed by chrome.storage.local. Import from `./plugin-storage.js`.
+- E2E tests that look for PluginIcon border classes (`[class*="border-border/30"]`) must use `xpath=..` to traverse from the accordion trigger to the parent header, because the icon was moved outside the trigger in US-003.
+- Plugin `homepage` is read from `pkg.opentabs.homepage` in the MCP server loader and flows via PluginMeta → chrome.storage.local → side panel. The `override` modifier is required when overriding `homepage` in the plugin class.
+- `context.waitForEvent('page')` detects tabs created by `chrome.tabs.create` in the extension background. `context.pages()` may not include them.
+
+# Ralph Progress Log
+PRD: prd-2026-03-07-132158-open-tab-feature-eb0453~running.json
+Started: Sat Mar  7 21:28:15 UTC 2026
+---
+
+## 2026-03-07 21:30 UTC - US-001
+- Added `tabs?: PluginTabInfo[]` field to `ConfigStatePlugin` in `platform/shared/src/index.ts`
+- Updated `handleBgGetFullState` in `platform/browser-extension/src/background-message-handlers.ts` to extract tabs from serialized tab state cache and include in response
+- bridge.ts `PluginState` inherits tabs automatically via `Omit<ConfigStatePlugin, 'tools'>`
+- Files changed: `platform/shared/src/index.ts`, `platform/browser-extension/src/background-message-handlers.ts`
+- **Learnings for future iterations:**
+  - The tab state cache stores serialized `PluginTabStateInfo` JSON strings (not objects). Parse with `JSON.parse()` and cast to `PluginTabStateInfo`.
+  - `tabs` is set to `undefined` (not empty array) when no tabs exist for efficiency — avoids sending empty arrays in the message protocol.
+  - `PluginTabInfo` import was added from `@opentabs-dev/shared` (type-only import, safe for extension CSP context).
+---
+
+## 2026-03-07 21:38 UTC - US-002
+- Added `BgOpenPluginTabMessage` interface to `platform/browser-extension/src/extension-messages.ts` and added it to the `InternalMessage` union
+- Added `handleBgOpenPluginTab` handler in `platform/browser-extension/src/background-message-handlers.ts` with round-robin cycling via ephemeral `cycleIndex` Map
+- Added `openPluginTab` bridge function in `platform/browser-extension/src/side-panel/bridge.ts`
+- Registered handler in dispatch map and `EXTENSION_ONLY_TYPES`
+- Files changed: `platform/browser-extension/src/extension-messages.ts`, `platform/browser-extension/src/background-message-handlers.ts`, `platform/browser-extension/src/side-panel/bridge.ts`
+- **Learnings for future iterations:**
+  - The biome pre-commit hook auto-sorts imports — no need to manually place imports in alphabetical order.
+  - TypeScript `noUncheckedIndexedAccess` is enabled — array index access returns `T | undefined`. Use optional chaining (`tab?.id`) instead of non-null assertions to satisfy both TS and biome's `noNonNullAssertion` rule.
+  - The handler uses the async IIFE pattern `(async () => { ... })().then().catch()` because `MessageHandler` is a sync type. The `return true` from the dispatch listener keeps the sendResponse channel open.
+  - The PRD notes said "Do NOT add bg:openPluginTab to EXTENSION_ONLY_TYPES" but it IS a side-panel-initiated message that should be extension-only (like all other `bg:*` messages). Added it to EXTENSION_ONLY_TYPES for consistency and security.
+---
+
+## 2026-03-07 21:44 UTC - US-003
+- Extracted PluginIcon from AccordionPrimitive.Trigger into an independent `<button>` element in PluginCard header
+- Added `openPluginTab` import from bridge.ts
+- Computed `tabCount`, `hasHomepage`, `isClickable`, `tooltipText` for dynamic icon behavior
+- Icon button has `cursor-pointer` + `hover:scale-105` when clickable, `disabled` when not
+- Tooltip shows contextual text: "Open {name}" (ready/unavailable), "Open {name} ({N} tabs)" (multi-tab), "Open {name} in new tab" (closed+homepage), or "v{version}" (closed, no homepage)
+- Split `px-3` padding between icon button (`pl-3 py-2`) and trigger (`pl-2 py-2 pr-0`) to maintain visual spacing
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginCard.tsx`
+- **Learnings for future iterations:**
+  - The `homepage` field on `ConfigStatePlugin` (and thus `PluginState`) is already optional and available — no additional plumbing needed.
+  - `PluginIcon` accepts `className?: string` with default `''`, so passing `undefined` when not clickable is fine.
+  - Radix AccordionPrimitive.Trigger captures clicks for expand/collapse — placing interactive elements OUTSIDE the trigger (but still inside AccordionPrimitive.Header) prevents click event conflicts.
+  - The `focus-ring` utility class provides keyboard focus styling consistent with the design system.
+---
+
+## 2026-03-07 21:48 UTC - US-004
+- Updated `mockPlugin` factory to include `homepage` and `tabs` fields by default (ready state with 1 tab)
+- Added 5 new stories: `ReadyMultipleTabs` (3 tabs), `ClosedWithHomepage`, `ClosedWithoutHomepage`, `UnavailableWithTabs` (2 tabs, ready=false), `OpenTabThemePair` (light/dark with 2 tabs)
+- Updated `TabClosed` story to explicitly set `tabs: undefined` (homepage still present from mockPlugin defaults)
+- Updated `MultiplePlugins` story to include realistic `homepage` and `tabs` data for GitHub (closed) and Datadog (unavailable) plugins
+- Files changed: `platform/browser-extension/src/side-panel/components/PluginCard.stories.tsx`
+- **Learnings for future iterations:**
+  - The `mockPlugin` factory spreads overrides at the end, so setting `tabs: undefined` explicitly overrides the default `tabs` array — useful for simulating closed tab state.
+  - The biome pre-commit hook auto-formats, so story code formatting adjustments happen automatically.
+  - Stories that call `openPluginTab` from the bridge will silently fail in Storybook (no `chrome.runtime.sendMessage`), which is expected — Storybook tests the visual behavior, not the bridge call.
+---
+
+## 2026-03-07 21:55 UTC - US-005
+- Created `e2e/side-panel-open-tab.e2e.ts` with 4 test cases:
+  1. `clicking plugin icon focuses the matching tab` — opens one test app tab, clicks icon, verifies focus via `document.hasFocus()`
+  2. `clicking plugin icon cycles through multiple tabs` — opens two tabs, verifies round-robin cycling across 3 clicks
+  3. `icon shows correct tooltip with tab count` — verifies version tooltip (closed, no homepage), "Open E2E Test" (1 tab), "Open E2E Test (2 tabs)" (2 tabs) via aria-label
+  4. `icon not clickable when no tabs and no homepage` — verifies button is disabled and has no cursor-pointer class
+- Extracted `waitForPluginTabState` helper within the test file for polling /health tab state
+- Used manual setup (not Playwright fixtures) following the pattern from `side-panel-data-flow.e2e.ts`
+- Files changed: `e2e/side-panel-open-tab.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - The icon button's `aria-label` equals the `tooltipText` computed in PluginCard.tsx — use this for reliable locator targeting in E2E tests
+  - `document.hasFocus()` is a reliable way to verify tab focus in Playwright — works because `chrome.tabs.update(tabId, { active: true })` + `chrome.windows.update(windowId, { focused: true })` brings the tab's page into focus
+  - The /health endpoint returns `tabs` array in `pluginDetails` with per-tab `{ tabId, url, title, ready }` — useful for asserting tab count without needing the side panel
+  - Side panel needs `reload()` after tab state changes to pick up the latest state from bg:getFullState, since push notifications from background may not reliably reach Playwright-opened extension pages
+---
+
+## 2026-03-07 22:15 UTC - US-006
+- Added `override readonly homepage = 'http://localhost:9876'` to the e2e-test plugin class in `plugins/e2e-test/src/index.ts`
+- Added `"homepage": "http://localhost:9876"` to the opentabs field in `plugins/e2e-test/package.json`
+- Replaced "icon not clickable when no tabs and no homepage" test with "clicking icon opens homepage when no matching tab exists" test in `e2e/side-panel-open-tab.e2e.ts`
+- Updated tooltip test to expect "Open E2E Test in new tab" (not version string) when plugin is closed with homepage
+- Started a minimal HTTP server on port 9876 in the test so the opened tab stays at the homepage URL
+- Used `context.waitForEvent('page')` + URL polling to verify the new tab
+- Verified plugin transitions from 'closed' to non-closed state via /health polling
+- Fixed 7 pre-existing E2E test failures in 4 files: added `xpath=..` to border-class locators that assumed PluginIcon was inside the accordion trigger (it was moved outside in US-003)
+- Files changed: `plugins/e2e-test/src/index.ts`, `plugins/e2e-test/package.json`, `e2e/side-panel-open-tab.e2e.ts`, `e2e/side-panel-data-flow.e2e.ts`, `e2e/side-panel-icons.e2e.ts`, `e2e/side-panel-plugin-toggle.e2e.ts`, `e2e/side-panel-realtime-state.e2e.ts`
+- **Learnings for future iterations:**
+  - Chrome navigates to `chrome-error://chromewebdata/` when a page fails to load (no server) — the original URL is lost. To test homepage open behavior, start a minimal HTTP server on the target port so the URL persists.
+  - `context.pages()` may not detect tabs created by `chrome.tabs.create` in the extension background. Use `context.waitForEvent('page')` instead.
+  - The `homepage` field in OpenTabsPlugin base class requires `override` when overridden in a subclass (TypeScript `noImplicitOverride` is enabled).
+  - When restructuring the accordion header (moving elements in/out of the trigger), ALL E2E tests that look for child elements of the trigger must be updated to use the new DOM structure.
+  - Playwright's `locator('xpath=..')` navigates to the parent element — useful when the target element was moved to a sibling container.
+---
