@@ -1,0 +1,54 @@
+# Ralph Progress Log
+PRD: prd-2026-03-06-171659-cdp-trusted-events-3cc8e0~running.json
+Started: Sat Mar  7 01:17:29 UTC 2026
+---
+
+## Codebase Patterns
+- The `withDebugger` helper in `platform/browser-extension/src/browser-commands/resource-commands.ts` manages chrome.debugger attach/detach lifecycle and reuses existing sessions from network capture. Use it for all CDP commands.
+- The `browser-tools-catalog.ts` in `platform/shared/src/generated/` has a runtime validation check in `platform/mcp-server/src/browser-tools/index.ts` that compares descriptions at module load time. When changing a browser tool description, you must update both the definition AND the catalog file — the `npm run generate:browser-tools-catalog` script imports from compiled `dist/` which triggers the validation before it can regenerate, creating a chicken-and-egg problem. Update the catalog directly.
+- `extractScriptResult` returns `Record<string, unknown>` — cast specific fields (e.g., `result.x as number`) when extracting typed values.
+- Importing `withDebugger` from `resource-commands.ts` pulls in `network-capture.ts` which registers `chrome.debugger.onEvent.addListener` and `chrome.tabs.onRemoved.addListener` at module load time. Test files must stub these chrome APIs before the dynamic import.
+
+---
+
+## 2026-03-07 - US-001
+- Implemented: Migrated `handleBrowserClickElement` from synthetic `element.click()` to CDP `Input.dispatchMouseEvent` (mousePressed + mouseReleased) for trusted events
+- Files changed:
+  - `platform/browser-extension/src/browser-commands/interaction-commands.ts` — replaced click() with getBoundingClientRect() + withDebugger CDP dispatch
+  - `platform/mcp-server/src/browser-tools/click-element.ts` — updated description to mention trusted CDP events
+  - `platform/shared/src/generated/browser-tools-catalog.ts` — updated catalog description to match
+- **Learnings for future iterations:**
+  - The browser-tools-catalog.ts must be manually updated when changing browser tool descriptions because the generation script imports the compiled barrel which triggers runtime validation against the old catalog
+  - The `withDebugger` helper is already imported in interaction-commands.ts so no import changes were needed
+  - Response shape { clicked, tagName, text } must be preserved for backward compatibility
+---
+
+## 2026-03-07 - US-002
+- Implemented: Migrated `handleBrowserPressKey` from synthetic JS events to CDP `Input.dispatchKeyEvent` for trusted events
+- Changes:
+  - Replaced the single monolithic `chrome.scripting.executeScript` closure with a two-phase approach: optional selector focus via scripting, then CDP key dispatch via `withDebugger`
+  - Moved helper logic (NAMED_KEY_CODES, deriveCode, getVirtualKeyCode, buildModifiers, isPrintableKeyPress) from the injected closure to module scope
+  - Named keys dispatch rawKeyDown + keyUp (2 CDP calls); printable characters dispatch keyDown + char + keyUp (3 CDP calls)
+  - Modifier flags passed as CDP bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8)
+- Files changed:
+  - `platform/browser-extension/src/browser-commands/key-press-command.ts` — major rewrite to CDP dispatch
+  - `platform/browser-extension/src/browser-commands/key-press-command.test.ts` — added chrome.debugger/tabs mock stubs for module loading
+  - `platform/mcp-server/src/browser-tools/press-key.ts` — updated description to mention trusted CDP events
+  - `platform/shared/src/generated/browser-tools-catalog.ts` — updated catalog description to match
+- **Learnings for future iterations:**
+  - Importing `withDebugger` from `resource-commands.ts` pulls in `network-capture.ts` which registers `chrome.debugger.onEvent.addListener` and `chrome.tabs.onRemoved.addListener` at module load time — all test files that import modules using `withDebugger` need chrome.debugger and chrome.tabs.onRemoved stubs in globalThis before the import
+  - The CDP modifier bitmask values are: Alt=1, Ctrl=2, Meta=4, Shift=8
+  - For CDP key events: named keys use `rawKeyDown`/`keyUp`, printable chars use `keyDown`/`char`/`keyUp`
+  - The `text` field for CDP key events: printable chars get the char itself, Enter gets '\r', Tab gets '\t', everything else gets empty string
+---
+
+## 2026-03-07 - US-003
+- Implemented: Added CDP dispatch unit tests for `handleBrowserPressKey` and fixed a pre-existing E2E test failure
+- Files changed:
+  - `platform/browser-extension/src/browser-commands/key-press-command.test.ts` — extracted chrome.debugger mock variables, added reset in beforeEach, added 4 new CDP dispatch test cases (named key, printable char, selector focus, modifier flags)
+  - `e2e/side-panel-plugin-toggle.e2e.ts` — removed references to the reverted hidden tools collapse feature that was causing the "re-selecting plugin permission clears overrides" test to fail
+- **Learnings for future iterations:**
+  - The hidden tools collapse feature was reverted in commit 546daa34 but the E2E test at line 837 still referenced it, causing a consistent failure. Always check git log for reverts when encountering unexplained E2E failures.
+  - `expandHiddenTools` helper in e2e/helpers.ts is a no-op when no hidden toggles exist (counts to 0), so calling it is harmless. The failure was from the explicit `toBeVisible` assertion on the toggle button.
+  - For CDP key event tests: mock `chrome.debugger.attach/detach/sendCommand` as named variables to enable assertions on call arguments and call counts
+---
