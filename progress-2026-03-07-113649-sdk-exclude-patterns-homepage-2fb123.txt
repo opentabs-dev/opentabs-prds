@@ -1,0 +1,92 @@
+# Ralph Progress Log
+PRD: prd-2026-03-07-113649-sdk-exclude-patterns-homepage-2fb123~running.json
+Started: Sat Mar  7 19:37:16 UTC 2026
+---
+
+## Codebase Patterns
+- PluginOpentabsField (manifest.ts) uses camelCase for field names
+- PluginManifest (index.ts) uses snake_case for url_patterns/exclude_patterns, matching Chrome match pattern convention
+- WirePluginPayload and ConfigStatePlugin use camelCase
+- parsePluginPackageJson validation uses err() from Result type for structured error handling
+- Error messages follow the pattern: `Invalid package.json at ${sourcePath}: "opentabs.<field>" must be ...`
+- Optional fields are spread conditionally: `...(value ? { field: value } : {})` to keep output clean
+- Browser extension's background-message-handlers.ts uses `...metaFields` spread from PluginMeta — new optional fields flow through automatically
+- ValidatedPluginPayload defaults arrays to [] and strings to undefined when absent — toPluginMeta converts empty arrays back to undefined for storage efficiency
+
+## 2026-03-07 - US-001
+- Implemented: Added excludePatterns and homepage fields to shared types and manifest parser
+- Files changed:
+  - platform/shared/src/manifest.ts (PluginOpentabsField + parsePluginPackageJson parsing)
+  - platform/shared/src/index.ts (PluginManifest, WirePluginPayload, ConfigStatePlugin)
+  - platform/shared/src/manifest.test.ts (11 new tests for excludePatterns and homepage validation)
+- **Learnings for future iterations:**
+  - PluginOpentabsField is the type for the `opentabs` field in package.json — it's defined in manifest.ts and re-exported from index.ts
+  - The parser returns undefined (omits from output) for absent optional fields rather than defaulting to empty values
+  - Empty excludePatterns array `[]` is allowed (unlike urlPatterns which requires non-empty)
+---
+
+## 2026-03-07 - US-002
+- Implemented: Added excludePatterns and homepage optional properties to OpenTabsPlugin base class
+- Files changed:
+  - platform/plugin-sdk/src/index.ts (added 2 optional readonly properties with JSDoc after urlPatterns)
+- **Learnings for future iterations:**
+  - Properties must be optional (non-abstract) — existing plugins that don't declare them continue to compile
+  - Properties are placed after urlPatterns for logical grouping (urlPatterns → excludePatterns → homepage → tools)
+  - JSDoc notes the Chrome match pattern reference for excludePatterns and that homepage is a concrete URL, not a pattern
+---
+
+## 2026-03-07 - US-003
+- Implemented: Added excludePatterns and homepage validation to plugin-tools build command
+- Files changed:
+  - platform/plugin-tools/src/commands/build.ts (validatePackageJson + validatePlugin)
+- **Learnings for future iterations:**
+  - validateUrlPattern is imported from @opentabs-dev/plugin-sdk in build.ts — no new import needed
+  - validatePackageJson throws on error (not pushes to array), so excludePatterns validation also throws
+  - validatePlugin accumulates errors into an array, so excludePatterns/homepage validation pushes to errors[]
+  - homepage validation uses `new URL()` constructor — throws on invalid URL strings
+  - The PRD note says "do NOT validate homepage in validatePackageJson" — only validate in validatePlugin (runtime instance)
+---
+
+## 2026-03-07 - US-004
+- Implemented: Plumbed excludePatterns and homepage through MCP server loader, state, and extension handlers
+- Files changed:
+  - platform/mcp-server/src/loader.ts (LoadedPlugin interface + loadPlugin: added fields, exclude pattern validation)
+  - platform/mcp-server/src/state.ts (RegisteredPlugin interface: added excludePatterns: string[] and homepage?: string)
+  - platform/mcp-server/src/extension-handlers.ts (serializePluginForExtension: added fields to return type and value)
+  - 9 test files updated to add excludePatterns: [] to RegisteredPlugin fixtures
+- **Learnings for future iterations:**
+  - LoadedPlugin flows into RegisteredPlugin via structural typing — discovery.ts passes LoadedPlugin[] directly to buildRegistry() which accepts RegisteredPlugin[]. No explicit mapping step exists.
+  - serializePluginForExtension uses conditional spreading `...(plugin.excludePatterns.length > 0 ? { excludePatterns: ... } : {})` to keep wire payloads clean (same pattern as iconSvg, etc.)
+  - RegisteredPlugin has excludePatterns as required (string[]) while homepage is optional — matching the pattern that excludePatterns defaults to [] (empty array) while homepage defaults to undefined
+  - Many test files have makePlugin/createPlugin helpers that construct RegisteredPlugin fixtures — adding a required field requires updating ALL of them
+---
+
+## 2026-03-07 - US-005
+- Implemented: Plumbed excludePatterns and homepage through browser extension storage and message router
+- Files changed:
+  - platform/browser-extension/src/extension-messages.ts (PluginMeta: added excludePatterns?: string[] and homepage?: string)
+  - platform/browser-extension/src/message-router.ts (ValidatedPluginPayload, validatePluginPayload, toPluginMeta, handleSyncFull cache, handlePluginUpdate cache)
+- **Learnings for future iterations:**
+  - ValidatedPluginPayload has excludePatterns as required string[] (defaulting to []) while PluginMeta has it as optional — toPluginMeta converts empty arrays to undefined to avoid bloating chrome.storage.local
+  - validatePluginPayload uses a defensive filter pattern: `Array.isArray(obj.field) ? filter(isString) : []` — this silently drops non-string elements rather than rejecting the whole payload
+  - handleSyncFull and handlePluginUpdate both construct ConfigStatePlugin objects for the server state cache — both use conditional spread `...(field.length > 0 ? { field } : {})` to keep payloads clean
+  - isValidPluginMeta (plugin-storage.ts) only checks required fields — optional fields like excludePatterns and homepage don't need validation changes
+  - background-message-handlers.ts uses `...metaFields` spread from PluginMeta, which automatically propagates new optional fields without code changes
+---
+
+## 2026-03-07 - US-006
+- Implemented: Added excludePatterns support to tab matching and adapter injection
+- Files changed:
+  - platform/browser-extension/src/tab-matching.ts (urlMatchesPatterns: added optional 3rd param, findAllMatchingTabs: post-filter excluded tabs)
+  - platform/browser-extension/src/tab-matching.test.ts (10 new tests: 6 for urlMatchesPatterns excludePatterns, 4 for findAllMatchingTabs excludePatterns)
+  - platform/browser-extension/src/iife-injection.ts (queryMatchingTabIds, injectPluginIntoMatchingTabs, cleanupAdaptersInMatchingTabs, injectPluginsIntoTab, reinjectStoredPlugins: all plumbed excludePatterns)
+  - platform/browser-extension/src/tab-state.ts (2 urlMatchesPatterns call sites updated with p.excludePatterns)
+  - platform/browser-extension/src/dispatch-helpers.ts (2 urlMatchesPatterns call sites updated with plugin.excludePatterns)
+  - platform/browser-extension/src/message-router.ts (4 call sites updated to pass excludePatterns to injection/cleanup functions)
+- **Learnings for future iterations:**
+  - urlMatchesPatterns third parameter must be optional to maintain backwards compatibility with existing 2-arg call sites
+  - queryMatchingTabIds already receives full chrome.tabs.Tab objects from chrome.tabs.query (including .url), so exclude filtering can happen inline without extra chrome.tabs.get calls
+  - findAllMatchingTabs post-filters with `!tab.url || !urlMatchesPatterns(tab.url, excludePatterns)` — tabs without URL are kept (conservative: chrome.tabs.query already matched them)
+  - injectPluginIntoMatchingTabs has many positional params — excludePatterns was added as the last param to avoid shifting existing callers
+  - The Jira/Confluence overlap scenario is the motivating use case: `*://*.atlassian.net/*` includes patterns with `*://*.atlassian.net/wiki/*` exclude patterns
+---
