@@ -1,0 +1,67 @@
+# Ralph Progress Log
+PRD: prd-2026-03-06-230002-failed-plugin-remove-3ad1e6~running.json
+Started: Sat Mar  7 07:00:31 UTC 2026
+---
+
+## Codebase Patterns
+- Plugin management functions in plugin-management.ts use a configWriteMutex for serialized read-modify-write to config.json, with atomicWrite for safe file writes
+- Extension handlers in extension-handlers.ts follow a consistent pattern: validate params, call business logic, trigger onReload, send plugins.changed notification, send success result
+- Dispatch routes in extension-protocol.ts are simple if/return blocks matching method name + id presence
+- Failed plugins only have their raw specifier string from config.json (not a plugin name), since they never enter the registry
+- New bg: message types require changes in 4 files: extension-messages.ts (type + InternalMessage union), background-message-handlers.ts (handler + map + EXTENSION_ONLY_TYPES + export), offscreen/index.ts (relay switch case), bridge.ts (function + export)
+- Storybook test utilities (fn, expect, etc.) import from `storybook/test`, not `@storybook/test`
+- Biome enforces CSS class sorting via nursery/useSortedClasses — check ordering when combining Tailwind utilities
+---
+
+## 2026-03-07 07:03 - US-001
+- Implemented removeLocalPluginBySpecifier in plugin-management.ts using exact string match against config.json localPlugins array
+- Implemented handlePluginRemoveBySpecifier handler in extension-handlers.ts following the handlePluginRemove pattern
+- Added dispatch route for plugin.removeBySpecifier in extension-protocol.ts
+- Files changed:
+  - platform/mcp-server/src/plugin-management.ts (added removeLocalPluginBySpecifier function + export)
+  - platform/mcp-server/src/extension-handlers.ts (added handlePluginRemoveBySpecifier handler + import + export)
+  - platform/mcp-server/src/extension-protocol.ts (added dispatch route + import)
+- **Learnings for future iterations:**
+  - The existing removeLocalPlugin matches by resolved path / package.json name — doesn't work for broken paths
+  - The new removeLocalPluginBySpecifier uses exact string equality against config entries (no path resolution)
+  - The handler intentionally does NOT call queryExtension('plugin.uninstall') since failed plugins have no adapter
+---
+
+## 2026-03-07 07:09 - US-002
+- Added BgRemoveFailedPluginMessage type to extension-messages.ts with type 'bg:removeFailedPlugin' and specifier field
+- Added removeFailedPlugin bridge function to bridge.ts following the exact pattern of removePlugin
+- Added handleBgRemoveFailedPlugin handler in background-message-handlers.ts that sends plugin.removeBySpecifier JSON-RPC
+- Registered handler in backgroundHandlers map and EXTENSION_ONLY_TYPES set
+- Added bg:removeFailedPlugin case to offscreen relay switch (non-processed messages list)
+- Files changed:
+  - platform/browser-extension/src/extension-messages.ts (added BgRemoveFailedPluginMessage type + InternalMessage union member)
+  - platform/browser-extension/src/side-panel/bridge.ts (added removeFailedPlugin function + export)
+  - platform/browser-extension/src/background-message-handlers.ts (added handler + map entry + EXTENSION_ONLY_TYPES entry + export)
+  - platform/browser-extension/src/offscreen/index.ts (added relay case)
+- **Learnings for future iterations:**
+  - Background message handlers follow a simple pattern: extract params from message, call sendServerRequest, resolve/reject via sendResponse
+  - New bg: message types need to be added in 4 places: extension-messages.ts (type + union), background-message-handlers.ts (handler + map + EXTENSION_ONLY_TYPES + export), offscreen/index.ts (relay switch), and bridge.ts (function + export)
+  - The EXTENSION_ONLY_TYPES set prevents content scripts from sending privileged messages
+---
+
+## 2026-03-07 07:20 - US-003
+- Added Trash2 icon button to FailedPluginCard header row with confirmation dialog using retro Dialog primitive
+- Confirmation dialog follows PluginMenu's destructive styling pattern (red header, Cancel/Remove buttons)
+- Specifier displayed in monospace font-mono block within the dialog body
+- Added removing state (shows Loader spinner when removal in progress)
+- Updated PluginList.tsx to pass onRemoveFailedPlugin and removingFailedPlugins props to FailedPluginCard
+- Added handleRemoveFailedPlugin handler in App.tsx following the existing handleRemove pattern
+- Imported removeFailedPlugin from bridge.ts and wired through to the handler
+- Reset removingFailedPlugins on disconnect alongside other state resets
+- Updated Storybook stories with fn() for onRemove, added Removing story, updated AllStates with new props
+- Files changed:
+  - platform/browser-extension/src/side-panel/components/FailedPluginCard.tsx (added Remove button, dialog, props interface)
+  - platform/browser-extension/src/side-panel/components/PluginList.tsx (added onRemoveFailedPlugin + removingFailedPlugins props)
+  - platform/browser-extension/src/side-panel/App.tsx (added handler, state, import, disconnect reset, PluginList props)
+  - platform/browser-extension/src/side-panel/components/FailedPluginCard.stories.tsx (updated with fn(), Removing story, AllStates)
+- **Learnings for future iterations:**
+  - Storybook test imports use `storybook/test` (not `@storybook/test`) in this project
+  - FailedPluginCard props are required (onRemove, removing) but PluginList's corresponding props are optional since SearchResults also renders PluginList without failed plugin removal support
+  - Failed plugins are hidden during search filtering (visibleFailed is empty when filterLower is set), so removal props aren't needed in SearchResults context
+  - CSS class sorting is enforced by Biome's nursery/useSortedClasses rule — `break-all` must come before `rounded`
+---
