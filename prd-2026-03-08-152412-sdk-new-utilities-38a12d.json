@@ -1,0 +1,109 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add five new SDK utilities to plugin-sdk that eliminate the most common boilerplate across all 27 plugins: auth cache persistence, fetchText for non-JSON responses, getMetaContent for meta tag reading, buildQueryString for URL parameter construction, and findLocalStorageEntry for key pattern searching. Update the barrel exports and internal CLAUDE.md docs.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add getAuthCache / setAuthCache / clearAuthCache to storage.ts",
+      "description": "Add three functions to platform/plugin-sdk/src/storage.ts that provide typed read/write/clear access to globalThis.__openTabs.tokenCache[namespace]. This eliminates ~20 lines of identical boilerplate from 15+ plugins that all manually persist auth tokens to survive adapter re-injection.",
+      "acceptanceCriteria": [
+        "getAuthCache<T>(namespace: string): T | null reads globalThis.__openTabs.tokenCache[namespace], returns null on missing or error",
+        "setAuthCache<T>(namespace: string, value: T): void writes to globalThis.__openTabs.tokenCache[namespace], initializing __openTabs and tokenCache objects if absent",
+        "clearAuthCache(namespace: string): void sets globalThis.__openTabs.tokenCache[namespace] to undefined",
+        "All three functions wrap access in try-catch and silently handle errors (consistent with existing storage.ts pattern)",
+        "All three functions are exported from storage.ts and re-exported from index.ts",
+        "The generic T allows both primitive strings (Discord token) and complex objects (Jira auth with accountId + cloudId)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-sdk/src/storage.ts (add 3 new functions after getCookie at line 136)\n- platform/plugin-sdk/src/index.ts (add re-exports in the Storage section at line 215)\n\nContext:\nEvery plugin that reads auth tokens persists them to `globalThis.__openTabs.tokenCache` to survive adapter re-injection. The pattern is byte-for-byte identical across 15+ plugins. Example from plugins/discord/src/discord-api.ts:\n\n```typescript\nconst getPersistedToken = (): string | null => {\n  try {\n    const ns = (globalThis as Record<string, unknown>).__openTabs as Record<string, unknown> | undefined;\n    const cache = ns?.tokenCache as Record<string, string | undefined> | undefined;\n    return cache?.discord ?? null;\n  } catch {\n    return null;\n  }\n};\n\nconst setPersistedToken = (token: string): void => {\n  try {\n    const g = globalThis as Record<string, unknown>;\n    if (!g.__openTabs) g.__openTabs = {};\n    const ns = g.__openTabs as Record<string, unknown>;\n    if (!ns.tokenCache) ns.tokenCache = {};\n    const cache = ns.tokenCache as Record<string, string | undefined>;\n    cache.discord = token;\n  } catch {}\n};\n\nconst clearPersistedToken = (): void => {\n  try {\n    const ns = (globalThis as Record<string, unknown>).__openTabs as Record<string, unknown> | undefined;\n    const cache = ns?.tokenCache as Record<string, string | undefined> | undefined;\n    if (cache) cache.discord = undefined;\n  } catch {}\n};\n```\n\nSome plugins store strings (Discord, Supabase), others store objects (Jira stores `{ accountId, cloudId }`, Notion stores `{ userId, spaceId }`, Linear stores `{ userAccountId, userId, ... }`). The generic T parameter handles both.\n\nChanges:\nAdd after line 136 in storage.ts:\n```typescript\nexport const getAuthCache = <T>(namespace: string): T | null => {\n  try {\n    const ns = (globalThis as Record<string, unknown>).__openTabs as Record<string, unknown> | undefined;\n    const cache = ns?.tokenCache as Record<string, unknown> | undefined;\n    return (cache?.[namespace] as T) ?? null;\n  } catch {\n    return null;\n  }\n};\n\nexport const setAuthCache = <T>(namespace: string, value: T): void => {\n  try {\n    const g = globalThis as Record<string, unknown>;\n    if (!g.__openTabs) g.__openTabs = {};\n    const ns = g.__openTabs as Record<string, unknown>;\n    if (!ns.tokenCache) ns.tokenCache = {};\n    (ns.tokenCache as Record<string, unknown>)[namespace] = value;\n  } catch {}\n};\n\nexport const clearAuthCache = (namespace: string): void => {\n  try {\n    const ns = (globalThis as Record<string, unknown>).__openTabs as Record<string, unknown> | undefined;\n    const cache = ns?.tokenCache as Record<string, unknown> | undefined;\n    if (cache) cache[namespace] = undefined;\n  } catch {}\n};\n```\n\nAdd to the Storage exports block in index.ts (around line 215):\n```typescript\nexport {\n  clearAuthCache,\n  getAuthCache,\n  ...\n} from './storage.js';\n```\n\nConstraints:\n- Do NOT change any existing functions in storage.ts\n- Do NOT add JSDoc that references specific plugins (keep it generic)\n- Follow the existing error handling pattern (try-catch, silently ignore, no log.warn for these — consistent with how plugins already use this pattern silently)\n- The namespace parameter is the plugin name string (e.g., 'discord', 'jira')"
+    },
+    {
+      "id": "US-002",
+      "title": "Add fetchText to fetch.ts",
+      "description": "Add a fetchText function to platform/plugin-sdk/src/fetch.ts that fetches a URL and returns the response body as a string (not JSON). This is needed by GitHub (diffs), GitLab (job logs), and Bitbucket (diffs) which all implement their own apiRaw() variants.",
+      "acceptanceCriteria": [
+        "fetchText(url, init?) returns Promise<string> using fetchFromPage under the hood",
+        "Returns response.text() on success",
+        "Handles 204/empty content-length by returning empty string",
+        "Inherits all fetchFromPage behavior (credentials, timeout, error classification)",
+        "Exported from fetch.ts and re-exported from index.ts"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-sdk/src/fetch.ts (add after deleteJSON, around line 374)\n- platform/plugin-sdk/src/index.ts (add re-export in the Fetch section)\n\nContext:\nGitHub, GitLab, and Bitbucket all have separate `apiRaw()` functions that return `response.text()` instead of JSON. Used for diffs, raw file content, and job logs. Example from plugins/github/src/github-api.ts:\n```typescript\nexport const apiRaw = async (endpoint: string, options: ApiOptions = {}): Promise<string> => {\n  // ... builds URL, headers ...\n  const response = await fetch(url, { method, headers, body: fetchBody, signal: AbortSignal.timeout(30_000) });\n  if (!response.ok) { /* manual error handling */ }\n  return response.text();\n};\n```\n\nChanges:\nAdd to fetch.ts after deleteJSON (after line 374):\n```typescript\nexport const fetchText = async (url: string, init?: FetchFromPageOptions): Promise<string> => {\n  const response = await fetchFromPage(url, init);\n  if (response.status === 204 || response.headers.get('content-length') === '0') {\n    return '';\n  }\n  return response.text();\n};\n```\n\nAdd to index.ts Fetch exports section (around line 190-202):\n```typescript\nexport {\n  ...\n  fetchText,\n  ...\n} from './fetch.js';\n```\n\nConstraints:\n- Do NOT change any existing fetch functions\n- fetchText should NOT parse JSON — it returns raw text\n- fetchText does NOT need overloaded signatures or Zod schema validation (text responses are unstructured)"
+    },
+    {
+      "id": "US-003",
+      "title": "Add getMetaContent to dom.ts",
+      "description": "Add a getMetaContent function to platform/plugin-sdk/src/dom.ts that reads the content attribute of a <meta> tag by name. Used by GitHub, Jira, Confluence, and GitLab for auth detection.",
+      "acceptanceCriteria": [
+        "getMetaContent(name: string): string | null queries document.querySelector('meta[name=\"...\"]') and returns the content attribute",
+        "Returns null if the meta tag is not found or has no content attribute",
+        "Handles invalid/empty name parameter gracefully (returns null)",
+        "Exported from dom.ts and re-exported from index.ts"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-sdk/src/dom.ts (add after getTextContent, around line 248)\n- platform/plugin-sdk/src/index.ts (add re-export in the DOM section at line 174)\n\nContext:\nFour plugins read meta tags for auth detection:\n- GitHub: `document.querySelector<HTMLMetaElement>('meta[name=\"user-login\"]')?.content`\n- Jira: `document.querySelector('meta[name=\"ajs-atlassian-account-id\"]')?.getAttribute('content')`\n- Confluence: has a local `getMetaContent` helper: `const getMetaContent = (name: string): string | null => document.querySelector(\\`meta[name=\"${name}\"]\\`)?.getAttribute('content') ?? null;`\n- GitLab: `document.querySelector<HTMLMetaElement>('meta[name=\"csrf-token\"]')?.content`\n\nChanges:\nAdd to dom.ts after getTextContent (after line 248):\n```typescript\nexport const getMetaContent = (name: string): string | null => {\n  if (!name) return null;\n  try {\n    const meta = document.querySelector<HTMLMetaElement>(`meta[name=\"${CSS.escape(name)}\"]`);\n    return meta?.content ?? null;\n  } catch {\n    return null;\n  }\n};\n```\n\nUse `CSS.escape(name)` to prevent CSS injection in the selector. This is defensive — meta names are typically alphanumeric, but an unsafe name could break the querySelector.\n\nAdd to index.ts DOM exports (line 174):\n```typescript\nexport { getMetaContent, getTextContent, observeDOM, querySelectorAll, waitForSelector, waitForSelectorRemoval } from './dom.js';\n```\n\nConstraints:\n- Do NOT change any existing DOM functions\n- Use CSS.escape for the name parameter in the selector\n- Return null (not empty string) when meta tag is missing or has no content"
+    },
+    {
+      "id": "US-004",
+      "title": "Add buildQueryString to fetch.ts",
+      "description": "Add a buildQueryString utility to platform/plugin-sdk/src/fetch.ts that converts a record of key-value pairs into a URL query string, filtering out undefined values. Used by ~20 plugins that all manually build URLSearchParams.",
+      "acceptanceCriteria": [
+        "buildQueryString accepts Record<string, string | number | boolean | string[] | undefined>",
+        "Filters out undefined values before building the query string",
+        "Converts number and boolean values to strings via String()",
+        "Handles string[] values by appending multiple entries for the same key",
+        "Returns empty string (not '?') when all values are undefined or the record is empty",
+        "Returns the query string WITHOUT the leading '?' character",
+        "Exported from fetch.ts and re-exported from index.ts"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-sdk/src/fetch.ts (add before fetchFromPage, around line 60)\n- platform/plugin-sdk/src/index.ts (add re-export in the Fetch section)\n\nContext:\nNearly every plugin builds query strings manually:\n```typescript\n// Common pattern in ~20 plugins:\nconst params = new URLSearchParams();\nfor (const [key, value] of Object.entries(options.query)) {\n  if (value !== undefined) params.append(key, String(value));\n}\nconst qs = params.toString();\nif (qs) url += `?${qs}`;\n```\n\nSome plugins (Sentry, Vercel) also support array values:\n```typescript\ntype QueryValue = string | number | boolean | string[] | undefined;\n```\n\nChanges:\nAdd to fetch.ts before fetchFromPage (around line 60):\n```typescript\nexport const buildQueryString = (\n  params: Record<string, string | number | boolean | string[] | undefined>,\n): string => {\n  const searchParams = new URLSearchParams();\n  for (const [key, value] of Object.entries(params)) {\n    if (value === undefined) continue;\n    if (Array.isArray(value)) {\n      for (const item of value) {\n        searchParams.append(key, item);\n      }\n    } else {\n      searchParams.append(key, String(value));\n    }\n  }\n  return searchParams.toString();\n};\n```\n\nAdd to index.ts Fetch exports section.\n\nConstraints:\n- Do NOT include a leading '?' — the caller decides how to append it\n- Do NOT change any existing fetch functions\n- The function returns a string (possibly empty), not URLSearchParams"
+    },
+    {
+      "id": "US-005",
+      "title": "Add findLocalStorageEntry to storage.ts",
+      "description": "Add a findLocalStorageEntry function to platform/plugin-sdk/src/storage.ts that searches localStorage keys using a predicate function. Needed by Teams (MSAL token discovery) and ClickHouse (Auth0 token discovery) which iterate localStorage to find tokens by key prefix.",
+      "acceptanceCriteria": [
+        "findLocalStorageEntry(predicate: (key: string) => boolean): { key: string; value: string } | null",
+        "Iterates localStorage keys and returns the first entry where the predicate returns true",
+        "Returns null if no matching key is found or if localStorage is inaccessible",
+        "Uses the same iframe fallback as getLocalStorage for environments where localStorage is deleted",
+        "Exported from storage.ts and re-exported from index.ts"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-sdk/src/storage.ts (add after getLocalStorage, around line 52)\n- platform/plugin-sdk/src/index.ts (add re-export in the Storage section)\n\nContext:\nTwo plugins need to search localStorage by key pattern:\n\nTeams (plugins/teams/src/teams-api.ts:27-45) searches for MSAL tokens:\n```typescript\nfor (let i = 0; i < localStorage.length; i++) {\n  const key = localStorage.key(i);\n  if (!key) continue;\n  if (key.includes('login.windows.net') && key.includes('accesstoken')) {\n    const raw = localStorage.getItem(key);\n    // ...\n  }\n}\n```\n\nClickHouse (plugins/clickhouse/src/clickhouse-api.ts:26-42) searches for Auth0 tokens:\n```typescript\nconst raw = localStorage.getItem(AUTH0_STORAGE_KEY); // but also searches @@auth0spajs@@:: prefix keys\n```\n\nThe SDK's getLocalStorage(key) only reads a specific key by name.\n\nChanges:\nAdd to storage.ts after getLocalStorage (after the closing of the iframe fallback at line 52):\n```typescript\nexport const findLocalStorageEntry = (\n  predicate: (key: string) => boolean,\n): { key: string; value: string } | null => {\n  const search = (storage: Storage): { key: string; value: string } | null => {\n    for (let i = 0; i < storage.length; i++) {\n      const key = storage.key(i);\n      if (key !== null && predicate(key)) {\n        const value = storage.getItem(key);\n        if (value !== null) return { key, value };\n      }\n    }\n    return null;\n  };\n\n  try {\n    return search(localStorage);\n  } catch {\n    // Direct access failed\n  }\n\n  // Same iframe fallback as getLocalStorage\n  let storage: Storage | undefined;\n  try {\n    storage = localStorage as Storage | undefined;\n  } catch {\n    return null;\n  }\n  if (storage !== undefined) return null;\n\n  try {\n    const iframe = document.createElement('iframe');\n    iframe.style.display = 'none';\n    document.body.appendChild(iframe);\n    try {\n      const iframeStorage = iframe.contentWindow?.localStorage;\n      return iframeStorage ? search(iframeStorage) : null;\n    } finally {\n      document.body.removeChild(iframe);\n    }\n  } catch {\n    return null;\n  }\n};\n```\n\nAdd to index.ts Storage exports section (around line 215).\n\nConstraints:\n- Do NOT change getLocalStorage or any existing function\n- Must use the same iframe fallback pattern as getLocalStorage (for Discord-like environments)\n- The predicate receives only the key, not the value (avoid reading all values upfront)\n- Returns the FIRST matching entry, not all matches (plugins only need one token)"
+    },
+    {
+      "id": "US-006",
+      "title": "Update plugin-sdk CLAUDE.md with new and missing utilities",
+      "description": "Update platform/plugin-sdk/CLAUDE.md to document all five new SDK utilities and the existing utilities that were previously missing from the internal docs (putJSON, patchJSON, deleteJSON, postForm, postFormData, httpStatusToToolError, parseRetryAfterMs, setSessionStorage, removeLocalStorage, removeSessionStorage).",
+      "acceptanceCriteria": [
+        "CLAUDE.md Fetch section lists all fetch utilities: fetchFromPage, fetchJSON, postJSON, putJSON, patchJSON, deleteJSON, fetchText, postForm, postFormData, httpStatusToToolError, parseRetryAfterMs, buildQueryString",
+        "CLAUDE.md Storage section lists: getLocalStorage, setLocalStorage, getSessionStorage, setSessionStorage, removeLocalStorage, removeSessionStorage, getCookie, getAuthCache, setAuthCache, clearAuthCache, findLocalStorageEntry",
+        "CLAUDE.md DOM section lists: waitForSelector, waitForSelectorRemoval, querySelectorAll, getTextContent, getMetaContent, observeDOM",
+        "Each new utility has a one-line signature description consistent with the existing format"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/plugin-sdk/CLAUDE.md (update the SDK Utilities section)\n\nContext:\nThe current CLAUDE.md is stale — it only lists 3 fetch utilities (fetchFromPage, fetchJSON, postJSON) but the SDK actually exports 12. Similarly, the storage section omits setSessionStorage, removeLocalStorage, removeSessionStorage. After the new utilities from US-001 through US-005 land, the CLAUDE.md needs to list everything.\n\nChanges:\nUpdate the Fetch Utilities section to include all functions:\n- `fetchFromPage(url, init?)` → `Promise<Response>` — existing\n- `fetchJSON<T>(url, init?, schema?)` → `Promise<T>` — existing\n- `fetchText(url, init?)` → `Promise<string>` — NEW, returns response as text instead of JSON\n- `postJSON<T>(url, body, init?, schema?)` → `Promise<T>` — existing\n- `putJSON<T>(url, body, init?, schema?)` → `Promise<T>` — existing but missing from docs\n- `patchJSON<T>(url, body, init?, schema?)` → `Promise<T>` — existing but missing from docs\n- `deleteJSON<T>(url, init?, schema?)` → `Promise<T>` — existing but missing from docs\n- `postForm<T>(url, body, init?, schema?)` → `Promise<T>` — existing but missing from docs\n- `postFormData<T>(url, body: FormData, init?, schema?)` → `Promise<T>` — existing but missing from docs\n- `httpStatusToToolError(response, message)` → `ToolError` — existing but missing from docs\n- `parseRetryAfterMs(value)` → `number | undefined` — existing but missing from docs\n- `buildQueryString(params)` → `string` — NEW\n\nUpdate the Storage Utilities section to include all functions:\n- `getLocalStorage(key)` → `string | null` — existing\n- `setLocalStorage(key, value)` → `void` — existing\n- `getSessionStorage(key)` → `string | null` — existing\n- `setSessionStorage(key, value)` → `void` — existing but missing from docs\n- `removeLocalStorage(key)` → `void` — existing but missing from docs\n- `removeSessionStorage(key)` → `void` — existing but missing from docs\n- `getCookie(name)` → `string | null` — existing\n- `getAuthCache<T>(namespace)` → `T | null` — NEW\n- `setAuthCache<T>(namespace, value)` → `void` — NEW\n- `clearAuthCache(namespace)` → `void` — NEW\n- `findLocalStorageEntry(predicate)` → `{ key, value } | null` — NEW\n\nUpdate the DOM Utilities section to add:\n- `getMetaContent(name)` → `string | null` — NEW\n\nConstraints:\n- Follow the existing one-line-per-function documentation style\n- Do NOT change any other sections of the CLAUDE.md\n- Keep descriptions concise — the public docs site has the full API reference"
+    }
+  ]
+}
