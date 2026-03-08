@@ -1,0 +1,80 @@
+# Ralph Progress Log
+PRD: prd-2026-03-07-200935-open-folder-from-menu-5ad324~running.json
+Started: Sun Mar  8 04:10:09 UTC 2026
+---
+
+## Codebase Patterns
+- The MCP server resolves its package root via `resolve(dirname(fileURLToPath(import.meta.url)), '..')` (same pattern as version.ts)
+- Extension→server JSON-RPC handlers follow the pattern: validate params, do work, sendToExtension with result or sendJsonRpcError
+- Extension→server methods are dispatched in extension-protocol.ts's handleExtensionMessage function
+- New handlers are added to extension-handlers.ts and exported, then imported and routed in extension-protocol.ts
+- sync.full in sendSyncFull manually picks fields from configState — new ConfigStateResult fields must be added there too
+- The 'open' npm package (sindresorhus/open, v11) is a pure ESM package — use `import open from 'open'` directly
+- New bg:* message types need 6 touchpoints: (1) interface in extension-messages.ts, (2) InternalMessage union, (3) bridge function in bridge.ts, (4) handler in background-message-handlers.ts, (5) backgroundHandlers map, (6) EXTENSION_ONLY_TYPES set
+- New ConfigStateResult fields need 6 extension layers to flow to the side panel: ServerStateCache, message-router (sync.full + plugins.changed), handleBgGetFullState response, bridge.ts FullStateResult, App.tsx state
+
+---
+
+## 2026-03-08 - US-001
+- Installed 'open' npm package as production dependency in mcp-server
+- Added handleFolderOpen handler in extension-handlers.ts that validates params.path and calls open(path)
+- Added 'folder.open' dispatch in extension-protocol.ts
+- Added serverSourcePath to ConfigStateResult in shared/src/index.ts
+- Added serverSourcePath to buildConfigStatePayload and sync.full notification
+- Computed serverSourcePath as a module-level const using resolve(dirname(fileURLToPath(import.meta.url)), '..')
+- Files changed:
+  - platform/mcp-server/package.json (added 'open' dependency)
+  - platform/mcp-server/src/extension-handlers.ts (added handleFolderOpen, serverSourcePath const, added to buildConfigStatePayload)
+  - platform/mcp-server/src/extension-protocol.ts (added folder.open dispatch, added serverSourcePath to sync.full)
+  - platform/shared/src/index.ts (added serverSourcePath to ConfigStateResult)
+  - package-lock.json (auto-updated)
+- **Learnings for future iterations:**
+  - Biome auto-fixes import ordering on commit — the pre-commit hook moves `import open from 'open'` after type imports
+  - sync.full in sendSyncFull manually selects fields from configState — if you add a new field to ConfigStateResult, you must add it in two places: buildConfigStatePayload return AND the sendSyncFull params object
+  - The handler pattern for extension→server methods: handler in extension-handlers.ts (export it), import and dispatch in extension-protocol.ts's handleExtensionMessage
+---
+
+## 2026-03-08 - US-002
+- Added BgOpenFolderMessage type to extension-messages.ts with type 'bg:openFolder' and path: string
+- Added BgOpenFolderMessage to the InternalMessage union
+- Added bridge.openFolder(path) function in bridge.ts that sends bg:openFolder message
+- Added handleBgOpenFolder handler in background-message-handlers.ts that relays to sendServerRequest('folder.open', { path })
+- Added 'bg:openFolder' to backgroundHandlers map and EXTENSION_ONLY_TYPES set
+- Exported handleBgOpenFolder from background-message-handlers.ts
+- Files changed:
+  - platform/browser-extension/src/extension-messages.ts (added BgOpenFolderMessage type, updated InternalMessage union)
+  - platform/browser-extension/src/side-panel/bridge.ts (added openFolder function, added to exports)
+  - platform/browser-extension/src/background-message-handlers.ts (added handler, registered in map + EXTENSION_ONLY_TYPES, exported)
+- **Learnings for future iterations:**
+  - Side panel → server relay follows a 4-hop path: side panel → chrome.runtime.sendMessage → background script → offscreen → WebSocket → server
+  - New bg:* message types need: (1) interface in extension-messages.ts, (2) add to InternalMessage union, (3) bridge function in bridge.ts, (4) handler in background-message-handlers.ts, (5) register in backgroundHandlers map, (6) add to EXTENSION_ONLY_TYPES
+  - The handler pattern for bg:* server relay messages follows handleBgRemovePlugin — Promise-based with error mapping via sendServerRequest
+---
+
+## 2026-03-08 - US-003
+- Stopped stripping sourcePath in handleBgGetFullState — removed `sourcePath: _sourcePath` from the destructuring
+- Added sourcePath to PluginState type in bridge.ts
+- Added serverSourcePath to ServerStateCache interface, EMPTY_CACHE, and loadServerStateCacheFromSession
+- Added serverSourcePath extraction in message-router.ts for both sync.full and plugins.changed handlers
+- Added serverSourcePath to handleBgGetFullState response
+- Added serverSourcePath to FullStateResult in bridge.ts
+- Added serverSourcePath state in App.tsx, flowing through applyFullState and disconnect handler
+- Passed serverSourcePath through BrowserToolsCard to BrowserToolsMenu
+- Updated PluginMenu: npm plugins open npmjs.com (ExternalLink icon), local plugins call bridge.openFolder (FolderOpen icon), fallback disabled if no sourcePath
+- Updated BrowserToolsMenu: opens server source folder when serverSourcePath available (FolderOpen icon), disabled fallback when not
+- Updated test to remove sourcePath leak assertion (now intentionally allowed)
+- Files changed:
+  - platform/browser-extension/src/background-message-handlers.ts (stop stripping sourcePath, add serverSourcePath to response)
+  - platform/browser-extension/src/background-message-handlers.test.ts (remove sourcePath leak assertion)
+  - platform/browser-extension/src/message-router.ts (extract serverSourcePath in sync.full and plugins.changed)
+  - platform/browser-extension/src/server-state-cache.ts (add serverSourcePath to interface, empty cache, session restore)
+  - platform/browser-extension/src/side-panel/bridge.ts (add sourcePath to PluginState, serverSourcePath to FullStateResult)
+  - platform/browser-extension/src/side-panel/App.tsx (add serverSourcePath state, pass to BrowserToolsCard)
+  - platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx (accept and pass serverSourcePath)
+  - platform/browser-extension/src/side-panel/components/BrowserToolsMenu.tsx (clickable version item with openFolder)
+  - platform/browser-extension/src/side-panel/components/PluginMenu.tsx (npm/local/fallback version items)
+- **Learnings for future iterations:**
+  - New ConfigStateResult fields need to flow through 6 extension layers: (1) server-state-cache interface + EMPTY_CACHE + session restore, (2) message-router sync.full handler, (3) message-router plugins.changed handler, (4) handleBgGetFullState response, (5) bridge.ts FullStateResult type, (6) App.tsx state + applyFullState + disconnect handler
+  - To avoid non-null assertion lint warnings in closures, extract the narrowed value to a local const before the closure (e.g., `const { sourcePath } = plugin; if (sourcePath) { ... openFolder(sourcePath) }`)
+  - PluginMeta fields like sourcePath that were previously stripped can flow through by removing them from the destructuring exclusion in handleBgGetFullState
+---
