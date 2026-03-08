@@ -1,0 +1,40 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix blurry icons in side panel empty state cards and improve the search empty state copy to guide users toward AI-generated plugin creation.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix blurry lucide icons in empty state cards",
+      "description": "Lucide icons in empty state cards (Ghost, Unplug, KeyRound, Package) render blurry because they are stretched via CSS h-full w-full inside a parent container, which forces the SVG to scale from its 24x24 viewBox to 40x40px — a non-integer multiplier that causes sub-pixel stroke anti-aliasing. Fix by using lucide's native size prop instead of CSS stretching.",
+      "acceptanceCriteria": [
+        "No lucide icon inside an Empty.Icon uses className h-full w-full for sizing",
+        "All lucide icons in empty states render at an explicit pixel size via the size prop (e.g. size={40})",
+        "The EmptyIcon component in Empty.tsx no longer applies h-full w-full to its default Ghost icon",
+        "EmptyStates.tsx Unplug and KeyRound icons use explicit size prop instead of h-full w-full",
+        "App.tsx Package icon in the No Plugins Installed state uses explicit size prop instead of h-full w-full",
+        "PluginList.tsx empty state uses the updated EmptyIcon pattern consistently"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/retro/Empty.tsx (fix EmptyIcon default rendering)\n- platform/browser-extension/src/side-panel/components/EmptyStates.tsx (fix Unplug and KeyRound icons)\n- platform/browser-extension/src/side-panel/App.tsx (fix Package icon in No Plugins Installed state)\n- platform/browser-extension/src/side-panel/components/PluginList.tsx (uses EmptyIcon default Ghost — inherits fix from Empty.tsx)\n- platform/browser-extension/src/side-panel/components/SearchResults.tsx (uses EmptyIcon default Ghost — inherits fix from Empty.tsx)\n\nContext:\nLucide icons have a native 24x24 viewBox with strokeWidth=2. When rendered via CSS `h-full w-full` inside a 40x40 container (h-10 w-10), the SVG scales by 1.667x, producing non-integer stroke widths (~3.33px) that anti-alias poorly and appear blurry. The fix is to use lucide's `size` prop which sets the SVG width/height directly, producing crisp rendering at the exact pixel size.\n\nChanges:\n\n1. In `Empty.tsx`, the `EmptyIcon` component currently renders:\n```tsx\nconst EmptyIcon = ({ children, className, ...props }: IEmptyProps) => (\n  <div className={cn(className)} {...props}>\n    {children || <Ghost className=\"h-full w-full\" />}\n  </div>\n);\n```\nChange the default Ghost to use an explicit size instead of `h-full w-full`. The container's className provides the dimensions (e.g. `h-10 w-10` = 40px), so the Ghost should match. However, the container size is passed by the caller, not known inside EmptyIcon. The cleanest approach: remove `h-full w-full` from the default Ghost and instead use `size={40}` (matching the most common usage `h-10 w-10`). The container div with `h-10 w-10` still provides the layout box; the icon inside it just renders at the correct pixel size with `flex items-center justify-center` on the container to center it. Update the container div to add `flex items-center justify-center` so the icon centers within its bounds.\n\n2. In `EmptyStates.tsx`, the icons currently use:\n```tsx\n<Empty.Icon className=\"h-10 w-10 text-destructive/60\">\n  <Unplug className=\"h-full w-full\" />\n</Empty.Icon>\n```\nand:\n```tsx\n<Empty.Icon className=\"h-10 w-10 text-destructive/60\">\n  <KeyRound className=\"h-full w-full\" />\n</Empty.Icon>\n```\nChange both to use `size={40}` instead of `className=\"h-full w-full\"`.\n\n3. In `App.tsx`, the Package icon currently uses:\n```tsx\n<Empty.Icon className=\"h-10 w-10 text-muted-foreground\">\n  <Package className=\"h-full w-full\" />\n</Empty.Icon>\n```\nChange to `size={40}` instead of `className=\"h-full w-full\"`.\n\n4. `PluginList.tsx` (line 206) and `SearchResults.tsx` (line 161) both use `<Empty.Icon className=\"h-10 w-10 text-muted-foreground\" />` with no children, so they inherit the default Ghost from EmptyIcon — the fix in Empty.tsx propagates automatically.\n\nConstraints:\n- Do NOT change the container size classes (h-10 w-10) — those control the layout box dimensions.\n- Do NOT change the text color classes (text-destructive/60, text-muted-foreground) — those control icon color via CSS currentColor.\n- Do NOT change any other Empty sub-components (EmptyTitle, EmptySeparator, EmptyDescription).\n- The EmptyIcon container div must still accept and apply the className prop for size and color.\n- Keep the pattern where EmptyIcon provides a default Ghost if no children are passed."
+    },
+    {
+      "id": "US-002",
+      "title": "Improve empty search results copy to guide users toward plugin creation",
+      "description": "When omnisearch returns zero results (no installed matches, no npm results), replace the generic 'Try searching by plugin name' message with a warmer, more actionable message that guides users to ask their AI assistant to create a custom plugin.",
+      "acceptanceCriteria": [
+        "SearchResults.tsx no-results empty state title reads 'No plugins found' (not 'No results for ...')",
+        "SearchResults.tsx no-results description mentions asking the AI assistant to create a custom plugin",
+        "The tone is warm and helpful without being cutesy — matches the existing developer-tool voice",
+        "The PluginList.tsx tool-filter empty state is NOT changed (it serves a different purpose: filtering within a plugin's tools)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/SearchResults.tsx (update no-results empty state copy)\n\nContext:\nThe SearchResults component handles omnisearch — searching across installed plugins, failed plugins, browser tools, and npm registry. When nothing matches, the current empty state shows a Ghost icon with generic advice. This is a missed opportunity to guide users toward OpenTabs's key value prop: AI agents can create custom plugins on demand.\n\nThe existing copy at lines 157-169:\n```tsx\n{showNoResults && (\n  <Empty className=\"border-muted\">\n    <Empty.Content>\n      <Empty.Icon className=\"h-10 w-10 text-muted-foreground\" />\n      <Empty.Title className=\"text-base\">No results for &ldquo;{toolFilter}&rdquo;</Empty.Title>\n      <Empty.Separator />\n      <Empty.Description className=\"text-xs\">\n        Try searching by plugin name, tool name, or description.\n      </Empty.Description>\n    </Empty.Content>\n  </Empty>\n)}\n```\n\nChanges:\nUpdate the title and description copy. The title should be simpler and not echo the search query (which adds visual noise). The description should warmly guide users to ask their AI to create a plugin.\n\nSuggested copy (adjust for natural tone):\n- Title: `No plugins found`\n- Description: Something like `Can't find what you're looking for? Ask your AI assistant to build a custom plugin for you — it only takes a minute.`\n\nThe icon (Ghost default from EmptyIcon) and the Empty component structure stay the same — only the text content changes.\n\nConstraints:\n- Do NOT change PluginList.tsx — its 'No tools matching' empty state (lines 202-214) is for filtering within a single plugin's tool list, which is a different UX context.\n- Do NOT change the Empty component structure, classes, or icon.\n- Do NOT add emoji to the copy.\n- Keep the tone concise, developer-friendly, and caring without being cutesy or whimsical. Match the existing UI voice: information-dense, respectful of user time."
+    }
+  ]
+}
