@@ -1,0 +1,51 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add comprehensive unit tests and E2E tests for the open-tab cycling feature (bg:openPluginTab handler). The handler has a critical bug fix (tab-ID-based cycling instead of index-based) that must be regression-tested. Also add unit tests for the pickNextTab helper and handleBgOpenPluginTab handler in background-message-handlers.test.ts.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Unit tests for pickNextTab and handleBgOpenPluginTab in background-message-handlers.test.ts",
+      "description": "Add comprehensive unit tests covering the open-tab cycling logic: pickNextTab helper function and the handleBgOpenPluginTab message handler. Test all edge cases including single tab, multiple tabs, first-click behavior (skips active tab), round-robin cycling, tab closed mid-cycle, no matching tabs with homepage fallback, and no matching tabs without homepage.",
+      "acceptanceCriteria": [
+        "Test: pickNextTab with empty array returns undefined",
+        "Test: pickNextTab first call (no lastFocusedTabId) picks first non-active tab",
+        "Test: pickNextTab first call when all tabs are inactive picks the first tab",
+        "Test: pickNextTab first call when only one tab exists and it is active picks that tab",
+        "Test: pickNextTab cycles through tabs in stable tab-ID order after first call",
+        "Test: pickNextTab wraps around to the first tab after reaching the end",
+        "Test: pickNextTab handles lastFocusedTabId pointing to a tab that no longer exists (removed mid-cycle) — falls back to next in order",
+        "Test: handleBgOpenPluginTab returns { opened: false } when pluginName is missing",
+        "Test: handleBgOpenPluginTab returns { opened: false } when plugin meta not found",
+        "Test: handleBgOpenPluginTab with one matching tab calls chrome.tabs.update and chrome.windows.update",
+        "Test: handleBgOpenPluginTab with two tabs cycles between them on repeated calls (not always the same tab)",
+        "Test: handleBgOpenPluginTab with no matching tabs and homepage calls chrome.tabs.create with the homepage URL",
+        "Test: handleBgOpenPluginTab with no matching tabs and no homepage returns { opened: false }",
+        "Test: handleBgOpenPluginTab first call with active tab among matches focuses a non-active tab"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/background-message-handlers.test.ts (add tests)\n- platform/browser-extension/src/background-message-handlers.ts (may need to export pickNextTab and TabEntry for testing, or test indirectly through handleBgOpenPluginTab)\n\nContext:\nThe test file (background-message-handlers.test.ts) already has ~65 tests with a comprehensive mock setup. It mocks chrome.tabs.query, chrome.tabs.update, chrome.windows.update, chrome.tabs.create, chrome.windows.getLastFocused, and all storage APIs.\n\nThe key functions to test:\n\n1. `pickNextTab(sorted: TabEntry[], pluginName: string): TabEntry | undefined` — a module-level function that selects the next tab to focus. It reads from the `lastFocusedTabId` Map (module-level state).\n\n2. `handleBgOpenPluginTab` — the message handler that:\n   - Gets plugin meta from storage\n   - Calls `findAllMatchingTabs(meta)` to get current tabs\n   - Filters to tabs with IDs, sorts by tab ID (stable order)\n   - Calls `pickNextTab` to select the target\n   - Calls `chrome.tabs.update` + `chrome.windows.update` to focus it\n   - Falls back to `chrome.tabs.create({ url: homepage })` if no tabs and homepage exists\n   - Returns `{ opened: false }` if no tabs and no homepage\n\nThe `lastFocusedTabId` Map and `pickNextTab` are module-level (not exported). Testing must go through `handleBgOpenPluginTab` or the test must import them. Check the existing test patterns — the test file uses `vi.importActual` and dynamic imports to access module internals.\n\nExisting mock setup (background-message-handlers.test.ts):\n- `mockGetPluginMeta` — returns a PluginMeta object\n- `mockFindAllMatchingTabs` — returns chrome.tabs.Tab[]\n- `mockTabsUpdate` — mock for chrome.tabs.update\n- `mockTabsCreate` — mock for chrome.tabs.create\n- `mockWindowsUpdate` — mock for chrome.windows.update\n\nThe tests should mock `findAllMatchingTabs` to return specific tab configurations, then call the message handler and verify the correct tab is focused.\n\nCritical regression test: With 2 tabs where tab A is active, verify that:\n1. First click focuses tab B (not tab A which is already active)\n2. Second click focuses tab A\n3. Third click focuses tab B\n\nThis is the exact bug that was fixed — the old code always focused the active tab first because findAllMatchingTabs sorts by rank.\n\nAnother edge case: When the previously focused tab is closed (its ID no longer in the sorted list), the `findIndex` returns -1, so `(-1 + 1) % length = 0` — it correctly falls back to the first tab. Test this.\n\nConstraints:\n- Follow the existing test patterns in the file (describe blocks, mock setup, async handlers)\n- Do NOT modify the source code — only add tests\n- Reset `lastFocusedTabId` state between tests if possible (check if the module exposes a reset function, or re-import the module for each test group)"
+    },
+    {
+      "id": "US-002",
+      "title": "E2E test for open-tab cycling with multiple tabs",
+      "description": "Add an E2E test that verifies clicking the plugin icon in the side panel cycles through multiple matching tabs correctly. The first click should NOT focus the currently-active tab (the regression case). Each subsequent click should focus the next tab in stable order.",
+      "acceptanceCriteria": [
+        "E2E test opens 2 test app tabs and verifies they are both recognized by the plugin",
+        "E2E test opens the side panel and waits for the plugin to show as ready",
+        "E2E test clicks the plugin icon and verifies it switches focus to a different tab (not the currently active one)",
+        "E2E test clicks the plugin icon again and verifies it switches to the other tab",
+        "E2E test clicks a third time and verifies it cycles back to the first tab",
+        "E2E test verifies tab focus changes by checking which tab is active after each click",
+        "Test properly cleans up all resources (tabs, server, extension) in try/finally"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-open-tab.e2e.ts (extend the existing file if it exists, or create new)\n\nContext:\nCheck if `e2e/side-panel-open-tab.e2e.ts` already exists from the previous ralph PRD. If it does, extend it with the cycling-specific regression tests. If not, create it.\n\nThe E2E test should use manual setup (not fixtures) for fine-grained tab control:\n\n```typescript\nimport { test, expect } from '@playwright/test';\nimport fs from 'node:fs';\nimport os from 'node:os';\nimport path from 'node:path';\nimport {\n  cleanupTestConfigDir,\n  copyE2eTestPlugin,\n  launchExtensionContext,\n  startMcpServer,\n  startTestServer,\n  writeTestConfig,\n} from './fixtures.js';\nimport {\n  openSidePanel,\n  setupAdapterSymlink,\n  waitForExtensionConnected,\n} from './helpers.js';\n```\n\nSetup pattern:\n1. Create temp config dir\n2. Copy e2e-test plugin\n3. Write test config with the plugin registered\n4. Start MCP server and test server\n5. Launch extension context\n6. Setup adapter symlink\n7. Wait for extension connected\n8. Open the side panel\n9. Wait for the plugin to appear in the side panel\n\nTo open test app tabs:\n```typescript\nconst tab1 = await context.newPage();\nawait tab1.goto(testServer.url);\nconst tab2 = await context.newPage();\nawait tab2.goto(testServer.url);\n```\n\nTo click the plugin icon in the side panel, find the button by aria-label:\n```typescript\nconst iconButton = sidePanelPage.locator('button[aria-label*=\"Open E2E Test\"]');\nawait iconButton.click();\n```\n\nTo verify which tab is active/focused after clicking:\nPlaywright's `context.pages()` returns all pages. After clicking the icon, the extension focuses a specific tab. We can verify by checking which page is in the foreground. However, in headless Chromium, tab focus doesn't map to Playwright page focus the same way.\n\nBetter approach: Use the background service worker to check `chrome.tabs.query({ active: true })` after each click:\n```typescript\nconst bgPage = context.serviceWorkers()[0];\nconst activeTabId = await bgPage.evaluate(async () => {\n  const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });\n  return tab?.id;\n});\n```\n\nOr use the side panel's tab state info which includes tab IDs.\n\nAlternatively, track which tab URL changes to active state by reading the active tab's title marker — set a unique title on each test app tab page:\n```typescript\nawait tab1.evaluate(() => { document.title = 'Tab-1'; });\nawait tab2.evaluate(() => { document.title = 'Tab-2'; });\n```\nThen after clicking, check the active tab's title via the background page.\n\nConstraints:\n- Use manual setup, not fixtures, for full control\n- Use try/finally for cleanup\n- Use expect.poll() for async assertions (no fixed sleeps)\n- Wait for the side panel to show the correct tab count in the tooltip before clicking\n- The e2e-test plugin must be ready (not just unavailable) for the icon to be clickable\n- The test MUST verify the regression case: first click does NOT re-focus the already-active tab"
+    }
+  ]
+}
