@@ -1,0 +1,57 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix a race condition in browser_execute_script where the polling function returns 'No result captured' before the injected IIFE has executed, causing intermittent undefined results for async code.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add execution-started sentinel to the IIFE wrapper",
+      "description": "Add a '__execStarted_<uuid>' flag to the IIFE wrapper in adapter-files.ts that is set at the very first line of the IIFE, before the try block. This sentinel tells the polling function whether the IIFE has begun executing.",
+      "acceptanceCriteria": [
+        "The IIFE wrapper sets __ot[__startedKey] = true as its first operation after initializing __ot",
+        "The startedKey follows the naming pattern __execStarted_<uuid> matching __execResult_<uuid> and __execAsync_<uuid>",
+        "The startedKey is cleaned up alongside __resultKey and __asyncKey in the polling function",
+        "The startedKey is cleaned up in the finally block cleanup (extension-commands.ts)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/adapter-files.ts (IIFE wrapper generation)\n- platform/mcp-server/src/browser-tools/execute-script.ts (passes execId, may need to pass startedKey)\n\nContext:\nThe IIFE wrapper is generated in `writeExecFile` (adapter-files.ts lines 177-197). The current wrapper:\n```js\n(function() {\n  var __ot = globalThis.__openTabs = globalThis.__openTabs || {};\n  var __resultKey = \"__execResult_<uuid>\";\n  var __asyncKey = \"__execAsync_<uuid>\";\n  try {\n    var __r = (async function() { <user-code> })();\n    // ... async detection and .then() chaining\n  } catch (e) { ... }\n})();\n```\n\nChanges:\nAdd a `__startedKey` variable and set it immediately after `__ot` initialization:\n```js\n(function() {\n  var __ot = globalThis.__openTabs = globalThis.__openTabs || {};\n  var __resultKey = \"__execResult_<uuid>\";\n  var __asyncKey = \"__execAsync_<uuid>\";\n  var __startedKey = \"__execStarted_<uuid>\";\n  __ot[__startedKey] = true;\n  try {\n    // ... existing code unchanged\n  } catch (e) { ... }\n})();\n```\n\nThe startedKey variable name should be derived from the same `execId` UUID used for resultKey and asyncKey. Currently `resultKey` = `__execResult_${execId}` and `asyncKey` = `__execAsync_${execId}`. Add `startedKey` = `__execStarted_${execId}`.\n\nConstraints:\n- Do NOT change the existing result/async key logic\n- Do NOT change how user code is wrapped\n- The started flag MUST be set synchronously at the top of the IIFE before the try block"
+    },
+    {
+      "id": "US-002",
+      "title": "Update polling function to check the started sentinel before returning 'No result captured'",
+      "description": "Modify the polling function in extension-commands.ts to check for the __execStarted_<uuid> flag. If the flag is not set, return { pending: true } instead of the erroneous 'No result captured' error. Also update the cleanup code to delete the started key.",
+      "acceptanceCriteria": [
+        "When __execStarted key is absent, the polling function returns { pending: true } instead of { error: 'No result captured' }",
+        "When __execStarted key is present and isAsync is false and no result exists, the polling function still returns { error: 'No result captured' } (genuine sync failure)",
+        "The __execStarted key is cleaned up in the inline cleanup (Reflect.deleteProperty) alongside resultKey and asyncKey",
+        "The __execStarted key is cleaned up in the finally block cleanup alongside resultKey and asyncKey",
+        "The startedKey is passed to the polling func and the finally cleanup func via the args array"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/browser-commands/extension-commands.ts (handleBrowserExecuteScript function, lines 376-508)\n\nContext:\nThe handleBrowserExecuteScript function extracts the execUuid from the filename and derives resultKey and asyncKey:\n```ts\nconst execUuid = execFile.replace(/^__exec-/, '').replace(/\\.js$/, '');\nconst resultKey = `__execResult_${execUuid}`;\nconst asyncKey = `__execAsync_${execUuid}`;\n```\n\nThe polling function (lines 418-451) is injected via `chrome.scripting.executeScript({ func })`. Currently it takes 3 args: `(truncLimit, rKey, aKey)`. The fallback at line 449-450 is:\n```ts\n// Sync code produced no result (should not happen)\nreturn { pending: false, result: { error: 'No result captured' } };\n```\n\nChanges:\n1. Add `const startedKey = \\`__execStarted_${execUuid}\\`;` alongside resultKey and asyncKey (around line 393)\n2. Add startedKey as a 4th arg to the polling func: `args: [EXEC_RESULT_TRUNCATION_LIMIT, resultKey, asyncKey, startedKey]`\n3. Update the func signature to accept 4 params: `(truncLimit: number, rKey: string, aKey: string, sKey: string)`\n4. In the polling func body, after the `if (result && ...)` and `if (isAsync)` checks, add:\n   ```ts\n   const started = ot[sKey] === true;\n   if (!started) return { pending: true };\n   ```\n   This goes BEFORE the existing `return { pending: false, result: { error: 'No result captured' } };` line.\n5. In the inline cleanup (line 441-442), add: `Reflect.deleteProperty(ot, sKey);`\n6. In the finally block cleanup function (around line 473-490), add startedKey as a 4th arg and delete it alongside the other keys\n\nThe three-state machine becomes:\n- __execStarted absent -> IIFE hasn't run yet -> { pending: true } (keep polling)\n- __execStarted present, __execAsync true, no __execResult -> async Promise pending -> { pending: true }\n- __execResult present -> done -> { pending: false, result }\n- __execStarted present, no __execAsync, no __execResult -> genuine sync failure -> { error: 'No result captured' }\n\nConstraints:\n- Do NOT change the polling interval (EXEC_POLL_INTERVAL_MS = 50ms)\n- Do NOT change the async timeout (EXEC_MAX_ASYNC_WAIT_MS = 10000ms)\n- Do NOT change the outer script timeout (SCRIPT_TIMEOUT_MS = 25000ms)\n- The finally block cleanup must also clean up the startedKey to prevent global pollution"
+    },
+    {
+      "id": "US-003",
+      "title": "Verify the fix with E2E tests",
+      "description": "Run the full E2E test suite to verify the fix eliminates the flaky failure in 'await fetch returns HTTP status' and that no other tests regress.",
+      "acceptanceCriteria": [
+        "All browser_execute_script E2E tests pass including 'await fetch returns HTTP status'",
+        "All browser_execute_script E2E tests pass including 'handles async code (Promises)'",
+        "All browser_execute_script E2E tests pass including 'multiple sequential await expressions'",
+        "The 'sequential executions leave no leftover state' test still passes (verifying cleanup of the new started key)",
+        "The 'concurrent executions on different tabs do not collide' test still passes",
+        "The full E2E suite passes with 0 failures"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/browser-tools.e2e.ts (E2E tests, no changes needed — just run them)\n\nContext:\nThe flaky test is at line 852:\n```ts\ntest('await fetch returns HTTP status', async ({ mcpServer, testServer, extensionContext: _extensionContext, mcpClient }) => {\n  await initAndListTools(mcpServer, mcpClient);\n  const tabId = await openTestServerTab(mcpClient, testServer);\n  const result = await mcpClient.callTool('browser_execute_script', {\n    tabId,\n    code: 'const r = await fetch(window.location.href); return r.status',\n  });\n  expect(result.isError).toBe(false);\n  const data = parseToolResult(result.content);\n  const value = data.value as Record<string, unknown>;\n  expect(value.value).toBe(200);\n  await mcpClient.callTool('browser_close_tab', { tabId });\n});\n```\n\nThe failure was: Expected 200, Received undefined. This happened because the polling function returned { error: 'No result captured' } before the IIFE had executed. With the started sentinel fix, the polling function will return { pending: true } until the IIFE begins, then correctly wait for the async result.\n\nRun: `npm run test:e2e`\n\nDo NOT modify any test files. The existing tests should pass as-is with the infrastructure fix.\n\nConstraints:\n- Do NOT add retries to the Playwright config — the fix should eliminate the flakiness, not mask it\n- Do NOT modify any test expectations or test code\n- If any test fails, investigate whether the started sentinel logic has a bug, not the test"
+    }
+  ]
+}
