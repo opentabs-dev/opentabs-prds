@@ -1150,13 +1150,19 @@ reap_workers() {
 
     # Mark PRD as ~done in queue and push (includes syncing updated files)
     if [ -n "$running_basename" ]; then
-      mark_done_and_push "$running_basename" "$updated_prd" "$updated_progress"
       local done_basename="${running_basename/~running/~done}"
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Marked done: $done_basename${RESET}"
+      if mark_done_and_push "$running_basename" "$updated_prd" "$updated_progress"; then
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Marked done: $done_basename${RESET}"
+      else
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${RED}Failed to mark done: $done_basename${RESET}"
+      fi
 
-      # Archive
-      archive_and_push "$done_basename"
-      echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Archived.${RESET}"
+      # Archive (non-critical — if it fails, the ~done file stays at root)
+      if archive_and_push "$done_basename"; then
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${GREEN}Archived.${RESET}"
+      else
+        echo -e "$(ts) ${CYAN}[${tag}]${RESET} ${YELLOW}Archive failed (non-critical): $done_basename${RESET}"
+      fi
     fi
 
     # Cleanup worktree and branch — only if push succeeded (sentinel exists).

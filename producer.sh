@@ -51,11 +51,13 @@ fi
 # Abort any in-progress rebase from a previous crashed run
 git rebase --abort 2>/dev/null || true
 
-# Discard any dirty working tree state from a previous crashed run
-# (only unstaged changes — staged changes indicate intentional work)
-if ! git diff --quiet 2>/dev/null; then
-  echo "Warning: dirty working tree detected. Resetting unstaged changes..."
-  git checkout -- . 2>/dev/null || true
+# Discard any dirty working tree state from a previous crashed run.
+# Use --hard reset to also clear the staging area — stale staged files are the
+# primary vector for accidentally re-introducing archived PRDs (see bug where a
+# publish commit re-added ~running files that had already been done+archived).
+if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+  echo "Warning: dirty working tree or index detected. Resetting to HEAD..."
+  git reset --hard HEAD --quiet
 fi
 
 # Fetch latest before publishing to minimize push failures
@@ -82,6 +84,18 @@ if [ "$LOCAL" != "$REMOTE" ]; then
     exit 1
   fi
 fi
+
+# Remove any stale ~running or ~done files left on disk from previous operations.
+# These are never valid in the producer's working tree — they're consumer artifacts.
+# Run AFTER fetch+rebase so that stale tracked files from older commits are cleaned.
+stale_count=0
+for stale in prd-*~running.json prd-*~done.json; do
+  [ -e "$stale" ] || continue
+  echo "Warning: removing stale file from working tree: $stale"
+  rm -f "$stale"
+  stale_count=$((stale_count + 1))
+done
+[ "$stale_count" -gt 0 ] && echo "Removed $stale_count stale PRD file(s)."
 
 # --- Validate and Prepare PRD Files ---
 
@@ -155,9 +169,31 @@ fi
 
 # --- Commit and Push ---
 
-# Stage all published files
+# Reset the index to HEAD before staging — this ensures that no stale files
+# (e.g. ~running or ~done files from a previous session) sneak into the commit.
+# Only the explicitly-added published files will be committed.
+git reset HEAD --quiet 2>/dev/null || true
+
+# Stage ONLY the published files (nothing else)
 for f in "${PUBLISHED_FILES[@]}"; do
   git add "$f"
+done
+
+# Safety check: verify that only the intended files are staged
+staged_files=$(git diff --cached --name-only)
+for sf in $staged_files; do
+  is_published=false
+  for pf in "${PUBLISHED_FILES[@]}"; do
+    if [ "$sf" = "$pf" ]; then
+      is_published=true
+      break
+    fi
+  done
+  if [ "$is_published" = false ]; then
+    echo "Error: unexpected file staged for commit: $sf"
+    echo "Unstaging it to prevent accidental inclusion."
+    git reset HEAD -- "$sf" --quiet 2>/dev/null || true
+  fi
 done
 
 # Build commit message
@@ -167,7 +203,7 @@ else
   commit_msg="publish: ${#PUBLISHED_FILES[@]} PRDs"
 fi
 
-# Commit
+# Commit only the staged files
 git commit -m "$commit_msg" --quiet
 
 # Push with retry — handles concurrent pushes from workers or other producers.
