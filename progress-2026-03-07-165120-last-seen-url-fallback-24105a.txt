@@ -1,0 +1,74 @@
+# Ralph Progress Log
+PRD: prd-2026-03-07-165120-last-seen-url-fallback-24105a~running.json
+Started: Sun Mar  8 00:51:52 UTC 2026
+---
+
+## Codebase Patterns
+- chrome.storage.local mock pattern: create a `store` object and `mockChromeStorage` with `get`/`set` methods, assign to `(globalThis as Record<string, unknown>).chrome`
+- TypeScript strict mode: array index access like `tabs[0]` requires optional chaining (`tabs[0]?.url`) even after a `.length > 0` check
+- Tab state persistence uses fire-and-forget `void` prefix on async calls in hot paths (tab-state.ts)
+- New source files need to be covered by an existing tsconfig — test files are covered by tsconfig.test.json via `src/**/*.test.ts`
+- E2E tests using fixed ports (e.g., 9876 for e2e-test plugin homepage) must handle EADDRINUSE gracefully to support parallel test execution
+- When asserting new tab creation in E2E, use `context.pages().length` instead of URL content when the target server may be unavailable
+
+## 2026-03-08 - US-001
+- Implemented last-seen URL persistence per plugin to chrome.storage.local
+- Files changed:
+  - platform/browser-extension/src/constants.ts (added LAST_SEEN_URLS_KEY)
+  - platform/browser-extension/src/last-seen-urls.ts (NEW — helper module with in-memory cache)
+  - platform/browser-extension/src/tab-state.ts (call setLastSeenUrl on state changes in sendTabSyncAll and notifyAffectedPlugins)
+  - platform/browser-extension/src/last-seen-urls.test.ts (NEW — 10 unit tests)
+- **Learnings for future iterations:**
+  - The tab-state.ts module has three spots where plugin state is updated: early notification callback in sendTabSyncAll, final state in sendTabSyncAll, and notifyAffectedPlugins — all three need the setLastSeenUrl call
+  - TypeScript strict mode catches `tabs[0].url` as possibly undefined — use `tabs[0]?.url` pattern with a local variable
+  - The `void` prefix is required on fire-and-forget async calls to satisfy the linter
+---
+
+## 2026-03-08 - US-002
+- Implemented last-seen URL fallback in handleBgOpenPluginTab and service worker wake loading
+- Files changed:
+  - platform/browser-extension/src/background-message-handlers.ts (imported getLastSeenUrl/setLastSeenUrl, added last-seen fallback after homepage, persist URL on tab focus)
+  - platform/browser-extension/src/background.ts (imported and called loadLastSeenUrlsFromStorage on service worker wake)
+- **Learnings for future iterations:**
+  - The handleBgOpenPluginTab fallback chain is: matching tabs → homepage → last-seen URL → { opened: false }
+  - loadLastSeenUrlsFromStorage is async and needs `.catch()` at the top level of background.ts (unlike restoreWsConnectedState which is synchronous fire-and-forget)
+  - The biome linter auto-sorts imports alphabetically during pre-commit hook — place imports in any order and they'll be sorted
+  - `pick.tab.url` is available from `findAllMatchingTabs` which returns `chrome.tabs.Tab[]`
+---
+
+## 2026-03-08 - US-003
+- Updated PluginCard tooltip to indicate last-seen URL availability
+- Files changed:
+  - platform/shared/src/index.ts (added `hasLastSeenUrl?: boolean` to ConfigStatePlugin)
+  - platform/browser-extension/src/background-message-handlers.ts (pre-computed last-seen URL flags via Promise.all, included in getFullState response)
+  - platform/browser-extension/src/side-panel/components/PluginCard.tsx (updated isClickable and tooltipText logic for last-seen URL)
+- **Learnings for future iterations:**
+  - The `.map` callback in handleBgGetFullState is synchronous, so async per-plugin lookups need to be pre-computed via `Promise.all` before the map
+  - Biome linter warns about non-null assertions (`!`) on array index access — use a guard variable + truthiness check instead
+  - `hasLastSeenUrl` is absent (not false) when there's no URL to keep the wire payload lean — use spread conditional `...(condition && { field: value })`
+  - PluginState inherits from ConfigStatePlugin via Omit in bridge.ts, so new optional fields flow through automatically without bridge changes
+---
+
+## 2026-03-08 - US-004
+- Added Storybook stories and unit tests for last-seen URL feature
+- Files changed:
+  - platform/browser-extension/src/side-panel/components/PluginCard.stories.tsx (added ClosedWithLastSeenUrl story)
+  - platform/browser-extension/src/background-message-handlers.test.ts (added mocks for last-seen-urls, tab-matching, getPluginMeta, chrome.tabs/windows; added 3 handleBgOpenPluginTab tests)
+- **Learnings for future iterations:**
+  - The background-message-handlers.test.ts uses vi.hoisted() for all mock definitions — new mocks must be added there
+  - handleBgOpenPluginTab is async via .then()/.catch() pattern — use vi.waitFor() to assert on sendResponse
+  - Chrome tabs/windows APIs needed explicit mocks in the global chrome object — add chrome.tabs.create, chrome.tabs.update, chrome.windows.update
+  - last-seen-urls.test.ts was already comprehensive from US-001 (10 tests) — no additional tests needed there
+---
+
+## 2026-03-08 - US-005
+- Added E2E test verifying the open-tab flow after visiting and closing a matching tab
+- Also fixed a pre-existing EADDRINUSE race condition in the existing homepage test
+- Files changed:
+  - e2e/side-panel-open-tab.e2e.ts (added new test + fixed port conflict in homepage test)
+- **Learnings for future iterations:**
+  - Port 9876 (e2e-test plugin homepage) can collide across parallel Playwright tests — always handle EADDRINUSE gracefully with fallback to dynamic port
+  - When a tab navigates to a URL with no server, Chrome shows `chrome-error://chromewebdata/` — assertions on the page URL will fail. Assert on page count (`context.pages().length`) instead of URL content when the target server may be unavailable.
+  - The e2e-test plugin has `homepage: 'http://localhost:9876'` which takes priority over last-seen URL in the fallback chain — E2E tests for last-seen URL verify the full visit→close→reopen flow, while unit tests verify the specific fallback ordering
+  - The `browser_execute_script` async reject test is flaky under parallel load — it passes in isolation but can fail when many E2E tests run concurrently
+---
