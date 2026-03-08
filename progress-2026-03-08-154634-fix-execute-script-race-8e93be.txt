@@ -1,0 +1,51 @@
+# Ralph Progress Log
+PRD: prd-2026-03-08-154634-fix-execute-script-race-8e93be~running.json
+Started: Sun Mar  8 22:47:02 UTC 2026
+---
+
+## Codebase Patterns
+- The IIFE wrapper for browser_execute_script is generated in `platform/mcp-server/src/adapter-files.ts` (`writeExecFile`), uses namespaced keys on `globalThis.__openTabs` (`__execResult_<uuid>`, `__execAsync_<uuid>`, `__execStarted_<uuid>`)
+- The polling function and cleanup are in `platform/browser-extension/src/browser-commands/extension-commands.ts` (`handleBrowserExecuteScript`)
+- Cleanup args in the finally block must match unit test expectations in `extension-commands.test.ts` — two tests explicitly assert the args array
+- The polling func is injected via `chrome.scripting.executeScript({ func, args })` — args are positional, so adding a new arg requires updating the func signature, the args array, and test expectations
+
+## 2026-03-08 - US-001
+- Added `__execStarted_<uuid>` sentinel to the IIFE wrapper in adapter-files.ts, set synchronously before the try block
+- Updated polling function in extension-commands.ts to accept startedKey as 4th arg, check it before returning 'No result captured'
+- Added startedKey cleanup to both inline cleanup (Reflect.deleteProperty) and finally block cleanup
+- Updated two unit test expectations for cleanup args to include startedKey
+- Files changed:
+  - platform/mcp-server/src/adapter-files.ts
+  - platform/browser-extension/src/browser-commands/extension-commands.ts
+  - platform/browser-extension/src/browser-commands/extension-commands.test.ts
+- **Learnings for future iterations:**
+  - US-001 acceptance criteria #3 and #4 overlap with US-002's scope — the polling function changes and cleanup were required in US-001 to make the IIFE sentinel useful and testable
+  - US-002 may already be fully implemented by US-001 — the next iteration should verify all US-002 acceptance criteria are met before doing additional work
+---
+
+## 2026-03-08 - US-002
+- Verified all 5 acceptance criteria are already met by US-001's commit (6e1f9df4)
+- No code changes needed — US-001 implemented the full started sentinel including polling function changes, inline cleanup, finally block cleanup, and args array updates
+- All Phase 1 checks pass: build, type-check, lint, knip, test (91 files, 3130 tests)
+- Files verified (no changes):
+  - platform/browser-extension/src/browser-commands/extension-commands.ts (lines 394, 419, 444, 452, 457, 482-490)
+  - platform/mcp-server/src/adapter-files.ts (lines 167, 188-189)
+- **Learnings for future iterations:**
+  - When US-001's scope overlaps with US-002 (IIFE sentinel requires both writer and reader changes to be testable), all the work may be done in US-001. Always verify acceptance criteria against the code before implementing.
+---
+
+## 2026-03-08 - US-003
+- Ran full Phase 1 (build, type-check, lint, knip, test) — all green (91 files, 3130 tests)
+- Ran full Phase 2 (E2E tests) — all green (530 passed, 2 skipped, 0 failures in 1.1m)
+- All 6 acceptance criteria verified:
+  - 'await fetch returns HTTP status' — passed (no longer flaky)
+  - 'handles async code (Promises)' — passed
+  - 'multiple sequential await expressions' — passed
+  - 'sequential executions leave no leftover state' — passed (startedKey cleanup works)
+  - 'concurrent executions on different tabs do not collide' — passed
+  - Full E2E suite: 530 passed, 0 failures
+- No code changes needed — the fix from US-001 resolves the race condition completely
+- **Learnings for future iterations:**
+  - The `__execStarted` sentinel successfully eliminates the race where polling returns 'No result captured' before the IIFE executes
+  - E2E verification stories that don't require code changes still need full Phase 1 + Phase 2 runs to confirm the fix works end-to-end
+---
