@@ -1,0 +1,46 @@
+# Ralph Progress Log
+PRD: prd-2026-03-09-125025-fix-supabase-cloudflare-bypass-84d22e~running.json
+Started: Mon Mar  9 19:51:07 UTC 2026
+---
+
+## Codebase Patterns
+- All Supabase tools import `api` from `../supabase-api.js` and use `api<T>(endpoint)` for API calls
+- The `api()` function in supabase-api.ts handles: auth via getAuth(), error handling (401/403/429/404/timeout), query params, JSON parsing
+- The base URL for Supabase API is `https://api.supabase.com/v1` — endpoints are relative paths like `/projects/${ref}/types/typescript`
+- The Supabase generate-types endpoint returns JSON `{ types: string }`, not raw text (despite what the PRD notes suggested)
+- Cloudflare's `cloudflareApi()` returns the standard CF envelope `{ success, errors, messages, result }` — the GraphQL endpoint (`/api/v4/graphql`) returns `{ data, errors }` instead, so it can't use `cloudflareApi()` directly
+- For Cloudflare tools that can't use cloudflareApi() due to different response formats, use SDK's `postJSON` with `getAtokHeader()` for auth
+- Cloudflare auth uses `x-atok` header (anti-forgery token from `window.bootstrap.atok`) + same-origin cookies; the SDK's `credentials: 'include'` works for same-origin requests
+
+## 2026-03-09 - US-001
+- Replaced raw fetch() with duplicated auth extraction in generate-types.ts with the plugin's api() function
+- Removed ToolError import (no longer needed), added api import from supabase-api.js
+- The handler went from 20 lines to 2 lines: a single api() call + return
+- Files changed: plugins/supabase/src/tools/generate-types.ts
+- **Learnings for future iterations:**
+  - The Supabase api() function already handles JSON responses including edge cases (204 no content, empty body) — no special handling needed in individual tools
+  - generate-types endpoint returns JSON with `{ types?: string }`, not text/plain as the PRD notes stated — always verify response format by reading existing code
+  - All 25+ Supabase tools follow the exact same pattern: `import { api } from '../supabase-api.js'` + `await api<T>(endpoint)` — new tools should match this
+---
+
+## 2026-03-09 - US-002
+- Replaced raw fetch() in graphql-query.ts with SDK's `postJSON()` utility
+- The handler went from 22 lines of manual fetch/error-handling to a single `postJSON()` call (3 lines)
+- `postJSON` handles: Content-Type header, body serialization, timeout (30s), credentials, HTTP error mapping (401/403 → auth, 429 → rate limit, etc.)
+- Kept explicit auth check with `getAtokHeader()` for a clear upfront error message
+- Could NOT use `cloudflareApi()` because the GraphQL endpoint returns `{ data, errors }` (GraphQL standard), not the Cloudflare envelope `{ success, result, errors }`
+- Files changed: plugins/cloudflare/src/tools/graphql-query.ts
+- **Learnings for future iterations:**
+  - The Cloudflare GraphQL endpoint at `/api/v4/graphql` returns a different response shape than all other CF API endpoints — always check response format before choosing an API caller
+  - `getAtokHeader()` in cloudflare-api.ts is explicitly exported for tools that can't use `cloudflareApi()` due to different response formats
+  - SDK's `postJSON` is the right choice when a plugin's own API caller doesn't fit (different response format, different base URL, etc.) — it provides all the same error handling as a custom API caller
+---
+
+## 2026-03-09 - US-003
+- Added `encodeURIComponent(params.project_slug)` in URL templates for get-project.ts and get-project-keys.ts
+- list-project-environments.ts already had the encoding — now all three tools are consistent
+- Files changed: plugins/sentry/src/tools/get-project.ts, plugins/sentry/src/tools/get-project-keys.ts
+- **Learnings for future iterations:**
+  - When interpolating user-provided slugs into URL paths, always wrap with `encodeURIComponent()` for safety — even if slugs rarely contain special characters
+  - The Sentry plugin uses `sentryApi()` from sentry-api.ts which takes a relative path — the slug encoding must happen at the call site, not inside the API helper
+---
