@@ -1,0 +1,91 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "SDK round 2: Add stripUndefined utility, widen buildQueryString type to accept mixed arrays, add parseRateLimitHeader for non-standard rate limit headers, update CLAUDE.md, then bump version to 0.0.71 and publish to npm.",
+  "qualityChecks": "npm run build && npm run type-check && npm run lint && npm run knip && npm run test",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add stripUndefined utility to fetch.ts",
+      "description": "Add a stripUndefined function that filters out keys with undefined values from an object. This is the most commonly repeated pattern across all plugins — 50+ tool files manually build request bodies with if (x !== undefined) body.x = x chains.",
+      "acceptanceCriteria": [
+        "stripUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> filters out undefined values",
+        "Keeps null, 0, false, empty string — only removes undefined",
+        "Exported from fetch.ts and re-exported from index.ts",
+        "Unit test in fetch.test.ts covers: filters undefined, keeps null, keeps falsy values, returns empty object for all-undefined input"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-sdk/src/fetch.ts (add before buildQueryString, around line 61)\n- platform/plugin-sdk/src/index.ts (add re-export in Fetch section)\n\nImplementation:\n```typescript\nexport const stripUndefined = <T extends Record<string, unknown>>(obj: T): Partial<T> =>\n  Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined)) as Partial<T>;\n```\n\nThis replaces the pattern found in 50+ tool files:\n```typescript\n// BEFORE (manual, 10+ lines per tool):\nconst body: Record<string, unknown> = { content: params.content };\nif (params.description !== undefined) body.description = params.description;\nif (params.project_id !== undefined) body.project_id = params.project_id;\nif (params.due_string !== undefined) body.due_string = params.due_string;\n\n// AFTER (1 line):\nconst body = stripUndefined(params);\n// Or for partial updates:\nconst { task_id, ...updates } = params;\nconst body = stripUndefined(updates);\n```\n\nConstraints:\n- Do NOT change any existing functions\n- Must preserve null, 0, false, '' — only filter undefined\n- Return type is Partial<T> to maintain type safety"
+    },
+    {
+      "id": "US-002",
+      "title": "Widen buildQueryString type to accept mixed arrays",
+      "description": "Change buildQueryString's type signature to accept (string | number | boolean)[] instead of just string[]. Sentry, Vercel, and Cloudflare can't adopt buildQueryString because their query parameters include number[] and boolean[] arrays.",
+      "acceptanceCriteria": [
+        "buildQueryString accepts Record<string, string | number | boolean | (string | number | boolean)[] | undefined>",
+        "Array items are converted to strings via String() before appending",
+        "Existing behavior unchanged for string[] arrays",
+        "Unit test covers number[] and boolean[] array values"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-sdk/src/fetch.ts line 62\n\nCurrent signature:\n```typescript\nexport const buildQueryString = (params: Record<string, string | number | boolean | string[] | undefined>): string => {\n```\n\nNew signature:\n```typescript\nexport const buildQueryString = (\n  params: Record<string, string | number | boolean | (string | number | boolean)[] | undefined>,\n): string => {\n```\n\nThe implementation already uses `String(value)` for non-array items and iterates arrays with `.append(key, item)`. The only change needed is:\n1. Widen the type signature\n2. In the array branch, convert each item to string: `searchParams.append(key, String(item))` instead of `searchParams.append(key, item)`\n\nThe current array branch just does `searchParams.append(key, item)` where `item` is typed as `string`. After widening, `item` becomes `string | number | boolean`, so wrap with `String(item)`.\n\nConstraints:\n- This is a backwards-compatible type widening — no breaking changes\n- Do NOT change the function's runtime behavior for existing input types"
+    },
+    {
+      "id": "US-003",
+      "title": "Add parseRateLimitHeader utility to fetch.ts",
+      "description": "Add a parseRateLimitHeader function that checks multiple common rate limit header names and normalizes them all to retryAfterMs. X uses x-rate-limit-reset (epoch), Reddit uses x-ratelimit-reset (seconds until reset), while standard APIs use Retry-After.",
+      "acceptanceCriteria": [
+        "parseRateLimitHeader(headers: Headers): number | undefined",
+        "Checks headers in order: Retry-After, x-rate-limit-reset, x-ratelimit-reset, RateLimit-Reset",
+        "Retry-After is parsed via existing parseRetryAfterMs (handles both seconds and HTTP-date)",
+        "x-rate-limit-reset (epoch seconds) is converted: value * 1000 - Date.now()",
+        "x-ratelimit-reset (seconds until reset) is converted: value * 1000",
+        "Returns undefined if no rate limit header is found or value is invalid",
+        "Exported from fetch.ts and re-exported from index.ts"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-sdk/src/fetch.ts (add after parseRetryAfterMs, around line 59)\n- platform/plugin-sdk/src/index.ts (add re-export in Fetch section)\n\nImplementation:\n```typescript\nexport const parseRateLimitHeader = (headers: Headers): number | undefined => {\n  // Standard Retry-After header (delta-seconds or HTTP-date)\n  const retryAfter = headers.get('Retry-After');\n  if (retryAfter !== null) return parseRetryAfterMs(retryAfter);\n\n  // X/Twitter: x-rate-limit-reset (Unix epoch in seconds)\n  const epochReset = headers.get('x-rate-limit-reset');\n  if (epochReset !== null) {\n    const epochMs = Number(epochReset) * 1000;\n    if (!Number.isNaN(epochMs)) {\n      const ms = epochMs - Date.now();\n      return ms > 0 ? ms : undefined;\n    }\n  }\n\n  // Reddit: x-ratelimit-reset (seconds until reset)\n  const deltaReset = headers.get('x-ratelimit-reset');\n  if (deltaReset !== null) {\n    const seconds = Number(deltaReset);\n    if (!Number.isNaN(seconds) && seconds > 0) return seconds * 1000;\n  }\n\n  // Generic RateLimit-Reset (seconds, per IETF draft)\n  const genericReset = headers.get('RateLimit-Reset');\n  if (genericReset !== null) {\n    const seconds = Number(genericReset);\n    if (!Number.isNaN(seconds) && seconds > 0) return seconds * 1000;\n  }\n\n  return undefined;\n};\n```\n\nConstraints:\n- Do NOT change parseRetryAfterMs — it handles the standard Retry-After format\n- parseRateLimitHeader is a superset that checks multiple headers and delegates to parseRetryAfterMs for the standard one"
+    },
+    {
+      "id": "US-004",
+      "title": "Update plugin-sdk CLAUDE.md with new utilities",
+      "description": "Update platform/plugin-sdk/CLAUDE.md to document stripUndefined, the widened buildQueryString type, and parseRateLimitHeader.",
+      "acceptanceCriteria": [
+        "Fetch section includes stripUndefined with signature and one-line description",
+        "Fetch section's buildQueryString description reflects the widened array type",
+        "Fetch section includes parseRateLimitHeader with signature and description"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/plugin-sdk/CLAUDE.md\n\nAdd to the Fetch Utilities section:\n- `stripUndefined<T>(obj)` → `Partial<T>` — filters out keys with undefined values, keeps null/0/false/empty string\n- Update `buildQueryString` description to mention `(string | number | boolean)[]` array support\n- `parseRateLimitHeader(headers)` → `number | undefined` — checks Retry-After, x-rate-limit-reset, x-ratelimit-reset, RateLimit-Reset and normalizes to milliseconds\n\nConstraints:\n- Follow the existing one-line-per-function documentation style\n- Do NOT change any other sections"
+    },
+    {
+      "id": "US-005",
+      "title": "Bump version to 0.0.71 and publish to npm",
+      "description": "Load the bump-version skill and execute every step: bump all version references, build, publish all 7 platform packages to npm in dependency order, rebuild all plugins to update lock files, and commit everything.",
+      "acceptanceCriteria": [
+        "All 7 platform package.json files have version 0.0.71",
+        "Chrome extension manifest.json has version 0.0.71",
+        "All plugin package.json files have version 0.0.71 with SDK/tools dep ranges ^0.0.71",
+        "All 7 platform packages are published to npm at 0.0.71 (verify with npm view)",
+        "All plugin package-lock.json files reference the published 0.0.71 versions",
+        "No hardcoded 0.0.70 version strings remain in platform/ TypeScript source"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Use the `skill` tool to load the `bump-version` skill, then follow every step in the 'Reference: What the Worker Does' section exactly.\n\nThe skill is at `.claude/skills/bump-version/__SKILL__.md` — read it first.\n\nKey steps in order:\n1. Update version in all 7 platform package.json files: shared, plugin-sdk, browser-extension, mcp-server, plugin-tools, cli, create-plugin\n2. Update version in platform/browser-extension/manifest.json\n3. Update version AND dependency ranges in all plugin package.json files (plugins/*/package.json)\n4. Run `npm install --package-lock-only` at repo root to update root lock file\n5. Scan for hardcoded '0.0.70' strings in platform/**/*.ts\n6. Run `npm run build` and `npm run type-check`\n7. Commit the version bump (message: 'bump version to 0.0.71')\n8. Verify npm auth: `npm whoami` must return 'REDACTED_NPM_USER'\n9. Publish in this exact order:\n   - cd platform/shared && npm publish\n   - cd platform/browser-extension && npm publish\n   - cd platform/mcp-server && npm publish\n   - cd platform/plugin-sdk && npm publish\n   - cd platform/plugin-tools && npm publish\n   - cd platform/cli && npm publish\n   - cd platform/create-plugin && npm publish\n10. After all 7 are published, verify: `npm view @opentabs-dev/shared@0.0.71 version`\n11. Run `npm run build:plugins` to install published versions and rebuild all plugins\n12. Commit plugin lock file updates (message: 'update plugin lock files for 0.0.71')\n\nConstraints:\n- Do NOT change any publishConfig.access values\n- Do NOT bump the docs/ version\n- Do NOT modify the root package.json\n- Plugin packages use `^0.0.71` semver ranges, NOT exact versions\n- The publish MUST happen before build:plugins"
+    }
+  ]
+}
