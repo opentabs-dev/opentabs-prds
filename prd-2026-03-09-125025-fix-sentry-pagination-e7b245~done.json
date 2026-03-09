@@ -1,0 +1,24 @@
+{
+  "project": "OpenTabs Plugin \u2014 sentry",
+  "description": "Fix Sentry's broken cursor pagination: sentryApi() never parses the Link header, so 11 list tools can't paginate. Parse the Link header to extract the next cursor and return it alongside the response data.",
+  "workingDirectory": "plugins/sentry",
+  "qualityChecks": "cd plugins/sentry && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix Sentry pagination by parsing Link header in sentryApi",
+      "description": "The sentryApi() function discards the Response object after parsing JSON, losing the Link header that contains cursor pagination info. Refactor to return both data and the next cursor parsed from the Link header. Update all 11 list tools to include the cursor in their output.",
+      "acceptanceCriteria": [
+        "sentryApi returns an object with { data: T, nextCursor?: string } instead of just T",
+        "The Link header is parsed to extract the cursor value from the rel=next link",
+        "All 11 list tools (search-issues, list-issue-events, list-issue-tags, list-comments, list-projects, list-members, list-teams, list-releases, list-alerts, list-monitors, list-replays) return a cursor field in their output",
+        "Plugin builds and type-checks clean"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/sentry/src/sentry-api.ts \u2014 refactor sentryApi() return type\n- plugins/sentry/src/tools/*.ts \u2014 all list tools that accept cursor input must also return cursor output\n\nContext:\nSentry's API uses cursor-based pagination via Link headers:\n```\nLink: <https://sentry.io/api/0/organizations/.../issues/?cursor=abc123>; rel=\"next\"; results=\"true\"\n```\n\nThe current sentryApi() (sentry-api.ts) calls fetchJSON which returns parsed JSON directly, discarding the Response. To access the Link header, the function needs to use fetchFromPage instead, read the Link header, then parse the JSON.\n\nChanges to sentry-api.ts:\n1. Change `sentryApi` to use `fetchFromPage` instead of `fetchJSON`\n2. Parse the Link header to extract the next cursor:\n```typescript\nconst parseLinkCursor = (headers: Headers): string | undefined => {\n  const link = headers.get('Link');\n  if (!link) return undefined;\n  // Find the rel=\"next\" link with results=\"true\"\n  const nextMatch = link.match(/<[^>]*[?&]cursor=([^&>]+)[^>]*>;\\s*rel=\"next\";\\s*results=\"true\"/);\n  return nextMatch?.[1] ?? undefined;\n};\n```\n3. Return `{ data: T, nextCursor?: string }` from sentryApi\n\nChanges to each list tool:\n1. Add `cursor: z.string().describe('Pagination cursor for next page, empty if no more results')` to output schema\n2. Update handle to: `const { data, nextCursor } = await sentryApi(...)` and include `cursor: nextCursor ?? ''` in the return\n\nThe 11 affected tools are:\n- search-issues.ts\n- list-issue-events.ts\n- list-issue-tags.ts\n- list-comments.ts\n- list-projects.ts\n- list-members.ts\n- list-teams.ts\n- list-releases.ts\n- list-alerts.ts\n- list-monitors.ts\n- list-replays.ts\n\nConstraints:\n- Non-list tools (get-issue, get-event, update-issue, create-comment, get-project, get-project-keys, list-project-environments, get-organization, get-release) should NOT be affected \u2014 they don't paginate\n- The cursor output field should be empty string (not undefined) when no next page exists, for consistency with other plugins"
+    }
+  ]
+}
