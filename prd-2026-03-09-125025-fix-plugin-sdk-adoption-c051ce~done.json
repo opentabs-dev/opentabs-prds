@@ -12,7 +12,7 @@
         "Plugin builds and type-checks clean"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- plugins/teams/src/teams-api.ts\n\nContext:\nTeams has two MSAL token discovery functions that iterate localStorage manually:\n```typescript\nfor (let i = 0; i < localStorage.length; i++) {\n  const key = localStorage.key(i);\n  if (!key) continue;\n  if (key.includes('login.windows.net') && key.includes('accesstoken')) {\n    const raw = localStorage.getItem(key);\n    // ...\n  }\n}\n```\n\nReplace with:\n```typescript\nimport { findLocalStorageEntry } from '@opentabs-dev/plugin-sdk';\n\nconst entry = findLocalStorageEntry(key => key.includes('login.windows.net') && key.includes('accesstoken'));\nif (entry) {\n  const parsed = JSON.parse(entry.value);\n  // ...\n}\n```\n\nThere may be two separate discovery functions (for different MSAL token types) — replace both.\n\nConstraints:\n- Do NOT change the token parsing logic — only the localStorage iteration\n- Do NOT change any tool files"
@@ -27,7 +27,7 @@
         "Plugin builds and type-checks clean"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- plugins/slack/src/slack-api.ts\n\nContext:\nSlack has multiple manual globalThis accesses for reading Slack's page globals:\n- `(globalThis as Record<string, unknown>).boot_data` for API tokens\n- `(globalThis as Record<string, unknown>).TS` for team/user info\n\nReplace with getPageGlobal:\n- `getPageGlobal('boot_data') as BootData | undefined`\n- `getPageGlobal('boot_data.api_token') as string | undefined`\n- `getPageGlobal('TS.boot_data.api_token') as string | undefined`\n\nNote: Slack's auth detection tries multiple sources (getAuthFromLocalStorage, getAuthFromBootData, getAuthFromPageScripts, getAuthFromLocalStorageScan). Only the getAuthFromBootData function and any other function that reads window.boot_data or window.TS needs to be updated.\n\nConstraints:\n- Do NOT change the auth detection priority or multi-source fallback logic\n- Do NOT change getAuthFromLocalStorage or getAuthFromPageScripts or getAuthFromLocalStorageScan\n- Do NOT change slackApi() or any tool files"
@@ -45,7 +45,7 @@
         "Plugin builds and type-checks clean"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- plugins/craigslist/src/craigslist-api.ts\n\nContext:\nThe callApi function at lines 64-128 has two violations:\n1. Raw `fetch()` at line 97 with manual `credentials: 'include'` and `AbortSignal.timeout(30_000)`\n2. Manual HTTP error chain at lines 111-127\n\nReplace with:\n```typescript\nimport { fetchFromPage, buildQueryString, getCookie, waitUntil } from '@opentabs-dev/plugin-sdk';\n\nconst callApi = async <T>(\n  base: string,\n  endpoint: string,\n  options: { method?: string; body?: FormData | string; contentType?: string; query?: Record<string, string | number | boolean | undefined>; } = {},\n): Promise<T> => {\n  if (!isAuthenticated()) throw ToolError.auth('Not authenticated — please log in to Craigslist.');\n\n  const query = { lang: 'en', ...options.query };\n  const qs = buildQueryString(query);\n  const url = `${base}${endpoint}?${qs}`;\n\n  const headers: Record<string, string> = {};\n  const method = options.method ?? 'GET';\n  const init: FetchFromPageOptions = { method, headers };\n\n  if (options.body) {\n    if (typeof options.body === 'string') {\n      headers['Content-Type'] = options.contentType ?? 'application/json';\n      init.body = options.body;\n    } else {\n      init.body = options.body;\n    }\n  }\n\n  const response = await fetchFromPage(url, init);\n  if (response.status === 204) return {} as T;\n  return (await response.json()) as T;\n};\n```\n\nfetchFromPage handles credentials:'include', 30s timeout, and throws httpStatusToToolError on non-ok responses automatically.\n\nAlso remove the unused `parseRetryAfterMs` import if it was only used in the manual error chain.\n\nConstraints:\n- Do NOT change wapi(), capi(), or accountsApi()\n- Do NOT change any tool files\n- FormData bodies must still work — fetchFromPage accepts arbitrary RequestInit"

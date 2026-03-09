@@ -1,0 +1,49 @@
+# Ralph Progress Log
+PRD: prd-2026-03-09-125025-fix-plugin-sdk-adoption-c051ce~running.json
+Started: Mon Mar  9 19:50:59 UTC 2026
+---
+
+## Codebase Patterns
+- Plugins in `plugins/` are standalone — they need `npm install` in their own directory before building
+- SDK utilities are exported from `@opentabs-dev/plugin-sdk` barrel — `findLocalStorageEntry`, `getPageGlobal`, `fetchFromPage`, etc.
+- `findLocalStorageEntry(predicate)` returns `{ key: string; value: string } | null` — the value is the raw string, caller must JSON.parse if needed
+- Root monorepo quality checks (build, type-check, lint, knip, test) don't cover plugins — plugin builds are separate
+
+---
+
+## 2026-03-09 19:54 UTC - US-001
+- Replaced manual `localStorage` for-loop in `findMsalToken` with SDK's `findLocalStorageEntry`
+- Added `findLocalStorageEntry` to the import from `@opentabs-dev/plugin-sdk`
+- Preserved JSON parsing and `secret` field validation logic
+- Files changed: `plugins/teams/src/teams-api.ts`
+- **Learnings for future iterations:**
+  - Teams plugin has a single `findMsalToken(scopeSuffix)` function that handles all MSAL token discovery (the PRD notes mentioned "two separate functions" but there's only one parameterized function)
+  - Plugin `node_modules` may not be pre-installed in worktrees — run `npm install` in the plugin dir before building
+  - `findLocalStorageEntry` handles the iteration and SecurityError fallback; caller only provides the key predicate
+---
+
+## 2026-03-09 20:02 UTC - US-002
+- Replaced manual `globalThis as Record<string, unknown>` casts with `getPageGlobal` from plugin SDK
+- Added `getPageGlobal` to the import from `@opentabs-dev/plugin-sdk`
+- Replaced `g.boot_data` with `getPageGlobal('boot_data')` and `g.TS` with `getPageGlobal('TS')`
+- Files changed: `plugins/slack/src/slack-api.ts`
+- **Learnings for future iterations:**
+  - Only `getAuthFromBootData` accessed globalThis directly — other auth functions (getAuthFromLocalStorage, getAuthFromPageScripts, getAuthFromLocalStorageScan) use DOM/SDK utilities
+  - `getPageGlobal` takes a dot-notation path (e.g., `'TS.boot_data.api_token'`) but here we use top-level access (`'boot_data'` and `'TS'`) and then traverse the typed object for subsequent properties
+  - The PRD AC mentioned `getPageGlobal('boot_data.api_token')` style but the existing code uses `authFromBootData()` helper which takes the whole boot_data object — keeping that pattern is cleaner
+---
+
+## 2026-03-09 20:10 UTC - US-003
+- Replaced raw `fetch()` in `callApi` with `fetchFromPage` from plugin SDK
+- Removed manual `credentials: 'include'` and `AbortSignal.timeout(30_000)` — `fetchFromPage` handles both
+- Removed entire try/catch block for timeout/network errors — `fetchFromPage` throws appropriate `ToolError` variants
+- Removed entire `if (!response.ok)` HTTP status error chain (429, 401/403, 404, 400) — `fetchFromPage` uses `httpStatusToToolError` internally
+- Removed unused `parseRetryAfterMs` import
+- Preserved FormData body support (fetchFromPage accepts any RequestInit body)
+- Preserved Content-Type header logic for string bodies
+- Files changed: `plugins/craigslist/src/craigslist-api.ts`
+- **Learnings for future iterations:**
+  - `fetchFromPage` returns a `Response` (not parsed JSON), so callers still need to handle 204 and `.json()` parsing themselves
+  - Biome's formatter collapses import statements to one line when they become short enough after removing an import — check format after changing imports
+  - `fetchFromPage` error messages include the full URL, so endpoint-specific messages in the old manual chain are replaced by URL-based messages from the SDK
+---
