@@ -1,0 +1,109 @@
+# Ralph Progress Log
+PRD: prd-2026-03-08-164126-migrate-plugins-remaining-2f4423~running.json
+Started: Sun Mar  8 23:51:12 UTC 2026
+---
+
+## Codebase Patterns
+- SDK auth cache pattern: `getAuthCache<T>(namespace)`, `setAuthCache(namespace, value)`, `clearAuthCache(namespace)` — replaces manual `globalThis.__openTabs.tokenCache` access
+- SDK waitUntil pattern for waitForAuth: `waitUntil(() => isAuthenticated(), { interval: 500, timeout: 5000 }).then(() => true, () => false)` — wraps to return boolean like the original
+- Plugins need `npm install` in worktrees before building (node_modules aren't pre-populated for standalone plugins)
+- Notion plugin (already migrated) is the reference for this migration pattern
+- SDK `getMetaContent(name)` replaces `document.querySelector<HTMLMetaElement>('meta[name="..."]')?.content` — used by GitHub for auth detection
+- SDK `getPageGlobal(path)` uses dot-notation for deep property access on globalThis — e.g., `getPageGlobal('__META_DATA__.isLoggedIn')` replaces `(globalThis as Record<string, unknown>).__META_DATA__` casts
+- SDK `getCookie(name)` replaces manual `document.cookie.match(...)` patterns — handles URI decoding
+- SDK `getLocalStorage(key)` replaces `localStorage.getItem(key)` — returns `string | null` just like the original
+- SDK `waitForSelector(selector, { timeout })` replaces custom `waitForElement` polling functions — uses MutationObserver, throws on timeout, takes options object
+
+## 2026-03-08 - US-001
+- Migrated Figma plugin to SDK utilities
+- Files changed: `plugins/figma/src/figma-api.ts`
+- Replaced manual `getPersistedAuth`/`setPersistedAuth`/`clearPersistedAuth` with SDK `getAuthCache<FigmaAuth>('figma')`/`setAuthCache('figma', auth)`/`clearAuthCache('figma')`
+- Replaced manual `waitForFigmaAuth` polling (setInterval) with `waitUntil(() => isFigmaAuthenticated(), { interval: 500, timeout: 5000 })`
+- **Learnings for future iterations:**
+  - The SDK `getAuthCache` is generic: `getAuthCache<T>(namespace)` — use the plugin's auth type as T
+  - The `clearAuthCache` calls in error handlers (401/403) are important to preserve — they ensure stale auth is cleared on auth failures
+  - The `figmaApi()` function and tool files were NOT changed per constraints
+---
+
+## 2026-03-08 - US-002
+- Migrated GitHub plugin to SDK utilities
+- Files changed: `plugins/github/src/github-api.ts`
+- Replaced manual `document.querySelector('meta[name="user-login"]')` with SDK `getMetaContent('user-login')`
+- Replaced manual `waitForAuth` polling (setInterval/clearInterval) with `waitUntil(() => isAuthenticated(), { interval: 500, timeout: 5000 })`
+- **Learnings for future iterations:**
+  - SDK `getMetaContent(name)` is a clean replacement for `document.querySelector<HTMLMetaElement>('meta[name="..."]')?.content`
+  - GitHub's auth detection reads a meta tag (not cookies or globals) — `getMetaContent` is the right SDK utility here
+  - The `api()` and `apiRaw()` functions were NOT changed per constraints
+---
+
+## 2026-03-09 - US-003
+- Migrated X (Twitter) plugin to SDK utilities
+- Files changed: `plugins/x/src/x-api.ts`
+- Replaced `document.cookie.match(/ct0=([^;]+)/)` with SDK `getCookie('ct0')` in `getCsrfToken`
+- Replaced `(globalThis as Record<string, unknown>).__META_DATA__` cast with SDK `getPageGlobal('__META_DATA__.isLoggedIn')` in `isAuthenticated`
+- Replaced manual `waitForAuth` polling (setInterval/clearInterval) with `waitUntil(() => isAuthenticated(), { interval: 500, timeout: 5000 })`
+- **Learnings for future iterations:**
+  - `getPageGlobal` uses dot-notation paths for deep property access — no need to cast `globalThis`
+  - `getCookie` is a direct replacement for `document.cookie.match(/name=([^;]+)/)` patterns — simpler and handles URI decoding
+  - The `graphqlQuery`, `graphqlMutation`, and `restApi` functions were NOT changed per constraints
+---
+
+## 2026-03-09 - US-004
+- Migrated Reddit plugin to SDK utilities and fixed ToolError bug
+- Files changed: `plugins/reddit/src/reddit-api.ts`, `plugins/reddit/src/tools/get-post.ts`
+- Replaced `document.cookie.match(/csrf_token=([^;]+)/)` with SDK `getCookie('csrf_token')` in `getBearerToken`
+- Replaced manual `waitForAuth` polling (setInterval/clearInterval) with `waitUntil(() => isAuthenticated(), { interval: 500, timeout: 3000 })`
+- Fixed `get-post.ts`: replaced `throw new Error('Post not found')` with `throw ToolError.notFound('Post not found')`
+- **Learnings for future iterations:**
+  - Reddit's waitForAuth uses 3000ms timeout (not 5000 like other plugins) — always check existing timeout values
+  - The `ToolError.notFound()` static method is the correct way to throw not-found errors in tool handlers
+  - The `redditGet`, `redditPost`, `redditOAuthPost` functions and other tool files were NOT changed per constraints
+---
+
+## 2026-03-09 - US-005
+- Migrated DoorDash plugin to SDK utilities
+- Files changed: `plugins/doordash/src/doordash-api.ts`
+- Replaced `document.cookie.includes('dd_cx_logged_in')` with `getCookie('dd_cx_logged_in') !== null`
+- Replaced `document.cookie.match(/csrf_token=([^;]+)/)` with `getCookie('csrf_token')` in `getCsrfToken`
+- Replaced `localStorage.getItem('consumerId')` with `getLocalStorage('consumerId')`
+- Replaced manual `waitForAuth` polling (setInterval/clearInterval) with `waitUntil(() => isAuthenticated(), { interval: 500, timeout: 5000 })`
+- **Learnings for future iterations:**
+  - `getLocalStorage(key)` is a direct drop-in for `localStorage.getItem(key)` — same `string | null` return type
+  - For `document.cookie.includes(name)` (boolean check), use `getCookie(name) !== null`
+  - The `gql()` function was NOT changed per constraints
+---
+
+## 2026-03-09 - US-006
+- Migrated Dominos plugin to SDK utilities
+- Files changed: `plugins/dominos/src/dominos-api.ts`, `plugins/dominos/src/tools/place-order-cash.ts`
+- Removed local `getCookie` function, imported `getCookie` and `waitUntil` from SDK
+- Replaced manual `waitForAuth` polling (setInterval/clearInterval) with `waitUntil(() => isAuthenticated(), { interval: 500, timeout: 5000 })`
+- Removed custom `waitForElement` function from `place-order-cash.ts`, replaced with SDK `waitForSelector` (uses MutationObserver instead of polling)
+- Updated `waitForSelector` call with options object `{ timeout: 15_000 }` to preserve the original 15s timeout
+- **Learnings for future iterations:**
+  - SDK `waitForSelector` uses MutationObserver (more efficient than setInterval polling) and has the same throw-on-timeout behavior as custom `waitForElement`
+  - `waitForSelector` takes an options object `{ timeout }` instead of a positional parameter
+  - The caller's try-catch around `waitForElement` worked unchanged with `waitForSelector` since both throw on timeout
+  - The `gql()` function and other tool files were NOT changed per constraints
+---
+
+## 2026-03-09 - US-007
+- Migrated 9 remaining plugins to SDK utilities
+- Files changed:
+  - `plugins/panda-express/src/panda-api.ts`: `localStorage.getItem` → `getLocalStorage`, waitForAuth → `waitUntil`
+  - `plugins/airbnb/src/airbnb-api.ts`: manual cookie parsing → `getCookie('_user_attributes')`, waitForAuth → `waitUntil`
+  - `plugins/clickhouse/src/clickhouse-api.ts`: `localStorage.getItem` → `getLocalStorage`, `window` cast → `getPageGlobal`, waitForAuth → `waitUntil`, removed unused `ConsoleConfig` interface
+  - `plugins/cockroachdb/src/cockroachdb-api.ts`: `globalThis` casts → `getPageGlobal` for `proto`, `initData`, and dynamic proto class lookup, waitForAuth → `waitUntil`
+  - `plugins/asana/src/asana-api.ts`: `window.env._user_id` / `window.page_load_globals.user_id` → `getPageGlobal`, removed `declare const window` augmentation, waitForAuth → `waitUntil`
+  - `plugins/airtable/src/airtable-api.ts`: `window.initData` → `getPageGlobal('initData.sessionUserId')` / `getPageGlobal('initData.csrfToken')`, removed `declare const window` and `InitData` interface, waitForAuth → `waitUntil`
+  - `plugins/stackoverflow/src/stackoverflow-api.ts`: `StackExchange.options.user` → `getPageGlobal('StackExchange.options.user.isRegistered')` / `getPageGlobal('StackExchange.options.user.userId')`, removed `declare const StackExchange` type, waitForAuth → `waitUntil`
+  - `plugins/linkedin/src/linkedin-api.ts`: `document.cookie.match(/JSESSIONID=.../)` → `getCookie('JSESSIONID')` with `.replace(/"/g, '')` for quote stripping, waitForAuth → `waitUntil`
+  - `plugins/teams/src/teams-api.ts`: waitForTeamsAuth → `waitUntil` with 8000ms timeout (preserved from original)
+- **Learnings for future iterations:**
+  - LinkedIn's JSESSIONID cookie may have surrounding double quotes — `getCookie` does URI decoding but does NOT strip quotes, so `.replace(/"/g, '')` is needed after getCookie
+  - Teams uses 8000ms timeout (not 5000 like most plugins) — always check existing timeout values before migrating
+  - When `getPageGlobal` replaces typed window/globalThis augmentations, `typeof` checks are needed since the return type is `unknown`
+  - Removing `declare const window` augmentations and ambient type declarations is safe when all access points are replaced by SDK utilities
+  - `getPageGlobal` supports dot-notation paths for deep property access — e.g., `getPageGlobal('initData.sessionUserId')` replaces `window.initData?.sessionUserId`
+  - CockroachDB's dynamic proto class lookup (`g.proto?.[className]`) can be replaced with `getPageGlobal(\`proto.${className}\`)` using template literals
+---
