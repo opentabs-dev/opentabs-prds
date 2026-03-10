@@ -1,0 +1,137 @@
+# Ralph Progress Log
+PRD: prd-2026-03-10-100438-multi-ws-connection-85513d~running.json
+Started: Tue Mar 10 17:05:06 UTC 2026
+---
+US-001: PASS — Add ExtensionConnection type and replace single extensionWs with connections Map
+  - Added ExtensionConnection interface with ws, connectionId, tabMapping, activeNetworkCaptures
+  - Replaced extensionWs: WsHandle | null with extensionConnections: Map<string, ExtensionConnection>
+  - Moved tabMapping and activeNetworkCaptures into per-connection scope
+  - Added helpers: getAnyConnection, getConnectionForTab, getMergedTabMapping, isExtensionConnected, pickBestTabState
+  - Updated all consumers (source + tests) with bridge patterns using getAnyConnection
+  - Bumped STATE_SCHEMA_VERSION from 5 to 6
+  - All Phase 1 checks pass: build, type-check, lint, knip, test (91 files, 3152 tests)
+
+## 2026-03-10 17:47 UTC - US-002
+US-002: PASS — Update sendToExtension to broadcast and add sendToConnection for targeted sends
+  - Added sendToConnection(state, connectionId, msg) function to extension-handlers.ts
+  - sendToExtension was already rewritten to broadcast in US-001, so no changes needed
+  - All notification senders (sendSyncFull, sendInvocationStart/End, sendExtensionReload, sendPluginUpdate, sendConfirmationRequest) already use sendToExtension for broadcasting (done in US-001)
+  - reload.ts already uses isExtensionConnected(state) (done in US-001)
+  - Fixed stale comment referencing removed extensionWs field in extension-protocol.ts
+  - All Phase 1 checks pass: build, type-check, lint, knip, test (91 files, 3152 tests)
+  - **Learnings for future iterations:**
+    - US-001 was very thorough — it already rewrote sendToExtension to broadcast, updated all reload.ts references to use isExtensionConnected(), and bridged tab handlers with getAnyConnection(). The main new work for US-002 was adding sendToConnection for targeted sends (needed by US-003).
+---
+
+## 2026-03-10 17:55 UTC - US-003
+US-003: PASS — Update dispatchToExtension to route dispatches to the correct connection
+  - Added resolveConnection() helper that finds the connection owning the target tab via getConnectionForTab()
+  - Fast path: single connection skips tab lookup entirely
+  - Falls back to any connection when tabId is absent or not found in any connection's tabMapping (per trap note — extension may not have reported tab yet)
+  - PendingDispatch now has optional connectionId field for scoped disconnect cleanup (US-004 will use this)
+  - Dispatch logs include connection ID for debugging
+  - Files changed: platform/mcp-server/src/state.ts, platform/mcp-server/src/extension-protocol.ts
+  - All Phase 1 checks pass: build, type-check, lint, knip, test (91 files, 3152 tests)
+  - **Learnings for future iterations:**
+    - The pong handler at extension-protocol.ts:339 was already updated to use getAnyConnection() in US-001, so no changes needed for US-003
+    - US-001 already bridged all extensionWs references with getAnyConnection(), so dispatchToExtension was already partially updated — the main new work was adding the resolveConnection routing logic and connectionId tracking on PendingDispatch
+    - The PRD acceptance criterion about rejecting "Tab not found in any connection" contradicts the trap note. The trap note is correct: fall back to any connection since the extension may not have reported the tab yet via tab.syncAll
+---
+
+## 2026-03-10 18:12 UTC - US-004
+US-004: PASS — Update WebSocket open/close handlers and tab sync for multi-connection
+  - handleWsUpgrade now parses connectionId from the third Sec-WebSocket-Protocol part (after 'opentabs' and secret)
+  - Uses state._pendingConnectionId to pass connectionId from upgrade handler to open handler (since WsHandle has no data property)
+  - createHandleWsOpen consumes _pendingConnectionId; falls back to random UUID for backwards compat
+  - Same-connectionId reconnect closes only the old connection with that ID
+  - Auto-generated connectionId preserves single-connection eviction behavior (backwards compat)
+  - createHandleWsClose scopes pending dispatch rejection per-connection via connectionId field
+  - Legacy dispatches (no connectionId) are rejected only when all connections are gone
+  - handleTabSyncAll signature changed: removed state param, added senderConn param
+  - handleTabStateChanged: added senderConn param (4th position after id)
+  - handleExtensionMessage resolves sender connection via findConnectionByWs helper
+  - Added findConnectionByWs to state.ts for ws identity lookup
+  - Updated 6 test call sites in extension-handlers.test.ts
+  - Files changed: state.ts, http-routes.ts, extension-handlers.ts, extension-protocol.ts, extension-handlers.test.ts
+  - All Phase 1 checks pass: build, type-check, lint, knip, test (91 files, 3152 tests)
+  - **Learnings for future iterations:**
+    - The Node.js server adapter (server-node.ts) wraps raw ws WebSocket into WsHandle={send,close} — no data property available. Used state._pendingConnectionId as a handoff mechanism between upgrade and open handlers.
+    - The upgrade→open sequence is synchronous within wss.handleUpgrade callback in the node adapter, so _pendingConnectionId is safe for concurrent use.
+    - When changing function signatures in handlers (e.g., removing state param from handleTabSyncAll), update both direct test calls AND the router call in extension-protocol.ts.
+    - The close handler must handle legacy dispatches (no connectionId) for backwards compat — don't just check `pending.connectionId === closedConn.connectionId`, also handle `pending.connectionId === undefined` when no connections remain.
+---
+
+## 2026-03-10 18:25 UTC - US-005
+US-005: PASS — Update health endpoint, mcp-tool-dispatch, and reload to use multi-connection state
+  - Added `extensionConnections` count field to health endpoint response (http-routes.ts)
+  - Updated HealthResponse test type and assertions in http-routes.test.ts
+  - Added assertion that unauthenticated health response excludes `extensionConnections`
+  - Verified all other consumers were already updated by US-001 through US-004:
+    - mcp-tool-dispatch.ts: already uses `state.extensionConnections.size === 0` (line 383)
+    - reload.ts: already uses `isExtensionConnected(state)` at all 3 check points
+    - buildConfigStatePayload: already uses `getMergedTabMapping(state)` (line 345)
+    - plugin_list_tabs: already uses `getMergedTabMapping(state)` (line 31)
+    - No `extensionWs` references remain in non-test source files
+  - All Phase 1 checks pass: build, type-check, lint, knip, test (91 files, 3152 tests)
+  - **Learnings for future iterations:**
+    - US-001 was extremely thorough — it updated nearly all consumers of the old state fields in a single story, leaving very little for US-005. When a PRD plans incremental migration across stories, earlier stories may absorb most of the work.
+    - The health endpoint already had `extensionConnected` (boolean) via `isExtensionConnected(state)` from US-001. US-005 added the complementary `extensionConnections` (count) field.
+    - Pre-existing biome `lint/style/noNonNullAssertion` warnings in test files (from US-001/US-004) don't block commits — they're warnings, not errors. These will be cleaned up in US-007 (test updates).
+---
+
+## 2026-03-10 18:42 UTC - US-006
+US-006: PASS — Extension sends connection ID in WebSocket subprotocol header
+  - Added `ensureConnectionId()` to background.ts: generates UUID in chrome.storage.local on first install
+  - Called ensureConnectionId before ensureOffscreenDocument at top-level and in onInstalled/onStartup
+  - Extended handleOffscreenGetUrl in background-message-handlers.ts to read and return connectionId from storage
+  - Offscreen document stores connectionId in module variable during bootstrap, adds to WebSocket protocols
+  - Fixed server-side handleWsUpgrade (http-routes.ts): only set _pendingConnectionId for explicitly-provided connectionIds, not fallback UUIDs — this was critical for backwards-compat eviction logic
+  - Files changed: background.ts, background-message-handlers.ts, offscreen/index.ts, http-routes.ts
+  - Phase 1 passes: build, type-check, lint, knip, test (91 files, 3152 tests)
+  - Phase 2 passes: all 530 E2E tests pass (0 failures, 2 skipped)
+  - **Learnings for future iterations:**
+    - The server's handleWsUpgrade was always generating a fallback UUID and storing it in _pendingConnectionId, making hasExplicitId always true in createHandleWsOpen. This completely disabled the backwards-compat eviction path for single-connection clients. The fix: only store the parsed connectionId (undefined when not provided), letting the open handler generate the UUID fallback and correctly detect the backwards-compat case.
+    - The offscreen document must have the connectionId BEFORE its first connect(). Since the offscreen starts connecting immediately on creation, ensureConnectionId() must complete before ensureOffscreenDocument() is called. The top-level code chains them: `ensureConnectionId().then(() => ensureOffscreenDocument())`.
+    - The offscreen document reads connectionId from the background via the existing offscreen:getUrl message — no new message types needed. The response was simply extended from `{ url }` to `{ url, connectionId }`.
+    - chrome.storage.local is isolated per browser profile (regular vs incognito), so connectionIds are naturally unique without any incognito detection logic.
+---
+
+## 2026-03-10 19:10 UTC - US-007
+US-007: PASS — Update unit tests for multi-connection server state
+  - state.test.ts: Added tests for isExtensionConnected, getAnyConnection, getConnectionForTab, findConnectionByWs, getMergedTabMapping (merging tabs from multiple connections, different plugins from different connections, best-state selection)
+  - extension-protocol.test.ts: Added multi-connection dispatch routing tests (routes to connection owning tabId, falls back when tabId not found, uses first connection when no tabId, stores connectionId on PendingDispatch), sendSyncFull broadcasts to all, sendConfirmationRequest broadcasts to all
+  - extension-handlers.test.ts: Added sendToExtension broadcast tests, sendToConnection targeting tests, per-connection tab sync scoping tests (sync from A doesn't clear B's tabs, state change updates only sender connection)
+  - http-routes.test.ts: Added wsClose scoping tests (closing one doesn't affect other, only rejects dispatches for closed connection), wsOpen with explicit connectionId tests (coexistence, reconnect replacement), health endpoint with multiple connections
+  - reload.test.ts: Type-annotated inline connection objects with ExtensionConnection
+  - export-har.test.ts: Refactored createConnectedState() to return typed conn variable, replaced all getAnyConnection(state)!. patterns
+  - Eliminated all 40 noNonNullAssertion lint warnings across test files by replacing getAnyConnection(state)!. patterns with local typed variables
+  - All Phase 1 checks pass: build, type-check, lint, knip, test (91 files, 3187 tests)
+  - **Learnings for future iterations:**
+    - sendSyncFull is async (writes adapter files to disk), so tests must await it and set up a temp OPENTABS_CONFIG_DIR — simply calling without await silently passes but never executes the send.
+    - US-001 through US-006 already converted most test setup to use extensionConnections Map, so existing tests already passed. The main new work was adding multi-connection specific tests and cleaning up lint warnings.
+---
+
+## 2026-03-10 19:35 UTC - US-008
+US-008: PASS — Add E2E tests for multi-connection WebSocket support
+  - Added `createRawWsConnection(port, secret, connectionId)` helper to e2e/fixtures.ts
+  - Added `extensionConnections: number` field to HealthResponse type in fixtures.ts
+  - Created e2e/multi-connection.e2e.ts with 8 comprehensive tests:
+    1. Two connections with different connectionIds coexist without eviction (3s stability check)
+    2. Same connectionId reconnect replaces only that connection (verifies close event + log)
+    3. Tab.syncAll from one connection does not affect the other (merged tab view + per-connection scoping)
+    4. Closing one connection does not affect the other (disconnect isolation)
+    5. Connection without connectionId gets random UUID (backwards compat)
+    6. Broadcasts (sync.full) sent to all connections via POST /reload trigger
+    7. Extension + raw WS coexist: real extension handles dispatches, raw WS receives broadcasts
+    8. Health endpoint shows extensionConnections count accurately (0→1→2→1→0 lifecycle)
+  - Added local helpers: sendJsonRpc (raw WS JSON-RPC sender), waitForWsMessage (predicate-based WS message listener)
+  - Files changed: e2e/fixtures.ts, e2e/multi-connection.e2e.ts (new)
+  - Phase 1 passes: build, type-check, lint, knip, test (91 files, 3187 tests)
+  - Phase 2 passes: all 538 E2E tests pass (0 failures, 2 skipped) — 8 new tests from this story
+  - **Learnings for future iterations:**
+    - The `createRawWsConnection` helper simplifies raw WS creation with connectionId — use it for any future E2E tests that need to simulate multiple browser profiles or extension instances.
+    - WebSocket `sec-websocket-protocol` header accepts the connectionId as the third comma-separated value after 'opentabs' and the secret. The server parses it by excluding 'opentabs' and the secret, treating the remaining part as the connectionId.
+    - The health endpoint's `extensionConnections` field is a count of active connections — it's the key assertion for multi-connection E2E tests. Use `waitForHealth(h => h.extensionConnections >= N)` to poll for connection count changes.
+    - Tab.syncAll scoping can be tested by sending JSON-RPC `tab.syncAll` messages from different raw WS connections and verifying the merged tab view in the health endpoint's `pluginDetails[].tabs` array.
+    - Broadcast testing uses `POST /reload` to trigger `sync.full` broadcasts, then `waitForWsMessage` to verify each connection received the message.
+---
