@@ -8,30 +8,16 @@ This is the complete development record for OpenTabs. Every feature, every bugfi
 
 The idea is simple: `git push` to a single branch is serialized by GitHub. When two workers try to claim the same PRD simultaneously, the first push wins and the second gets a non-fast-forward rejection — a natural compare-and-swap. The losing worker retries with a different PRD. No database, no message broker, no coordinator. Just git.
 
-```
-┌──────────────┐     git push PRD      ┌──────────────────────┐
-│   Producer   │ ──────────────────────→│  opentabs-prds repo  │
-│ (Ralph skill)│                        │  (GitHub — queue)    │
-└──────────────┘                        └──────┬───────────────┘
-                                               │
-                         ┌─────────────────────┼─────────────────────┐
-                         │ git push (claim)    │                     │
-                    ┌────▼─────┐          ┌────▼─────┐          ┌────▼─────┐
-                    │ Worker A │          │ Worker B │          │ Worker C │
-                    └────┬─────┘          └────┬─────┘          └────┬─────┘
-                         │                     │                     │
-                         │ git push branch     │                     │
-                         ▼                     ▼                     ▼
-                    ┌──────────────────────────────────────────────────────┐
-                    │            opentabs repo (code)                      │
-                    │  ralph-* branches pushed by workers                  │
-                    └──────────────────┬──────────────────────────────────┘
-                                       │
-                                  ┌────▼──────────┐
-                                  │ Consolidator  │
-                                  │ merges ralph-*│
-                                  │ into main     │
-                                  └───────────────┘
+```mermaid
+graph TD
+    Producer["Producer\n(Ralph skill)"] -->|git push PRD| Queue["opentabs-prds repo\n(GitHub — queue)"]
+    Queue -->|git push — claim| A["Worker A"]
+    Queue -->|git push — claim| B["Worker B"]
+    Queue -->|git push — claim| C["Worker C"]
+    A -->|git push branch| Code["opentabs repo (code)\nralph-* branches pushed by workers"]
+    B -->|git push branch| Code
+    C -->|git push branch| Code
+    Code --> Consolidator["Consolidator\nmerges ralph-* into main"]
 ```
 
 Three scripts, three jobs:
