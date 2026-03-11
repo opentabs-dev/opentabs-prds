@@ -1,0 +1,109 @@
+# Ralph Progress Log
+PRD: prd-2026-03-10-191317-fix-multi-ws-routing-3004ad~running.json
+Started: Wed Mar 11 02:13:52 UTC 2026
+---
+
+## Codebase Patterns
+- Browser tool descriptions must match the BROWSER_TOOLS_CATALOG in platform/shared/src/generated/browser-tools-catalog.ts. When changing a description, update both the tool definition and the catalog (or run `npm run generate:browser-tools-catalog`). The barrel in browser-tools/index.ts validates at import time and throws on mismatch.
+- The `dispatchToExtension` function routes to a single connection via `resolveConnection`. For broadcasting to all connections, use the new `dispatchToAllConnections` helper which dispatches in parallel and collects per-connection results.
+- TypeScript strict mode: array indexing returns `T | undefined`. Use `entries()` with destructuring or explicit null checks instead of bare `array[i]`.
+
+## 2026-03-11 02:18 - US-001
+- Implemented `dispatchToAllConnections` helper in extension-protocol.ts that dispatches JSON-RPC requests to all active extension connections in parallel with Promise.allSettled, collecting per-connection results
+- Rewrote browser_list_tabs handler to use the new helper, merging tab results and annotating each tab with connectionId
+- Updated tool description to mention connectionId field and multi-profile support
+- Updated browser-tools-catalog.ts to match the new description
+- Files changed:
+  - platform/mcp-server/src/extension-protocol.ts (new helper + export)
+  - platform/mcp-server/src/browser-tools/list-tabs.ts (rewritten handler)
+  - platform/shared/src/generated/browser-tools-catalog.ts (description update)
+- **Learnings for future iterations:**
+  - The browser-tools-catalog.ts in platform/shared/src/generated/ is a committed generated file that must match tool definitions. The barrel's validation check at import time prevents drift but also means you must update the catalog before `npm run build` will succeed (since the catalog generation script imports the barrel which triggers the check).
+  - `dispatchToAllConnections` follows the same pattern as `dispatchToExtension` for creating pending dispatches, but wraps them in Promise.allSettled for partial-success tolerance.
+---
+
+## 2026-03-11 02:50 - US-002
+- Updated `resolveConnection` in extension-protocol.ts to check `params.connectionId` (string) before `params.tabId` (number), enabling explicit connection targeting
+- Added optional `connectionId` parameter to 5 browser tools that dispatch without tabId:
+  - browser_open_tab (open-tab.ts)
+  - extension_get_state (extension-get-state.ts)
+  - extension_get_logs (extension-get-logs.ts)
+  - extension_force_reconnect (extension-force-reconnect.ts)
+  - extension_get_side_panel (extension-get-side-panel.ts)
+- Updated descriptions in both tool definitions and browser-tools-catalog.ts to document the new parameter
+- Files changed:
+  - platform/mcp-server/src/extension-protocol.ts (resolveConnection update)
+  - platform/mcp-server/src/browser-tools/open-tab.ts
+  - platform/mcp-server/src/browser-tools/extension-get-state.ts
+  - platform/mcp-server/src/browser-tools/extension-get-logs.ts
+  - platform/mcp-server/src/browser-tools/extension-force-reconnect.ts
+  - platform/mcp-server/src/browser-tools/extension-get-side-panel.ts
+  - platform/shared/src/generated/browser-tools-catalog.ts
+- **Learnings for future iterations:**
+  - Tools that already have `tabId` (screenshot, click, etc.) don't need `connectionId` — `resolveConnection` already routes correctly via `getConnectionForTab`.
+  - The connectionId is passed through to the extension as an extra field in params — the extension ignores unknown fields, so no stripping is needed.
+  - When updating tool descriptions, both the tool definition file AND the browser-tools-catalog.ts must be updated in sync. The catalog validation runs at import time.
+---
+
+## 2026-03-11 03:12 - US-003
+- Added connectionId annotation to each tab entry in plugin_list_tabs results
+- Created `getMergedTabMappingWithConnectionId` helper in plugin-list-tabs.ts that iterates connections and annotates each tab with its source connection's connectionId
+- Exported `pickBestTabState` from state.ts (was previously private) so the new helper can use it
+- Updated tool description and browser-tools-catalog.ts to mention connectionId field
+- Did NOT change getMergedTabMapping or PluginTabInfo type — the annotation is server-side only for the MCP response
+- Files changed:
+  - platform/mcp-server/src/browser-tools/plugin-list-tabs.ts (rewritten handler with connectionId annotation)
+  - platform/mcp-server/src/state.ts (exported pickBestTabState)
+  - platform/shared/src/generated/browser-tools-catalog.ts (description update)
+- **Learnings for future iterations:**
+  - `getMergedTabMapping` is used by `buildConfigStatePayload` (side panel) and http-routes, so it shouldn't be changed to include connectionId. The plugin_list_tabs handler builds its own annotated mapping instead.
+  - The `PluginTabInfo` type in shared/ flows through the extension protocol and doesn't need connectionId — the annotation is a server-side concern only for MCP responses.
+  - `pickBestTabState` was private in state.ts. When you need it elsewhere, just export it — it's a pure utility with no side effects.
+---
+
+## 2026-03-11 03:38 - US-004
+- Fixed network capture state tracking in enable-network-capture.ts and disable-network-capture.ts to use `getConnectionForTab(state, args.tabId)` instead of `getAnyConnection(state)` for tracking active captures
+- Both files fall back to `getAnyConnection(state)` when the tab's connection can't be found (graceful degradation)
+- Files changed:
+  - platform/mcp-server/src/browser-tools/enable-network-capture.ts (import + capture tracking fix)
+  - platform/mcp-server/src/browser-tools/disable-network-capture.ts (import + capture tracking fix)
+- **Learnings for future iterations:**
+  - The `dispatchToExtension` call already routes correctly via `resolveConnection` → `getConnectionForTab` when `tabId` is in params. The bug was only in the post-dispatch state tracking that used `getAnyConnection` instead.
+  - `getConnectionForTab` is already exported from state.ts — no changes needed to the state module.
+  - The `?? getAnyConnection(state)` fallback is important: if tab mapping hasn't been reported yet (e.g., race condition at startup), the connection lookup might fail, but tracking on any connection is better than not tracking at all.
+---
+
+## 2026-03-11 04:05 - US-005
+- Added unit tests for all multi-connection routing fixes:
+  - **resolveConnection with connectionId** (5 tests in extension-protocol.test.ts): connectionId priority over tabId, direct routing, fallback to tabId on unknown connectionId, fallback to getAnyConnection, single-connection shortcut bypass
+  - **dispatchToAllConnections** (5 tests in extension-protocol.test.ts): rejects with no connections, parallel dispatch with result collection, partial failure handling, single connection, __opentabs_dispatchId injection
+  - **browser_list_tabs handler** (5 tests in list-tabs.test.ts): multi-connection merge with connectionId, single connection, no connections error, non-array result handling, correct connectionId annotation per profile
+  - **plugin_list_tabs connectionId** (5 tests in plugin-list-tabs.test.ts): connectionId from source connection, all plugins include connectionId, empty tabs, unknown plugin error, multi-connection merge with best state
+  - **network capture tracking** (4 tests in network-capture-tracking.test.ts): enable tracks on correct connection via getConnectionForTab, disable removes from correct connection, fallback to getAnyConnection for both enable and disable
+- Files changed:
+  - platform/mcp-server/src/extension-protocol.test.ts (added dispatchToAllConnections import, 2 new describe blocks with 10 tests)
+  - platform/mcp-server/src/browser-tools/list-tabs.test.ts (new file, 5 tests)
+  - platform/mcp-server/src/browser-tools/plugin-list-tabs.test.ts (new file, 5 tests)
+  - platform/mcp-server/src/browser-tools/network-capture-tracking.test.ts (new file, 4 tests)
+- **Learnings for future iterations:**
+  - The `createMockConnection` helper defined near the bottom of extension-protocol.test.ts is the standard pattern for creating mock connections with a trackable WsHandle. New test files should replicate this pattern.
+  - For testing browser tool handlers that dispatch via `dispatchToAllConnections`, settle pending dispatches by iterating `state.pendingDispatches` and resolving each entry based on its `connectionId`.
+  - Test files in `src/browser-tools/` subdirectory are automatically picked up by `tsconfig.test.json` which includes `src/**/*.test.ts`.
+---
+
+## 2026-03-11 04:35 - US-006
+- Added 4 E2E tests for multi-connection routing to e2e/multi-connection.e2e.ts:
+  - **browser_list_tabs merge test**: Creates two raw WS connections (alpha, beta), each responding to browser.listTabs with fake tab data. Verifies merged results contain tabs from both connections, each annotated with the correct connectionId.
+  - **browser_open_tab routing test**: Uses real extension + raw WS connection. Discovers the real extension's connectionId via browser_list_tabs, then calls browser_open_tab with that connectionId. Verifies the tab opens in the real extension (not the raw WS which would return an error).
+  - **plugin_list_tabs connectionId test**: Two raw WS connections send tab.syncAll with e2e-test plugin tabs. Verifies plugin_list_tabs returns tabs with correct connectionId annotations matching the source connection.
+  - **network capture routing test**: Two raw WS connections register tabs, handle enableNetworkCapture/disableNetworkCapture dispatches. Verifies enable/disable succeed (dispatched to correct connection owning the tab).
+- All 542 E2E tests pass (including the 4 new ones)
+- Files changed:
+  - e2e/multi-connection.e2e.ts (added 4 tests in the existing describe block)
+- **Learnings for future iterations:**
+  - Raw WS connections can handle dispatches by listening for messages with a `method` and `id` field, then responding with `{ jsonrpc: '2.0', id, result: ... }`. This is the same JSON-RPC protocol the real extension uses.
+  - The `createRawWsConnection` helper from fixtures.ts provides a ready-to-use WebSocket connection with authentication. Use it over manual WS setup.
+  - When a raw WS responds to `browser.listTabs`, its result is merged by `dispatchToAllConnections`. Each response's tabs get annotated with the connection's connectionId by the list-tabs handler.
+  - The `extensionContext` fixture parameter must be used (even as `_extensionContext`) to trigger Chromium launch with the extension. Without it, no real extension connects, and tests that need the extension's connectionId won't work.
+  - Biome lint requires optional chaining (`?.`) over non-null assertions (`!.`). Use guards like `if (!x) throw new Error(...)` instead of `expect(x).toBeDefined(); x!.prop`.
+---
