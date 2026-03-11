@@ -1,0 +1,37 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix the PluginMenu npm URL (currently uses short plugin name like 'github' instead of the full npm package name like '@opentabs-dev/opentabs-plugin-github') and fix the E2E test 'uninstall plugin via three-dot menu' that is timing out due to our recent PluginSearchResult displayName changes.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add npmPackageName to ConfigStatePlugin and wire it through to the extension",
+      "description": "The PluginMenu in the Chrome extension side panel generates an npm URL using plugin.name (e.g., 'github'), which produces https://www.npmjs.com/package/github — a wrong URL. The correct URL needs the full npm package name (e.g., '@opentabs-dev/opentabs-plugin-github'). Add an optional npmPackageName field to ConfigStatePlugin in shared types, populate it in serializePluginForExtension, and use it in PluginMenu to construct the correct npm URL.",
+      "acceptanceCriteria": [
+        "ConfigStatePlugin in platform/shared/src/index.ts has an optional npmPackageName field of type string",
+        "serializePluginForExtension in platform/mcp-server/src/extension-handlers.ts includes npmPackageName when the RegisteredPlugin has one",
+        "PluginMenu's VersionItem uses plugin.npmPackageName (falling back to plugin.name) when constructing the npm URL",
+        "The npm URL for an npm-sourced plugin like 'github' resolves to https://www.npmjs.com/package/@opentabs-dev/opentabs-plugin-github",
+        "Local plugins (no npmPackageName) still render the FolderOpen menu item correctly"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/shared/src/index.ts (add npmPackageName field to ConfigStatePlugin)\n- platform/mcp-server/src/extension-handlers.ts (include npmPackageName in serializePluginForExtension)\n- platform/browser-extension/src/side-panel/components/PluginMenu.tsx (fix VersionItem URL)\n- platform/browser-extension/src/side-panel/bridge.ts (PluginState type inherits from ConfigStatePlugin so it auto-gets the field)\n\nContext:\nThe RegisteredPlugin type in platform/mcp-server/src/state.ts already has `npmPackageName?: string` at line 111 — it stores the full npm package name (e.g., '@opentabs-dev/opentabs-plugin-github'). But serializePluginForExtension at line 144-200 in extension-handlers.ts does NOT include it in the wire format.\n\nThe PluginState type in bridge.ts is derived from ConfigStatePlugin: `type PluginState = Omit<ConfigStatePlugin, 'tools'> & { tools?: WireToolDef[]; sourcePath?: string };` — so adding npmPackageName to ConfigStatePlugin automatically makes it available in the extension.\n\nChanges:\n1. In platform/shared/src/index.ts, ConfigStatePlugin interface (line 307-336): add `npmPackageName?: string;` after `source: 'npm' | 'local';`\n\n2. In platform/mcp-server/src/extension-handlers.ts, serializePluginForExtension (line 175-199): add to the return object:\n   `...(plugin.npmPackageName ? { npmPackageName: plugin.npmPackageName } : {}),`\n   Also add `npmPackageName?: string;` to the return type annotation.\n\n3. In platform/browser-extension/src/side-panel/components/PluginMenu.tsx, VersionItem (line 21-42): change line 24 from:\n   `<Menu.Item onSelect={() => window.open(`https://www.npmjs.com/package/${plugin.name}`, '_blank')}>`\n   to:\n   `<Menu.Item onSelect={() => window.open(`https://www.npmjs.com/package/${plugin.npmPackageName ?? plugin.name}`, '_blank')}>`\n\nConstraints:\n- Do NOT rename or change plugin.name — it remains the short name used everywhere for tool prefixing and state management\n- npmPackageName is optional — local plugins don't have one\n- The PluginMenu.stories.tsx file may need updating if it tests the VersionItem rendering — check and update mock data to include npmPackageName"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix E2E test 'uninstall plugin via three-dot menu' timeout",
+      "description": "The E2E test at e2e/side-panel-npm-search.e2e.ts:147 ('uninstall plugin via three-dot menu and confirmation dialog') is timing out at 32.8s. This test pre-installs @opentabs-dev/opentabs-plugin-slack via npm install -g, starts the server with npm auto-discovery, and expects a 'Slack' card to appear in the side panel. Investigate and fix the timeout — the test may need adjustment for timing or the npm uninstall may be slow.",
+      "acceptanceCriteria": [
+        "The E2E test 'uninstall plugin via three-dot menu and confirmation dialog' passes consistently",
+        "The test timeout is adequate for the npm install/uninstall operations it performs"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-npm-search.e2e.ts (the failing test)\n\nContext:\nThe test at line 147-227 does:\n1. Pre-installs @opentabs-dev/opentabs-plugin-slack via `npm install -g` (line 156)\n2. Starts MCP server with npm auto-discovery enabled (OPENTABS_SKIP_NPM_DISCOVERY: undefined)\n3. Opens side panel and waits for 'Slack' card to appear (line 186-187)\n4. Clicks three-dot menu > Uninstall > confirms in dialog\n5. Waits for Slack card to disappear (line 210, 60s timeout)\n6. Verifies via MCP that slack_ tools are gone\n\nThe test uses `test.slow()` which doubles the default timeout. The test was timing out at 32.8s.\n\nPossible causes to investigate:\n1. The npm uninstall triggered by the side panel may be slow in the isolated NPM_CONFIG_PREFIX environment\n2. The waitForExtensionConnected or plugin discovery may be slow\n3. The `slackTrigger.toBeHidden({ timeout: 60_000 })` wait at line 210 may not be matching correctly\n4. The test may be hitting the npm search debounce or some other race condition\n\nRun the test in isolation to reproduce: `npx playwright test e2e/side-panel-npm-search.e2e.ts -g 'uninstall'`\n\nConstraints:\n- Do not weaken the test assertions — the test should still verify the full uninstall flow\n- The test already has `test.slow()` — adding more timeout may be acceptable if the npm operations genuinely need it\n- Check if the test failure is consistent or flaky by running it multiple times"
+    }
+  ]
+}
