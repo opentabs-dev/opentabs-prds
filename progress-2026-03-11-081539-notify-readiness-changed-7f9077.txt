@@ -1,0 +1,69 @@
+# Ralph Progress Log
+PRD: prd-2026-03-11-081539-notify-readiness-changed-7f9077~running.json
+Started: Wed Mar 11 15:16:12 UTC 2026
+---
+
+## Codebase Patterns
+- The plugin SDK uses `globalThis.__openTabs` as a runtime bridge between the IIFE wrapper and SDK functions. The IIFE wrapper sets closures/nonces on this object, and SDK functions read them.
+- The log transport pattern (`log.ts`) is the template for cross-world communication: MAIN world posts via `window.postMessage` with a nonce, ISOLATED world validates the nonce and forwards via `chrome.runtime.sendMessage`.
+- SDK functions that only work in browser context must be wrapped in try/catch and return silently in Node.js environments (no `window`, no `globalThis.__openTabs`).
+- The background `MessageHandler` type receives only `(message, sendResponse)` — `sender` from `chrome.runtime.onMessage` is not passed through. Content-script-origin messages (like `plugin:logs`, `plugin:readinessChanged`, `tool:progress`) must NOT be added to `EXTENSION_ONLY_TYPES`.
+- `notifyAffectedPlugins` takes `PluginMeta[]` and handles full diff detection + notification. Use `getPluginMeta(name)` to look up metadata from a plugin name string.
+- The `npm run test:e2e` script does `npm ci` in `plugins/e2e-test/` which reinstalls deps from npm. Unpublished platform changes (plugin-sdk, plugin-tools) are NOT available in the rebuilt plugin. The IIFE wrapper code comes from published plugin-tools, but the browser extension relay code uses local builds. To test features needing unpublished SDK exports, use `globalThis.__openTabs` directly or post raw `window.postMessage` with the nonce.
+- `validate-icon.ts` uses `MAX_ICON_SIZE = 16 * 1024` (16KB) — E2E icon tests must match this threshold.
+
+---
+
+## 2026-03-11 15:20 UTC - US-001
+- Implemented `notifyReadinessChanged()` in `platform/plugin-sdk/src/readiness.ts`
+- The function delegates to `globalThis.__openTabs._notifyReadinessChanged` — a closure set by the IIFE wrapper (US-002) that has the plugin name and nonce baked in
+- Re-exported from `platform/plugin-sdk/src/index.ts`
+- Files changed: `platform/plugin-sdk/src/readiness.ts` (new), `platform/plugin-sdk/src/index.ts` (re-export added)
+- **Learnings for future iterations:**
+  - The SDK pattern for browser-only functions is: access `globalThis.__openTabs`, call a pre-bound closure set by the IIFE wrapper, wrap in try/catch for Node.js safety
+  - New `.ts` files in `platform/plugin-sdk/src/` are automatically covered by `tsconfig.json` (includes `src`)
+  - The IIFE wrapper (built by `opentabs-plugin build`) is responsible for setting up closures on `globalThis.__openTabs` — the SDK just provides typed wrappers
+---
+
+## 2026-03-11 15:25 UTC - US-002
+- Wired `_notifyReadinessChanged` closure in the IIFE wrapper (`build.ts`) that posts `window.postMessage` with type `opentabs:readiness-changed`, the plugin name, and the readiness nonce
+- Added `injectReadinessRelay` in `iife-injection.ts` following the log relay pattern: generates a separate `crypto.randomUUID()` nonce, installs an ISOLATED world listener that validates the nonce and forwards valid messages to background as `chrome.runtime.sendMessage({ type: 'plugin:readinessChanged', plugin })`
+- Injected the readiness nonce into MAIN world on `globalThis.__openTabs._readinessNonce`
+- Added `_readinessNonce` and `_notifyReadinessChanged` to the `OpenTabsRuntime` interface in `build.ts`
+- Updated `iife-injection.test.ts` to account for additional ISOLATED world calls from the readiness relay
+- Files changed: `platform/plugin-tools/src/commands/build.ts`, `platform/browser-extension/src/iife-injection.ts`, `platform/browser-extension/src/iife-injection.test.ts`
+- **Learnings for future iterations:**
+  - The `injectAdapterFile` function injects both log and readiness relays before the adapter IIFE — order matters (relays must be in place before the adapter posts messages)
+  - The readiness relay follows the exact same pattern as the log relay: separate guard, separate nonce Set, separate message type — keeping them fully independent prevents cross-channel spoofing
+  - Tests counting ISOLATED world `executeScript` calls need to be updated when adding new relays (each relay adds 1 ISOLATED call per injection)
+  - The `_notifyReadinessChanged` closure reads `_readinessNonce` at call time (not capture time) so it survives nonce rotation on re-injection
+---
+
+## 2026-03-11 15:32 UTC - US-003
+- Added `PluginReadinessChangedMessage` interface to `extension-messages.ts` and added it to the `InternalMessage` union
+- Exported `notifyAffectedPlugins` from `tab-state.ts` so the handler can call it
+- Added `handlePluginReadinessChanged` handler in `background-message-handlers.ts` that validates the plugin name, looks up `PluginMeta` via `getPluginMeta`, and calls `notifyAffectedPlugins([meta])` to re-probe all matching tabs and diff against cached state
+- Added `'plugin:readinessChanged'` to the background dispatch map (NOT to `EXTENSION_ONLY_TYPES` — this message comes from content scripts)
+- Files changed: `platform/browser-extension/src/extension-messages.ts`, `platform/browser-extension/src/tab-state.ts`, `platform/browser-extension/src/background-message-handlers.ts`
+- **Learnings for future iterations:**
+  - The `MessageHandler` type only receives `(message, sendResponse)` — `sender` from `chrome.runtime.onMessage` is NOT passed to handlers. To access sender info, you'd need to change the handler signature.
+  - `notifyAffectedPlugins` takes `PluginMeta[]` (not `string[]`), so you need to look up plugin metadata via `getPluginMeta` before calling it.
+  - `notifyAffectedPlugins` already handles serialized diff detection (via `serializeTabState`) and only fires `sendTabStateNotification` when state actually changes — no need to manually diff.
+  - The `withPluginLock` inside `notifyAffectedPlugins` serializes concurrent probes for the same plugin, so rapid calls from an SPA (e.g., multiple localStorage writes during login) are safe.
+---
+
+## 2026-03-11 15:50 UTC - US-004
+- Created `sdk_notify_readiness_changed` tool in `plugins/e2e-test/src/tools/sdk-notify-readiness-changed.ts`
+  - Calls `globalThis.__openTabs._notifyReadinessChanged()` directly (cannot import from SDK because `npm run test:e2e` does `npm ci` which installs the published SDK version that doesn't have the new export yet)
+- Registered the tool in `plugins/e2e-test/src/index.ts`
+- Created E2E tests in `e2e/notify-readiness-changed.e2e.ts`:
+  - Test 1: Calls the tool while plugin is ready, verifies state remains ready and tools still work
+  - Test 2: Full unavailable → ready transition without page reload — toggles auth off → reload to establish unavailable → toggles auth back on → posts `opentabs:readiness-changed` message with nonce → verifies state transitions to ready
+- Fixed pre-existing bug in `e2e/build-icons.e2e.ts`: oversized icon test expected 8KB limit but validation uses 16KB limit — updated to generate >16KB SVG
+- Files changed: `plugins/e2e-test/src/tools/sdk-notify-readiness-changed.ts` (new), `plugins/e2e-test/src/index.ts`, `e2e/notify-readiness-changed.e2e.ts` (new), `e2e/build-icons.e2e.ts`
+- **Learnings for future iterations:**
+  - The `npm run test:e2e` script does `npm ci` in `plugins/e2e-test/` which reinstalls all deps from npm — local changes to platform packages (`plugin-sdk`, `plugin-tools`) are NOT available in the rebuilt plugin. To test features that depend on unpublished SDK/tools changes, either: (a) access `globalThis.__openTabs` directly, or (b) post the raw `window.postMessage` using the nonce from `_readinessNonce`
+  - The ISOLATED world relay (`injectReadinessRelay`) is part of the browser extension, which IS built locally — so `_readinessNonce` is always available on `globalThis.__openTabs` after injection, even when the adapter IIFE was built with the published plugin-tools
+  - The `_notifyReadinessChanged` closure is set by the IIFE wrapper code in `platform/plugin-tools/src/commands/build.ts` — this is NOT available in the E2E prebuild because `opentabs-plugin build` comes from the published `@opentabs-dev/plugin-tools` package
+  - `validate-icon.ts` uses `MAX_ICON_SIZE = 16 * 1024` (16KB) — E2E tests must match this limit
+---
