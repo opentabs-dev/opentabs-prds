@@ -2,7 +2,7 @@
 
 Git-based distributed work queue for building [OpenTabs](https://github.com/opentabs-dev/opentabs). PRD files are the unit of work — producers publish them, distributed workers claim and execute them atomically, and a consolidator merges the results back into main.
 
-This is the almost complete development record for OpenTabs. Every feature, every bugfix, every plugin — it started as a PRD in this repo. If you're curious about AI-driven development or want to run a similar setup for your own project, everything here is open source and MIT-licensed. Take what's useful.
+This is the almost complete development record for OpenTabs — early work predates the PRD process, but everything since has been tracked here. If you're curious about AI-driven development or want to run a similar setup for your own project, everything here is open source and MIT-licensed. Take what's useful.
 
 ## How It Works
 
