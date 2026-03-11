@@ -1,0 +1,46 @@
+# Ralph Progress Log
+PRD: prd-2026-03-11-144158-search-registry-api-direct-probe-2a50ec~running.json
+Started: Wed Mar 11 21:42:29 UTC 2026
+---
+
+## Codebase Patterns
+- The MCP server's `searchNpmPlugins` in `platform/mcp-server/src/plugin-management.ts` now uses the npm registry HTTP API (`fetch()`) instead of spawning `npm search`. The registry API endpoint is `https://registry.npmjs.org/-/v1/search` with `size=250` and `from` for pagination.
+- Direct package probe uses `https://registry.npmjs.org/{packageName}` to check for exact package matches. Response includes `dist-tags.latest` and `versions[latest]._npmUser.name` for publisher info.
+- `spawnAsync` is still used by `runNpmGlobal` for install/uninstall/update operations — only search was migrated to fetch().
+- AbortController + setTimeout pattern replaces the old Promise.race timeout pattern for fetch-based operations.
+
+## 2026-03-11 21:46 - US-001
+- Replaced `npm search` child process with direct fetch() calls to npm registry HTTP API
+- Added `fetchAllPlugins()` for paginated keyword search (250 results/page)
+- Added `probeDirectPackage()` for exact-name package probes (scoped + unscoped candidates)
+- Rewrote `searchNpmPlugins()` to run keyword search and direct probe in parallel, merge with deduplication
+- Replaced `NpmSearchJsonEntry` interface with `NpmRegistrySearchPackage`
+- Added `NPM_REGISTRY` constant for the registry URL
+- Used AbortController for timeout instead of Promise.race with spawnAsync
+- Files changed: `platform/mcp-server/src/plugin-management.ts`
+- **Learnings for future iterations:**
+  - The npm registry search API returns `{ objects: [{ package: {...} }], total: number }` — note the nested `package` property
+  - The direct package endpoint returns `{ name, description, 'dist-tags': { latest }, versions: { [v]: { _npmUser: { name } } } }` — publisher info is in the version-specific `_npmUser` field
+  - The `probeDirectPackage` function handles both shorthand queries (generating `@opentabs-dev/opentabs-plugin-{q}` and `opentabs-plugin-{q}` candidates) and fully-qualified package names (pass-through)
+  - All Phase 1 and Phase 2 checks passed on first run
+---
+
+## 2026-03-11 21:53 - US-002
+- Replaced `npm search` and `npm view` child processes with direct fetch() calls to npm registry HTTP API
+- Rewrote `npmSearchPlugins` as async with paginated fetch to `/-/v1/search` (250 per page)
+- Rewrote `fetchPackageInfo` as async with direct fetch to `/{package}` endpoint
+- Made `handlePluginSearch` async, runs keyword search and direct probes in parallel via `Promise.all`
+- Direct probe results now appear first (exact match priority), consistent with MCP server behavior
+- Removed `parseMaintainer` (no longer needed — registry API returns publisher directly)
+- Removed `KNOWN_OFFICIAL_PLUGIN_SLUGS` (paginated keyword search fetches all plugins, no need for hardcoded list)
+- Removed `NpmSearchJsonEntry` interface (replaced by inline type assertions)
+- Updated `buildDirectLookupCandidates` to return empty array for no-query case
+- Updated commander action to be async
+- Updated tests: removed parseMaintainer tests, updated buildDirectLookupCandidates no-query test
+- Files changed: `platform/cli/src/commands/plugin.ts`, `platform/cli/src/commands/plugin.test.ts`
+- **Learnings for future iterations:**
+  - The CLI's commander action handlers support async functions natively — no special handling needed
+  - `spawnProcessSync` is still used by `handlePluginRemove` (for `npm list -g`) and `spawnProcessAsync` is used by `packageExistsOnNpmAsync`, `warnIfNotPlugin`, and `scanNpmPlugins` — these remain unchanged as they perform package management operations rather than search
+  - The direct probe in `handlePluginSearch` uses `Promise.all` with spread to merge keyword search and variable-length direct probe results into a single parallel operation
+  - All Phase 1 checks passed on first run (e2eCheckpoint: false, so Phase 2 skipped)
+---
