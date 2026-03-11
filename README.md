@@ -10,14 +10,14 @@ The idea is simple: `git push` to a single branch is serialized by GitHub. When 
 
 ```mermaid
 graph TD
-    Producer["Producer\n(Ralph skill)"] -->|git push PRD| Queue["opentabs-prds repo\n(GitHub — queue)"]
+    Producer["Producer<br/>(Ralph skill)"] -->|git push PRD| Queue["opentabs-prds repo<br/>(GitHub — queue)"]
     Queue -->|git push — claim| A["Worker A"]
     Queue -->|git push — claim| B["Worker B"]
     Queue -->|git push — claim| C["Worker C"]
-    A -->|git push branch| Code["opentabs repo (code)\nralph-* branches pushed by workers"]
+    A -->|git push branch| Code["opentabs repo (code)<br/>ralph-* branches pushed by workers"]
     B -->|git push branch| Code
     C -->|git push branch| Code
-    Code --> Consolidator["Consolidator\nmerges ralph-* into main"]
+    Code --> Consolidator["Consolidator<br/>merges ralph-* into main"]
 ```
 
 Three scripts, three jobs:
