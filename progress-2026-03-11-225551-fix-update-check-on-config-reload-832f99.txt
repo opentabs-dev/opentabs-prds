@@ -1,0 +1,54 @@
+# Ralph Progress Log
+PRD: prd-2026-03-11-225551-fix-update-check-on-config-reload-832f99~running.json
+Started: Thu Mar 12 05:56:26 UTC 2026
+---
+
+## Codebase Patterns
+- `reload.ts` has two reload paths: `performReload` (full hot reload, also used at startup) and `performConfigReload` (config-only reload, used by POST /reload, file watcher, plugin install/uninstall)
+- `reloadCore` is the shared fast state-swap path — update checks and extension notifications belong in the callers, not in reloadCore
+- `buildConfigStatePayload` and `sendToExtension` are in `extension-handlers.ts`; `isExtensionConnected` is in `state.ts`; `checkForUpdates` is in `version-check.ts`
+- Imports in reload.ts must be alphabetically sorted (biome enforces this)
+- The `plugins.changed` notification format: `{ jsonrpc: '2.0', method: 'plugins.changed', params: { ...buildConfigStatePayload(state) } }`
+- To mock an async function in vitest: use `vi.mock('./module.js')` at module level (hoisted), import the function, then use `vi.mocked(fn).mockResolvedValue(undefined)` in beforeEach. The mock replaces the module's export codebase-wide in that test file.
+- `await undefined` is valid JS/TS — `vi.fn()` returns `undefined` by default, so existing tests using `await asyncMockedFn()` won't break even without `mockResolvedValue`
+- `checkForUpdates` returns early (`if (npmPlugins.length === 0) return;`) for local-only plugin setups WITHOUT touching `state.outdatedPlugins` — PRD notes claiming it "replaces with empty array" are incorrect. Local plugins have `source: 'local'` and are filtered out, so `npmPlugins.length === 0`.
+- ALL plugins (including local ones) have `npmPackageName` set to `pkg.name` from their `package.json` (see `loader.ts:432`). So `pruneStaleState` will NOT prune injected outdated data for local plugins, since `npmPkgNames` includes the local plugin's package name.
+- For E2E tests, POST /reload preserves injected outdated data for local plugins (dot stays visible), because: pruneStaleState keeps it, sendSyncFull includes it, checkForUpdates returns early (no change), plugins.changed is sent (but same data). The dot stays visible.
+
+## 2026-03-12 - US-001
+- Modified `platform/mcp-server/src/reload.ts`
+- Added import: `buildConfigStatePayload` and `sendToExtension` from `./extension-handlers.js`
+- In `performReload`: added `plugins.changed` notification after the existing `checkForUpdates` try/catch block
+- In `performConfigReload`: added `checkForUpdates` wrapped in try/catch after `reloadCore`, plus `plugins.changed` notification if outdated plugins found and extension connected
+- **Learnings for future iterations:**
+  - Import must be in alphabetical order — `extension-handlers` comes before `extension-install` and `extension-protocol`
+  - The two-phase structure (reloadCore syncs the extension first, then checkForUpdates runs and sends a follow-up plugins.changed) is intentional — comments explain this clearly
+  - All Phase 1 checks (build, type-check, lint, knip, test) passed on the first run
+---
+
+## 2026-03-12 - US-002
+- Modified `platform/mcp-server/src/reload.test.ts`
+- Added `vi` to the vitest import
+- Added `vi.mock('./version-check.js')` at module level (hoisted by vitest)
+- Added `import { checkForUpdates } from './version-check.js'` to access the mocked function
+- Added new `describe('performConfigReload — checkForUpdates integration')` block with two tests:
+  - `performConfigReload calls checkForUpdates`: verifies mock was called with state after reload
+  - `performConfigReload succeeds when checkForUpdates throws`: mocks rejection, verifies result still valid
+- All 3207 existing tests continued to pass with the new module-level mock
+- **Learnings for future iterations:**
+  - The mock is set up in `beforeEach` with `mockClear()` + `mockResolvedValue(undefined)` to reset between tests and avoid affecting other describe blocks
+  - The new describe block follows the same setup/teardown pattern as the existing `performConfigReload` block
+  - All Phase 1 checks passed on the first run
+---
+
+## 2026-03-12 - US-003
+- Modified `e2e/side-panel-plugin-update.e2e.ts`
+- Added new `test.describe('Side panel — plugin update after reload')` block with one test:
+  - `POST /reload preserves update dot when plugin has a pending update`: injects fake outdated data, verifies dot appears, triggers POST /reload, verifies dot is still visible
+- All 547 E2E tests passed (Phase 2 checkpoint)
+- **Learnings for future iterations:**
+  - The PRD notes incorrectly claimed that `checkForUpdates` would "replace outdatedPlugins with empty array" for local plugins. In reality, `checkForUpdates` returns early at `if (npmPlugins.length === 0) return;` without modifying state for local-only setups. The injected outdated data PERSISTS through a POST /reload.
+  - `loader.ts:432` sets `npmPackageName: pkg.name` for ALL plugins (including local ones), so `pruneStaleState` will NOT prune injected outdated entries for local plugins — they are preserved in the registry's `npmPkgNames` set.
+  - The correct test expectation is `toBeVisible` (dot stays) not `not.toBeVisible` (dot disappears). The dot stays because: reloadCore's sendSyncFull includes the outdated data (from buildConfigStatePayload which reads state.outdatedPlugins), checkForUpdates returns early, plugins.changed is sent with the same data.
+  - For a test that verifies checkForUpdates was actually CALLED during performConfigReload, unit tests (US-002) are the right approach. The E2E test verifies the reload doesn't break the update indicator.
+---
