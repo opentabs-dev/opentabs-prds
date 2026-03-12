@@ -1,0 +1,55 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix: plugin update check not running on config reloads — updates published to npm after server startup are never detected until server restart. Also fix startup sequencing where update data is not included in the initial sync.full to the extension.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Run checkForUpdates during performConfigReload and send plugins.changed with results",
+      "description": "Add checkForUpdates to performConfigReload so that config reloads (POST /reload, config file watcher, plugin install/uninstall) trigger npm update checks. After the check, if outdated plugins were found and the extension is connected, send a plugins.changed notification so the extension immediately reflects update availability.\n\nAlso fix the same sequencing issue in performReload: after checkForUpdates runs (line 480), if outdated plugins exist and extension is connected, send a plugins.changed notification.",
+      "acceptanceCriteria": [
+        "performConfigReload calls checkForUpdates(state) after reloadCore, wrapped in try/catch (best-effort, same pattern as performReload line 478-483)",
+        "After checkForUpdates in performConfigReload, if state.outdatedPlugins.length > 0 and isExtensionConnected(state), send a plugins.changed notification via sendToExtension with buildConfigStatePayload(state)",
+        "After checkForUpdates in performReload (line 480), if state.outdatedPlugins.length > 0 and isExtensionConnected(state), send a plugins.changed notification via sendToExtension with buildConfigStatePayload(state)",
+        "The plugins.changed notification follows the existing pattern: { jsonrpc: '2.0', method: 'plugins.changed', params: { ...buildConfigStatePayload(state) } }",
+        "Import sendToExtension and buildConfigStatePayload from extension-handlers.js — isExtensionConnected is already imported from state.js",
+        "No changes to reloadCore itself — the update check is added to the callers (performReload and performConfigReload), not the shared core"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File to modify: platform/mcp-server/src/reload.ts\n\nThe fix is small and surgical:\n\n1. Add imports at the top of reload.ts:\n   - `sendToExtension` and `buildConfigStatePayload` from `./extension-handlers.js`\n   - `isExtensionConnected` is already imported from `./state.js`\n\n2. In `performConfigReload` (line 504), after the `reloadCore` call (line 523) and BEFORE the 'Notify all MCP clients' loop (line 528), add:\n   ```typescript\n   // Version check: run on every config reload so newly published versions are detected.\n   // Best-effort — failures do not affect the reload result.\n   try {\n     await checkForUpdates(state);\n   } catch {\n     // Update check is best-effort — failures are not actionable\n   }\n\n   // If outdated plugins were found, push the update data to the extension.\n   // reloadCore's sync.full was sent before the version check ran, so it\n   // did not include the fresh outdated data — send a follow-up notification.\n   if (state.outdatedPlugins.length > 0 && isExtensionConnected(state)) {\n     sendToExtension(state, {\n       jsonrpc: '2.0',\n       method: 'plugins.changed',\n       params: { ...buildConfigStatePayload(state) },\n     });\n   }\n   ```\n\n3. In `performReload` (line 391), after the existing `checkForUpdates` call (line 480), add the same plugins.changed notification:\n   ```typescript\n   if (state.outdatedPlugins.length > 0 && isExtensionConnected(state)) {\n     sendToExtension(state, {\n       jsonrpc: '2.0',\n       method: 'plugins.changed',\n       params: { ...buildConfigStatePayload(state) },\n     });\n   }\n   ```\n\nConstraints:\n- Do NOT move checkForUpdates into reloadCore — it belongs in the callers because reloadCore is the fast state-swap path.\n- Do NOT remove the existing checkForUpdates call from performReload — keep it and add the notification after it.\n- Do NOT change the checkForUpdates function itself.\n- The try/catch must swallow all errors (same pattern as performReload).\n- Only send plugins.changed when outdatedPlugins is non-empty AND extension is connected."
+    },
+    {
+      "id": "US-002",
+      "title": "Add unit tests verifying performConfigReload runs checkForUpdates",
+      "description": "Add unit tests in reload.test.ts that verify: (1) performConfigReload calls checkForUpdates, and (2) performConfigReload succeeds even if checkForUpdates throws.",
+      "acceptanceCriteria": [
+        "A new test in reload.test.ts verifies that performConfigReload calls checkForUpdates",
+        "A new test verifies that performConfigReload still returns a valid result even if checkForUpdates throws",
+        "The tests use vitest mocking to stub checkForUpdates from version-check.js",
+        "All existing tests in reload.test.ts continue to pass"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "File to modify: platform/mcp-server/src/reload.test.ts\n\nRead the existing test file first to understand the setup pattern. The file already creates temp config dirs, writes config files, and creates mock plugin dirs.\n\nThe key challenge: the existing test file imports `performConfigReload` and `performReload` directly. To mock `checkForUpdates`, you need `vi.mock('./version-check.js')` at the top of the test file.\n\nHowever, be careful: `performReload` already calls `checkForUpdates` (line 480 in reload.ts). The existing tests for `performReload` may already pass without the mock because `checkForUpdates` with no npm plugins is a no-op. Adding a mock won't break them, but verify all tests still pass.\n\nApproach:\n1. Add `vi.mock('./version-check.js')` at the module level\n2. Import the mocked function\n3. Add a new describe block with two tests:\n   - 'performConfigReload calls checkForUpdates' — verify the mock was called with state\n   - 'performConfigReload succeeds when checkForUpdates throws' — mock rejects, verify result is still valid\n4. Reset the mock between tests with `mockClear()`\n\nIMPORTANT: The mock must be hoisted (vi.mock is hoisted by vitest). Do NOT use dynamic mocking inside tests — declare it at the module level."
+    },
+    {
+      "id": "US-003",
+      "title": "Add E2E test verifying plugins.changed includes update data after reload",
+      "description": "Add an E2E test that verifies the plugins.changed notification sent after a reload includes update data. This tests the new behavior where performReload sends a follow-up plugins.changed after checkForUpdates populates outdated data.",
+      "acceptanceCriteria": [
+        "A new E2E test in side-panel-plugin-update.e2e.ts verifies that after injecting outdated data and triggering a POST /reload, the update dot reappears in the side panel",
+        "The test uses the existing test infrastructure and follows the same patterns",
+        "All existing E2E tests continue to pass"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "File to modify: e2e/side-panel-plugin-update.e2e.ts\n\nIMPORTANT DESIGN NOTE: There is a subtlety with testing this. `checkForUpdates` does a FULL REPLACE of `state.outdatedPlugins` (line 154 of version-check.ts). For LOCAL plugins, `checkForUpdates` skips them entirely (filters by `source !== 'local'`), producing an EMPTY outdated array that overwrites any injected data. Since E2E tests use a local test plugin, injected outdated data will be wiped by `checkForUpdates` during the reload.\n\nThe test MUST work around this by verifying the behavior in two phases:\n\nPhase 1: Verify POST /reload doesn't break existing update indicators\n1. Start server with local test plugin\n2. Open side panel, verify no update dot\n3. Inject fake outdated data via `POST /__test/set-outdated`\n4. Verify update dot appears\n5. Trigger `POST /reload`\n6. After reload completes, `checkForUpdates` runs but produces empty results for the local plugin, wiping the injected data\n7. Verify update dot DISAPPEARS — this proves checkForUpdates ran during the config reload (the new behavior!) and correctly cleared stale data\n\nThis is a valid regression test: before the fix, POST /reload did NOT call checkForUpdates, so injected outdated data would SURVIVE a reload. After the fix, checkForUpdates runs and replaces the outdated data (empty for local plugins). The test proves the new code path is exercised.\n\nTest structure:\n```typescript\ntest('POST /reload runs update check — stale outdated data is cleared', async () => {\n  // ... standard setup (server, extension, side panel, test app tab) ...\n  \n  // Inject fake outdated data\n  await setOutdatedPlugins(server.port, secret, [{\n    name: pkgName,\n    currentVersion,\n    latestVersion: '99.0.0',\n    updateCommand: `npm update -g ${pkgName}`,\n  }]);\n  \n  // Verify update dot appears\n  const menuButton = sidePanelPage.locator('[aria-label=\"Plugin options\"]');\n  const updateDot = menuButton.locator('div.rounded-full');\n  await expect(updateDot).toBeVisible({ timeout: 10_000 });\n  \n  // Trigger POST /reload\n  const reloadRes = await fetch(`http://localhost:${server.port}/reload`, {\n    method: 'POST',\n    headers: { Authorization: `Bearer ${secret}` },\n  });\n  expect(reloadRes.ok).toBe(true);\n  \n  // Wait a moment for the reload + checkForUpdates + plugins.changed\n  // checkForUpdates runs during reload, finds no npm updates for the\n  // local test plugin, replaces outdatedPlugins with empty array\n  await expect(updateDot).not.toBeVisible({ timeout: 15_000 });\n});\n```\n\nThis test proves that checkForUpdates now runs during performConfigReload (POST /reload path). Before the fix, the outdated data would persist through the reload because checkForUpdates was never called."
+    }
+  ]
+}
