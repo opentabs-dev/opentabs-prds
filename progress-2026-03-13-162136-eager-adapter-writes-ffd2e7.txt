@@ -1,0 +1,78 @@
+# Ralph Progress Log
+PRD: prd-2026-03-13-162136-eager-adapter-writes-ffd2e7~running.json
+Started: Fri Mar 13 23:22:07 UTC 2026
+---
+
+## Codebase Patterns
+- Adapter IIFE files are written via `writeAdapterFile()` in `adapter-files.ts` — it uses content-hashed filenames, making writes idempotent
+- `sendSyncFull` handles both file writes and WS notification to the extension; after the refactor, file writes are in `writeAllAdapterFiles` and `sendSyncFull` delegates to it
+- `reloadCore` in `reload.ts` is the central reload pipeline: config → discover → state swap → prune → resetStaleReviewedVersions → writeAllAdapterFiles → secret reload → extension sync
+- The `isExtensionConnected` guard in `reloadCore` only gates the WS notification (sendSyncFull), not the file writes
+- `ensureAdaptersDir`, `cleanupStaleAdapterFiles`, `writeAdapterFile`, `timeoutRace`, `ADAPTER_WRITE_TIMEOUT_MS` are all in `adapter-files.ts`
+
+## 2026-03-13T23:25 - US-001
+- Extracted `writeAllAdapterFiles` from `sendSyncFull` in `extension-protocol.ts`
+- `writeAllAdapterFiles` writes adapter IIFE files for all plugins and returns a `Map<string, string>` (plugin name → file path)
+- `sendSyncFull` now delegates to `writeAllAdapterFiles` and re-derives `pluginList` from `state.registry`
+- `reloadCore` in `reload.ts` calls `writeAllAdapterFiles` eagerly after `resetStaleReviewedVersions`, inside the try/catch block with its own inner try/catch
+- Files changed: `platform/mcp-server/src/extension-protocol.ts`, `platform/mcp-server/src/reload.ts`
+- **Learnings for future iterations:**
+  - `sendSyncFull` had `pluginList` in scope from the original combined function; after extraction, `sendSyncFull` needs to re-derive it from `state.registry.plugins`
+  - The eager write in `reloadCore` is placed inside the outer try/catch (after state swap) with its own inner try/catch so failure doesn't prevent the rest of reload
+  - All Phase 1 checks (build, type-check, lint, knip, test) pass cleanly after changes
+---
+
+## 2026-03-13T23:28 - US-002
+- Added 4 unit tests for `writeAllAdapterFiles` in a new describe block in `extension-protocol.test.ts`
+- Tests verify: writes adapter .js files per plugin and returns Map, works with empty extensionConnections, cleans up stale adapters for removed plugins, returns empty Map with no plugins
+- Files changed: `platform/mcp-server/src/extension-protocol.test.ts`
+- **Learnings for future iterations:**
+  - The `sendSyncFull` test block has a local `makePlugin` helper and `setupTmpConfigDir` — the new `writeAllAdapterFiles` tests follow the same pattern with `beforeEach`/`afterEach` for env var patching and tmpdir cleanup
+  - `writeAllAdapterFiles` is fully independent of extension connections — it only reads `state.registry.plugins` and writes to disk via `OPENTABS_CONFIG_DIR`
+  - Content-hashed filenames mean adapter files follow the pattern `<pluginName>-<hash>.js` in the `<configDir>/extension/adapters/` directory
+---
+
+## 2026-03-13T23:31 - US-003
+- Added E2E test in `e2e/adapter-files-eager.e2e.ts` verifying adapter files exist on disk before extension connects
+- Test creates isolated config dir, starts MCP server (non-hot mode), and checks `<configDir>/extension/adapters/` for `e2e-test-*.js` files
+- Verifies the adapter file has a content-hashed filename and is non-empty
+- Files changed: `e2e/adapter-files-eager.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - `createTestConfigDir()` pre-creates config.json with e2e-test in localPlugins and auth.json — no extra setup needed
+  - `startMcpServer(configDir, false)` for non-hot mode is simpler for tests that don't need hot reload
+  - `noUncheckedIndexedAccess: true` requires `as string` cast for array indexing after length assertions
+  - Adapter files are written to `<configDir>/extension/adapters/` by `reloadCore` during startup
+---
+
+## 2026-03-13T23:35 - US-004
+- Added E2E test verifying adapter files are re-written after hot reload without extension
+- Test starts MCP server in hot mode, verifies adapter files exist, deletes them, triggers hot reload, and verifies files are re-created
+- Files changed: `e2e/adapter-files-eager.e2e.ts` (added second test)
+- **Learnings for future iterations:**
+  - `startMcpServer(configDir, true)` for hot mode enables `triggerHotReload()` (sends SIGUSR1 to dev proxy)
+  - `server.logs.length = 0` clears accumulated logs before waiting for a specific log line
+  - `waitForLog(server, 'Hot reload complete', 20_000)` waits for the dev proxy to finish the reload cycle
+  - Deleting all files (not just `.js`) from adapters/ ensures a clean slate — source maps are also present
+---
+
+## 2026-03-13T23:45 - US-005
+- Added full-stack E2E test verifying extension injects adapters and reaches ready state on first connection
+- Test uses the standard fixture chain (mcpServer, testServer, extensionContext, mcpClient) with `setupToolTest`
+- Verifies tool dispatch succeeds via `waitForToolResult` (proves adapter injection worked)
+- Verifies via `extension_check_adapter` that adapterPresent=true, hashMatch=true, isReady=true
+- Files changed: `e2e/adapter-files-eager.e2e.ts` (added third test in new describe block)
+- **Learnings for future iterations:**
+  - Full-fixture tests (using mcpServer/testServer/extensionContext/mcpClient destructuring) can coexist in the same file as manual-setup tests (createTestConfigDir/startMcpServer)
+  - `setupToolTest` handles the entire setup sequence: waitForExtensionConnected, waitForLog, testServer.reset, openTestAppTab, waitForToolResult
+  - `callToolExpectSuccess` parses JSON content automatically — returns a typed Record<string, unknown>
+  - All 550 E2E tests pass including the new test
+---
+
+## 2026-03-13T23:50 - US-006
+- Updated comment at `e2e/fixtures.ts` lines 1454-1457: changed "may have already created" to "writes adapter files eagerly during startup" to reflect the new guaranteed behavior
+- Updated docstring for `cleanupStaleAdapterFiles` in `platform/mcp-server/src/adapter-files.ts`: updated caller attribution from "sendSyncFull" to "writeAllAdapterFiles (and transitively from sendSyncFull and reloadCore)"
+- Files changed: `e2e/fixtures.ts`, `platform/mcp-server/src/adapter-files.ts`
+- **Learnings for future iterations:**
+  - Comment-only changes still run through the full biome-check-ts pre-commit hook — they need no special treatment
+  - All Phase 1 checks pass with no issues
+---
