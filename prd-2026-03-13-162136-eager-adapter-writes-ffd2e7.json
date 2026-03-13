@@ -1,0 +1,99 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Decouple adapter file I/O from WebSocket notification. Currently adapter IIFE files are only written to ~/.opentabs/extension/adapters/ inside sendSyncFull(), which only runs when the extension is connected. After this change, adapter files are written eagerly during every server startup and reload — regardless of extension connection status — so the extension always finds valid adapter files when it connects or re-injects into tabs.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Extract writeAllAdapterFiles and call it eagerly in reloadCore",
+      "description": "Extract the adapter-file-writing logic from sendSyncFull into a standalone writeAllAdapterFiles function. Call it unconditionally in reloadCore (not guarded by isExtensionConnected). Refactor sendSyncFull to reuse writeAllAdapterFiles.",
+      "acceptanceCriteria": [
+        "writeAllAdapterFiles is exported from extension-protocol.ts and writes adapter files for all plugins in state.registry",
+        "reloadCore calls writeAllAdapterFiles unconditionally after plugin discovery completes (outside the isExtensionConnected guard)",
+        "sendSyncFull delegates to writeAllAdapterFiles instead of duplicating the write logic",
+        "Adapter files exist in the adapters/ directory immediately after server startup, before any extension connects"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/extension-protocol.ts (extract writeAllAdapterFiles from sendSyncFull)\n- platform/mcp-server/src/reload.ts (call writeAllAdapterFiles in reloadCore)\n\nContext:\nAdapter IIFE files are written to ~/.opentabs/extension/adapters/ by writeAdapterFile() (in adapter-files.ts). Currently, the ONLY place that calls writeAdapterFile in batch is sendSyncFull() (extension-protocol.ts line 62-132). sendSyncFull is called from:\n1. reloadCore (reload.ts line 340-341) — guarded by `if (isExtensionConnected(state))`\n2. wsOpen handler (http-routes.ts line 699) — when extension connects\n3. file watcher callbacks (reload.ts lines 178, 192)\n\nSince reloadCore guards the call with isExtensionConnected, adapter files are never written during startup if the extension hasn't connected yet. This causes 'Could not load file' errors when the extension connects and tries to inject adapters.\n\nChanges:\n\n1. In extension-protocol.ts, extract lines 62-93 of sendSyncFull into a new function:\n```\nconst writeAllAdapterFiles = async (state: ServerState): Promise<Map<string, string>> => {\n  const pluginList = Array.from(state.registry.plugins.values());\n  await ensureAdaptersDir(state);\n  const currentPluginNames = new Set(pluginList.map(p => p.name));\n  await cleanupStaleAdapterFiles(currentPluginNames);\n  const writePromise = Promise.allSettled(pluginList.map(p => writeAdapterFile(p.name, p.iife, p.iifeSourceMap)));\n  const timeout = timeoutRace<null>(null, ADAPTER_WRITE_TIMEOUT_MS);\n  const writeResults = await Promise.race([writePromise, timeout.promise]);\n  timeout.cancel();\n  const adapterFileMap = new Map<string, string>();\n  // ... collect results into adapterFileMap (same logic as current lines 78-93)\n  return adapterFileMap;\n};\n```\n\n2. Refactor sendSyncFull to call writeAllAdapterFiles:\n```\nconst sendSyncFull = async (state: ServerState): Promise<void> => {\n  const adapterFileMap = await writeAllAdapterFiles(state);\n  // ... rest of sendSyncFull (build payload and send to extension)\n};\n```\n\n3. In reload.ts, add an eager call in reloadCore after resetStaleReviewedVersions (around line 299), BEFORE the isExtensionConnected check:\n```\n// Write adapter files eagerly so they exist on disk before the extension connects.\ntry {\n  await writeAllAdapterFiles(state);\n} catch (err) {\n  log.warn('Failed to write adapter files:', err);\n}\n```\n\n4. Export writeAllAdapterFiles from extension-protocol.ts and import it in reload.ts.\n\nThe writes are idempotent — writeAdapterFile uses content-hashed filenames, so calling it twice with the same IIFE content writes the same file. The second call from sendSyncFull (if the extension is connected) is effectively a no-op since the files already exist.\n\nConstraints:\n- Do NOT change the sendSyncFull interface or its WS message format\n- Do NOT remove the sendSyncFull call from the isExtensionConnected block — it still needs to send the WS message\n- Do NOT change writeAdapterFile or cleanupStaleAdapterFiles in adapter-files.ts\n- Do NOT change the wsOpen handler in http-routes.ts\n- The log message 'Sent sync.full to extension with N plugin(s)' must still appear when the extension is connected"
+    },
+    {
+      "id": "US-002",
+      "title": "Add unit tests for writeAllAdapterFiles",
+      "description": "Add unit tests for the new writeAllAdapterFiles function verifying it writes adapter files independently of extension connection state.",
+      "acceptanceCriteria": [
+        "Test verifies writeAllAdapterFiles writes .js adapter files for each plugin in state.registry",
+        "Test verifies writeAllAdapterFiles returns a Map of plugin name to adapter file path",
+        "Test verifies writeAllAdapterFiles cleans up stale adapter files for removed plugins",
+        "Test verifies writeAllAdapterFiles works when no extension is connected (extensionConnections is empty)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/extension-protocol.test.ts (add new describe block)\n\nContext:\nThe existing sendSyncFull tests (line 666 onwards) set up a temp dir, create mock plugins, and verify adapter files are written. The new tests should follow the same pattern but call writeAllAdapterFiles directly.\n\nLook at the existing test setup in the 'sendSyncFull' describe block (around line 666-862) for patterns:\n- Uses `createState()`, `buildRegistry()`, and `makePlugin()` helpers\n- Sets OPENTABS_CONFIG_DIR env var to a tmpdir\n- Creates mock WebSocket objects with `.sent` arrays\n- Reads adapter files from `join(tmpDir, 'extension', 'adapters')`\n\nNew tests should:\n1. Create a state with plugins but NO extension connections (state.extensionConnections is empty Map)\n2. Call writeAllAdapterFiles(state)\n3. Verify adapter .js files exist on disk for each plugin\n4. Verify the returned Map has correct entries\n5. Add a plugin, call again, verify new adapter appears\n6. Remove a plugin from registry, call again, verify old adapter is cleaned up\n\nConstraints:\n- Follow the existing test file patterns exactly (temp dirs, env var patching, cleanup)\n- Import writeAllAdapterFiles from the same module as sendSyncFull"
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: adapter files exist on disk before extension connects",
+      "description": "Add an E2E test that verifies adapter IIFE files are present in the adapters/ directory immediately after the MCP server starts, before the Chrome extension connects.",
+      "acceptanceCriteria": [
+        "Test starts MCP server with e2e-test plugin configured",
+        "Test verifies adapter files exist in <configDir>/extension/adapters/ BEFORE launching the browser extension",
+        "Test verifies the adapter file has a content-hashed filename matching the pattern <pluginName>-<hash>.js",
+        "Test verifies the adapter file content is non-empty"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/adapter-files-eager.e2e.ts (new file)\n\nContext:\nThe E2E fixture `startMcpServer` (fixtures.ts around line 230) spawns the MCP server and waits for it to be healthy. The server's configDir is available as `mcpServer.configDir`. Adapter files are written to `<configDir>/extension/adapters/`.\n\nCurrently, the extensionContext fixture (line 1443) creates a symlink from the extension copy's adapters/ to the server's adapters/. But this test needs to verify adapter files BEFORE the extension connects — so it should NOT use the `extensionContext` fixture.\n\nTest flow:\n1. Create a test config dir using `createTestConfigDir()` from fixtures.ts\n2. Write config with e2e-test plugin in localPlugins using `writeTestConfig()`\n3. Write the .opentabs-version file so ensureExtensionInstalled doesn't try to copy\n4. Start MCP server using `startMcpServer(configDir)`\n5. Wait for server to be healthy (startMcpServer already does this)\n6. List files in `<configDir>/extension/adapters/` using fs.readdirSync\n7. Assert at least one file matching `e2e-test-*.js` exists\n8. Assert the file is non-empty\n9. Clean up\n\nKey imports from fixtures.ts:\n- `createTestConfigDir`, `cleanupTestConfigDir`, `startMcpServer`, `writeTestConfig`\n- `test`, `expect` from fixtures.ts\n\nLook at e2e/dev-proxy.e2e.ts for patterns on using startMcpServer directly without the full fixture chain.\n\nConstraints:\n- This test must NOT depend on the extensionContext fixture (no browser launch)\n- Use `mcpServer.configDir` to find the adapters directory\n- Clean up the server process in teardown"
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: adapter files re-written after hot reload without extension",
+      "description": "Add an E2E test that verifies adapter files are re-written to disk after a dev proxy hot reload, even when no extension is connected.",
+      "acceptanceCriteria": [
+        "Test starts MCP server in hot mode, verifies adapter files exist",
+        "Test deletes all adapter files from the adapters/ directory",
+        "Test triggers a hot reload via mcpServer.triggerHotReload()",
+        "Test verifies adapter files are re-created after the hot reload completes, without any extension connection"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/adapter-files-eager.e2e.ts (same file as US-003)\n\nContext:\nThe dev proxy hot reload is triggered by `mcpServer.triggerHotReload()` which sends SIGUSR1 to the proxy process. The proxy kills the old worker and forks a new one. The new worker runs performReload → reloadCore → writeAllAdapterFiles (after US-001 fix).\n\nUse `waitForLog(mcpServer, 'Hot reload complete', 20_000)` (from helpers.ts) to wait for the reload to finish.\n\nTest flow:\n1. Same setup as US-003: createTestConfigDir, writeTestConfig, startMcpServer(configDir, true) (true = hot mode)\n2. Wait for server healthy\n3. Verify adapter files exist in <configDir>/extension/adapters/\n4. Delete all .js files from the adapters/ directory using fs.unlinkSync\n5. Verify adapters/ is empty\n6. Clear logs: `mcpServer.logs.length = 0`\n7. Trigger hot reload: `mcpServer.triggerHotReload()`\n8. Wait for log: `await waitForLog(mcpServer, 'Hot reload complete', 20_000)`\n9. List files in adapters/ again\n10. Assert adapter files are back (e2e-test-*.js exists)\n11. Clean up\n\nConstraints:\n- This test must NOT depend on extensionContext (no browser)\n- Must use hot mode (startMcpServer second arg = true) to test hot reload\n- Must verify files are re-created, not just the directory"
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: extension injects adapters immediately on connect after server startup",
+      "description": "Add a full-stack E2E test that verifies the extension can inject adapters and reach ready state on its first connection attempt — no retry or re-sync needed — because adapter files were already written eagerly during server startup.",
+      "acceptanceCriteria": [
+        "Test starts MCP server, then launches extension, then opens test page",
+        "Test verifies the e2e-test plugin reaches ready state on the first tab.syncAll",
+        "Test verifies a tool dispatch succeeds without any adapter injection failures in the extension logs"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/adapter-files-eager.e2e.ts (same file as US-003 and US-004)\n\nContext:\nThis test uses the full fixture chain (mcpServer, testServer, extensionContext, mcpClient) to verify the end-to-end flow works correctly with eager adapter writes.\n\nThe key assertion is that there are NO 'Could not load file' warnings in the extension logs after the first connection. Previously, if the server started and the extension connected quickly, adapter files might not exist yet, causing injection failures.\n\nTest flow:\n1. Use the standard fixture chain: `test('...', async ({ mcpServer, testServer, extensionContext, mcpClient }) => { ... })`\n2. Call `setupToolTest(mcpServer, testServer, extensionContext, mcpClient)` from helpers.ts\n3. Verify tool dispatch works: `await waitForToolResult(mcpClient, 'e2e-test_echo', { message: 'eager-adapters' }, { isError: false }, 15_000)`\n4. Check extension logs for injection failures. The extension_get_state or extension_get_logs MCP tools aren't available in E2E tests (they go through the MCP client). Instead, check the mcpServer.logs for any 'Injection failed' warnings — the extension sends adapter injection errors through the WebSocket protocol. Actually, the simpler approach: just verify the tool dispatch succeeded (step 3), which proves the adapter was injected successfully.\n5. Optionally, verify via extension.checkAdapter that the adapter is present and hash matches: call callToolExpectSuccess(mcpClient, mcpServer, 'extension_check_adapter', { plugin: 'e2e-test' }) and verify adapterPresent=true, hashMatch=true, isReady=true.\n\nConstraints:\n- This test DOES use extensionContext (full browser stack)\n- Follow patterns from adapter-hash.e2e.ts for the full-stack setup\n- Import test, expect from fixtures.ts and helpers from helpers.ts"
+    },
+    {
+      "id": "US-006",
+      "title": "Update E2E fixture comment about adapter file timing",
+      "description": "Update the comment in the extensionContext fixture that says adapter files 'may have already been created during startup' to reflect the new behavior where adapter files are always written during startup.",
+      "acceptanceCriteria": [
+        "The comment at fixtures.ts around line 1454 accurately describes the new behavior: adapter files ARE written during startup, not 'may have'",
+        "The comment at adapter-files.ts docstring for cleanupStaleAdapterFiles mentions it is called from both writeAllAdapterFiles and sendSyncFull"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- e2e/fixtures.ts (update comment around line 1454)\n- platform/mcp-server/src/adapter-files.ts (update docstring for cleanupStaleAdapterFiles at line 92-95)\n\nContext:\nThe comment at fixtures.ts lines 1454-1457 currently says:\n```\n// The MCP server's reload sequence may have already created the adapters/\n// directory and written files there during startup. Remove it first so the\n// symlink can be created. The files will be re-written on sync.full when\n// the extension connects.\n```\n\nAfter the fix, adapter files are ALWAYS written during startup (not 'may have'). Update to:\n```\n// The MCP server writes adapter files eagerly during startup (before the\n// extension connects). Remove the directory so the symlink can be created.\n// Files are re-written on sync.full when the extension connects.\n```\n\nAlso update the docstring for cleanupStaleAdapterFiles in adapter-files.ts (line 92-95):\nCurrent: `Called from sendSyncFull before writing new adapter files.`\nNew: `Called from writeAllAdapterFiles (and transitively from sendSyncFull and reloadCore) before writing new adapter files.`\n\nConstraints:\n- Only update comments, no code changes\n- Keep comments factual and present-tense (per CLAUDE.md code quality rules)"
+    }
+  ]
+}
