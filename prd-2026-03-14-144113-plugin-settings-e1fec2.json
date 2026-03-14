@@ -1,0 +1,252 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add a first-class Plugin Settings system. Plugins can declare a configSchema (typed fields with labels, descriptions, validation) in their SDK class and package.json. Users provide values in config.json under a new 'settings' map. The server resolves settings at load time — url-type settings derive Chrome match patterns and homepage automatically. Settings flow to the extension and are injected into adapters at runtime. Three user surfaces: CLI interactive (opentabs plugin configure), CLI scripted (opentabs config set setting.*), and side panel UI (ConfigDialog with NeedsSetup badge). The e2e-test plugin gains configSchema fields for testing.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add config schema types to shared package",
+      "description": "Define the ConfigSettingDefinition and ConfigSchema types in platform/shared, add configSchema to PluginOpentabsField and PluginPackageJson, parse it in parsePluginPackageJson, and relax the non-empty urlPatterns requirement when a configSchema with a required url field is present.",
+      "acceptanceCriteria": [
+        "ConfigSettingDefinition type exported from @opentabs-dev/shared with fields: type ('url'|'string'|'number'|'boolean'|'select'), label (string), description (optional string), required (optional boolean), placeholder (optional string), options (optional string[] for select type)",
+        "ConfigSchema type exported as Record<string, ConfigSettingDefinition>",
+        "PluginOpentabsField includes optional configSchema: ConfigSchema",
+        "parsePluginPackageJson parses and validates configSchema from the opentabs field",
+        "parsePluginPackageJson allows empty urlPatterns when configSchema contains at least one required url-type field",
+        "parsePluginPackageJson rejects empty urlPatterns when no configSchema with required url field exists (existing behavior preserved)",
+        "ConfigStatePlugin gains optional configSchema and optional resolvedSettings fields",
+        "All existing unit tests continue to pass"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/shared/src/index.ts (add ConfigSettingDefinition, ConfigSchema types; add to ConfigStatePlugin)\n- platform/shared/src/manifest.ts (add configSchema to PluginOpentabsField and PluginPackageJson; parse in parsePluginPackageJson; relax urlPatterns validation)\n- platform/shared/src/manifest.test.ts (add tests for configSchema parsing and urlPatterns relaxation)\n\nContext:\nPluginOpentabsField is defined in manifest.ts:\n```typescript\ninterface PluginOpentabsField {\n  readonly displayName: string;\n  readonly description: string;\n  readonly urlPatterns: string[];\n  readonly excludePatterns?: string[];\n  readonly homepage?: string;\n}\n```\n\nThe current urlPatterns validation at line 98:\n```typescript\nif (!Array.isArray(urlPatterns) || urlPatterns.length === 0) {\n    return err(`Invalid package.json at ${sourcePath}: \"opentabs.urlPatterns\" must be a non-empty array of strings`);\n}\n```\n\nConfigStatePlugin in index.ts at line 307 already has urlPatterns, homepage, etc. Add configSchema and resolvedSettings alongside them.\n\nChanges:\n1. Add new types in index.ts:\n```typescript\nexport type ConfigSettingType = 'url' | 'string' | 'number' | 'boolean' | 'select';\nexport interface ConfigSettingDefinition {\n  readonly type: ConfigSettingType;\n  readonly label: string;\n  readonly description?: string;\n  readonly required?: boolean;\n  readonly placeholder?: string;\n  readonly options?: readonly string[]; // for select type\n}\nexport type ConfigSchema = Record<string, ConfigSettingDefinition>;\n```\n\n2. Add to ConfigStatePlugin:\n```typescript\nconfigSchema?: ConfigSchema;\nresolvedSettings?: Record<string, string | number | boolean>;\n```\n\n3. In manifest.ts, add configSchema to PluginOpentabsField:\n```typescript\nreadonly configSchema?: ConfigSchema;\n```\n\n4. In parsePluginPackageJson, after parsing homepage, parse configSchema. Validate each field has a valid type and label. For select type, validate options is a non-empty string array.\n\n5. Change the urlPatterns validation: allow empty array if configSchema has at least one required url-type field.\n\n6. Export the new types from index.ts.\n\nConstraints:\n- Do NOT change the behavior for plugins without configSchema — the non-empty urlPatterns requirement stays for those.\n- Do NOT add configSchema parsing to the PluginManifest type (that's for tools.json, handled separately in US-003).\n- Export new types from the barrel in index.ts alongside existing manifest exports."
+    },
+    {
+      "id": "US-002",
+      "title": "Add configSchema field and getConfig utility to plugin SDK",
+      "description": "Add the optional configSchema field to OpenTabsPlugin base class and a getConfig() SDK utility that reads from globalThis.__openTabs.pluginConfig at runtime.",
+      "acceptanceCriteria": [
+        "OpenTabsPlugin has optional readonly configSchema property typed as ConfigSchema (imported from shared)",
+        "getConfig(key) function exported from plugin-sdk that reads globalThis.__openTabs.pluginConfig[key]",
+        "getConfig returns string | number | boolean | undefined",
+        "getConfig returns undefined gracefully when pluginConfig is not set (e.g., in tests)",
+        "ConfigSchema and ConfigSettingDefinition re-exported from plugin-sdk for plugin author convenience",
+        "Unit test verifies getConfig reads from globalThis.__openTabs.pluginConfig"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-sdk/src/index.ts (add configSchema to OpenTabsPlugin, add re-exports)\n- platform/plugin-sdk/src/config.ts (new file — getConfig utility)\n- platform/plugin-sdk/src/config.test.ts (new file — tests)\n\nContext:\nOpenTabsPlugin is in index.ts at line 70. It has abstract fields (name, description, urlPatterns, tools, isReady, displayName) and optional fields (excludePatterns, homepage, teardown, onActivate, etc.).\n\nThe SDK already uses globalThis.__openTabs for other runtime state — see storage.ts getAuthCache/setAuthCache pattern:\n```typescript\nexport const getAuthCache = <T>(namespace: string): T | null => {\n  const cache = (globalThis as Record<string, unknown>).__openTabs as Record<string, unknown> | undefined;\n  if (!cache?.tokenCache) return null;\n  return ((cache.tokenCache as Record<string, unknown>)[namespace] as T) ?? null;\n};\n```\n\nChanges:\n1. Create platform/plugin-sdk/src/config.ts:\n```typescript\n/**\n * Plugin configuration accessor.\n * Reads resolved settings injected by the adapter IIFE at runtime.\n * Returns undefined when no config is available (tests, unconfigured plugins).\n */\nexport const getConfig = (key: string): string | number | boolean | undefined => {\n  const ot = (globalThis as Record<string, unknown>).__openTabs as Record<string, unknown> | undefined;\n  const config = ot?.pluginConfig as Record<string, string | number | boolean> | undefined;\n  return config?.[key];\n};\n```\n\n2. In OpenTabsPlugin class, add after homepage:\n```typescript\nreadonly configSchema?: ConfigSchema;\n```\n\n3. Re-export from index.ts:\n```typescript\nexport type { ConfigSchema, ConfigSettingDefinition, ConfigSettingType } from '@opentabs-dev/shared';\nexport { getConfig } from './config.js';\n```\n\n4. Tests: set globalThis.__openTabs.pluginConfig, call getConfig, verify values. Test undefined case.\n\nConstraints:\n- Do NOT make configSchema abstract — it's optional.\n- Keep the same globalThis pattern as existing SDK utilities (getAuthCache, _setLogTransport).\n- The re-exports from shared are type-only for ConfigSchema/ConfigSettingDefinition but the ConfigSettingType is a regular type alias."
+    },
+    {
+      "id": "US-003",
+      "title": "Serialize configSchema in plugin build tool",
+      "description": "Update opentabs-plugin build to include configSchema in dist/tools.json manifest and relax the empty urlPatterns validation in the build tool to allow plugins with a configSchema that has a required url field.",
+      "acceptanceCriteria": [
+        "PluginManifestOutput interface gains optional configSchema field",
+        "generateManifest includes configSchema from plugin instance when present",
+        "configSchema appears in dist/tools.json when the plugin defines one",
+        "validatePlugin allows empty urlPatterns when plugin has configSchema with a required url-type field",
+        "Build succeeds for a plugin with empty urlPatterns and a configSchema with required url field"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-tools/src/commands/build.ts (update PluginManifestOutput, generateManifest, validatePlugin)\n- platform/plugin-tools/src/commands/build.test.ts (update tests)\n\nContext:\nPluginManifestOutput at line 585:\n```typescript\ninterface PluginManifestOutput {\n  sdkVersion: string;\n  iconSvg?: string;\n  iconInactiveSvg?: string;\n  iconDarkSvg?: string;\n  iconDarkInactiveSvg?: string;\n  tools: ManifestTool[];\n}\n```\n\ngenerateManifest at line 655:\n```typescript\nconst generateManifest = (plugin: OpenTabsPlugin, sdkVersion: string, icons?: IconResult): PluginManifestOutput => ({\n  sdkVersion,\n  ...(icons?.iconSvg ? { iconSvg: icons.iconSvg } : {}),\n  ...(icons?.iconInactiveSvg ? { iconInactiveSvg: icons.iconInactiveSvg } : {}),\n```\n\nvalidatePlugin at line 319 has:\n```typescript\nif (plugin.urlPatterns.length === 0) {\n    errors.push('At least one URL pattern is required');\n}\n```\n\nChanges:\n1. Add configSchema to PluginManifestOutput:\n```typescript\nconfigSchema?: ConfigSchema;\n```\n\n2. In generateManifest, spread configSchema:\n```typescript\n...(plugin.configSchema && Object.keys(plugin.configSchema).length > 0 ? { configSchema: plugin.configSchema } : {}),\n```\n\n3. In validatePlugin, relax urlPatterns check:\n```typescript\nconst hasRequiredUrlSetting = plugin.configSchema && Object.values(plugin.configSchema).some(\n  s => s.type === 'url' && s.required\n);\nif (plugin.urlPatterns.length === 0 && !hasRequiredUrlSetting) {\n    errors.push('At least one URL pattern is required (or declare a required url-type configSchema field)');\n}\n```\n\n4. Import ConfigSchema type from plugin-sdk.\n\nConstraints:\n- Do NOT change how tools are serialized — only add configSchema as a top-level field alongside sdkVersion and tools.\n- The configSchema in tools.json is the raw schema object, not the resolved values."
+    },
+    {
+      "id": "US-004",
+      "title": "Parse settings from config.json and add settings resolution in MCP server",
+      "description": "Extend config.ts to parse a 'settings' map from config.json. Add a settings resolver that derives URL patterns from url-type settings. Update LoadedPlugin and RegisteredPlugin to carry configSchema. Thread configSchema and resolved settings through the discovery and registry pipeline.",
+      "acceptanceCriteria": [
+        "OpentabsConfig interface gains settings: Record<string, Record<string, unknown>>",
+        "loadConfig parses the settings field from config.json",
+        "LoadedPlugin gains optional configSchema field",
+        "RegisteredPlugin gains optional configSchema field",
+        "loadPlugin reads configSchema from tools.json manifest and includes it in LoadedPlugin",
+        "During discovery, url-type settings with user-provided values derive Chrome match patterns appended to static urlPatterns",
+        "A plugin with empty urlPatterns and a configured instanceUrl gets an effective pattern like *://hostname/*",
+        "When no user value is provided for a required url setting, the plugin still loads (with empty effective urlPatterns)",
+        "Settings validation: url-type values must parse as valid URLs (new URL() succeeds), invalid values are logged and skipped",
+        "saveConfig preserves the settings field when writing config back",
+        "Unit tests cover settings parsing, URL pattern derivation, and invalid URL handling"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts (add settings to OpentabsConfig, parse in parseConfigRecord, preserve in saveConfig)\n- platform/mcp-server/src/config.test.ts (tests for settings parsing)\n- platform/mcp-server/src/loader.ts (read configSchema from tools.json, add to LoadedPlugin)\n- platform/mcp-server/src/loader.test.ts (tests)\n- platform/mcp-server/src/state.ts (add configSchema to RegisteredPlugin)\n- platform/mcp-server/src/settings-resolver.ts (new file — resolvePluginSettings function)\n- platform/mcp-server/src/settings-resolver.test.ts (new file — tests)\n- platform/mcp-server/src/discovery.ts (apply settings resolution after loading, before building registry)\n\nContext:\nOpentabsConfig in config.ts:\n```typescript\ninterface OpentabsConfig {\n  localPlugins: string[];\n  permissions: Record<string, PluginPermissionConfig>;\n}\n```\n\nparseConfigRecord at line 156:\n```typescript\nconst parseConfigRecord = (record: Record<string, unknown>): OpentabsConfig => {\n  const localPlugins = Array.isArray(record.localPlugins)\n    ? (record.localPlugins as unknown[]).filter((p): p is string => typeof p === 'string')\n    : [];\n  const permissions = parsePluginsConfig(record.permissions);\n  return { localPlugins, permissions };\n};\n```\n\nLoaderPlugin in loader.ts at line 38:\n```typescript\ninterface LoadedPlugin {\n  readonly name: string;\n  readonly version: string;\n  // ... many fields ...\n}\n```\n\nRegisteredPlugin in state.ts at line 93:\n```typescript\nexport interface RegisteredPlugin {\n  name: string;\n  version: string;\n  // ... many fields including urlPatterns, homepage ...\n}\n```\n\nChanges:\n1. config.ts: Add settings to OpentabsConfig and parse it:\n```typescript\ninterface OpentabsConfig {\n  localPlugins: string[];\n  permissions: Record<string, PluginPermissionConfig>;\n  settings: Record<string, Record<string, unknown>>;\n}\n```\nIn parseConfigRecord, add:\n```typescript\nconst settings = parseSettingsConfig(record.settings);\nreturn { localPlugins, permissions, settings };\n```\nAdd parseSettingsConfig helper that validates the nested structure.\n\n2. loader.ts: Read configSchema from manifest (tools.json). The manifest already has a `manifestObj` variable that reads top-level fields like sdkVersion:\n```typescript\nconst pluginSdkVersion = manifestObj && typeof manifestObj.sdkVersion === 'string' ? manifestObj.sdkVersion : undefined;\n```\nAdd similar for configSchema:\n```typescript\nconst configSchema = manifestObj && typeof manifestObj.configSchema === 'object' && manifestObj.configSchema !== null\n  ? manifestObj.configSchema as ConfigSchema : undefined;\n```\nAdd configSchema to the LoadedPlugin return value.\n\n3. state.ts: Add to RegisteredPlugin:\n```typescript\nconfigSchema?: ConfigSchema;\n```\n\n4. Create settings-resolver.ts:\n```typescript\nimport type { ConfigSchema } from '@opentabs-dev/shared';\nimport { validateUrlPattern } from '@opentabs-dev/shared';\n\ninterface ResolvedSettings {\n  effectiveUrlPatterns: string[];\n  effectiveHomepage: string | undefined;\n  resolvedValues: Record<string, string | number | boolean>;\n}\n\nconst resolvePluginSettings = (\n  staticUrlPatterns: string[],\n  staticHomepage: string | undefined,\n  configSchema: ConfigSchema | undefined,\n  userSettings: Record<string, unknown> | undefined,\n): ResolvedSettings => {\n  // ... derive patterns from url-type settings\n};\n```\n\n5. discovery.ts: After Phase 4 (merge), apply settings resolution to each loaded plugin before Phase 5 (buildRegistry). Pass the resolved urlPatterns and homepage into the registered plugin.\n\nConstraints:\n- Do NOT mutate LoadedPlugin — create a new object with the resolved values.\n- Do NOT change the discovery pipeline's phase structure — add resolution as a step between merge and buildRegistry.\n- The settings field in config.json is per-plugin-name (internal name like 'sqlpad', not npm package name).\n- saveConfig and savePluginPermissions must preserve the settings field when doing read-modify-write."
+    },
+    {
+      "id": "US-005",
+      "title": "Add settings to server state and config state payload",
+      "description": "Store user settings on ServerState, include configSchema and resolvedSettings in the config.getState payload (ConfigStatePlugin), and create a new config.setPluginSettings handler and HTTP endpoint for saving settings.",
+      "acceptanceCriteria": [
+        "ServerState gains pluginSettings field: Record<string, Record<string, unknown>>",
+        "buildConfigStatePayload includes configSchema and resolvedSettings in each ConfigStatePlugin entry",
+        "New handleConfigSetPluginSettings handler processes config.setPluginSettings JSON-RPC requests from the extension",
+        "The handler validates settings against the plugin's configSchema (type checking, required fields)",
+        "The handler writes to config.json (settings field), triggers reload, and broadcasts plugins.changed",
+        "New POST /plugin-settings HTTP endpoint for CLI use (accepts JSON body with plugin name and settings, bearer auth)",
+        "Unit tests cover the handler validation and the HTTP endpoint"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/state.ts (add pluginSettings to ServerState and createState)\n- platform/mcp-server/src/extension-handlers.ts (add handleConfigSetPluginSettings, update buildConfigStatePayload and serializePluginForExtension)\n- platform/mcp-server/src/extension-handlers.test.ts (tests)\n- platform/mcp-server/src/http-routes.ts (add POST /plugin-settings route)\n- platform/mcp-server/src/http-routes.test.ts (tests)\n- platform/mcp-server/src/config.ts (add savePluginSettings function)\n- platform/mcp-server/src/reload.ts or index.ts (thread settings through reloadCore)\n\nContext:\nServerState at line 268 in state.ts already has pluginPermissions:\n```typescript\npluginPermissions: Record<string, PluginPermissionConfig>;\n```\nAdd a similar field:\n```typescript\npluginSettings: Record<string, Record<string, unknown>>;\n```\n\ncreateState at line 342:\n```typescript\npluginPermissions: {},\n```\nAdd:\n```typescript\npluginSettings: {},\n```\n\nbuildConfigStatePayload at line 342 in extension-handlers.ts builds the ConfigStatePlugin objects. Currently:\n```typescript\nreturn {\n  ...serializePluginForExtension(state, p),\n  source: p.source,\n  tabState: tabInfo?.state ?? 'closed',\n  // ...\n};\n```\nAdd configSchema and resolvedSettings here.\n\nserializePluginForExtension at line 144 returns plugin metadata. Add configSchema from plugin.configSchema and resolvedSettings from state.pluginSettings[plugin.name] resolved against the schema.\n\nThe existing handleConfigSetPluginPermission pattern (line 483) is the model for handleConfigSetPluginSettings: validate params, update state, persist to config, broadcast plugins.changed.\n\nFor the HTTP endpoint, follow the pattern of POST /reload in http-routes.ts: bearer auth, JSON body, respond with ok.\n\nThe savePluginSettings function in config.ts should follow the savePluginPermissions pattern — read-modify-write with the configWriteMutex, only updating the settings field.\n\nConstraints:\n- Do NOT mix settings and permissions in the same config map — they are separate concerns.\n- The HTTP endpoint must require bearer auth (same secret as /reload).\n- Settings validation should be lenient — store the values even if the plugin isn't loaded yet (user may configure before installing).\n- When broadcasting plugins.changed after a settings save, the server must reload first so URL patterns are re-derived.\n- Bump STATE_SCHEMA_VERSION since ServerState gains a new field."
+    },
+    {
+      "id": "US-006",
+      "title": "Inject resolved settings into adapter IIFE at runtime",
+      "description": "Update the adapter IIFE wrapper generated by opentabs-plugin build to populate globalThis.__openTabs.pluginConfig from settings injected at adapter injection time by the Chrome extension background script.",
+      "acceptanceCriteria": [
+        "The adapter IIFE wrapper code sets globalThis.__openTabs.pluginConfig from an injected settings object",
+        "The extension background script passes resolved settings when injecting the adapter via chrome.scripting.executeScript",
+        "When no settings exist for a plugin, pluginConfig is set to an empty object (not undefined)",
+        "The getConfig SDK utility can read values injected this way",
+        "Settings injection does not break existing adapter functionality (tools, lifecycle hooks, logging)"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-tools/src/commands/build.ts (update wrapperCode to read injected config)\n- platform/browser-extension/src/background.ts (pass settings when injecting adapter)\n\nContext:\nThe adapter IIFE wrapper in build.ts (around line 690) sets up globalThis.__openTabs:\n```typescript\nif (!globalThis.__openTabs) {\n  globalThis.__openTabs = {} as OpenTabsRuntime;\n}\n```\n\nThe extension injects adapters via chrome.scripting.executeScript. The server sends plugin metadata (including iife, urlPatterns, etc.) to the extension via sync.full. The extension stores plugins in its local state and injects the IIFE when a matching tab is found.\n\nThe injection path is: server sends sync.full with plugin data → extension stores it → when tab matches, extension calls chrome.scripting.executeScript with the IIFE code.\n\nFor settings injection, there are two approaches:\nA) Include a settings JSON string in the IIFE itself (generated at build time) — but this means the IIFE is static and settings changes require rebuild.\nB) The extension injects settings as a separate script before the adapter IIFE — sets globalThis.__openTabs.pluginConfig = {...}.\nC) The adapter IIFE reads from a well-known location that the extension populates.\n\nApproach B is cleanest — the extension injects a tiny settings script before the main IIFE:\n```javascript\nglobalThis.__openTabs = globalThis.__openTabs || {};\nglobalThis.__openTabs.pluginConfig = {\"instanceUrl\":\"https://sqlpad.mycompany.com\"};\n```\n\nThen the adapter IIFE reads it. This way settings changes don't require plugin rebuild — just server reload.\n\nThe settings to inject come from the server's state.pluginSettings, resolved and sent to the extension alongside the plugin metadata in sync.full.\n\nChanges:\n1. The server's sync.full payload for each plugin should include resolvedSettings (from settings-resolver.ts).\n2. The extension, when injecting the adapter, first injects a small config script that sets pluginConfig.\n3. The adapter wrapper code does NOT need changes — getConfig already reads from globalThis.__openTabs.pluginConfig.\n\nAlternatively, the wrapper code in build.ts can include a line that initializes pluginConfig from a placeholder that gets replaced. But the separate injection approach is cleaner.\n\nConstraints:\n- Settings must be injected BEFORE the adapter IIFE runs (so getConfig works in onActivate and tool handlers).\n- The injection must work with the existing CSP-compliant injection model.\n- Do NOT embed settings in the IIFE at build time — settings are runtime configuration, not build-time."
+    },
+    {
+      "id": "US-007",
+      "title": "Add side panel ConfigDialog component and NeedsSetup badge",
+      "description": "Create a ConfigDialog component that dynamically renders form fields from a plugin's configSchema, add a 'Needs Setup' badge to PluginCard for unconfigured plugins, and add a 'Settings' menu item to PluginMenu for configured plugins.",
+      "acceptanceCriteria": [
+        "ConfigDialog renders form fields for each configSchema entry: Input for url/string, number input for number, Switch for boolean, Select for select",
+        "ConfigDialog validates url fields (must be valid URL), marks required fields with asterisk, shows placeholder text",
+        "ConfigDialog pre-fills current values from resolvedSettings and saves via bg:setPluginSettings",
+        "ConfigDialog follows retro theme: border-2, border-border, rounded, shadow-md, font-mono for labels",
+        "PluginCard shows a NeedsSetup badge (Settings lucide icon + 'Needs Setup' text) when plugin has configSchema with required unconfigured fields",
+        "When expanded, unconfigured plugin shows a 'Configure' button inside the card content area instead of tools",
+        "PluginMenu gains a 'Settings' item (Cog icon) visible only when plugin has a configSchema",
+        "Both the Configure button and Settings menu item open the ConfigDialog",
+        "Storybook stories for ConfigDialog covering: url field, string field, number field, boolean field, select field, validation errors, pre-filled values"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/ConfigDialog.tsx (new file)\n- platform/browser-extension/src/side-panel/components/ConfigDialog.stories.tsx (new file)\n- platform/browser-extension/src/side-panel/components/PluginCard.tsx (add NeedsSetup badge and Configure button)\n- platform/browser-extension/src/side-panel/components/PluginMenu.tsx (add Settings menu item)\n- platform/browser-extension/src/side-panel/bridge.ts (add setPluginSettings function, update PluginState with configSchema/resolvedSettings)\n\nContext:\nPluginCard.tsx renders the plugin card with header (icon, name, chevron, menu, permission select) and content (tool list). The header already has conditional badges:\n```typescript\n{plugin.source === 'local' && (\n  <Badge variant=\"default\" size=\"sm\" className=\"align-middle\">DEV</Badge>\n)}\n{!plugin.reviewed && (\n  <Tooltip>...<ShieldQuestionMark .../></Tooltip>\n)}\n```\nAdd the NeedsSetup badge in the same pattern.\n\nPluginMenu.tsx has the kebab menu with VersionItem and remove. Add Settings between them:\n```typescript\n{plugin.configSchema && Object.keys(plugin.configSchema).length > 0 && (\n  <Menu.Item onSelect={() => setConfigOpen(true)}>\n    <Settings className=\"h-3.5 w-3.5\" />Settings\n  </Menu.Item>\n)}\n```\n\nFor the unconfigured state, when the card content expands:\n- If plugin has unconfigured required settings, show a banner instead of tool list\n- The banner has text and a Configure button\n- Tools are hidden until configuration is complete\n\nThe ConfigDialog should use:\n- Dialog from retro/Dialog.tsx (already used for unreviewed plugin confirmation)\n- Input from retro/Input.tsx\n- Select from retro/Select.tsx\n- Switch from retro/Switch.tsx\n- Button from retro/Button.tsx\n\nFor the bridge, add:\n```typescript\nconst setPluginSettings = (plugin: string, settings: Record<string, unknown>): Promise<unknown> =>\n  sendBgMessage({ type: 'bg:setPluginSettings', plugin, settings });\n```\n\nPluginState (which is Omit<ConfigStatePlugin, 'tools'> & { tools?: ... }) will automatically get configSchema and resolvedSettings from ConfigStatePlugin.\n\nNeedsSetup detection: a plugin needs setup if it has configSchema with at least one required field AND that field is not in resolvedSettings (or resolvedSettings is empty).\n\nConstraints:\n- The ConfigDialog MUST follow the retro theme exactly. Use theme-aware Tailwind classes only.\n- Use the existing Input, Select, Switch, Dialog, Button retro primitives — do NOT create new UI primitives for this.\n- The Settings icon from lucide-react is the correct icon for the NeedsSetup badge (already imported as 'Settings' in other components, or use 'Cog').\n- The form should be uncontrolled with commit-on-save (not controlled inputs that fight the user).\n- URL validation should use try { new URL(value) } catch — not regex."
+    },
+    {
+      "id": "US-008",
+      "title": "Wire bg:setPluginSettings through extension background to MCP server",
+      "description": "Add the bg:setPluginSettings message handler in the extension background script that relays settings save requests from the side panel to the MCP server via the WebSocket connection.",
+      "acceptanceCriteria": [
+        "Background script handles bg:setPluginSettings messages from the side panel",
+        "The handler sends a config.setPluginSettings JSON-RPC request over the WebSocket to the MCP server",
+        "On success, returns { ok: true } to the side panel",
+        "On error, propagates the error message back to the side panel",
+        "The extension protocol handler (MCP server side) routes config.setPluginSettings to handleConfigSetPluginSettings"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/background.ts (add bg:setPluginSettings handler)\n- platform/mcp-server/src/extension-protocol.ts (route config.setPluginSettings to handler)\n\nContext:\nThe background script handles side panel messages in a chrome.runtime.onMessage listener. Existing handlers follow this pattern:\n```typescript\ncase 'bg:setPluginPermission': {\n  const { plugin, permission, reviewedVersion } = data;\n  // Send JSON-RPC request to MCP server via WebSocket\n  const result = await sendJsonRpcRequest('config.setPluginPermission', { plugin, permission, ...(reviewedVersion ? { reviewedVersion } : {}) });\n  sendResponse(result);\n  return true;\n}\n```\n\nAdd a similar case for bg:setPluginSettings:\n```typescript\ncase 'bg:setPluginSettings': {\n  const { plugin, settings } = data;\n  const result = await sendJsonRpcRequest('config.setPluginSettings', { plugin, settings });\n  sendResponse(result);\n  return true;\n}\n```\n\nIn extension-protocol.ts, the router dispatches methods to handlers. Add:\n```typescript\ncase 'config.setPluginSettings':\n  await handleConfigSetPluginSettings(state, params, id, callbacks);\n  break;\n```\n\nConstraints:\n- Follow the exact same pattern as bg:setPluginPermission for consistency.\n- The WebSocket message format must be standard JSON-RPC 2.0.\n- Error handling: if the WebSocket is not connected, return an error to the side panel immediately."
+    },
+    {
+      "id": "US-009",
+      "title": "Add opentabs plugin configure CLI command",
+      "description": "Add the interactive 'opentabs plugin configure <name>' command that reads a plugin's configSchema, prompts for each field, validates inputs, saves to config.json, and notifies the server.",
+      "acceptanceCriteria": [
+        "opentabs plugin configure <name> reads the plugin's configSchema from its installed package (dist/tools.json)",
+        "Prompts for each field in order: label, description, placeholder shown as hint, required fields enforced",
+        "URL fields validated with new URL() — reprompts on invalid input",
+        "Pre-fills current values from config.json settings map when editing existing config",
+        "Writes to config.json under the settings map and notifies the server via POST /reload",
+        "Prints clear error if plugin is not installed or has no configSchema",
+        "Works offline (reads from disk, server notification is best-effort)"
+      ],
+      "priority": 9,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/plugin.ts (add configure subcommand and handler)\n- platform/cli/src/commands/plugin.test.ts (tests)\n- platform/cli/src/config.ts (add readPluginConfigSchema and readPluginSettings helpers)\n\nContext:\nThe plugin command is registered at line 658:\n```typescript\nconst registerPluginCommand = (program: Command): void => {\n  const pluginCmd = program.command('plugin').description('Manage plugins')...\n```\n\nExisting subcommands: search, list, install, remove, create. Add configure.\n\nThe configure handler needs to:\n1. Find the plugin on disk (scan global npm + local plugins, similar to readLocalPluginInfo at line 450)\n2. Read its dist/tools.json to get configSchema\n3. Read current settings from config.json\n4. Use readline (Node.js built-in) or a simple prompt library for interactive input\n5. Validate and save\n\nFor reading tools.json:\n```typescript\nconst toolsJsonPath = join(pluginDir, 'dist', TOOLS_FILENAME);\nconst manifest = JSON.parse(await readFile(toolsJsonPath, 'utf-8'));\nconst configSchema = manifest.configSchema;\n```\n\nFor reading current settings, add to cli/src/config.ts:\n```typescript\nconst getPluginSettings = (config: Record<string, unknown>, pluginName: string): Record<string, unknown> => {\n  const settings = config.settings;\n  if (!settings || typeof settings !== 'object' || Array.isArray(settings)) return {};\n  const pluginSettings = (settings as Record<string, unknown>)[pluginName];\n  if (!pluginSettings || typeof pluginSettings !== 'object' || Array.isArray(pluginSettings)) return {};\n  return pluginSettings as Record<string, unknown>;\n};\n```\n\nFor the interactive prompt, use Node.js readline/promises:\n```typescript\nimport { createInterface } from 'node:readline/promises';\nconst rl = createInterface({ input: process.stdin, output: process.stdout });\n```\n\nThe registration:\n```typescript\npluginCmd\n  .command('configure')\n  .alias('config')\n  .description('Configure plugin settings (e.g., instance URL for self-hosted tools)')\n  .argument('<name>', 'Plugin name (e.g., sqlpad, github)')\n  .addHelpText('after', `\\nExamples:\\n  $ opentabs plugin configure sqlpad\\n  $ opentabs plugin configure github`)\n  .action(...);\n```\n\nConstraints:\n- Use Node.js readline/promises (built-in, no new dependencies).\n- Match the existing CLI output style: picocolors for formatting, pc.bold for plugin names, pc.dim for hints.\n- The handler must work even if the server is not running (offline mode).\n- For select-type fields, show numbered options and accept the number.\n- Do NOT prompt for fields that already have values unless the user wants to change them — show current values and let them press Enter to keep."
+    },
+    {
+      "id": "US-010",
+      "title": "Add config set setting.* CLI command and update config show",
+      "description": "Extend the opentabs config set command to handle the setting.<plugin>.<key> prefix for non-interactive settings configuration. Update config show to display the settings section.",
+      "acceptanceCriteria": [
+        "opentabs config set setting.sqlpad.instanceUrl https://sqlpad.example.com writes to config.json settings map and notifies server",
+        "opentabs config set setting.sqlpad.instanceUrl '' removes the key",
+        "opentabs config show displays a 'settings' section with per-plugin settings",
+        "opentabs config show --json includes settings in JSON output",
+        "opentabs plugin list shows '⚙ needs setup' indicator for plugins with unconfigured required settings",
+        "SUPPORTED_KEYS help text includes the new setting.* key format",
+        "suggestKey returns suggestions for misspelled setting.* keys"
+      ],
+      "priority": 10,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/config.ts (add handleSetSetting, update handleConfigShow, update SUPPORTED_KEYS, update KNOWN_KEYS)\n- platform/cli/src/commands/config.test.ts (tests)\n- platform/cli/src/commands/plugin.ts (update handlePluginList to show needs-setup indicator)\n- platform/cli/src/commands/plugin.test.ts (tests)\n\nContext:\nhandleConfigSet at line 449 dispatches based on key prefix:\n```typescript\nif (key.startsWith(TOOL_PERMISSION_PREFIX)) return handleSetToolPermission(key, value, options);\nif (key.startsWith(PLUGIN_PERMISSION_PREFIX)) return handleSetPluginPermission(key, value, options);\nif (key === PORT_KEY) return handleSetPort(value, options);\n```\n\nAdd a new prefix:\n```typescript\nconst SETTING_PREFIX = 'setting.';\n```\n\nAdd to handleConfigSet:\n```typescript\nif (key.startsWith(SETTING_PREFIX)) return handleSetSetting(key, value, options);\n```\n\nhandleSetSetting should:\n1. Parse key: setting.<plugin>.<settingKey>\n2. Read config\n3. Ensure config.settings[plugin] exists\n4. If value is empty string, delete the key; otherwise set it\n5. Prune empty plugin entries\n6. Write config\n7. Notify server\n\nFor config show, after the permissions section at line 124, add:\n```typescript\n} else if (key === 'settings' && typeof value === 'object' && value !== null) {\n  const entries = Object.entries(value as Record<string, unknown>);\n  console.log(`  ${pc.cyan('settings')}`);\n  if (entries.length === 0) {\n    console.log(`    ${pc.dim('(none)')}`);\n  } else {\n    for (const [pluginName, pluginSettings] of entries) {\n      console.log(`    ${pluginName}`);\n      if (typeof pluginSettings === 'object' && pluginSettings !== null) {\n        for (const [k, v] of Object.entries(pluginSettings as Record<string, unknown>)) {\n          console.log(`      ${k}: ${String(v)}`);\n        }\n      }\n    }\n  }\n}\n```\n\nUpdate SUPPORTED_KEYS:\n```\n  setting.<plugin>.<key>            Set a plugin setting (e.g., setting.sqlpad.instanceUrl)\n```\n\nUpdate KNOWN_KEYS:\n```typescript\nconst KNOWN_KEYS = ['tool-permission.', 'plugin-permission.', 'setting.', PORT_KEY, LOCAL_PLUGINS_ADD, LOCAL_PLUGINS_REMOVE];\n```\n\nUpdate CANONICAL_CONFIG_SECTIONS:\n```typescript\nconst CANONICAL_CONFIG_SECTIONS = ['localPlugins', 'permissions', 'settings'] as const;\n```\n\nFor plugin list, the health endpoint response needs to include configSchema and whether the plugin needs setup. Check if the server already includes this info in /health pluginDetails.\n\nConstraints:\n- Follow the exact same pattern as handleSetToolPermission and handleSetPluginPermission.\n- The setting key format is setting.<plugin>.<key>, parsed with two dots (plugin name and key may contain hyphens but not dots).\n- normalizeConfigForDisplay should show settings with default empty object."
+    },
+    {
+      "id": "US-011",
+      "title": "Add configSchema to e2e-test plugin for testing",
+      "description": "Add configSchema fields to the e2e-test plugin (instanceUrl required url, testString optional string) and add a get_config tool that returns the resolved config for verification.",
+      "acceptanceCriteria": [
+        "E2eTestPlugin class declares configSchema with instanceUrl (required url) and testString (optional string)",
+        "package.json opentabs field includes matching configSchema",
+        "urlPatterns remains ['http://localhost/*'] as-is (hybrid mode — static patterns plus optional config-derived ones)",
+        "New sdk_get_config tool returns the values from getConfig() for specified keys",
+        "Plugin builds successfully with npm run build"
+      ],
+      "priority": 11,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/e2e-test/src/index.ts (add configSchema, add sdk_get_config tool to tools array)\n- plugins/e2e-test/src/tools/sdk-get-config.ts (new file — tool that reads config)\n- plugins/e2e-test/package.json (add configSchema to opentabs field)\n\nContext:\nE2eTestPlugin at line 33 in plugins/e2e-test/src/index.ts:\n```typescript\nclass E2eTestPlugin extends OpenTabsPlugin {\n  readonly name = 'e2e-test';\n  readonly description = 'Dead-simple plugin for E2E testing — relays to a local test web server';\n  override readonly displayName = 'E2E Test';\n  readonly urlPatterns = ['http://localhost/*'];\n  override readonly homepage = 'http://localhost:9876';\n  readonly tools: ToolDefinition[] = [echo, greet, ...];\n```\n\npackage.json opentabs field:\n```json\n\"opentabs\": {\n    \"displayName\": \"E2E Test\",\n    \"description\": \"Dead-simple plugin for E2E testing\",\n    \"urlPatterns\": [\"http://localhost/*\"],\n    \"homepage\": \"http://localhost:9876\"\n}\n```\n\nChanges:\n1. Add to E2eTestPlugin:\n```typescript\noverride readonly configSchema = {\n  instanceUrl: {\n    type: 'url' as const,\n    label: 'Instance URL',\n    description: 'URL of the test server instance',\n    required: false, // keep as optional since e2e-test already has static urlPatterns\n    placeholder: 'http://localhost:9876',\n  },\n  testString: {\n    type: 'string' as const,\n    label: 'Test String',\n    description: 'A test string for config verification',\n    required: false,\n  },\n};\n```\n\nNote: Keep instanceUrl as required: false because the e2e-test plugin already has static urlPatterns. Making it required would be misleading since the plugin works without it. This tests the hybrid scenario.\n\n2. Add package.json configSchema:\n```json\n\"configSchema\": {\n    \"instanceUrl\": {\n        \"type\": \"url\",\n        \"label\": \"Instance URL\",\n        \"description\": \"URL of the test server instance\",\n        \"required\": false,\n        \"placeholder\": \"http://localhost:9876\"\n    },\n    \"testString\": {\n        \"type\": \"string\",\n        \"label\": \"Test String\",\n        \"description\": \"A test string for config verification\",\n        \"required\": false\n    }\n}\n```\n\n3. Create sdk-get-config.ts following the pattern of other tools (e.g., sdk-get-local-storage.ts):\n```typescript\nimport { defineTool, getConfig } from '@opentabs-dev/plugin-sdk';\nimport { z } from 'zod';\n\nexport const sdkGetConfig = defineTool({\n  name: 'sdk_get_config',\n  description: 'Tests getConfig — reads a plugin config value by key',\n  input: z.object({ key: z.string().describe('Config key to read') }),\n  output: z.object({ key: z.string(), value: z.union([z.string(), z.number(), z.boolean()]).nullable() }),\n  async handle(params) {\n    const value = getConfig(params.key);\n    return { key: params.key, value: value ?? null };\n  },\n});\n```\n\n4. Import and add to tools array in index.ts.\n\nConstraints:\n- Do NOT change existing urlPatterns — this tests hybrid mode (static + optional config-derived).\n- The plugin must build with both the existing SDK version AND the new one (configSchema is optional on OpenTabsPlugin).\n- Make sure the new tool's import is added in the correct alphabetical position."
+    },
+    {
+      "id": "US-012",
+      "title": "Update all CLAUDE.md documentation",
+      "description": "Update CLAUDE.md files across all packages to document the new Plugin Settings system: types, SDK utility, build behavior, server resolution, side panel UI, and CLI commands.",
+      "acceptanceCriteria": [
+        "Root CLAUDE.md Key Concepts section mentions plugin settings (configSchema, settings resolution, url-type pattern derivation)",
+        "platform/shared CLAUDE.md (if exists) documents ConfigSettingDefinition, ConfigSchema, ConfigSettingType types",
+        "platform/plugin-sdk/CLAUDE.md documents configSchema field, getConfig utility, and the ConfigSchema types",
+        "platform/plugin-tools/CLAUDE.md documents configSchema serialization in tools.json and the relaxed urlPatterns validation",
+        "platform/mcp-server/CLAUDE.md documents settings resolution, savePluginSettings, POST /plugin-settings endpoint, and configSchema in ConfigStatePlugin",
+        "platform/browser-extension/CLAUDE.md documents ConfigDialog component, NeedsSetup badge, Settings menu item, and bg:setPluginSettings",
+        "platform/cli/CLAUDE.md documents opentabs plugin configure command and config set setting.* key",
+        "plugins/CLAUDE.md documents how plugins declare configSchema",
+        "Documentation describes the three user surfaces: CLI interactive, CLI scripted, side panel UI"
+      ],
+      "priority": 12,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- CLAUDE.md (root — Key Concepts section)\n- platform/plugin-sdk/CLAUDE.md\n- platform/plugin-tools/CLAUDE.md\n- platform/mcp-server/CLAUDE.md\n- platform/browser-extension/CLAUDE.md\n- platform/cli/CLAUDE.md\n- plugins/CLAUDE.md\n\nContext:\nThe root CLAUDE.md Key Concepts section (around line ~100) lists concepts like tool name prefixing, tab state machine, multi-tab targeting, authentication, plugin discovery, permission model, lifecycle hooks, progress reporting, plugin review system. Add a new 'Plugin Settings' subsection.\n\nFor each package CLAUDE.md, add documentation in the appropriate section (Key Files, overview, or a new section).\n\nChanges:\nKeep documentation high-level — describe architecture and patterns, not implementation details. Follow the existing style in each file.\n\nConstraints:\n- Do NOT enumerate individual plugins or specific setting keys.\n- Keep additions concise — high-level architecture and patterns, not code-level details.\n- Follow the existing documentation style in each CLAUDE.md."
+    },
+    {
+      "id": "US-013",
+      "title": "Add E2E tests for plugin settings flow",
+      "description": "Write E2E tests verifying the full plugin settings flow: configSchema in health endpoint, settings resolution deriving URL patterns, getConfig reading resolved values, side panel showing configSchema, and CLI config set setting.* working.",
+      "acceptanceCriteria": [
+        "E2E test verifies /health endpoint includes configSchema for e2e-test plugin",
+        "E2E test verifies that writing settings to config.json and reloading causes URL pattern derivation for url-type settings",
+        "E2E test verifies the sdk_get_config tool returns values configured via settings",
+        "E2E test verifies side panel displays configSchema fields for the e2e-test plugin (via plugin card inspection)",
+        "E2E test verifies the NeedsSetup badge does NOT appear when all required fields are satisfied",
+        "All tests pass in parallel execution (isolated config dirs)"
+      ],
+      "priority": 13,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/plugin-settings.e2e.ts (new file)\n\nContext:\nE2E tests use the fixture system in fixtures.ts. Each test gets:\n- Its own MCP server on an ephemeral port\n- Its own config directory (OPENTABS_CONFIG_DIR)\n- Its own Chrome extension + browser context\n- Its own MCP client\n\nThe e2e-test plugin is registered in localPlugins by the fixture.\n\nTest scenarios:\n1. Health endpoint includes configSchema:\n```typescript\ntest('health endpoint includes configSchema', async ({ mcpServer }) => {\n  const health = await fetchHealth(mcpServer);\n  const plugin = health.pluginDetails.find(p => p.name === 'e2e-test');\n  expect(plugin.configSchema).toBeDefined();\n  expect(plugin.configSchema.instanceUrl.type).toBe('url');\n});\n```\n\n2. Settings resolution (URL pattern derivation):\n- Write settings to the test's config.json:\n```typescript\nconst config = JSON.parse(await readFile(configPath, 'utf-8'));\nconfig.settings = { 'e2e-test': { instanceUrl: 'http://localhost:9999' } };\nawait writeFile(configPath, JSON.stringify(config, null, 2));\n```\n- Trigger reload (POST /reload)\n- Verify /health shows the derived URL pattern in the plugin's urlPatterns\n\n3. getConfig tool:\n- Configure settings in config.json\n- Reload\n- Call sdk_get_config tool via MCP client\n- Verify it returns the configured value\n\n4. Side panel configSchema display:\n- Open side panel\n- Find e2e-test plugin card\n- Verify it shows the Settings menu item in the kebab menu\n- Since e2e-test has no required unconfigured fields (instanceUrl is optional), NeedsSetup badge should NOT appear\n\nFollow the patterns in existing E2E tests:\n- Import { test, expect } from './fixtures.js'\n- Use mcpServer, testServer, extensionContext, mcpClient fixtures\n- Use helpers from helpers.ts (openSidePanel, getExtensionId, etc.)\n\nConstraints:\n- Tests must be isolated (each gets its own config dir and server)\n- Tests must pass in parallel execution\n- Use the existing fixture system — do NOT create custom server setup\n- Test file should be named plugin-settings.e2e.ts following existing convention"
+    }
+  ]
+}
