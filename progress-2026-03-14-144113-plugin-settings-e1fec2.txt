@@ -1,0 +1,323 @@
+# Ralph Progress Log
+PRD: prd-2026-03-14-144113-plugin-settings-e1fec2~running.json
+Started: Sat Mar 14 21:41:43 UTC 2026
+---
+
+## Codebase Patterns
+- Config schema types (ConfigSettingDefinition, ConfigSchema, ConfigSettingType) are defined in platform/shared/src/manifest.ts and re-exported from platform/shared/src/index.ts
+- parsePluginPackageJson validates configSchema with full field-level validation before urlPatterns validation, enabling the relaxation logic
+- ConfigStatePlugin in index.ts uses `import('./manifest.js').ConfigSchema` for the configSchema field type to avoid circular re-exports
+- The VALID_SETTING_TYPES set in manifest.ts is the source of truth for allowed setting types: url, string, number, boolean, select
+- PluginManifestOutput in build.ts is the shape of dist/tools.json — add new top-level fields here alongside sdkVersion, icons, and tools
+- validatePlugin and generateManifest in build.ts are exported via a bottom-of-file `export {}` block and tested in build.test.ts
+- OpentabsConfig in config.ts has settings, localPlugins, and permissions — all three must be preserved in savePluginPermissions
+- configSchema flows: package.json → shared parsing → plugin-tools build (dist/tools.json) → loader.ts → RegisteredPlugin → discovery settings resolution
+- Settings resolution (settings-resolver.ts) runs between Phase 4 (merge) and Phase 5 (buildRegistry) in discovery.ts
+- url-type settings derive Chrome match patterns via `*://hostname/*` and populate homepage if static homepage is undefined
+- Settings are injected into tab MAIN world before the adapter IIFE via injectPluginConfig in iife-injection.ts, setting globalThis.__openTabs.pluginConfig
+- resolvedSettings flows: server buildConfigStatePayload/resolvePluginSettings → sync.full/plugin.update → extension validatePluginPayload → PluginMeta storage → injectAdapterFile → MAIN world
+- PluginState in bridge.ts inherits configSchema and resolvedSettings from ConfigStatePlugin via Omit<ConfigStatePlugin, 'tools'> — no explicit type changes needed
+- PluginMenu uses an onConfigOpen callback prop from PluginCard (which owns the ConfigDialog state) to trigger the settings dialog
+- needsSetup helper is exported from ConfigDialog.tsx and reused in PluginCard for badge visibility and content area switching
+- ConfigDialog uses uncontrolled form pattern (defaultValue + formRef) for commit-on-save behavior — avoids fighting user input with React re-renders
+- Radix Select requires a name prop for form access (unlike Input which uses native form.elements.namedItem)
+- Switch (boolean) fields use data-key attribute and data-state="checked" for form reading since Switch is not a native form element
+- Side panel → background message relay handlers live in background-message-handlers.ts (not background.ts) and use sendServerRequest for JSON-RPC relay
+- New bg:* message types need: interface in extension-messages.ts, handler in background-message-handlers.ts, entry in backgroundHandlers map, entry in EXTENSION_ONLY_TYPES, and export
+- pluginNameFromPackage derives the short plugin name used as the settings key — it strips PLUGIN_PREFIX and @opentabs-dev scope
+- CLI plugin discovery (findPluginDir) checks local plugins first, then global npm via resolvePluginPackageCandidates candidates
+- Settings in config.json use the short plugin name as key (e.g., settings.slack not settings.@opentabs-dev/opentabs-plugin-slack)
+
+## 2026-03-14 21:45 - US-001
+- Implemented ConfigSettingDefinition, ConfigSettingType, ConfigSchema types in platform/shared/src/manifest.ts
+- Added configSchema field to PluginOpentabsField interface
+- Added configSchema parsing and validation in parsePluginPackageJson with full field-level validation
+- Relaxed urlPatterns validation: empty urlPatterns allowed when configSchema contains at least one required url-type field
+- Added configSchema and resolvedSettings optional fields to ConfigStatePlugin in index.ts
+- Exported new types from manifest.ts and re-exported from index.ts barrel
+- Added 18 unit tests covering all configSchema validation paths and urlPatterns relaxation scenarios
+- Files changed:
+  - platform/shared/src/manifest.ts (types, validation, exports)
+  - platform/shared/src/index.ts (re-exports, ConfigStatePlugin fields)
+  - platform/shared/src/manifest.test.ts (18 new tests)
+- **Learnings for future iterations:**
+  - configSchema is parsed before urlPatterns in the function to enable the relaxation check
+  - The urlPatterns field must still be present as an array even when empty — only the non-empty requirement is relaxed
+  - Use spread with conditional objects for optional fields in the validated output to avoid undefined keys
+---
+
+## 2026-03-14 21:50 - US-002
+- Created platform/plugin-sdk/src/config.ts with getConfig(key) utility that reads from globalThis.__openTabs.pluginConfig
+- Added optional configSchema property (typed as ConfigSchema) to OpenTabsPlugin class in index.ts
+- Re-exported ConfigSchema, ConfigSettingDefinition, ConfigSettingType from @opentabs-dev/shared via plugin-sdk index.ts
+- Created platform/plugin-sdk/src/config.test.ts with 6 unit tests covering string/number/boolean values, missing keys, and undefined globalThis states
+- Files changed:
+  - platform/plugin-sdk/src/config.ts (new — getConfig utility)
+  - platform/plugin-sdk/src/config.test.ts (new — 6 tests)
+  - platform/plugin-sdk/src/index.ts (configSchema on OpenTabsPlugin, re-exports, getConfig export)
+- **Learnings for future iterations:**
+  - The globalThis.__openTabs pattern is shared across SDK utilities (tokenCache in storage.ts, pluginConfig in config.ts)
+  - Plugin-sdk re-exports types from shared for plugin author convenience — use `export type {}` for pure types
+  - The biome pre-commit hook auto-formats type exports into multi-line when there are multiple items
+---
+
+## 2026-03-14 21:55 - US-003
+- Added configSchema field to PluginManifestOutput interface in build.ts
+- Updated generateManifest to include configSchema in dist/tools.json when plugin defines one (omitted for empty/undefined)
+- Relaxed validatePlugin to allow empty urlPatterns when configSchema contains a required url-type field
+- Added 6 tests: 3 for validatePlugin urlPatterns relaxation, 3 for generateManifest configSchema serialization
+- Files changed:
+  - platform/plugin-tools/src/commands/build.ts (import ConfigSchema, PluginManifestOutput, generateManifest, validatePlugin)
+  - platform/plugin-tools/src/commands/build.test.ts (import ConfigSchema, 6 new tests)
+- **Learnings for future iterations:**
+  - The build.ts exports are at the bottom of the file in a single `export {}` block — all internal functions are accessible to tests
+  - The spread-with-conditional pattern `...(condition ? { field: value } : {})` is the standard for optional manifest fields
+  - biome pre-commit hook auto-reformats multi-line expressions (e.g., breaks `const hasRequiredUrlSetting = plugin.configSchema &&` into wrapped form)
+---
+
+## 2026-03-14 22:05 - US-004
+- Added `settings: Record<string, Record<string, unknown>>` to OpentabsConfig interface
+- Added `parseSettingsConfig` helper to parse and validate nested settings structure from config.json
+- Updated `parseConfigRecord` to include settings field
+- Updated `loadConfig` default config to include empty settings
+- Updated `savePluginPermissions` read-modify-write to preserve settings field
+- Added `configSchema: ConfigSchema | undefined` to LoadedPlugin interface in loader.ts
+- Read configSchema from tools.json manifest object in `loadPlugin`
+- Added `configSchema?: ConfigSchema` to RegisteredPlugin interface in state.ts
+- Created `settings-resolver.ts` with `resolvePluginSettings` function that derives Chrome match patterns from url-type settings
+- Integrated settings resolution in discovery.ts between Phase 4 (merge) and Phase 5 (buildRegistry)
+- Threaded `config.settings` through `reload.ts` → `discoverPlugins` → resolution pipeline
+- Added 16 unit tests for settings resolver covering all setting types, invalid URLs, and edge cases
+- Added 5 unit tests for config settings parsing and preservation
+- Files changed:
+  - platform/mcp-server/src/config.ts (OpentabsConfig, parseSettingsConfig, parseConfigRecord, loadConfig, savePluginPermissions)
+  - platform/mcp-server/src/config.test.ts (settings parsing tests, savePluginPermissions preservation)
+  - platform/mcp-server/src/loader.ts (ConfigSchema import, LoadedPlugin, loadPlugin)
+  - platform/mcp-server/src/state.ts (ConfigSchema import, RegisteredPlugin)
+  - platform/mcp-server/src/discovery.ts (settings-resolver import, Phase 4.5 resolution, pluginSettings param)
+  - platform/mcp-server/src/reload.ts (pass config.settings to discoverPlugins)
+  - platform/mcp-server/src/settings-resolver.ts (new — resolvePluginSettings, deriveMatchPattern)
+  - platform/mcp-server/src/settings-resolver.test.ts (new — 16 tests)
+- **Learnings for future iterations:**
+  - OpentabsConfig is only used within the mcp-server package — no cross-package updates needed
+  - The discovery pipeline uses LoadedPlugin → RegisteredPlugin structural compatibility via buildRegistry accepting `readonly RegisteredPlugin[]`
+  - savePluginPermissions does a read-modify-write on config.json — new fields must be preserved in the write-back
+  - configSchema is read from tools.json manifest (set by `opentabs-plugin build` in US-003)
+  - Settings resolution produces a new object with spread (...plugin) — does not mutate LoadedPlugin
+---
+
+## 2026-03-14 22:15 - US-005
+- Added `pluginSettings` field to ServerState interface and `createState`, bumped STATE_SCHEMA_VERSION to 7
+- Added `savePluginSettings` function to config.ts following the savePluginPermissions read-modify-write pattern
+- Updated `buildConfigStatePayload` to include configSchema and resolvedSettings per plugin by calling `resolvePluginSettings`
+- Added `handleConfigSetPluginSettings` handler with full schema validation (type checking, required fields, select options)
+- Added `config.setPluginSettings` JSON-RPC method routing in extension-protocol.ts
+- Added POST /plugin-settings HTTP endpoint with bearer auth and rate limiting for CLI use
+- Threaded `pluginSettings` through `reloadCore` (loaded from config.json on each reload)
+- Added `onPluginSettingsPersist` callback to McpCallbacks interface, wired in http-routes.ts
+- Added 7 unit tests for handler validation, 3 for HTTP endpoint auth/validation, 2 for settings persistence
+- Files changed:
+  - platform/mcp-server/src/state.ts (pluginSettings field, STATE_SCHEMA_VERSION bump)
+  - platform/mcp-server/src/config.ts (savePluginSettings, export)
+  - platform/mcp-server/src/config.test.ts (savePluginSettings round-trip tests)
+  - platform/mcp-server/src/extension-handlers.ts (handleConfigSetPluginSettings, buildConfigStatePayload update, McpCallbacks)
+  - platform/mcp-server/src/extension-handlers.test.ts (7 new handler tests)
+  - platform/mcp-server/src/extension-protocol.ts (config.setPluginSettings routing)
+  - platform/mcp-server/src/extension-protocol.test.ts (noopCallbacks fix)
+  - platform/mcp-server/src/http-routes.ts (POST /plugin-settings, onPluginSettingsPersist)
+  - platform/mcp-server/src/http-routes.test.ts (3 new endpoint tests)
+  - platform/mcp-server/src/mcp-setup-dispatch.test.ts (noopCallbacks fix)
+  - platform/mcp-server/src/reload.ts (thread pluginSettings through reloadCore)
+- **Learnings for future iterations:**
+  - Adding a new field to McpCallbacks requires updating noopCallbacks in 3 test files: extension-handlers.test.ts, extension-protocol.test.ts, mcp-setup-dispatch.test.ts
+  - extension-protocol.test.ts has both a shared noopCallbacks and many inline callback objects — both need updating
+  - buildConfigStatePayload constructs ConfigStatePlugin objects — resolvedSettings are computed live from state.pluginSettings and the plugin's configSchema
+  - The POST /plugin-settings endpoint follows the same pattern as POST /reload: bearer auth, rate limiting, JSON body, then reload + plugins.changed broadcast
+  - handleConfigSetPluginSettings is async (unlike handleConfigSetPluginPermission) because it awaits callbacks.onReload() for URL pattern re-derivation
+---
+
+## 2026-03-14 22:25 - US-006
+- Included resolvedSettings in sync.full payload by spreading from configPlugin in sendSyncFull
+- Included resolvedSettings in plugin.update payload by computing via resolvePluginSettings in sendPluginUpdate
+- Added resolvedSettings field to ValidatedPluginPayload, PluginMeta, and toPluginMeta
+- Added parseResolvedSettings helper in message-router.ts for defensive validation of settings from WebSocket
+- Created injectPluginConfig function in iife-injection.ts that sets globalThis.__openTabs.pluginConfig via chrome.scripting.executeScript MAIN world injection
+- Modified injectAdapterFile to accept and inject resolvedSettings before the adapter IIFE runs
+- Threaded resolvedSettings through injectPluginIntoMatchingTabs → injectAdapterFile in all 3 code paths: sync.full, plugin.update, and reinjectStoredPlugins/injectPluginsIntoTab
+- Files changed:
+  - platform/mcp-server/src/extension-protocol.ts (sync.full + plugin.update include resolvedSettings, import resolvePluginSettings)
+  - platform/browser-extension/src/extension-messages.ts (PluginMeta.resolvedSettings)
+  - platform/browser-extension/src/message-router.ts (ValidatedPluginPayload, toPluginMeta, parseResolvedSettings, caller updates)
+  - platform/browser-extension/src/iife-injection.ts (injectPluginConfig, injectAdapterFile + callers updated)
+- **Learnings for future iterations:**
+  - Settings injection follows the same pattern as injectLogRelay/injectReadinessRelay: executeScript MAIN world before the adapter file
+  - injectPluginIntoMatchingTabs has 8+ params — resolvedSettings is the last optional one to avoid breaking existing callers
+  - sendSyncFull already computes configPlugin via buildConfigStatePayload which includes resolvedSettings — just needs spreading
+  - sendPluginUpdate has no configPlugin — must compute resolvedSettings directly via resolvePluginSettings
+  - parseResolvedSettings filters to only string/number/boolean values as defense-in-depth against malformed server payloads
+---
+
+## 2026-03-14 22:30 - US-007
+- Created ConfigDialog.tsx component with dynamic form field rendering from configSchema
+  - Input for url/string, number input for number, Switch for boolean, Select for select type
+  - URL validation via `new URL()`, required field enforcement, error display
+  - Uncontrolled form with commit-on-save via formRef
+  - Saves via setPluginSettings bridge function
+- Added NeedsSetup badge (Settings icon + "Needs Setup" Badge) to PluginCard header
+- Added Configure button in card content area when plugin has unconfigured required fields (replaces tool list)
+- Added Settings menu item (Cog icon) to PluginMenu, visible when plugin has configSchema
+- Added setPluginSettings function to bridge.ts for side panel -> background communication
+- Created ConfigDialog.stories.tsx with 8 stories: UrlField, StringField, NumberField, BooleanField, SelectField, PreFilledValues, AllFieldTypes, AllFieldTypesThemePair
+- Files changed:
+  - platform/browser-extension/src/side-panel/components/ConfigDialog.tsx (new)
+  - platform/browser-extension/src/side-panel/components/ConfigDialog.stories.tsx (new)
+  - platform/browser-extension/src/side-panel/components/PluginCard.tsx (NeedsSetup badge, Configure button, ConfigDialog integration)
+  - platform/browser-extension/src/side-panel/components/PluginMenu.tsx (Settings menu item, onConfigOpen prop)
+  - platform/browser-extension/src/side-panel/bridge.ts (setPluginSettings function)
+- **Learnings for future iterations:**
+  - PluginState inherits configSchema/resolvedSettings from ConfigStatePlugin automatically — no type changes needed in bridge.ts
+  - PluginMenu uses callback prop (onConfigOpen) from PluginCard which owns ConfigDialog state
+  - Radix Switch is not a native form element — use data-key + data-state attributes for form reading
+  - Radix Select needs name prop for form.elements.namedItem access
+  - Biome lint enforces CSS class sorting (useSortedClasses) — text-[11px] before text-muted-foreground
+---
+
+## 2026-03-14 22:35 - US-008
+- Added BgSetPluginSettingsMessage interface to extension-messages.ts with type 'bg:setPluginSettings', plugin, and settings fields
+- Added it to the InternalMessage discriminated union
+- Created handleBgSetPluginSettings handler in background-message-handlers.ts that relays to MCP server via sendServerRequest('config.setPluginSettings', ...)
+- Registered handler in backgroundHandlers dispatch map and EXTENSION_ONLY_TYPES guard set
+- Exported handler for testing
+- config.setPluginSettings routing in extension-protocol.ts was already done in US-005 (line 549)
+- Files changed:
+  - platform/browser-extension/src/extension-messages.ts (BgSetPluginSettingsMessage type, InternalMessage union)
+  - platform/browser-extension/src/background-message-handlers.ts (handler, dispatch map, EXTENSION_ONLY_TYPES, export)
+- **Learnings for future iterations:**
+  - Side panel → background message handlers live in background-message-handlers.ts, not background.ts
+  - The handler pattern uses sendServerRequest (from server-request.ts) to relay JSON-RPC to the MCP server, not sendToServer directly
+  - EXTENSION_ONLY_TYPES prevents content scripts from sending privileged bg:* messages
+  - The config.setPluginSettings server-side routing was already wired in US-005 — this story only needed the extension-side relay
+---
+
+## 2026-03-14 22:42 - US-009
+- Added `opentabs plugin configure <name>` interactive CLI command
+- Implemented pluginNameFromPackage (mirrors mcp-server/src/loader.ts logic) to derive short plugin names
+- Implemented findPluginDir to locate plugins on disk (scans local plugins first, then global npm)
+- Implemented readPluginConfigSchema to read configSchema from dist/tools.json manifest
+- Added getPluginSettings helper to config.ts for reading per-plugin settings from config.json
+- Interactive prompt using Node.js readline/promises:
+  - URL fields validated with `new URL()`
+  - Select fields show numbered options, accept number or value directly
+  - Boolean fields accept yes/y/true/1 and no/n/false/0
+  - Number fields validated with `Number()` and `Number.isNaN()`
+  - Required fields enforced (reprompts on empty)
+  - Current values shown as defaults (press Enter to keep)
+- Settings saved to config.json under `settings.<pluginShortName>` map
+- Server notified via POST /reload (best-effort, works offline)
+- Registered as `opentabs plugin configure` with alias `config`
+- Files changed:
+  - platform/cli/src/commands/plugin.ts (configure handler, helpers, registration, exports)
+  - platform/cli/src/commands/plugin.test.ts (14 new tests for pluginNameFromPackage, readPluginConfigSchema, findPluginDir)
+  - platform/cli/src/config.ts (getPluginSettings helper)
+  - platform/cli/src/config.test.ts (7 new tests for getPluginSettings)
+- **Learnings for future iterations:**
+  - pluginNameFromPackage is duplicated between CLI and mcp-server — the shared package exports PLUGIN_PREFIX but not this function
+  - findPluginDir scans local plugins first (matching server's local-overrides-npm convention)
+  - The settings key in config.json uses the short plugin name (e.g., "slack") not the npm package name
+  - readline/promises createInterface works well for interactive CLI prompts, no external deps needed
+  - The configure command uses notifyServer (POST /reload) not POST /plugin-settings — settings are saved to disk and the server re-reads config.json on reload
+---
+
+## 2026-03-14 22:50 - US-010
+- Added `setting.<plugin>.<key>` prefix to `opentabs config set` for non-interactive plugin settings
+- Added `handleSetSetting` function following the same pattern as handleSetToolPermission/handleSetPluginPermission
+- Empty string value removes the key; prunes empty plugin entries and settings map
+- Updated `handleConfigSet` to allow empty string for setting.* keys (bypasses the "Missing value" guard)
+- Updated `config show` to display a `settings` section with per-plugin key-value pairs
+- Updated `config show --json` to include settings (via normalizeConfigForDisplay)
+- Added `SETTING_PREFIX`, updated `SUPPORTED_KEYS`, `KNOWN_KEYS`, `CANONICAL_CONFIG_SECTIONS`
+- Added `needsSetup` boolean to health endpoint's pluginDetails (computed from configSchema required fields vs pluginSettings)
+- Added `needsSetup` field to CLI's `HealthPluginDetail` interface
+- Added `⚙ needs setup` yellow indicator in `opentabs plugin list` output
+- Added 9 unit tests: 6 for handleSetSetting, 1 for suggestKey setting prefix, 3 for normalizeConfigForDisplay settings
+- Files changed:
+  - platform/cli/src/commands/config.ts (SETTING_PREFIX, handleSetSetting, config show settings, SUPPORTED_KEYS, KNOWN_KEYS, CANONICAL_CONFIG_SECTIONS, handleConfigSet, normalizeConfigForDisplay, exports)
+  - platform/cli/src/commands/config.test.ts (handleSetSetting tests, suggestKey test, normalizeConfigForDisplay tests)
+  - platform/cli/src/commands/plugin.ts (HealthPluginDetail.needsSetup, setupIndicator in handlePluginList)
+  - platform/mcp-server/src/http-routes.ts (needsSetup computation in health endpoint pluginDetails)
+- **Learnings for future iterations:**
+  - handleConfigSet has an early-return guard for empty value that must be bypassed for setting.* keys
+  - The setting key format `setting.<plugin>.<key>` uses the first dot after the prefix to split plugin from key
+  - handleSetSetting uses the same read-modify-write + atomicWriteConfig + notifyServer pattern as the permission handlers
+  - Health endpoint pluginDetails can be extended with computed fields from state (e.g., needsSetup from configSchema + pluginSettings)
+  - CANONICAL_CONFIG_SECTIONS controls the order of sections in config show and normalizeConfigForDisplay
+---
+
+## 2026-03-14 22:55 - US-011
+- Added configSchema to E2eTestPlugin class with instanceUrl (optional url) and testString (optional string)
+- Added matching configSchema to package.json opentabs field
+- Created sdk-get-config.ts tool using defineTool + getConfig from plugin-sdk
+- Imported sdkGetConfig and added to tools array in index.ts
+- urlPatterns kept as-is ['http://localhost/*'] — tests hybrid mode (static + optional config-derived)
+- Plugin builds successfully with 29 tools including sdk_get_config
+- Files changed:
+  - plugins/e2e-test/src/index.ts (configSchema, sdkGetConfig import and tools entry)
+  - plugins/e2e-test/src/tools/sdk-get-config.ts (new — tool that reads config via getConfig)
+  - plugins/e2e-test/package.json (configSchema in opentabs field)
+- **Learnings for future iterations:**
+  - Plugin node_modules contains published @opentabs-dev/* packages which may not have the latest platform changes — need to copy platform dist/ into plugin node_modules for type-checking
+  - configSchema fields use `as const` for type literals in TypeScript class declarations
+  - instanceUrl is optional (required: false) because the e2e-test plugin already has static urlPatterns — this tests the hybrid scenario
+---
+
+## 2026-03-14 22:58 - US-012
+- Added "Plugin Settings" subsection to root CLAUDE.md Key Concepts section covering configSchema, settings resolution, url-type pattern derivation, getConfig, and the three user surfaces
+- Created platform/shared/CLAUDE.md documenting ConfigSettingType, ConfigSettingDefinition, ConfigSchema types and the browser context warning about barrel imports
+- Added "Plugin Settings" section to platform/plugin-sdk/CLAUDE.md documenting configSchema property, getConfig utility, and type re-exports
+- Added "Config Schema in tools.json" section to platform/plugin-tools/CLAUDE.md documenting configSchema serialization and relaxed urlPatterns validation
+- Added "Plugin Settings" section to platform/mcp-server/CLAUDE.md documenting settings resolution, ConfigStatePlugin fields, savePluginSettings, POST /plugin-settings, and config.setPluginSettings
+- Added "Plugin Settings UI" section to platform/browser-extension/CLAUDE.md documenting ConfigDialog, needsSetup helper, NeedsSetup badge, Settings menu item, and bg:setPluginSettings message
+- Added "Plugin Settings Commands" section to platform/cli/CLAUDE.md documenting opentabs plugin configure, config set setting.*, and plugin list needsSetup indicator
+- Added "Plugin Settings (configSchema)" section to plugins/CLAUDE.md with full TypeScript + JSON example showing declaration pattern, empty urlPatterns, getConfig usage, and the three user surfaces
+- Files changed:
+  - CLAUDE.md (root — Key Concepts section)
+  - platform/shared/CLAUDE.md (new)
+  - platform/plugin-sdk/CLAUDE.md (Plugin Settings section)
+  - platform/plugin-tools/CLAUDE.md (Config Schema in tools.json section)
+  - platform/mcp-server/CLAUDE.md (Plugin Settings section)
+  - platform/browser-extension/CLAUDE.md (Plugin Settings UI section)
+  - platform/cli/CLAUDE.md (Plugin Settings Commands section)
+  - plugins/CLAUDE.md (Plugin Settings section)
+- **Learnings for future iterations:**
+  - The Edit tool requires the file to have been read in the current tool-use context — re-read the file if "File has not been read yet" errors appear mid-session
+  - platform/shared/CLAUDE.md did not exist — created it fresh since the acceptance criterion explicitly required documenting config schema types
+  - Documentation added at the end of each file (or before the final "Why..." section in plugin-sdk) to follow existing append-style conventions
+---
+
+## 2026-03-14 23:30 - US-013
+- Created e2e/plugin-settings.e2e.ts with 5 tests across 4 describe blocks:
+  1. Health endpoint includes configSchema fields for e2e-test plugin
+  2. Health endpoint needsSetup is false when all configSchema fields are optional
+  3. Writing settings to config.json and POST /reload preserves plugin with settings
+  4. sdk_get_config tool returns values configured via settings (full stack: settings → server → extension → adapter → getConfig)
+  5. Side panel shows Settings menu item in kebab menu and no NeedsSetup badge
+- Added needsSetup and configSchema fields to PluginDetail interface in e2e/fixtures.ts
+- Added settings field to OpentabsConfig interface in e2e/fixtures.ts for writeTestConfig
+- Fixed configSchema not reaching the Chrome extension side panel:
+  - sendSyncFull in extension-protocol.ts was not spreading configSchema from configPlugin into the sync.full payload
+  - sendPluginUpdate in extension-protocol.ts was not including configSchema in plugin.update payload
+  - extractServerOnlyFields in message-router.ts was not extracting configSchema and resolvedSettings from raw WebSocket payloads
+- Added configSchema to health endpoint pluginDetails in http-routes.ts
+- Files changed:
+  - e2e/plugin-settings.e2e.ts (new — 5 E2E tests)
+  - e2e/fixtures.ts (PluginDetail.needsSetup, PluginDetail.configSchema, OpentabsConfig.settings)
+  - platform/mcp-server/src/extension-protocol.ts (configSchema in sync.full + plugin.update)
+  - platform/mcp-server/src/http-routes.ts (configSchema in health endpoint)
+  - platform/browser-extension/src/message-router.ts (ConfigSchema import, ServerOnlyPluginFields, extractServerOnlyFields)
+- **Learnings for future iterations:**
+  - reloadCount in health endpoint tracks hot reloads (dev proxy restarts), not POST /reload config reloads — use the reload response directly
+  - The sync.full payload is built by sendSyncFull which selectively picks fields from configPlugin — new fields must be explicitly spread
+  - extractServerOnlyFields in the extension must match all server-only fields added to ConfigStatePlugin
+  - PluginMenu Settings menu item depends on plugin.configSchema being truthy — data must flow through server → sync.full → extension cache → bg:getFullState → side panel
+---
+
