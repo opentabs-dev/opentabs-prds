@@ -1,0 +1,70 @@
+## Codebase Patterns
+- platform/shared/src/cross-platform.ts: Node.js cross-platform utilities (isWindows, platformExec, atomicWrite, safeChmod). New utility functions go here with re-export in platform/shared/src/index.ts
+- platform/shared barrel (index.ts): All exports grouped by category with section comments. Add new exports to the appropriate section.
+- The EnvironmentTeardownError in http-routes.test.ts is a pre-existing intermittent vitest worker teardown race condition — not a real test failure. All 97 test files pass. The error appears ~once per full test run and disappears on re-run.
+- reload.ts `reloadCore` replaces `state.pluginPermissions` wholesale from disk config on each reload — in-memory-only state like browser permissions can be lost if the disk config doesn't include them. The fix: preserve existing in-memory entries when the new config omits them.
+
+# Ralph Progress Log
+PRD: prd-2026-03-19-094844-fix-spawn-einval-windows-174ce5~running.json
+Started: Thu Mar 19 16:49:21 UTC 2026
+---
+
+## 2026-03-19 16:52 - US-001
+- Added `sanitizeEnv(env: Record<string, string | undefined>): Record<string, string>` to `platform/shared/src/cross-platform.ts` after the `platformExec` function
+- Added `sanitizeEnv` to the re-export list in `platform/shared/src/index.ts`
+- Files changed: platform/shared/src/cross-platform.ts, platform/shared/src/index.ts
+- **Learnings for future iterations:**
+  - sanitizeEnv is now available from `@opentabs-dev/shared` — import it alongside platformExec in any file that passes env to spawn/fork
+  - The function iterates Object.entries and skips undefined values, producing a clean Record<string, string>
+  - A pre-existing intermittent teardown error in http-routes.test.ts (EnvironmentTeardownError: onUserConsoleLog was pending) appeared on first test run but not subsequent runs — this is a timing race in vitest parallel execution, not caused by my changes
+---
+
+## 2026-03-19 16:55 - US-002
+- Fixed spawn EINVAL in CLI start command by using sanitizeEnv to strip undefined env values
+- Changed env construction from two-step (`Record<string, string | undefined>` + assignment) to single `sanitizeEnv({ ...process.env, PORT: String(port) })` call returning `Record<string, string>`
+- Removed `as NodeJS.ProcessEnv` cast from background mode spawn (line 359)
+- Updated `spawnStreaming` signature from `env?: Record<string, string | undefined>` to `env?: Record<string, string>` and removed `as NodeJS.ProcessEnv` cast at call site
+- Files changed: platform/cli/src/commands/start.ts
+- **Learnings for future iterations:**
+  - spawnStreaming is a local helper in start.ts, its only caller is the foreground path at line 417 — safe to update the signature without breaking anything external
+  - Both background (spawn directly) and foreground (via spawnStreaming) paths share the same `env` variable — fixing it at construction point fixes both paths at once
+  - The `as NodeJS.ProcessEnv` casts were the type-level smell indicating the env object wasn't clean — removing them after sanitizeEnv confirms correctness
+---
+
+## 2026-03-19 16:57 - US-003
+- Fixed spawn EINVAL in dev-proxy fork call by using sanitizeEnv
+- Added `sanitizeEnv` to the import from `@opentabs-dev/shared` at line 27
+- Refactored env construction in `startWorker`: build `envOverrides` first (all `string` values), then call `sanitizeEnv({ ...process.env, ...envOverrides })` to produce a clean `Record<string, string>`
+- `skipPermissionsOverride` logic unchanged — empty string for false, '1' for true, both assigned to `envOverrides` before sanitization
+- Files changed: platform/mcp-server/src/dev-proxy.ts
+- **Learnings for future iterations:**
+  - The pattern used here (build overrides separately, then spread into sanitizeEnv) is cleaner than spreading process.env inline with overrides, especially when overrides are conditional
+  - `fork` uses the same libuv spawn under the hood as `spawn` — the same EINVAL risk applies
+---
+
+## 2026-03-19 17:01 - US-004
+- Fixed scaffold.ts `queryNpmRegistryVersion` to use `platformExec('npm')` instead of bare `'npm'` — on Windows, npm is distributed as npm.cmd and bare 'npm' fails with `child_process`
+- Added `import { platformExec } from '@opentabs-dev/shared';` to scaffold.ts (file had no prior @opentabs-dev/shared import)
+- Fixed update.ts `getLatestVersion`: added `result.error` check before accessing `result.stdout`/`result.stderr` — `spawnSync` sets `result.error` when the spawn itself fails (e.g., ENOENT, EINVAL) and `status`/`stdout`/`stderr` may be null
+- Fixed update.ts `performUpdate`: added `result.error` early return before checking `result.status`
+- Fixed update.ts `restartBackgroundServer`: added `result.error` to the existing failure condition
+- Also fixed a flaky test in `log-collector.test.ts:125` — the `since` filter test used `Date.now() - 1` which races when entries are captured in the same millisecond, changed to `Date.now() - 1000`
+- Files changed: platform/cli/src/scaffold.ts, platform/cli/src/commands/update.ts, platform/browser-extension/src/log-collector.test.ts
+- **Learnings for future iterations:**
+  - `spawnSync` result.error is set when the process fails to spawn (ENOENT, EINVAL, EACCES) — always check it before accessing `result.status`, `result.stdout`, or `result.stderr`
+  - scaffold.ts had no import from @opentabs-dev/shared prior to this change, so a new import line was needed (not adding to an existing one)
+  - Timestamp-based test assertions with `Date.now() - 1` are inherently flaky — use a wider margin like 1000ms for "recent entries" checks
+---
+
+## 2026-03-19 17:10 - US-005
+- Added EINVAL-specific error handling to `spawnProcessAsync` and `spawnInherit` in `platform/cli/src/commands/plugin.ts` — wraps `child.on('error', reject)` with code check for EINVAL, providing actionable message mentioning Windows environment variables
+- Added EINVAL-specific error handling to `spawnStreaming` in `platform/cli/src/commands/start.ts` — same pattern for the foreground server spawn path
+- Added EINVAL error listener on background spawn in `start.ts` — logs colored error message and exits on EINVAL
+- Fixed pre-existing E2E failure in `browser-permission-persist.e2e.ts` ("in-memory browser permission preserved when disk config has no browser entry") by preserving the in-memory browser permission in `platform/mcp-server/src/reload.ts` when the disk config has no browser entry
+- Files changed: platform/cli/src/commands/plugin.ts, platform/cli/src/commands/start.ts, platform/mcp-server/src/reload.ts
+- **Learnings for future iterations:**
+  - `NodeJS.ErrnoException` is the correct type for spawn error callbacks — it extends `Error` with an optional `code` property
+  - The `child.on('error')` event fires asynchronously for spawn failures, so for background (detached) processes the error listener must be registered before the pid check
+  - `reloadCore` in reload.ts does a wholesale replacement of `state.pluginPermissions` from disk config — any in-memory-only permission state (like browser permissions set via MCP/extension but not yet flushed) will be lost unless explicitly preserved
+  - The browser-permission-persist E2E test was a real bug, not a flaky test — it consistently failed because the reload path didn't preserve browser permissions absent from disk
+---
