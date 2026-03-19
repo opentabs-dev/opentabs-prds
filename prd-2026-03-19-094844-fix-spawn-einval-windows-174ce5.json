@@ -1,0 +1,83 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix 'Error: spawn EINVAL' that crashes the server on Windows. The root cause is passing environment objects with undefined values to child_process.spawn/fork, which libuv rejects on Windows. Also fix bare 'npm' commands that skip platformExec(), missing result.error checks on spawnSync, and add a sanitizeEnv helper to strip undefined values from env objects before spawning.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add sanitizeEnv utility to shared cross-platform module",
+      "description": "Add a sanitizeEnv function to platform/shared/src/cross-platform.ts that strips undefined values from environment objects, making them safe to pass to spawn/fork on all platforms.",
+      "acceptanceCriteria": [
+        "sanitizeEnv exported from @opentabs-dev/shared barrel",
+        "sanitizeEnv returns a new Record<string, string> with all undefined-valued keys removed",
+        "sanitizeEnv preserves all string-valued entries unchanged"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/shared/src/cross-platform.ts (add sanitizeEnv function)\n- platform/shared/src/index.ts (re-export sanitizeEnv)\n\nContext:\nNode.js child_process.spawn on Windows (libuv) throws EINVAL when the env option contains entries with undefined values. process.env values are typed as `string | undefined` in TypeScript, and spreading process.env into a new object preserves those undefined entries. On macOS/Linux this is silently tolerated, but on Windows it crashes with `Error: spawn EINVAL`.\n\nChanges:\nAdd after the existing `platformExec` function (around line 41):\n\n```ts\n/**\n * Strip undefined values from an environment object.\n *\n * `process.env` values are `string | undefined`. On Windows, libuv rejects\n * `undefined` values in the `env` option passed to `spawn` / `fork` with\n * `EINVAL`. This helper produces a clean `Record<string, string>` safe for\n * all platforms.\n */\nexport const sanitizeEnv = (env: Record<string, string | undefined>): Record<string, string> => {\n  const clean: Record<string, string> = {};\n  for (const [key, value] of Object.entries(env)) {\n    if (value !== undefined) clean[key] = value;\n  }\n  return clean;\n};\n```\n\nThen in platform/shared/src/index.ts, the existing re-export line:\n```ts\nexport { atomicWrite, isWindows, platformExec, safeChmod } from './cross-platform.js';\n```\nAdd `sanitizeEnv` to this list.\n\nConstraints:\n- Do NOT change any other functions in cross-platform.ts\n- Do NOT change the existing exports — only add sanitizeEnv to the barrel"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix spawn EINVAL in CLI start command (foreground and background modes)",
+      "description": "Use sanitizeEnv in platform/cli/src/commands/start.ts to strip undefined env values before passing to spawn, fixing the crash that Windows users hit when running 'opentabs start'.",
+      "acceptanceCriteria": [
+        "env object passed to spawn in both foreground (line 417) and background (line 359) modes is sanitized",
+        "No env value is undefined when passed to spawn",
+        "The cast `as NodeJS.ProcessEnv` is removed — sanitizeEnv returns the correct type"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/start.ts (fix env handling)\n\nContext:\nThe current code at line 314:\n```ts\nconst env: Record<string, string | undefined> = { ...process.env };\nenv.PORT = String(port);\n```\n\nThis env object is used in two places:\n1. Line 359-362 (background mode): `spawn(platformExec('node'), [serverEntry, ...serverArgs], { env: env as NodeJS.ProcessEnv, ... })`\n2. Line 417-420 (foreground mode via spawnStreaming): `spawnStreaming(platformExec('node'), [serverEntry, ...serverArgs], { env: env, ... })` which passes to `spawn` at line 40-43 with `env: opts?.env as NodeJS.ProcessEnv`\n\nChanges:\n1. Add import: `import { DEFAULT_PORT, isWindows, platformExec, sanitizeEnv, toErrorMessage } from '@opentabs-dev/shared';`\n2. Change line 314 from:\n```ts\nconst env: Record<string, string | undefined> = { ...process.env };\n```\nto:\n```ts\nconst env: Record<string, string> = sanitizeEnv({ ...process.env, PORT: String(port) });\n```\n3. Remove the separate `env.PORT = String(port);` assignment on line 315 (now inline above)\n4. At line 359-362, remove `as NodeJS.ProcessEnv` cast — sanitizeEnv already returns Record<string, string>:\n```ts\nconst child = spawn(platformExec('node'), [serverEntry, ...serverArgs], {\n  env: env,\n  stdio: ['ignore', logStream, logStream],\n  detached: true,\n});\n```\n5. Also update the spawnStreaming type signature at line 38. Change:\n```ts\nopts?: { cwd?: string; env?: Record<string, string | undefined>; stdin?: 'inherit' | 'pipe' | 'ignore' },\n```\nto:\n```ts\nopts?: { cwd?: string; env?: Record<string, string>; stdin?: 'inherit' | 'pipe' | 'ignore' },\n```\n6. And update line 42 to remove the cast:\n```ts\nenv: opts?.env,\n```\n\nConstraints:\n- Do NOT change any other behavior in start.ts\n- The PORT env var must still be set correctly\n- Keep the spawnStreaming function signature compatible with all its callers (only one caller at line 417)"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix spawn EINVAL in dev-proxy fork call",
+      "description": "Use sanitizeEnv in platform/mcp-server/src/dev-proxy.ts to strip undefined env values before passing to fork.",
+      "acceptanceCriteria": [
+        "env object passed to fork at line 222 is sanitized",
+        "No env value is undefined when passed to fork",
+        "skipPermissionsOverride logic still works correctly (empty string for false, '1' for true)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/dev-proxy.ts (fix env handling in startWorker)\n\nContext:\nThe current code at lines 214-222:\n```ts\nconst env: Record<string, string | undefined> = {\n  ...process.env,\n  PORT: '0',\n  OPENTABS_PROXY: '1',\n};\nif (skipPermissionsOverride !== null) {\n  env.OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS = skipPermissionsOverride ? '1' : '';\n}\nconst child = fork(WORKER_JS, ['--dev'], { env });\n```\n\nThe `env` type allows `undefined` values from `process.env` spread, which causes EINVAL on Windows when passed to `fork` (which uses the same libuv spawn under the hood).\n\nChanges:\n1. Add import: `import { sanitizeEnv } from '@opentabs-dev/shared';` (add to the existing import from @opentabs-dev/shared at line 27)\n2. Change lines 214-222 to:\n```ts\nconst envOverrides: Record<string, string> = {\n  PORT: '0',\n  OPENTABS_PROXY: '1',\n};\nif (skipPermissionsOverride !== null) {\n  envOverrides.OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS = skipPermissionsOverride ? '1' : '';\n}\nconst env = sanitizeEnv({ ...process.env, ...envOverrides });\nconst child = fork(WORKER_JS, ['--dev'], { env });\n```\n\nConstraints:\n- Do NOT change any other code in dev-proxy.ts\n- The fork behavior must remain identical — same args, same IPC channel\n- The skipPermissionsOverride logic must still work: empty string for false, '1' for true"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix bare 'npm' in scaffold.ts and missing result.error checks in update.ts",
+      "description": "Fix scaffold.ts using bare 'npm' instead of platformExec('npm'), and add result.error checks to spawnSync calls in update.ts that would throw on Windows.",
+      "acceptanceCriteria": [
+        "scaffold.ts queryNpmRegistryVersion uses platformExec('npm') instead of bare 'npm'",
+        "update.ts getLatestVersion checks result.error before accessing stdout/stderr",
+        "update.ts performUpdate checks result.error before accessing result.status",
+        "update.ts restartBackgroundServer checks result.error before accessing result.status"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/scaffold.ts (fix bare 'npm')\n- platform/cli/src/commands/update.ts (add result.error checks)\n\nContext:\nOn Windows, npm is distributed as npm.cmd. Node.js child_process does not search PATHEXT, so bare 'npm' fails. The platformExec helper handles this.\n\nChanges for scaffold.ts:\nLine 69 currently reads:\n```ts\nexecFile('npm', ['view', '@opentabs-dev/plugin-sdk', 'version'], { timeout: 5000 }, (error, stdout) => {\n```\nChange to:\n```ts\nexecFile(platformExec('npm'), ['view', '@opentabs-dev/plugin-sdk', 'version'], { timeout: 5000 }, (error, stdout) => {\n```\nAlso add the import. Currently scaffold.ts imports execFile from 'node:child_process' (line 1 area). Add platformExec to the imports from @opentabs-dev/shared. Check if scaffold.ts already imports from @opentabs-dev/shared — if so, add platformExec to that import. If not, add a new import line.\n\nChanges for update.ts:\n1. getLatestVersion (lines 34-44): Add a result.error check before accessing stdout/stderr:\n```ts\nconst getLatestVersion = (): string => {\n  const result = spawnSync(platformExec('npm'), ['view', CLI_PACKAGE_NAME, 'version'], {\n    stdio: ['ignore', 'pipe', 'pipe'],\n  });\n  if (result.error) {\n    throw new Error(`Failed to run npm: ${result.error.message}`);\n  }\n  const exitCode = result.status ?? 1;\n  if (exitCode !== 0) {\n    const stderr = result.stderr.toString().trim();\n    throw new Error(`npm view failed: ${stderr || `exit code ${exitCode}`}`);\n  }\n  return result.stdout.toString().trim();\n};\n```\n\n2. performUpdate (lines 170-174): Add result.error check:\n```ts\nconst performUpdate = (version: string): boolean => {\n  const target = `${CLI_PACKAGE_NAME}@${version}`;\n  const result = spawnSync(platformExec('npm'), ['install', '-g', target], { stdio: 'inherit' });\n  if (result.error) return false;\n  return (result.status ?? 1) === 0;\n};\n```\n\n3. restartBackgroundServer (lines 141-148): Add result.error check:\n```ts\nconst result = spawnSync(platformExec('node'), [cliEntry, ...startArgs], {\n  stdio: 'inherit',\n});\n\nif (result.error || (result.status ?? 1) !== 0) {\n  console.log(pc.yellow('Warning: Failed to restart server. Run manually:'));\n  console.log(pc.dim('  opentabs start --background'));\n}\n```\n\nConstraints:\n- Do NOT change any other behavior in update.ts or scaffold.ts\n- The error messages must remain helpful and actionable\n- Do NOT add sanitizeEnv to these files — they don't pass env objects to spawn"
+    },
+    {
+      "id": "US-005",
+      "title": "Add EINVAL-specific error messaging to CLI spawn helpers",
+      "description": "Add EINVAL detection to the CLI's spawn helper functions so users get an actionable error message instead of a raw stack trace when spawn fails with EINVAL.",
+      "acceptanceCriteria": [
+        "spawnProcessAsync in plugin.ts catches spawn errors with code EINVAL and wraps with actionable message",
+        "spawnInherit in plugin.ts catches spawn errors with code EINVAL and wraps with actionable message",
+        "spawnStreaming in start.ts provides EINVAL-specific error handling via its error reject path",
+        "Error message mentions Windows and suggests checking environment variables"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/plugin.ts (improve spawn error handling)\n- platform/cli/src/commands/start.ts (improve spawn error handling)\n\nContext:\nWhen spawn fails with EINVAL, Node.js throws a raw error like `Error: spawn EINVAL` with no context about what went wrong or how to fix it. The user in the Reddit thread saw exactly this error. Even after fixing the env sanitization (US-001 through US-003), there may be other EINVAL triggers (e.g., invalid command paths, corrupted PATH). We should catch EINVAL specifically and provide a helpful message.\n\nChanges for plugin.ts:\nIn spawnProcessAsync (lines 55-70), wrap the child.on('error', reject) to detect EINVAL:\n```ts\nchild.on('error', (err: NodeJS.ErrnoException) => {\n  if (err.code === 'EINVAL') {\n    reject(new Error(\n      `Failed to spawn '${cmd}': invalid argument (EINVAL). ` +\n      `This typically happens on Windows when environment variables contain invalid values. ` +\n      `Try running in a clean terminal.`\n    ));\n  } else {\n    reject(err);\n  }\n});\n```\n\nApply the same pattern to spawnInherit (lines 72-77):\n```ts\nchild.on('error', (err: NodeJS.ErrnoException) => {\n  if (err.code === 'EINVAL') {\n    reject(new Error(\n      `Failed to spawn '${cmd}': invalid argument (EINVAL). ` +\n      `This typically happens on Windows when environment variables contain invalid values. ` +\n      `Try running in a clean terminal.`\n    ));\n  } else {\n    reject(err);\n  }\n});\n```\n\nChanges for start.ts:\nIn spawnStreaming (lines 54-56), wrap the error handler:\n```ts\nchild.on('error', (err: NodeJS.ErrnoException) => {\n  if (err.code === 'EINVAL') {\n    reject(new Error(\n      `Failed to start server: invalid argument (EINVAL). ` +\n      `This typically happens on Windows when environment variables contain invalid values. ` +\n      `Try running in a clean terminal or check your system PATH.`\n    ));\n  } else {\n    reject(err);\n  }\n});\n```\n\nAlso add EINVAL detection in the background spawn path (around line 366-369). Currently:\n```ts\nconst pid = child.pid;\nif (pid === undefined) {\n  console.error(pc.red('Error: Failed to start background server process.'));\n  process.exit(1);\n}\n```\n\nAdd an error listener before the pid check:\n```ts\nchild.on('error', (err: NodeJS.ErrnoException) => {\n  if (err.code === 'EINVAL') {\n    console.error(pc.red('Error: Failed to start server: invalid argument (EINVAL).'));\n    console.error(pc.dim('This typically happens on Windows when environment variables contain invalid values.'));\n    console.error(pc.dim('Try running in a clean terminal or check your system PATH.'));\n  } else {\n    console.error(pc.red(`Error: Failed to start server: ${err.message}`));\n  }\n  process.exit(1);\n});\n```\n\nConstraints:\n- Do NOT change the happy-path behavior of any spawn call\n- The EINVAL message must be actionable — tell the user what to try\n- Keep the existing error handling for non-EINVAL errors unchanged\n- The `cmd` variable is available in scope for plugin.ts helpers (it's a parameter)"
+    }
+  ]
+}
