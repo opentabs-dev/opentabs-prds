@@ -1,0 +1,99 @@
+# Ralph Progress Log
+PRD: prd-2026-03-21-054727-github-actions-ci-b99c40~running.json
+Started: Sat Mar 21 12:47:53 UTC 2026
+---
+
+## Codebase Patterns
+- GitHub Actions workflows live in `.github/workflows/`
+- Two workflows already existed: `deploy-docs.yml` (Cloudflare deploy) and `publish-plugins.yml` (npm publish)
+- `npm run check` runs: build + build:plugins + storybook:build + lint + format:check + knip + test
+- `npm run storybook:build` delegates to `npm run --prefix platform/browser-extension storybook:build`
+- Use `npm ci` in CI for deterministic installs from package-lock.json
+- Existing README has badge markdown on lines 3-8
+
+## 2026-03-21 - US-001
+- Implemented: Created `.github/workflows/ci.yml` with main CI workflow
+- Files changed: `.github/workflows/ci.yml` (new file)
+- Workflow triggers on push to main and on pull_request
+- Uses concurrency group `ci-${{ github.ref }}` with cancel-in-progress
+- Runs on ubuntu-latest with Node.js 22
+- Caches node_modules via actions/cache with hash of package-lock.json
+- Steps: npm ci → build → storybook:build → lint → format:check → knip → test
+- **Learnings for future iterations:**
+  - The workflow structure matches the existing workflows' patterns (checkout, setup-node, then job-specific steps)
+  - E2E tests are NOT included in this job — they need xvfb-run for headed Chromium (separate job in US-002)
+  - Plugin checks are NOT included — plugins have separate node_modules (separate job in US-003)
+---
+
+## 2026-03-21 - US-002
+- Implemented: Added `e2e` job to `.github/workflows/ci.yml`
+- Files changed: `.github/workflows/ci.yml` (modified)
+- Job depends on `check` job via `needs: check`
+- Uses `xvfb-run --auto-servernum` for headed Chromium with extension support
+- Installs Playwright chromium with `--with-deps` for system dependencies
+- Sets `CI: '1'` env var to reduce Playwright workers to 2
+- 30-minute timeout for slow E2E runs
+- Uploads `playwright-report/` and `test-results/` as artifacts on failure (7-day retention)
+- **Learnings for future iterations:**
+  - The e2e-test plugin build is handled by `npm run test:e2e` itself — no separate build step needed
+  - `xvfb-run --auto-servernum` is the standard way to provide a virtual display on headless Linux CI
+  - `npx playwright install chromium --with-deps` installs both the browser and OS-level dependencies
+---
+
+## 2026-03-21 - US-003
+- Implemented: Added `plugins` job to `.github/workflows/ci.yml`
+- Files changed: `.github/workflows/ci.yml` (modified)
+- Job depends on `check` job via `needs: check`
+- Builds platform first (`npm run build`), then builds plugins (`npm run build:plugins`), then checks plugins (`npm run check:plugins`)
+- Caches root node_modules via actions/cache (same pattern as other jobs)
+- **Learnings for future iterations:**
+  - Plugins are standalone projects (not in npm workspaces) and depend on published `@opentabs-dev/*` packages from npm
+  - `npm run build:plugins` runs `tsx scripts/plugins.ts --build` which handles `npm install` + build for each plugin
+  - `npm run check:plugins` runs `tsx scripts/plugins.ts --check` which handles type-check + lint for each plugin
+  - Platform must be built first because `opentabs-plugin build` (from plugin-tools) is used during plugin builds
+---
+
+## 2026-03-21 - US-004
+- Implemented: Created `.github/workflows/ci-docs.yml` as a separate workflow for docs quality checks
+- Files changed: `.github/workflows/ci-docs.yml` (new file)
+- Workflow triggers on push to main and on pull_request, both with `paths: ['docs/**']` filter
+- Uses concurrency group `ci-docs-${{ github.ref }}` with cancel-in-progress
+- Runs on ubuntu-latest with Node.js 22
+- Uses `npm install` (not `npm ci`) because docs/ has no package-lock.json
+- Uses `working-directory: docs` for both install and check steps
+- Runs `npm run check` which delegates to: build + type-check + lint + knip + format:check
+- **Learnings for future iterations:**
+  - Docs has no package-lock.json, so use `npm install` (matching the pattern in deploy-docs.yml)
+  - The existing `deploy-docs.yml` uses `working-directory: docs` with `npm install` — same pattern followed here
+  - Separate workflow file (ci-docs.yml) is cleaner than adding a docs job to ci.yml — avoids noise on non-docs PRs
+  - `npm run check` in docs/package.json runs the full quality suite sequentially
+---
+
+## 2026-03-21 - US-005
+- Implemented: Added CI and Docs CI status badges to README.md
+- Files changed: `README.md`
+- Added two badges after the existing badge block (lines 3-8):
+  - `[![CI](...)` linking to `ci.yml` workflow runs
+  - `[![Docs](...)` linking to `ci-docs.yml` workflow runs
+- **Learnings for future iterations:**
+  - Existing badges are each on their own line in the markdown source but render inline (no blank lines between them)
+  - Badge markdown format: `[![Label](badge-svg-url)](workflow-url)` using GitHub Actions badge endpoint
+  - GitHub Actions badge URL pattern: `https://github.com/<owner>/<repo>/actions/workflows/<file>.yml/badge.svg`
+---
+
+## 2026-03-21 - US-006
+- Implemented: Added unit test at `platform/shared/src/ci-workflows.test.ts` validating all workflow YAML files
+- Files changed: `platform/shared/src/ci-workflows.test.ts` (new file)
+- 5 test cases:
+  1. Workflow directory exists and contains .yml files
+  2. Each workflow file is non-empty and has required top-level fields (name, on, jobs)
+  3. Each job has runs-on and steps
+  4. CI workflow has expected jobs (check, e2e, plugins)
+  5. CI docs workflow has expected structure (check job, docs/** path filter)
+- Uses string pattern matching (no YAML parser dependency) with helper functions for extracting top-level keys, job names, and job content
+- **Learnings for future iterations:**
+  - Vitest includes `platform/**/*.test.ts` — any test file in a platform package's src/ is auto-discovered
+  - `platform/shared/tsconfig.test.json` is referenced from root tsconfig, so test files there are type-checked
+  - Biome forbids non-null assertions (`!`) — use optional chaining (`?.`) instead
+  - Biome forbids adjacent spaces in regex — use `{2}` quantifier for readability
+---
