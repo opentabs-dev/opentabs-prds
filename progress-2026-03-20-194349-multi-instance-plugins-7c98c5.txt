@@ -1,0 +1,184 @@
+# Ralph Progress Log
+PRD: prd-2026-03-20-194349-multi-instance-plugins-7c98c5~running.json
+Started: Sat Mar 21 02:44:20 UTC 2026
+---
+
+## Codebase Patterns
+- url-type config field values are now `Record<string, string>` (instance name → URL) in config.json, not plain strings
+- Two paths set plugin settings: HTTP `POST /plugin-settings` (http-routes.ts, CLI) and WebSocket `config.setPluginSettings` (extension-handlers.ts, side panel) — both must validate consistently
+- Plugin configSchema is accessed via `state.registry.plugins.get(pluginName)?.configSchema`
+- resolvedValues type is `Record<string, unknown>` (not `Record<string, string | number | boolean>`) — url fields store maps, other fields store primitives
+- The resolvedSettings type flows through: settings-resolver.ts → ConfigStatePlugin (shared) → PluginMeta (extension-messages.ts) → ValidatedPluginPayload + ServerOnlyPluginFields (message-router.ts) → ConfigDialog props → injectPluginConfig. Changing the type requires updating all these.
+- parseResolvedSettings (message-router.ts) validates and passes through both primitives and plain objects (url field maps)
+- ResolvedSettings.instanceMap maps instance name → Chrome match pattern, built from all url-type config fields
+- Chrome match patterns from deriveMatchPattern are always `*://hostname/*` — hostname extraction via regex `/^\*:\/\/([^/]+)\/\*$/` is reliable
+- getMergedTabMapping merges tab mappings from all extension connections — use for cross-connection tab lookups
+- Platform-injected params (tabId, instance) are extracted via destructuring before Ajv validation and stripped from plugin args
+- Per-tab config resolution: `resolvePerTabSettings` in iife-injection.ts matches tab hostname against instanceMap patterns and replaces url field maps (Record<string, string>) with the single URL string for that tab's instance
+- instanceMap propagation in extension: 4 code paths must pass it: sync.full, plugin.update, tab.onUpdated (injectPluginsIntoTab), and extension startup (reinjectStoredPlugins)
+- `queryMatchingTabs` returns `{tabId, url}` pairs; `queryMatchingTabIds` is a thin wrapper returning just IDs
+- For multi-instance E2E tests, use localhost vs 127.0.0.1 as distinct instances since `deriveMatchPattern` strips ports (both `http://localhost:3000` and `http://localhost:4000` derive `*://localhost/*`)
+
+## 2026-03-21 02:49 UTC - US-001
+- Implemented url-type config field validation as Record<string, string> in both handlePluginSettings (HTTP route) and handleConfigSetPluginSettings (WebSocket handler)
+- Files changed:
+  - platform/mcp-server/src/http-routes.ts (added url map validation block in handlePluginSettings)
+  - platform/mcp-server/src/extension-handlers.ts (updated case 'url' validation in handleConfigSetPluginSettings)
+- **Learnings for future iterations:**
+  - There are two separate paths for setting plugin settings (HTTP and WebSocket) — both need consistent validation
+  - The extension-handlers.ts previously had `case 'url':` falling through to `case 'string':` — this was split into separate cases
+  - config.ts savePluginSettings already writes arbitrary JSON, so no changes needed there
+---
+## 2026-03-21 02:58 UTC - US-002
+- Updated resolvePluginSettings to handle Record<string, string> url config values (instance name → URL maps)
+- Added instanceMap field to ResolvedSettings interface (instance name → Chrome match pattern)
+- Widened resolvedValues type to Record<string, unknown> to accommodate url field maps
+- Propagated type change to ConfigStatePlugin.resolvedSettings in shared/src/index.ts
+- Updated browser extension types (PluginMeta, ValidatedPluginPayload, injectPluginConfig, parseResolvedSettings) to accept Record<string, unknown>
+- Updated parseResolvedSettings to pass through object values (url field maps) alongside primitives
+- Files changed:
+  - platform/mcp-server/src/settings-resolver.ts (core resolver logic)
+  - platform/mcp-server/src/settings-resolver.test.ts (updated + 10 new tests)
+  - platform/shared/src/index.ts (ConfigStatePlugin.resolvedSettings type)
+  - platform/browser-extension/src/extension-messages.ts (PluginMeta type)
+  - platform/browser-extension/src/iife-injection.ts (injection function signatures)
+  - platform/browser-extension/src/message-router.ts (parsing and type changes)
+  - platform/browser-extension/src/side-panel/components/ConfigDialog.tsx (needsSetup and props types)
+- **Learnings for future iterations:**
+  - Widening resolvedValues from Record<string, string | number | boolean> to Record<string, unknown> ripples to many downstream consumers — the browser extension has 5+ files that use this type
+  - The parseResolvedSettings function in message-router.ts strips non-primitive values by design — it must be updated to pass through object values when url fields store maps
+  - injectPluginConfig serializes settings via chrome.scripting.executeScript args — Record<string, unknown> serializes fine since the values are JSON-compatible
+  - ConfigDialog's needsSetup function only checks for null/undefined values, so it works with unknown type without logic changes
+---
+## 2026-03-21 03:00 UTC - US-003
+- Added instanceMap field to RegisteredPlugin (state.ts) and ConfigStatePlugin (shared/src/index.ts)
+- Updated discovery.ts to destructure instanceMap from resolvePluginSettings and pass it to RegisteredPlugin
+- Updated serializePluginForExtension in extension-handlers.ts to include instanceMap in return type and implementation
+- instanceMap is conditionally included (only when non-empty) to avoid cluttering payloads for plugins without multi-instance settings
+- Files changed:
+  - platform/mcp-server/src/state.ts (RegisteredPlugin interface)
+  - platform/shared/src/index.ts (ConfigStatePlugin interface)
+  - platform/mcp-server/src/discovery.ts (Phase 4.5 settings resolution)
+  - platform/mcp-server/src/extension-handlers.ts (serializePluginForExtension return type + body)
+- **Learnings for future iterations:**
+  - instanceMap flows through serializePluginForExtension which is used by both buildConfigStatePayload and sync.full/plugins.changed messages, so one change covers both paths
+  - The resolvedSettings type was already widened to Record<string, unknown> in US-002, so no additional type changes needed for ConfigStatePlugin
+  - serializePluginForExtension has an explicit return type annotation that must be updated when adding new fields
+---
+## 2026-03-21 03:05 UTC - US-004
+- Injected required `instance` string enum parameter into plugin tool schemas when instanceMap has 2+ entries
+- The enum values come directly from the plugin's instanceMap keys
+- Single-instance and no-instance plugins are unchanged
+- Files changed:
+  - platform/mcp-server/src/mcp-setup.ts (getAllToolsList function — added instance injection after tabId injection)
+- **Learnings for future iterations:**
+  - The getAllToolsList function in mcp-setup.ts is where all schema injection happens (tabId, instance) — it clones schemas via structuredClone so original ManifestTool schemas are never mutated
+  - The `required` array on clonedSchema may not exist (tools with no required params), so it must be initialized with `?? []`
+  - Browser tools and platform tools are in separate loops and are not affected by plugin-specific injections
+---
+## 2026-03-21 03:10 UTC - US-005
+- Extracted `instance` parameter alongside `tabId` from tool args before Ajv validation
+- Implemented `findTabForInstance` helper that resolves an instance's Chrome match pattern to a tab ID by matching hostnames against the merged tab mapping
+- Implemented `hostnameFromPattern` helper that extracts hostname from `*://hostname/*` patterns
+- Instance resolution prefers ready tabs over non-ready ones (fallback behavior)
+- When instance is provided, it takes precedence over tabId
+- Unknown instance names return an error listing valid instances
+- Missing tabs return an error telling the user to open the instance
+- Used `resolvedTabId` instead of `tabId` in the dispatch call
+- Files changed:
+  - platform/mcp-server/src/mcp-tool-dispatch.ts (imports, helpers, extraction, resolution, dispatch)
+- **Learnings for future iterations:**
+  - `getMergedTabMapping` merges tab mappings from all extension connections — use it for cross-connection tab lookups
+  - Chrome match patterns from deriveMatchPattern are always `*://hostname/*` — extracting the hostname via regex is reliable
+  - The dispatch call sends `tabId` as a top-level field in params — `resolveConnection` in extension-protocol.ts uses it to route to the correct extension connection
+  - `getConnectionForTab` scans all connections' tab mappings to find which connection owns a tab ID — this happens inside `resolveConnection` during dispatch
+---
+## 2026-03-21 03:15 UTC - US-006
+- Added instance labels to plugin_list_tabs output by matching each tab's URL hostname against the plugin's instanceMap patterns
+- Added `hostnameFromPattern` helper (duplicated from mcp-tool-dispatch.ts — small utility, not worth extracting to shared)
+- Added `annotateTabsWithInstance` helper that maps over tabs and attaches the matching instance name
+- Extended `AnnotatedTab` type with optional `instance` field
+- Applied annotation in both single-plugin and all-plugins code paths
+- Files changed:
+  - platform/mcp-server/src/browser-tools/plugin-list-tabs.ts
+- **Learnings for future iterations:**
+  - Chrome match patterns from deriveMatchPattern are always `*://hostname/*` — the `hostnameFromPattern` regex is simple and reliable
+  - The `annotateTabsWithInstance` function is a pure mapping — no state mutations, easy to test
+  - Both code paths (single plugin and all plugins) use the same annotation logic via the shared helper
+---
+## 2026-03-21 03:25 UTC - US-007
+- Implemented per-instance config injection: when a plugin has instanceMap, url-type fields are resolved to the single URL matching the tab's hostname before injection
+- Added `resolvePerTabSettings` helper that matches tab hostname against instanceMap patterns and replaces url field maps with single URL strings
+- Changed `queryMatchingTabIds` to `queryMatchingTabs` returning `{tabId, url}` pairs so tab URLs are available during injection
+- Kept `queryMatchingTabIds` as a thin wrapper for callers that only need IDs (e.g., `cleanupAdaptersInMatchingTabs`)
+- Added `instanceMap` to `PluginMeta` for chrome.storage persistence
+- Parsed `instanceMap` from wire payloads in `validatePluginPayload` via new `parseInstanceMap` helper
+- Propagated `instanceMap` through `toPluginMeta`, `handleSyncFull` cache, and `handlePluginUpdate` cache
+- Threaded `instanceMap` and `tabUrl` through `injectAdapterFile`, `injectPluginIntoMatchingTabs`, `injectPluginsIntoTab`, and `reinjectStoredPlugins`
+- Files changed:
+  - platform/browser-extension/src/extension-messages.ts (PluginMeta.instanceMap)
+  - platform/browser-extension/src/iife-injection.ts (resolvePerTabSettings, queryMatchingTabs, parameter threading)
+  - platform/browser-extension/src/message-router.ts (parseInstanceMap, ValidatedPluginPayload, toPluginMeta, cache construction)
+- **Learnings for future iterations:**
+  - `queryMatchingTabs` returns full tab info including URLs — callers that need per-tab config resolution should use this instead of `queryMatchingTabIds`
+  - `injectPluginsIntoTab` already receives `tabUrl` as a parameter (from chrome.tabs.onUpdated), so no additional chrome.tabs.get call is needed
+  - The `resolvePerTabSettings` fallback (first URL in map when no instance matches) prevents blank config for edge cases
+  - instanceMap must be propagated through 4 code paths: sync.full injection, plugin.update injection, tab.onUpdated injection, and extension startup re-injection
+---
+## 2026-03-21 03:25 UTC - US-008
+- Updated ConfigDialog to render url-type fields as a list of named instance entries (name/URL pairs) with add/remove functionality
+- Created InstanceUrlField component for the multi-instance UI within ConfigDialog
+- Added controlled state (`urlEntries`) for url fields, initialized from resolvedSettings (which contains the full Record<string, string> map)
+- Updated handleSave to validate url field entries (non-empty unique names, valid URLs) and build Record<string, string> for saving
+- Updated Storybook stories: Wrapper type widened to Record<string, unknown>, PreFilledValues story uses map format
+- All UI elements use retro theme tokens (border-2, border-border, rounded, shadow-sm, bg-card, text-destructive)
+- Files changed:
+  - platform/browser-extension/src/side-panel/components/ConfigDialog.tsx (InstanceUrlField component, url validation in handleSave, controlled state for url entries)
+  - platform/browser-extension/src/side-panel/components/ConfigDialog.stories.tsx (type update, map format for PreFilledValues)
+- **Learnings for future iterations:**
+  - resolvedSettings in ConfigStatePlugin already contains the full Record<string, string> map for url fields (from server-side resolvedValues), so no separate rawConfigValues field is needed for the ConfigDialog
+  - Per-tab resolution (resolvePerTabSettings) only happens during adapter injection in iife-injection.ts, not in the side panel data flow — the ConfigDialog sees the full map
+  - The uncontrolled form pattern (formRef) doesn't work for dynamic list fields — url fields use controlled state (useState) while other fields remain uncontrolled
+  - Required url fields enforce minimum 1 entry by hiding the remove button; optional fields allow removing all entries
+---
+## 2026-03-21 03:30 UTC - US-009
+- Updated CLI `promptField` to support multi-instance url prompting: for url-type fields, prompts for instance name + URL pairs
+- Widened `promptField` return type to `Promise<string | number | boolean | Record<string, string> | undefined>`
+- Added `promptInstance` inner function that validates instance names (non-empty, unique) and URLs (valid via `new URL()`)
+- Existing instances shown as defaults when re-configuring (pre-populates from currentValue Record<string, string>)
+- Users can add more instances by answering 'y' to "Add another instance?" prompt
+- Separated url and string handling into distinct branches (url is now its own `if` block)
+- Files changed:
+  - platform/cli/src/commands/plugin.ts (promptField function)
+- **Learnings for future iterations:**
+  - `handlePluginConfigure` already uses `Record<string, unknown>` for `newSettings`, so the wider return type from `promptField` is compatible without changes
+  - The `opentabs config set setting.<plugin>.<key>` command stores raw string values — it doesn't need changes since url fields are set interactively via `plugin configure`
+  - The url field branch now handles all URL validation; the string branch no longer checks for URL validity
+---
+## 2026-03-21 03:35 UTC - US-010
+- Added 9 unit tests for instance schema injection in mcp-setup.test.ts
+- Added 7 unit tests for instance dispatch and resolution in mcp-tool-dispatch.test.ts
+- Added getMergedTabMapping to the state.js mock in dispatch tests (was missing since it's imported from state.js, not extension-protocol.js)
+- Files changed:
+  - platform/mcp-server/src/mcp-setup.test.ts (new describe block: 'getAllToolsList — instance schema injection')
+  - platform/mcp-server/src/mcp-tool-dispatch.test.ts (new describe block: 'handlePluginToolCall — instance parameter', added getMergedTabMapping import and mock)
+- **Learnings for future iterations:**
+  - getMergedTabMapping is in state.ts (not extension-protocol.ts) — the state.js vi.mock factory must include it for tests that exercise instance resolution
+  - The existing test helpers (createMockState, createMockLookup, createMockCallbacks, createMockExtra) are sufficient for testing instance dispatch — no new test infrastructure needed
+  - Tab mapping mocks must include `state: 'ready'` and full PluginTabInfo objects (`{ tabId, url, title, ready }`) to match the TabMapping interface
+  - The vi.mock factory for state.js replaces the entire module — all used exports must be listed in the factory or they'll be undefined at runtime
+---
+## 2026-03-21 03:45 UTC - US-011
+- Added 6 E2E tests for multi-instance plugin dispatch in e2e/multi-instance.e2e.ts
+- Tests cover: instance labels in plugin_list_tabs, targeted dispatch via instance parameter, unknown instance error, per-tab getConfig, tool schema injection, missing instance tab error
+- Used localhost vs 127.0.0.1 as distinct instances to produce different match patterns (`*://localhost/*` vs `*://127.0.0.1/*`)
+- Two independent test servers verify dispatch isolation (alpha receives only alpha calls, beta receives only beta calls)
+- Files changed:
+  - e2e/multi-instance.e2e.ts (new file — 6 test cases)
+- **Learnings for future iterations:**
+  - `deriveMatchPattern` uses `url.hostname` which strips ports — so `http://localhost:3000` and `http://localhost:4000` both derive `*://localhost/*`. For E2E testing, use different hostnames (localhost vs 127.0.0.1) to produce distinguishable patterns
+  - Non-fixture E2E tests (using manual setup/cleanup instead of Playwright fixtures) must manually start MCP server, test servers, extension context, and MCP client — follow the pattern in plugin-settings.e2e.ts
+  - `startTestServer()` can be called multiple times to get independent test servers on different ephemeral ports
+  - The beta tab (127.0.0.1) doesn't use `openTestAppTab` helper since it relies on different diagnostics — use manual `page.goto` + `waitForFunction` for adapter injection instead
+  - `test.slow()` is needed for multi-instance tests since they start multiple servers and wait for adapter injection
+---
