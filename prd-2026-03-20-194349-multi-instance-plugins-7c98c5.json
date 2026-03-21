@@ -1,0 +1,192 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add multi-instance support for plugins with url-type config fields. When a url-type config value is a Record<string, string> (name→URL map), the platform derives match patterns for all URLs, injects instance-specific config per tab, adds an 'instance' parameter to tool schemas, and resolves instance names to tabs at dispatch time. Enables plugins like SQLPad to work with both production and staging simultaneously without any plugin code changes.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Change url config value type to Record<string, string>",
+      "description": "Change the url-type config field value from a plain string to always be a Record<string, string> (instance name → URL map). Update the shared types, manifest validation, and all config reading/writing code.",
+      "acceptanceCriteria": [
+        "url-type config values are stored as Record<string, string> in config.json",
+        "Manifest validation (parsePluginPackageJson) still allows empty urlPatterns when configSchema has a required url field",
+        "The ConfigSettingDefinition type is unchanged — the value shape change is in config.json storage, not the schema definition"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts (config read/write for settings)\n- platform/mcp-server/src/http-routes.ts (POST /plugin-settings validation)\n- platform/mcp-server/src/extension-handlers.ts (config.setPluginSettings handler)\n\nContext:\nCurrently url-type config values are stored as plain strings in config.json:\n```json\n{ \"settings\": { \"sqlpad\": { \"instanceUrl\": \"https://sqlpad.production.brexapps.io\" } } }\n```\n\nThe new format uses a named map:\n```json\n{ \"settings\": { \"sqlpad\": { \"instanceUrl\": { \"production\": \"https://sqlpad.production.brexapps.io\" } } } }\n```\n\nChanges:\n1. In http-routes.ts handlePluginSettings (line 447): the validation currently just checks `typeof body.settings === 'object'`. It passes the raw object through to `state.pluginSettings` and `savePluginSettings`. The url field values inside settings should now be validated as `Record<string, string>` when the matching configSchema field has `type: 'url'`. Find the registered plugin from `state.registry.plugins` by name, read its `configSchema`, and for each url-type field, validate the value is a non-empty `Record<string, string>` where every key is a non-empty string and every value is a valid URL string.\n\n2. In config.ts savePluginSettings: no changes needed — it already writes arbitrary JSON.\n\n3. In extension-handlers.ts handleConfigSetPluginSettings: no changes needed — it passes through to savePluginSettings.\n\nConstraints:\n- Do NOT change ConfigSettingDefinition or ConfigSchema types — those describe the schema, not the stored values\n- Do NOT change the config.json file format for non-url fields (string, number, boolean, select remain unchanged)\n- The http-routes validation should reject the old string format for url fields — no backwards compat"
+    },
+    {
+      "id": "US-002",
+      "title": "Update settings resolver for multi-instance URL patterns",
+      "description": "Update resolvePluginSettings to handle Record<string, string> url config values. Derive a match pattern for each URL in the map. Return an instanceMap mapping instance names to their URL patterns.",
+      "acceptanceCriteria": [
+        "resolvePluginSettings derives one match pattern per URL in the Record<string, string> map",
+        "ResolvedSettings includes an instanceMap field: Record<string, string> mapping instance name to derived match pattern",
+        "resolvedValues for url fields stores the full Record<string, string> map",
+        "effectiveHomepage is derived from the first URL in the map",
+        "Invalid URLs within the map are skipped with a warning"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/settings-resolver.ts (main logic)\n- platform/mcp-server/src/settings-resolver.test.ts (update existing tests + add new ones)\n\nContext:\nThe current url handling in resolvePluginSettings (line 62-76):\n```ts\nif (definition.type === 'url') {\n  if (typeof rawValue !== 'string' || rawValue.length === 0) {\n    log.warn(...);\n    continue;\n  }\n  const pattern = deriveMatchPattern(rawValue);\n  if (!pattern) { log.warn(...); continue; }\n  derivedPatterns.push(pattern);\n  resolvedValues[key] = rawValue;\n  if (!derivedHomepage) derivedHomepage = rawValue;\n}\n```\n\nChanges:\nReplace the url handling block to expect `Record<string, string>`:\n```ts\nif (definition.type === 'url') {\n  if (typeof rawValue !== 'object' || rawValue === null || Array.isArray(rawValue)) {\n    log.warn(`Plugin \"${pluginName}\" setting \"${key}\": expected a Record<string, string>, got ${typeof rawValue} — skipping`);\n    continue;\n  }\n  const urlMap = rawValue as Record<string, string>;\n  const validEntries: Record<string, string> = {};\n  for (const [instanceName, url] of Object.entries(urlMap)) {\n    if (typeof url !== 'string' || url.length === 0) {\n      log.warn(`Plugin \"${pluginName}\" setting \"${key}\" instance \"${instanceName}\": expected a URL string — skipping`);\n      continue;\n    }\n    const pattern = deriveMatchPattern(url);\n    if (!pattern) {\n      log.warn(`Plugin \"${pluginName}\" setting \"${key}\" instance \"${instanceName}\": invalid URL \"${url}\" — skipping`);\n      continue;\n    }\n    derivedPatterns.push(pattern);\n    validEntries[instanceName] = pattern;\n    if (!derivedHomepage) derivedHomepage = url;\n  }\n  if (Object.keys(validEntries).length > 0) {\n    instanceMap = { ...instanceMap, ...validEntries };\n    resolvedValues[key] = rawValue; // Store the full map — needed for per-tab config injection\n  }\n}\n```\n\nAdd `instanceMap` to ResolvedSettings interface:\n```ts\ninterface ResolvedSettings {\n  effectiveUrlPatterns: string[];\n  effectiveHomepage: string | undefined;\n  resolvedValues: Record<string, unknown>; // Changed from Record<string, string | number | boolean> to support url maps\n  instanceMap: Record<string, string>; // instance name → match pattern\n}\n```\n\nNote: `resolvedValues` type needs to widen to `Record<string, unknown>` since url fields now store `Record<string, string>` instead of `string`. This type change will ripple to `RegisteredPlugin.resolvedSettings` in state.ts and `ConfigStatePlugin.resolvedSettings` in shared/src/index.ts. The worker should update those types too.\n\nUpdate existing tests to use the new map format and add tests for:\n- Single-instance map: `{ instanceUrl: { production: 'https://prod.example.com' } }` → 1 pattern, instanceMap has 1 entry\n- Multi-instance map: `{ instanceUrl: { production: '...', staging: '...' } }` → 2 patterns, instanceMap has 2 entries\n- Mixed valid/invalid URLs in map\n- Empty map\n- Non-object url value (should warn and skip)\n\nConstraints:\n- deriveMatchPattern function is unchanged\n- Non-url field handling is unchanged\n- The resolvedValues for url fields stores the raw Record<string, string> from config (the URL values, not the patterns)"
+    },
+    {
+      "id": "US-003",
+      "title": "Store instanceMap on RegisteredPlugin and propagate to extension",
+      "description": "Add instanceMap to RegisteredPlugin in state.ts and include it in the ConfigStatePlugin payload sent to the extension. Update the discovery pipeline to pass instanceMap from resolved settings to the registered plugin.",
+      "acceptanceCriteria": [
+        "RegisteredPlugin has an instanceMap field: Record<string, string> (instance name → match pattern)",
+        "ConfigStatePlugin in shared/src/index.ts includes instanceMap",
+        "buildConfigStatePayload includes instanceMap in each plugin's serialized state",
+        "The extension receives instanceMap via sync.full and plugins.changed messages"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/state.ts (RegisteredPlugin interface, line 94)\n- platform/shared/src/index.ts (ConfigStatePlugin interface, around line 310)\n- platform/mcp-server/src/extension-handlers.ts (buildConfigStatePayload, serializePluginForExtension)\n- platform/mcp-server/src/discovery.ts or wherever RegisteredPlugin is constructed from resolved settings\n\nContext:\nRegisteredPlugin (state.ts line 94-125) currently has:\n```ts\nexport interface RegisteredPlugin {\n  name: string;\n  version: string;\n  urlPatterns: string[];\n  ...\n  configSchema?: ConfigSchema;\n}\n```\n\nConfigStatePlugin (shared/src/index.ts) currently has:\n```ts\ninterface ConfigStatePlugin {\n  ...\n  configSchema?: ConfigSchema;\n  resolvedSettings?: Record<string, string | number | boolean>;\n}\n```\n\nChanges:\n1. Add to RegisteredPlugin:\n```ts\n/** Instance name → Chrome match pattern mapping for multi-instance url settings */\ninstanceMap?: Record<string, string>;\n```\n\n2. Add to ConfigStatePlugin:\n```ts\n/** Instance name → Chrome match pattern mapping for multi-instance url settings */\ninstanceMap?: Record<string, string>;\n```\n\n3. Update resolvedSettings type in ConfigStatePlugin to `Record<string, unknown>` to accommodate url field maps.\n\n4. In extension-handlers.ts, serializePluginForExtension: include `instanceMap: plugin.instanceMap` in the serialized output.\n\n5. In discovery.ts (or wherever the resolver output feeds into RegisteredPlugin construction): pass `resolvedResult.instanceMap` to the plugin's `instanceMap` field.\n\nConstraints:\n- instanceMap is optional — plugins without multi-instance url settings have no instanceMap\n- Do NOT change the extension-protocol.ts message format — instanceMap rides on the existing ConfigStatePlugin shape"
+    },
+    {
+      "id": "US-004",
+      "title": "Inject instance parameter into plugin tool schemas",
+      "description": "In mcp-setup.ts getAllToolsList, inject an 'instance' enum parameter into plugin tool schemas when the plugin has an instanceMap with 2+ entries. Make it required. Do not inject it for single-instance or no-instance plugins.",
+      "acceptanceCriteria": [
+        "Plugin tools with instanceMap.size >= 2 have a required 'instance' string enum parameter in their schema",
+        "The enum values are the instance names from instanceMap (e.g., ['production', 'staging'])",
+        "Plugin tools with 0-1 instances do NOT have an 'instance' parameter",
+        "The 'instance' parameter description explains what it does",
+        "tabId parameter is still injected alongside instance"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/mcp-setup.ts (getAllToolsList function, line 344)\n\nContext:\nThe current tabId injection (lines 353-361):\n```ts\nfor (const plugin of state.registry.plugins.values()) {\n  for (const toolDef of plugin.tools) {\n    const prefixed = prefixedToolName(plugin.name, toolDef.name);\n    const prefix = descriptionPrefix(state, plugin.name, toolDef.name);\n    const clonedSchema = structuredClone(toolDef.input_schema);\n    const properties = (clonedSchema.properties ?? {}) as Record<string, unknown>;\n    properties.tabId = {\n      type: 'integer',\n      minimum: 1,\n      description: 'Optional. Target a specific browser tab by its ID...',\n    };\n    clonedSchema.properties = properties;\n    tools.push({ name: prefixed, description: `${prefix}${toolDef.description}`, inputSchema: clonedSchema });\n  }\n}\n```\n\nChanges:\nAfter the tabId injection, add instance injection:\n```ts\nconst instanceNames = plugin.instanceMap ? Object.keys(plugin.instanceMap) : [];\nif (instanceNames.length >= 2) {\n  properties.instance = {\n    type: 'string',\n    enum: instanceNames,\n    description: `Target a named instance. Required when multiple instances are configured. Valid values: ${instanceNames.join(', ')}.`,\n  };\n  // Add 'instance' to required array\n  const required = (clonedSchema.required ?? []) as string[];\n  required.push('instance');\n  clonedSchema.required = required;\n}\n```\n\nConstraints:\n- tabId injection is unchanged\n- Browser tools and platform tools are unchanged\n- The enum values come directly from instanceMap keys, preserving the user's chosen names"
+    },
+    {
+      "id": "US-005",
+      "title": "Resolve instance to tab in dispatch pipeline",
+      "description": "In mcp-tool-dispatch.ts, extract the 'instance' parameter from tool args before Ajv validation (alongside tabId extraction). Resolve instance name → match pattern → matching tab. Use the resolved tab for dispatch.",
+      "acceptanceCriteria": [
+        "The 'instance' parameter is stripped from args before Ajv validation",
+        "When instance is provided, the dispatch finds the tab whose URL matches the instance's pattern",
+        "When instance is provided but no matching tab is open, an error is returned describing which instance tab is needed",
+        "When both instance and tabId are provided, instance takes precedence",
+        "When neither is provided for a multi-instance plugin, auto-select works as before"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/mcp-tool-dispatch.ts (handlePluginToolCall, around line 309-314)\n\nContext:\nThe current tabId extraction (lines 309-314):\n```ts\n// Extract platform-injected tabId before validation\nconst { tabId: rawTabId, ...pluginArgs } = args;\nconst tabId = typeof rawTabId === 'number' && Number.isInteger(rawTabId) && rawTabId > 0 ? rawTabId : undefined;\n```\n\nThen tabId is threaded to the extension at line 421:\n```ts\nconst result = await dispatchToExtension(\n  state,\n  'tool.dispatch',\n  { plugin: pluginName, tool: toolBaseName, input: pluginArgs, ...(tabId !== undefined && { tabId }) },\n  { label: `${pluginName}/${toolBaseName}`, progressToken, onProgress },\n);\n```\n\nChanges:\n1. Extract `instance` alongside `tabId`:\n```ts\nconst { tabId: rawTabId, instance: rawInstance, ...pluginArgs } = args;\nconst tabId = typeof rawTabId === 'number' && Number.isInteger(rawTabId) && rawTabId > 0 ? rawTabId : undefined;\nconst instance = typeof rawInstance === 'string' && rawInstance.length > 0 ? rawInstance : undefined;\n```\n\n2. Resolve instance to tabId before dispatch. Need to access the plugin's instanceMap from the registry and the tab mapping from state. The lookup variable (line 215) gives access to `lookup.pluginName`. Get the registered plugin from `state.registry.plugins.get(pluginName)`. Get the instance's match pattern from `plugin.instanceMap?.[instance]`. Then scan the tab mapping for a tab whose URL matches that pattern.\n\n```ts\nlet resolvedTabId = tabId;\nif (instance !== undefined) {\n  const plugin = state.registry.plugins.get(pluginName);\n  const pattern = plugin?.instanceMap?.[instance];\n  if (!pattern) {\n    return { content: [{ type: 'text', text: `Unknown instance \"${instance}\" for plugin \"${pluginName}\". Valid instances: ${Object.keys(plugin?.instanceMap ?? {}).join(', ')}` }], isError: true };\n  }\n  // Find a tab matching this instance's pattern\n  // Import getMergedTabMapping or iterate state.extensionConnections\n  const matchingTab = findTabForInstance(state, pluginName, pattern);\n  if (!matchingTab) {\n    return { content: [{ type: 'text', text: `No open tab found for instance \"${instance}\" (pattern: ${pattern}). Open the ${instance} instance in your browser.` }], isError: true };\n  }\n  resolvedTabId = matchingTab;\n}\n```\n\n3. Use `resolvedTabId` instead of `tabId` in the dispatch call.\n\nThe findTabForInstance helper needs to iterate the merged tab mapping for the plugin and find a tab whose URL matches the pattern. Use `new URL(tab.url).hostname` to match against the pattern's hostname (strip the `*://` prefix and `/*` suffix).\n\nConstraints:\n- When instance is provided, it takes precedence over tabId\n- When neither is provided, existing auto-select behavior is unchanged\n- The function must handle the case where state.extensionConnections has multiple connections (multi-browser-profile support)"
+    },
+    {
+      "id": "US-006",
+      "title": "Add instance labels to plugin_list_tabs output",
+      "description": "Enhance plugin_list_tabs to include an 'instance' field on each tab entry, derived by matching the tab's URL against the plugin's instanceMap.",
+      "acceptanceCriteria": [
+        "Each tab in plugin_list_tabs output includes an 'instance' string field when the plugin has an instanceMap",
+        "The instance value is the name of the matching instance (e.g., 'production', 'staging')",
+        "Tabs that don't match any instance pattern have instance: undefined",
+        "The output still includes tabId, url, title, ready, and connectionId"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/browser-tools/plugin-list-tabs.ts\n\nContext:\nThe current output (lines 76-83):\n```ts\nconst mapping = mergedTabs.get(plugin);\nreturn Promise.resolve([{\n  plugin,\n  displayName: registered.displayName,\n  state: mapping?.state ?? 'closed',\n  tabs: mapping?.tabs ?? [],\n}]);\n```\n\nEach tab in mapping.tabs is a PluginTabInfo: `{ tabId, url, title, ready }`.\n\nChanges:\nAfter getting the tabs, annotate each with its instance name:\n```ts\nconst instanceMap = registered.instanceMap;\nconst annotatedTabs = (mapping?.tabs ?? []).map(tab => {\n  let instance: string | undefined;\n  if (instanceMap) {\n    for (const [name, pattern] of Object.entries(instanceMap)) {\n      // pattern is like *://hostname/* — extract hostname\n      const patternHost = pattern.replace('*://', '').replace('/*', '');\n      try {\n        const tabHost = new URL(tab.url).hostname;\n        if (tabHost === patternHost) {\n          instance = name;\n          break;\n        }\n      } catch { /* skip invalid URLs */ }\n    }\n  }\n  return { ...tab, ...(instance !== undefined ? { instance } : {}) };\n});\n```\n\nUse `annotatedTabs` instead of `mapping?.tabs ?? []` in the return value.\n\nApply the same annotation in the all-plugins loop (lines 92-101).\n\nConstraints:\n- Do NOT change the AnnotatedTab type — extend it by adding instance as an optional field\n- The AnnotatedMapping type may need an update to support the extended tab shape"
+    },
+    {
+      "id": "US-007",
+      "title": "Inject per-instance config into tabs",
+      "description": "Update the extension's config injection to resolve which instance a tab belongs to and inject only that instance's URL value (not the full map) into pluginConfig. This way getConfig('instanceUrl') returns the correct URL string for the current tab's instance.",
+      "acceptanceCriteria": [
+        "When a plugin has instanceMap, getConfig('instanceUrl') in a production tab returns the production URL string",
+        "When a plugin has instanceMap, getConfig('instanceUrl') in a staging tab returns the staging URL string",
+        "Non-url config fields are injected identically to all tabs",
+        "Plugins without instanceMap continue to work unchanged"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/iife-injection.ts (injectAdapterFile, injectPluginConfig)\n- platform/browser-extension/src/extension-messages.ts (PluginMeta interface)\n\nContext:\nPluginMeta (extension-messages.ts line 249) has:\n```ts\nexport interface PluginMeta {\n  ...\n  resolvedSettings?: Record<string, string | number | boolean>;\n  ...\n}\n```\n\nThe resolvedSettings are injected into every tab identically via injectPluginConfig (iife-injection.ts line 234):\n```ts\nconst injectPluginConfig = async (\n  tabId: number,\n  settings: Record<string, string | number | boolean>,\n) => {\n  await chrome.scripting.executeScript({\n    target: { tabId },\n    world: 'MAIN',\n    func: (config: Record<string, string | number | boolean>) => {\n      const ot = ((globalThis as Record<string, unknown>).__openTabs ?? {}) as Record<string, unknown>;\n      (globalThis as Record<string, unknown>).__openTabs = ot;\n      ot.pluginConfig = config;\n    },\n    args: [settings],\n  });\n};\n```\n\nChanges:\n1. Update PluginMeta to include instanceMap:\n```ts\ninstanceMap?: Record<string, string>; // instance name → match pattern\n```\n\n2. Update resolvedSettings type on PluginMeta to `Record<string, unknown>` to accommodate url field maps.\n\n3. In injectAdapterFile (or wherever injectPluginConfig is called with resolvedSettings), resolve the per-tab config before injection:\n\n```ts\n// Resolve per-tab settings: for url fields, replace the Record<string, string> map\n// with the single URL value matching this tab's instance\nconst resolvePerTabSettings = (\n  settings: Record<string, unknown>,\n  instanceMap: Record<string, string> | undefined,\n  tabUrl: string,\n): Record<string, string | number | boolean> => {\n  if (!instanceMap) return settings as Record<string, string | number | boolean>;\n  const resolved: Record<string, string | number | boolean> = {};\n  let matchedInstance: string | undefined;\n  // Find which instance this tab belongs to\n  try {\n    const tabHost = new URL(tabUrl).hostname;\n    for (const [name, pattern] of Object.entries(instanceMap)) {\n      const patternHost = pattern.replace('*://', '').replace('/*', '');\n      if (tabHost === patternHost) {\n        matchedInstance = name;\n        break;\n      }\n    }\n  } catch {}\n  for (const [key, value] of Object.entries(settings)) {\n    if (typeof value === 'object' && value !== null && !Array.isArray(value) && matchedInstance) {\n      // url-type field stored as Record<string, string> — resolve to this instance's URL\n      const urlMap = value as Record<string, string>;\n      resolved[key] = urlMap[matchedInstance] ?? '';\n    } else if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {\n      resolved[key] = value;\n    }\n  }\n  return resolved;\n};\n```\n\n4. Call this resolver before injectPluginConfig, passing the tab's URL (available from chrome.tabs.get or the URL pattern matching context).\n\nThe tab URL is available in the injection context — injectIntoMatchingTabs gets tabs via chrome.tabs.query and each tab has a url property.\n\nConstraints:\n- The injectPluginConfig function signature can change to accept the resolved per-tab settings\n- Non-url fields (string, number, boolean, select) pass through unchanged\n- If no instance matches the tab (shouldn't happen since the tab matched the plugin's URL patterns), fall back to the first URL in the map"
+    },
+    {
+      "id": "US-008",
+      "title": "Update ConfigDialog UI for named URL instances",
+      "description": "Update the side panel ConfigDialog to render url-type fields as a list of named instances with add/remove functionality, fitting the retro design system.",
+      "acceptanceCriteria": [
+        "url-type fields render as a list of instance entries, each with a name input and URL input on the same row",
+        "An 'Add instance' button appends a new empty row",
+        "Each instance row has a remove button (except when only 1 remains if required)",
+        "Validation ensures all instance names are non-empty and unique, all URLs are valid",
+        "The saved value is a Record<string, string> map",
+        "All UI elements use retro theme tokens (border-2 border-border rounded shadow-sm font-mono bg-card text-foreground)",
+        "The add/remove buttons match the retro style"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/ConfigDialog.tsx\n\nContext:\nThe current url field rendering (ConfigDialog.tsx lines 144-153):\n```tsx\n<Input\n  id={`config-${key}`}\n  name={key}\n  type={def.type === 'number' ? 'number' : 'text'}\n  placeholder={def.placeholder ?? ''}\n  defaultValue={resolvedSettings?.[key] != null ? String(resolvedSettings[key]) : ''}\n  aria-invalid={Boolean(errors[key])}\n  className=\"py-1.5 text-sm\"\n/>\n```\n\nChanges:\nFor url-type fields, replace the single Input with an InstanceUrlField component. This component manages a list of name→URL entries as local state.\n\nThe UI design for each instance row (fits retro theme):\n```\n┌─────────────────────────────────────────────────┐\n│ SQLPad URL *                                     │\n│ The URL of your SQLPad instance                  │\n│                                                  │\n│ ┌──────────┐ ┌──────────────────────────────┐ ╳ │\n│ │production│ │https://sqlpad.prod.brex.io   │   │\n│ └──────────┘ └──────────────────────────────┘   │\n│ ┌──────────┐ ┌──────────────────────────────┐ ╳ │\n│ │staging   │ │https://sqlpad.staging.brex.io│   │\n│ └──────────┘ └──────────────────────────────┘   │\n│                                                  │\n│ [+ Add instance]                                 │\n└─────────────────────────────────────────────────┘\n```\n\nThe name input is ~30% width, URL input is ~60% width, remove button is the remaining.\n\nSince ConfigDialog uses an uncontrolled form pattern with formRef, the url instance list needs to be controlled state within the dialog. Use useState to manage the entries array: `Array<{ name: string; url: string }>`. Initialize from resolvedSettings on mount.\n\nFor `handleSave`, when the field type is 'url', read from the controlled state instead of form elements. Build the Record<string, string> from the entries array.\n\nFor defaultValue initialization, the resolvedSettings for a url field is the full Record<string, string> map (from US-003 ConfigStatePlugin). Parse it into the entries array.\n\nWait — actually, resolvedSettings for url fields will be the per-tab resolved string (from US-007). But in the ConfigDialog, we want to show all instances. The dialog needs access to the full map. Two options:\n1. The ConfigDialog reads from a different source (the raw config, not resolvedSettings)\n2. The ConfigStatePlugin includes both resolvedSettings (per-tab) and the raw config values\n\nThe simplest approach: add a `rawSettings` field to ConfigStatePlugin that contains the unresolved config values. Or, since the ConfigDialog is about editing settings, it can read from the raw config. Actually, looking at the current code, `resolvedSettings` is what's passed to ConfigDialog. The simplest fix: pass the raw settings separately. Add a `configValues` field to ConfigStatePlugin containing the raw values from config.json (not the per-tab resolved values). The ConfigDialog reads from `configValues` for initialization and writes back the same shape.\n\nAlternatively, keep things simple: include instanceMap in the ConfigStatePlugin and reconstruct the url map from instanceMap (pattern → name) combined with the actual URLs. But this is fragile.\n\nBest approach: add `rawConfigValues?: Record<string, unknown>` to ConfigStatePlugin. In buildConfigStatePayload, populate it from state.pluginSettings[pluginName]. The ConfigDialog uses rawConfigValues for initialization (not resolvedSettings). This cleanly separates \"what the tab sees\" (resolvedSettings) from \"what the user configured\" (rawConfigValues).\n\nRetro style requirements:\n- All inputs use the existing retro Input component\n- Remove button: use a small retro Button with variant='outline' and an X icon, or a text button with 'text-destructive'\n- Add button: retro Button variant='outline' size='sm' with '+ Add instance' label\n- Each row is a flex container with gap-2\n- Instance name input has placeholder 'Name (e.g. production)'\n- URL input has the configSchema's placeholder\n\nConstraints:\n- Do NOT modify the retro component primitives\n- The add/remove interaction must be smooth — no jarring re-renders\n- At least one entry must remain if the field is required"
+    },
+    {
+      "id": "US-009",
+      "title": "Update CLI plugin configure for named URL instances",
+      "description": "Update the CLI handlePluginConfigure and promptField to support entering named URL instances interactively.",
+      "acceptanceCriteria": [
+        "For url-type fields, the CLI prompts for instance name + URL pairs",
+        "Users can add multiple instances by typing 'y' when asked 'Add another instance?'",
+        "The saved value is a Record<string, string> map",
+        "Current values are shown as defaults when re-configuring"
+      ],
+      "priority": 9,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/plugin.ts (promptField function, around line 780; handlePluginConfigure, around line 881)\n\nContext:\nThe current url field prompting in promptField (lines 856-879):\n```ts\n// url or string\nconst hint = hasCurrentValue ? String(currentValue) : (definition.placeholder ?? '');\nconst prompt = hint ? `  Value [${hint}]: ` : '  Value: ';\nwhile (true) {\n  const answer = await rl.question(prompt);\n  ...\n  if (definition.type === 'url') {\n    try { new URL(answer.trim()); } catch { ... }\n  }\n  return answer.trim();\n}\n```\n\nChanges:\nFor url-type fields, replace the simple prompt with a multi-instance flow:\n\n```\n  SQLPad URL *\n  The URL of your SQLPad instance\n\n  Instance 1:\n    Name [production]: \n    URL [https://sqlpad.prod.brex.io]: \n  Add another instance? (y/n) [n]: y\n  Instance 2:\n    Name: staging\n    URL: https://sqlpad.staging.brex.io\n  Add another instance? (y/n) [n]: n\n```\n\nReturn value should be `Record<string, string>` for url fields instead of a single string.\n\nThe function signature of promptField returns `Promise<string | number | boolean | undefined>`. This needs to change to `Promise<string | number | boolean | Record<string, string> | undefined>` to support the url map return type.\n\nFor re-configuration, if currentValue is a Record<string, string>, show existing instances as defaults.\n\nConstraints:\n- Non-url field prompting is unchanged\n- The flow must handle the case where the user enters only one instance (still stored as Record with one entry)"
+    },
+    {
+      "id": "US-010",
+      "title": "Add unit tests for multi-instance dispatch and schema injection",
+      "description": "Add comprehensive unit tests for the instance parameter injection in mcp-setup.ts and the instance-to-tab resolution in mcp-tool-dispatch.ts.",
+      "acceptanceCriteria": [
+        "Tests verify instance enum is injected into tool schemas when instanceMap has 2+ entries",
+        "Tests verify instance is NOT injected when instanceMap has 0-1 entries",
+        "Tests verify instance is required in the schema",
+        "Tests verify instance is stripped from args before Ajv validation",
+        "Tests verify instance resolves to the correct tab",
+        "Tests verify error when instance tab is not open",
+        "Tests verify instance takes precedence over tabId"
+      ],
+      "priority": 10,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/mcp-setup.test.ts (add tests for getAllToolsList instance injection)\n- platform/mcp-server/src/mcp-tool-dispatch.test.ts (add tests for instance extraction and resolution)\n\nContext:\nExisting tests in mcp-setup.test.ts test getAllToolsList for tabId injection and permission prefixes. Follow the same patterns.\n\nFor dispatch tests, mcp-tool-dispatch.test.ts has extensive test helpers for creating mock state, plugins, and tab mappings. Use the existing test infrastructure.\n\nTest cases for mcp-setup.test.ts:\n1. Plugin with instanceMap { production: '*://prod.example.com/*', staging: '*://staging.example.com/*' } → tools have `instance` param with enum ['production', 'staging'] and it's required\n2. Plugin with instanceMap { default: '*://app.example.com/*' } → tools do NOT have `instance` param (only 1 instance)\n3. Plugin with no instanceMap → tools do NOT have `instance` param\n4. Instance enum values match the instanceMap keys exactly\n\nTest cases for mcp-tool-dispatch.test.ts:\n1. Tool called with `instance: 'staging'` → dispatched to the staging tab\n2. Tool called with `instance: 'staging'` but staging tab not open → error returned\n3. Tool called with `instance: 'nonexistent'` → error listing valid instances\n4. Tool called with both `instance` and `tabId` → instance takes precedence\n5. Tool called without `instance` on multi-instance plugin → auto-select works\n6. `instance` is stripped from args before Ajv validation\n\nConstraints:\n- Use existing test helpers and mock factories — do NOT create new test infrastructure"
+    },
+    {
+      "id": "US-011",
+      "title": "Add E2E test for multi-instance plugin dispatch",
+      "description": "Add an E2E test that verifies the complete multi-instance flow: configure multiple URLs, verify both tabs are matched, dispatch to a specific instance, and verify instance labels in plugin_list_tabs.",
+      "acceptanceCriteria": [
+        "E2E test creates a plugin with configSchema url field",
+        "Test configures two instances via config.json",
+        "Test verifies both instance tabs appear in plugin_list_tabs with correct instance labels",
+        "Test verifies dispatching with instance parameter hits the correct tab",
+        "Test verifies dispatching with wrong instance returns an error",
+        "Test verifies getConfig returns the per-tab URL in each instance"
+      ],
+      "priority": 11,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance.e2e.ts (new file)\n\nContext:\nExisting E2E tests in e2e/ use the test infrastructure from e2e/fixtures.ts and e2e/helpers.ts. The test-server.ts creates a local HTTP server for testing. Look at e2e/plugin-settings.e2e.ts and e2e/multi-tab-targeting.e2e.ts for patterns.\n\nThe test should:\n1. Create a test plugin with `configSchema: { instanceUrl: { type: 'url', label: 'URL', required: true } }` and empty urlPatterns\n2. Write config.json with `settings: { testplugin: { instanceUrl: { alpha: 'http://localhost:PORT1', beta: 'http://localhost:PORT2' } } }`\n3. Start two local test servers on different ports\n4. Start the MCP server, connect extension\n5. Open tabs to both localhost:PORT1 and localhost:PORT2\n6. Call plugin_list_tabs and verify both tabs appear with instance labels 'alpha' and 'beta'\n7. Call the test plugin's tool with `instance: 'alpha'` and verify it dispatches to PORT1\n8. Call the test plugin's tool with `instance: 'beta'` and verify it dispatches to PORT2\n9. Call with `instance: 'gamma'` and verify the error message\n10. Verify getConfig('instanceUrl') returns the correct URL in each tab\n\nFollow the existing test patterns for creating test plugins, managing config, and dispatching tools.\n\nConstraints:\n- Use the existing test infrastructure (fixtures.ts, helpers.ts, test-server.ts)\n- Clean up test servers and temp files in afterAll\n- The test must be self-contained and not depend on external services"
+    }
+  ]
+}
