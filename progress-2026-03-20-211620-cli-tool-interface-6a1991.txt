@@ -1,0 +1,178 @@
+# Ralph Progress Log
+PRD: prd-2026-03-20-211620-cli-tool-interface-6a1991~running.json
+Started: Sat Mar 21 04:16:57 UTC 2026
+---
+
+## Codebase Patterns
+- HTTP route handlers are defined as standalone functions in `platform/mcp-server/src/http-routes.ts` and wired into the router via `createHandleFetch`
+- Each route handler follows the pattern: check auth first, then process the request
+- Route tests use `createTestHandlers()` to get handlers + state, then construct `Request` objects and call `handlers.fetch(req, mockServer)`
+- Plugin tools are annotated via `state.registry.toolLookup`, browser tools via `state.cachedBrowserTools`, platform tools via `PLATFORM_TOOL_NAMES`
+- `getAllToolsList(state)` from `mcp-setup.ts` returns the combined list of plugin + browser + platform tools
+- `buildRegistry([plugins], [failures])` creates a plugin registry for testing
+- `fetchJson<T>(handlers, url, headers?)` is a test utility for typed JSON responses
+
+## 2026-03-21 04:20 - US-001
+- Implemented GET /tools HTTP endpoint for tool discovery
+- Files changed:
+  - `platform/mcp-server/src/http-routes.ts` — added `handleListTools` handler and `/tools` route
+  - `platform/mcp-server/src/http-routes.test.ts` — added 6 test cases for auth, annotation, filtering
+- **Learnings for future iterations:**
+  - `getAllToolsList` already includes tabId/instance schema injection, so the HTTP endpoint returns the same enriched schemas as MCP
+  - The `PLATFORM_TOOL_NAMES` set is exported from `mcp-setup.ts` for O(1) platform tool identification
+  - No rate limiting is needed for read-only endpoints (only POST endpoints like `/reload` are rate-limited)
+- `checkToolCallable` from `mcp-setup.ts` verifies plugin tools exist in the registry; permission checks happen at dispatch time
+- `handleBrowserToolCall`, `handlePluginToolCall`, `handlePluginInspect`, `handlePluginMarkReviewed` from `mcp-tool-dispatch.ts` are reusable dispatch handlers
+- `RequestHandlerExtra` requires `signal` and `sendNotification` fields; MCP progress features are optional
+- `DispatchCallbacks` has `onToolConfigChanged` callback for notifying MCP clients of tool list changes
+- Route matching for dynamic paths (like `/tools/:name/call`) uses `startsWith` + `endsWith` in the router, then regex in the handler
+---
+
+## Codebase Patterns
+- HTTP route handlers are defined as standalone functions in `platform/mcp-server/src/http-routes.ts` and wired into the router via `createHandleFetch`
+- Each route handler follows the pattern: check auth first, then process the request
+- Route tests use `createTestHandlers()` to get handlers + state, then construct `Request` objects and call `handlers.fetch(req, mockServer)`
+- Plugin tools are annotated via `state.registry.toolLookup`, browser tools via `state.cachedBrowserTools`, platform tools via `PLATFORM_TOOL_NAMES`
+- `getAllToolsList(state)` from `mcp-setup.ts` returns the combined list of plugin + browser + platform tools
+- `buildRegistry([plugins], [failures])` creates a plugin registry for testing
+- `fetchJson<T>(handlers, url, headers?)` is a test utility for typed JSON responses
+- CLI commands follow the pattern: `registerXxxCommand(program: Command)` function that creates subcommands
+- CLI commands use `readAuthSecret()`, `resolvePort(options)`, `DEFAULT_HOST`, `isConnectionRefused()` for server communication
+- The `fetchTools()` helper in `tool.ts` is reusable for future `tool schema` and `tool call` subcommands
+- MCP gateway at `/mcp/gateway` uses separate `gatewayTransports`/`gatewaySessionServers` from full `/mcp` endpoint
+- `RouteDeps` interface defines all dependencies injected into route handlers; update both `RouteDeps`, `HotState`, and `createTestHandlers` when adding new endpoint state
+- `annotateTools(state)` in `mcp-gateway.ts` is a reusable function for annotating tools with their plugin names
+- Plugin tools with default 'off' permission get a `[Disabled]` prefix in their description from `getAllToolsList`
+- Browser tool dispatch tests need real `CachedBrowserTool` objects with Zod `input` schemas and mock `handler` functions
+- `handleBrowserToolCall` validates args through the tool's Zod schema before calling the handler
+- Dev proxy (`dev-proxy.ts`) must preserve the original URL path in `ProxySession.path` for all forwarding — hardcoding `/mcp` breaks gateway sessions
+- E2E gateway tests need a standalone MCP client targeting `/mcp/gateway` since `createMcpClient` from fixtures.ts hardcodes `/mcp`
+
+## 2026-03-21 04:27 - US-002
+- Implemented POST /tools/:name/call HTTP endpoint for tool invocation
+- Files changed:
+  - `platform/mcp-server/src/http-routes.ts` — added `handleToolCall` handler, imports from `mcp-tool-dispatch.ts` and `mcp-setup.ts`, route in `createHandleFetch`
+  - `platform/mcp-server/src/http-routes.test.ts` — added 7 test cases: auth, unknown tool, malformed URL, empty body, platform tool dispatch, plugin tool dispatch (no extension), rate limiting, auth pass-through
+- **Learnings for future iterations:**
+  - The dispatch functions from `mcp-tool-dispatch.ts` are designed to be reusable across MCP and HTTP contexts — only `RequestHandlerExtra` needs to be adapted
+  - Platform tools (plugin_inspect, plugin_mark_reviewed) bypass permissions entirely and are always routed first
+  - Plugin tool dispatch returns "Extension not connected" when no extension WebSocket connections exist — useful for unit testing the routing without a real extension
+  - `postJson<T>()` test helper was added alongside `fetchJson<T>()` for testing POST endpoints
+---
+
+## 2026-03-21 04:34 - US-003
+- Implemented `opentabs tool list` CLI command
+- Files changed:
+  - `platform/cli/src/commands/tool.ts` — new file with `registerToolCommand`, `fetchTools` helper, `handleToolList` handler
+  - `platform/cli/src/commands/index.ts` — added `registerToolCommand` export
+  - `platform/cli/src/cli.ts` — added `registerToolCommand(program)` call
+- **Learnings for future iterations:**
+  - `fetchTools()` is a reusable helper for `tool schema` and `tool call` subcommands (already extracted)
+  - picocolors automatically strips ANSI codes when stdout is not a TTY — no extra work needed for pipe-friendly output
+  - The `ToolEntry` interface matches the GET /tools response shape: `{ name, description, plugin, inputSchema }`
+  - Commander's `optsWithGlobals()` merges parent command options (like `--port`) into subcommand options
+---
+
+## 2026-03-21 04:32 - US-004
+- Implemented `opentabs tool schema <name>` CLI subcommand
+- Files changed:
+  - `platform/cli/src/commands/tool.ts` — added `handleToolSchema` handler and `schema` subcommand registration
+- **Learnings for future iterations:**
+  - The `fetchTools()` helper was perfectly reusable — just call it without a plugin filter to get all tools
+  - For "not found" errors with suggestions, sort tool names alphabetically for easier scanning
+  - Output is always JSON (pretty-printed) since schemas are inherently structured data — no human-readable mode needed
+---
+
+## 2026-03-21 04:37 - US-005
+- Implemented `opentabs tool call <name> [json]` CLI subcommand
+- Files changed:
+  - `platform/cli/src/commands/tool.ts` — added `handleToolCall` handler, `ToolCallResult` interface, and `call` subcommand registration
+- **Learnings for future iterations:**
+  - The POST /tools/:name/call endpoint returns `{ content: Array<{ type, text }>, isError?: boolean }` — same shape as MCP tools/call
+  - Exit codes: 0 = success, 1 = tool error (isError: true), 2 = HTTP/connection errors — mirrors standard Unix conventions
+  - `encodeURIComponent(name)` is used for the tool name in the URL path to handle any special characters
+  - 300s timeout matches the server's `AbortSignal.timeout(300_000)` for tool dispatch
+  - `Number.parseInt` is used instead of bare `parseInt` to satisfy Biome lint rules
+---
+
+## 2026-03-21 04:50 - US-007
+- Updated `opentabs start` to print three labeled connection mode sections: Full MCP, Gateway MCP, CLI only
+- Files changed:
+  - `platform/cli/src/commands/start.ts` — updated `printMcpClientConfigs` to show 3 sections (Full MCP with per-client configs, Gateway MCP with `/mcp/gateway` URL, CLI only with `opentabs tool` examples), updated `printFirstTimeInstructions` label, updated `printStartupHeader` to show `/mcp/gateway` endpoint, updated `--show-config` label
+  - `platform/cli/src/commands/config.ts` — updated `handleConfigShow` label from "MCP client config" to "Connection modes"
+- **Learnings for future iterations:**
+  - `printMcpClientConfigs` is shared across first-time instructions, `--show-config`, and `config show --show-secret` — changes propagate to all three surfaces
+  - `getMcpClientConfigs` generates configs for a given URL; calling it with both `/mcp` and `/mcp/gateway` URLs gives full + gateway configs
+  - For Claude Code gateway registration, use `opentabs-gateway` as the server name to avoid conflict with the full `opentabs` registration
+  - Non-Claude clients (OpenCode, Cursor, Windsurf) don't have CLI commands, so the gateway section shows "use URL ..." for them
+---
+
+## 2026-03-21 04:55 - US-008
+- Added 10 comprehensive unit tests for GET /tools and POST /tools/:name/call HTTP endpoints
+- Files changed:
+  - `platform/mcp-server/src/http-routes.test.ts` — added z import, CachedBrowserTool type import, 3 GET /tools tests (field validation, multi-plugin annotation, platform filter), 7 POST tests (browser dispatch, disabled permission, off permission, response shape, handler error, validation error)
+- **Learnings for future iterations:**
+  - Plugin tools with default 'off' permission get a `[Disabled]` prefix in their description from `getAllToolsList` — use `toContain()` instead of `toBe()` for description assertions
+  - Browser tool dispatch requires a real `CachedBrowserTool` with a Zod `input` schema and `handler` function — cannot use `{} as never` for dispatch tests
+  - The `handleBrowserToolCall` validates args through the tool's Zod schema before calling the handler, so invalid args are caught with a Zod error
+  - Permission 'off' for browser tools is checked inside `handleBrowserToolCall` (not `checkToolCallable`), returning "currently disabled" message
+  - For plugin tools, `checkToolCallable` only checks registry existence — permission checks happen inside `handlePluginToolCall` at dispatch time
+---
+
+## 2026-03-21 04:47 - US-006
+- Implemented MCP gateway endpoint at /mcp/gateway with 2 meta-tools
+- Files changed:
+  - `platform/mcp-server/src/mcp-gateway.ts` — new file with `createGatewayMcpServer`, `registerGatewayHandlers`, `GATEWAY_TOOLS`, `annotateTools`, `handleListTools`, `handleCallTool`
+  - `platform/mcp-server/src/http-routes.ts` — added `handleGatewayMcp` handler, `/mcp/gateway` route, `gatewayTransports`/`gatewaySessionServers` in `RouteDeps`
+  - `platform/mcp-server/src/index.ts` — added `gatewayTransports`/`gatewaySessionServers` to `HotState` and initialization
+  - `platform/mcp-server/src/http-routes.test.ts` — updated `createTestHandlers` to pass gateway deps
+- **Learnings for future iterations:**
+  - The gateway uses completely independent transport and session maps from the full /mcp endpoint
+  - `annotateTools()` extracts the plugin annotation logic (from `handleListTools` in http-routes.ts) into a reusable function in mcp-gateway.ts
+  - The `/mcp/gateway` route must be placed BEFORE `/mcp` in the router to avoid prefix collision
+  - Gateway sessions use a separate rate limit key (`/mcp/gateway-session-create`) from full MCP sessions
+  - `registerGatewayHandlers` is exported separately from `createGatewayMcpServer` for future hot reload support
+  - The MCP SDK's `Server` class is dynamically imported (same pattern as `mcp-setup.ts`) to avoid deprecated static imports
+  - Gateway instructions are distinct from full MCP instructions — they explain the 2-tool workflow
+---
+
+## 2026-03-21 04:55 - US-009
+- Added 26 unit tests for MCP gateway meta-tools across 4 describe blocks
+- Files changed:
+  - `platform/mcp-server/src/mcp-gateway.test.ts` — new file with tests for GATEWAY_TOOLS constant, annotateTools, handleListTools, and handleCallTool
+- **Learnings for future iterations:**
+  - Gateway module exports `annotateTools`, `handleListTools`, `handleCallTool`, `GATEWAY_TOOLS`, `createGatewayMcpServer`, `registerGatewayHandlers` — all directly testable without MCP transport
+  - `handleListTools` returns `{ content: [{ type: 'text', text: JSON.stringify(tools) }] }` — parse the JSON from content to verify tool data
+  - `handleCallTool` validates the `tool` field (must be non-empty string) before routing, and rejects arrays for the `arguments` field (treats them as empty object)
+  - Browser tools can be tested with real `BrowserToolDefinition` objects (Zod input + handler) + `rebuildCachedBrowserTools(state)` for full dispatch testing
+  - Plugin tool dispatch without an extension returns "Extension not connected" — useful for testing routing without real extension
+  - `plugin_inspect` routes through `handleCallTool` as a platform tool — tests verify the platform tool routing even though the adapter file doesn't exist on disk
+---
+
+## 2026-03-21 05:08 - US-010
+- Added E2E tests for HTTP tool API and MCP gateway endpoint
+- Fixed dev proxy to preserve original URL path for gateway sessions
+- Files changed:
+  - `e2e/tool-http-api.e2e.ts` — new file with 6 tests: GET /tools (auth, annotation, filtering), POST /tools/:name/call (dispatch, args, unknown tool, auth)
+  - `e2e/mcp-gateway.e2e.ts` — new file with 6 tests: gateway serves exactly 2 meta-tools, opentabs_list_tools (all tools + plugin filter), opentabs_call (dispatch, args, unknown tool)
+  - `platform/mcp-server/src/dev-proxy.ts` — added `path` field to ProxySession, replaced all hardcoded `/mcp` paths with `session.path` or `req.url`
+- **Learnings for future iterations:**
+  - The dev proxy (`dev-proxy.ts`) manages MCP sessions and forwards requests to the worker. It previously hardcoded `/mcp` in all forwarding paths, which broke gateway sessions — they were created on the full MCP server instead of the gateway.
+  - `ProxySession.path` now tracks the original URL path (`/mcp` or `/mcp/gateway`) and is used in all forwarding: initialize, non-init POST, GET SSE, DELETE, and session re-initialization after worker restart.
+  - For gateway E2E tests, a standalone `createGatewayClient` was needed because `createMcpClient` from fixtures.ts hardcodes `/mcp` — the gateway client uses the same MCP protocol but targets `/mcp/gateway`.
+  - The `isMcpRequest` check in the proxy (`req.url.startsWith('/mcp')`) correctly captures both `/mcp` and `/mcp/gateway` — the fix was in the forwarding, not the routing.
+  - HTTP tool API tests use native `fetch` directly (not MCP protocol) — simpler setup since they don't need session management.
+---
+
+## 2026-03-21 05:12 - US-011
+- Verified that the tool command registration and exports were already complete from US-003
+- No code changes needed — all wiring was done in earlier stories
+- Ran full Phase 1 + Phase 2 verification (e2eCheckpoint: true): build, type-check, lint, knip, unit tests (3426 passed), E2E tests (577 passed)
+- Files already in place:
+  - `platform/cli/src/commands/index.ts:9` — `registerToolCommand` export
+  - `platform/cli/src/cli.ts:17,54` — import and registration call
+  - `platform/cli/src/commands/tool.ts:227-288` — full command with list, schema, call subcommands
+- **Learnings for future iterations:**
+  - When earlier stories pre-implement wiring that a later story formalizes, the later story may only need verification — no code changes
+  - All 11 stories in this PRD passed with zero E2E failures, confirming the full CLI tool interface and MCP gateway work end-to-end
+---
