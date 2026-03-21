@@ -1,0 +1,192 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add a CLI tool interface and an MCP gateway endpoint so AI agents can choose how to interact with OpenTabs: (1) full MCP with all tools registered, (2) gateway MCP with just 2 meta-tools (opentabs_list_tools + opentabs_call), or (3) CLI-only via shell commands (opentabs tool list/call). All three interfaces share the same running server and dispatch pipeline.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add GET /tools HTTP endpoint for tool discovery",
+      "description": "Add a new authenticated HTTP endpoint GET /tools that returns all available plugin and browser tools with their full JSON schemas. Supports optional query params for filtering by plugin and selecting specific fields.",
+      "acceptanceCriteria": [
+        "GET /tools returns a JSON array of all tools with name, description, pluginName, and inputSchema",
+        "GET /tools?plugin=slack filters to tools from the slack plugin only",
+        "GET /tools?plugin=browser filters to browser tools only",
+        "GET /tools requires bearer auth (same as /health)",
+        "Returns 401 without valid auth, 200 with valid auth"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.ts (add endpoint)\n- platform/mcp-server/src/http-routes.test.ts (add tests)\n\nContext:\nThe routing table is in the `createHandlers` function, starting at line 687. Each endpoint is a simple pathname match:\n```ts\nif (url.pathname === '/health' && req.method === 'GET') return handleHealth(req, state, transports, getHotState);\n```\n\nThe tool data is already available via `getAllToolsList(state)` from mcp-setup.ts (line 344). This returns `Array<{ name, description, inputSchema }>`. We just need to expose it via HTTP.\n\nChanges:\n1. Add a new handler function `handleListTools`:\n```ts\nconst handleListTools = (req: Request, url: URL, state: ServerState): Response => {\n  const authError = checkBearerAuth(req, state.wsSecret);\n  if (authError) return authError;\n\n  const pluginFilter = url.searchParams.get('plugin');\n  const allTools = getAllToolsList(state);\n\n  // Annotate each tool with its plugin name for filtering\n  const annotated = allTools.map(t => {\n    // Browser tools have no underscore prefix pattern\n    const browserTool = state.cachedBrowserTools.find(bt => bt.name === t.name);\n    if (browserTool) return { ...t, plugin: 'browser' };\n    // Platform tools\n    if (PLATFORM_TOOL_NAMES.has(t.name)) return { ...t, plugin: 'platform' };\n    // Plugin tools: extract plugin name from prefixed name (slack_send_message → slack)\n    const lookup = state.registry.toolLookup.get(t.name);\n    return { ...t, plugin: lookup?.pluginName ?? 'unknown' };\n  });\n\n  const filtered = pluginFilter\n    ? annotated.filter(t => t.plugin === pluginFilter)\n    : annotated;\n\n  return Response.json(filtered);\n};\n```\n\n2. Add the route in the routing table (line 687-699):\n```ts\nif (url.pathname === '/tools' && req.method === 'GET') return handleListTools(req, url, state);\n```\n\n3. Import `PLATFORM_TOOL_NAMES` from mcp-setup.js (already imported: `createMcpServer, notifyToolListChanged` — add to the import).\n\nAlso need to import `getAllToolsList` from mcp-setup.js.\n\nUnit tests:\n- GET /tools without auth → 401\n- GET /tools with auth → 200, returns array with name/description/inputSchema/plugin fields\n- GET /tools?plugin=browser → only browser tools\n- GET /tools?plugin=nonexistent → empty array\n- Follow existing test patterns in http-routes.test.ts: create state with `createState()`, build registry with plugins, call handler directly.\n\nConstraints:\n- Do NOT change getAllToolsList — just consume its output\n- Do NOT add rate limiting on this read-only endpoint (unlike POST endpoints)\n- Platform tools (plugin_inspect, plugin_mark_reviewed) should be included in the response with plugin: 'platform'"
+    },
+    {
+      "id": "US-002",
+      "title": "Add POST /tools/:name/call HTTP endpoint for tool invocation",
+      "description": "Add a new authenticated HTTP endpoint POST /tools/:name/call that invokes any tool by its prefixed name, dispatches it through the existing pipeline, and returns the result as JSON.",
+      "acceptanceCriteria": [
+        "POST /tools/slack_send_message/call with JSON body {\"arguments\":{...}} invokes the tool and returns the result",
+        "POST /tools/browser_list_tabs/call works for browser tools",
+        "Returns the tool result content as JSON (same shape as MCP tools/call response)",
+        "Returns 401 without auth, 404 for unknown tools, 400 for invalid body",
+        "Respects the same permission model as MCP dispatch (off → error, ask → error with message, auto → execute)",
+        "Supports tabId and instance parameters in the arguments object"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.ts (add endpoint + handler)\n- platform/mcp-server/src/http-routes.test.ts (add tests)\n\nContext:\nThe existing MCP tools/call handler in mcp-setup.ts (line 184) routes to:\n- `handleBrowserToolCall` for browser tools\n- `handlePluginToolCall` for plugin tools\n- `handlePluginInspect` / `handlePluginMarkReviewed` for platform tools\n\nThese functions are in mcp-tool-dispatch.ts and already return `{ content: Array<{ type: string, text: string }>, isError?: boolean }`.\n\nThe HTTP endpoint should reuse these exact functions. The main challenge is that `handlePluginToolCall` and `handleBrowserToolCall` take a `RequestHandlerExtra` parameter (for progress tokens). For HTTP, we can pass a minimal extra object with no progress token.\n\nChanges:\n1. Add handler:\n```ts\nconst handleToolCall = async (\n  req: Request,\n  url: URL,\n  state: ServerState,\n  sessionServers: McpServerInstance[],\n  transports: Map<string, WebStandardStreamableHTTPServerTransport>,\n): Promise<Response> => {\n  const authError = checkBearerAuth(req, state.wsSecret);\n  if (authError) return authError;\n  if (!checkEndpointRateLimit(state, '/tools/call', 30)) {\n    return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });\n  }\n\n  // Extract tool name from URL: /tools/<name>/call\n  const match = url.pathname.match(/^\\/tools\\/([^/]+)\\/call$/);\n  if (!match) return Response.json({ error: 'Invalid tool call URL' }, { status: 400 });\n  const toolName = match[1];\n\n  const body = await req.json().catch(() => null) as { arguments?: Record<string, unknown> } | null;\n  const args = body?.arguments ?? {};\n\n  // Create minimal RequestHandlerExtra for HTTP context\n  const extra: RequestHandlerExtra = {\n    signal: AbortSignal.timeout(300_000),\n    sendNotification: () => Promise.resolve(),\n    sendRequest: () => Promise.resolve({} as never),\n    authInfo: undefined,\n    requestId: crypto.randomUUID(),\n    sessionId: undefined,\n  };\n\n  const callbacks: DispatchCallbacks = {\n    onToolConfigChanged: () => {\n      for (const srv of sessionServers) notifyToolListChanged(srv);\n    },\n  };\n\n  // Route to the correct handler\n  if (toolName === 'plugin_inspect') {\n    const result = await handlePluginInspect(state, args);\n    return Response.json(result);\n  }\n  if (toolName === 'plugin_mark_reviewed') {\n    const result = await handlePluginMarkReviewed(state, args, callbacks);\n    return Response.json(result);\n  }\n\n  const cachedBt = state.cachedBrowserTools.find(c => c.name === toolName);\n  if (cachedBt) {\n    const result = await handleBrowserToolCall(state, toolName, args, cachedBt, extra, callbacks);\n    return Response.json(result);\n  }\n\n  const callableCheck = checkToolCallable(state, toolName);\n  if (!callableCheck.ok) {\n    return Response.json({ content: [{ type: 'text', text: callableCheck.error }], isError: true }, { status: 404 });\n  }\n\n  const lookup = state.registry.toolLookup.get(toolName);\n  if (!lookup) {\n    return Response.json({ content: [{ type: 'text', text: `Tool ${toolName} not found` }], isError: true }, { status: 404 });\n  }\n\n  const result = await handlePluginToolCall(state, toolName, args, callableCheck.pluginName, callableCheck.toolName, lookup, extra, callbacks);\n  const status = (result as Record<string, unknown>).isError ? 422 : 200;\n  return Response.json(result, { status });\n};\n```\n\n2. Add route matching. Since the tool name is in the path, use a prefix match:\n```ts\nif (url.pathname.startsWith('/tools/') && url.pathname.endsWith('/call') && req.method === 'POST')\n  return handleToolCall(req, url, state, sessionServers, transports);\n```\n\nPlace this BEFORE the generic 404 fallback but AFTER the specific routes.\n\n3. Import `handleBrowserToolCall`, `handlePluginToolCall`, `handlePluginInspect`, `handlePluginMarkReviewed`, `checkToolCallable`, `DispatchCallbacks` from mcp-tool-dispatch.js. Also import `PLATFORM_TOOL_NAMES` from mcp-setup.js.\n\nNote on `RequestHandlerExtra`: check the actual interface in mcp-tool-dispatch.ts to see what fields are required. The type is re-exported from mcp-setup.ts. The extra object must satisfy the interface — some fields may have changed. Read the type definition before implementing.\n\nFor the `ask` permission case: in MCP mode, `ask` triggers a side panel confirmation dialog. In HTTP mode, we cannot do that. Return an error response:\n```json\n{ \"content\": [{ \"type\": \"text\", \"text\": \"Tool requires approval. Use --yes flag or change permission to 'auto'.\" }], \"isError\": true }\n```\nActually, the existing `runAskFlow` in mcp-tool-dispatch.ts handles the ask flow — it sends a confirmation request to the extension and waits. This would work for HTTP too (the side panel would show the confirmation). So we can reuse the existing ask flow.\n\nUnit tests:\n- POST /tools/unknown_tool/call → 404\n- POST /tools/valid_tool/call without auth → 401\n- POST /tools/valid_tool/call with valid body → dispatches and returns result\n- POST /tools/valid_tool/call with empty body → uses empty args\n- Verify rate limiting kicks in\n\nConstraints:\n- Do NOT duplicate the dispatch logic — reuse handlePluginToolCall and handleBrowserToolCall directly\n- The response shape must match MCP tools/call response: `{ content: Array<{ type, text }>, isError? }`\n- Do NOT add a separate permission model for HTTP — reuse the existing one"
+    },
+    {
+      "id": "US-003",
+      "title": "Add opentabs tool list CLI command",
+      "description": "Add a new 'opentabs tool list' CLI command that fetches tools from the running server via GET /tools and displays them. Supports --json for machine-readable output, --plugin for filtering, and human-readable table output by default.",
+      "acceptanceCriteria": [
+        "opentabs tool list displays all tools in a human-readable format with name, plugin, and description",
+        "opentabs tool list --json outputs the full tool list with schemas as JSON",
+        "opentabs tool list --plugin slack filters to tools from the slack plugin",
+        "When the server is not running, shows an error with 'opentabs start' hint",
+        "Output is piped cleanly (no colors when stdout is not a TTY)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/tool.ts (new file)\n- platform/cli/src/commands/index.ts (add export for registerToolCommand)\n- platform/cli/src/cli.ts (register the tool command)\n\nContext:\nThe CLI entry point (cli.ts) registers commands via functions like `registerPluginCommand(program)`. Follow the same pattern.\n\nThe CLI already has a helper pattern for talking to the server. Look at how `handlePluginList` in plugin.ts (line 561) fetches from `/health`:\n```ts\nconst headers: Record<string, string> = {};\nif (secret) headers.Authorization = `Bearer ${secret}`;\nconst res = await fetch(`http://${DEFAULT_HOST}:${port}/health`, {\n  headers,\n  signal: AbortSignal.timeout(3_000),\n});\n```\n\nUse the same pattern to fetch from `/tools`.\n\nFor the command structure:\n```ts\nconst registerToolCommand = (program: Command): void => {\n  const toolCmd = program\n    .command('tool')\n    .description('Discover and invoke plugin tools')\n    .action(() => toolCmd.help());\n\n  toolCmd\n    .command('list')\n    .alias('ls')\n    .description('List available tools from the running server')\n    .option('--port <number>', 'Server port', parsePort)\n    .option('--json', 'Output full tool schemas as JSON')\n    .option('--plugin <name>', 'Filter by plugin name')\n    .action(...);\n};\n```\n\nHuman-readable output format (match the style of `opentabs plugin list`):\n```\nAvailable Tools\n\n  slack (Slack) — 5 tools\n    slack_send_message          Send a message to a Slack channel\n    slack_read_messages         Read recent messages from a channel\n    slack_search_messages       Search messages across channels\n    slack_list_channels         List channels in the workspace\n    slack_get_user_info         Get user profile information\n\n  browser (Browser) — 12 tools\n    browser_list_tabs           List all open browser tabs\n    browser_screenshot_tab      Take a screenshot of a tab\n    ...\n```\n\nJSON output: the raw array from GET /tools.\n\nNon-TTY detection: use `process.stdout.isTTY` to strip colors (picocolors handles this automatically).\n\nConstraints:\n- Follow the existing CLI patterns (readAuthSecret, resolvePort, DEFAULT_HOST, isConnectionRefused)\n- Group tools by plugin in human-readable mode\n- Show tool count per plugin\n- Use picocolors for styling, matching the plugin list style"
+    },
+    {
+      "id": "US-004",
+      "title": "Add opentabs tool schema CLI command",
+      "description": "Add 'opentabs tool schema <name>' CLI command that fetches and displays the full JSON schema for a specific tool.",
+      "acceptanceCriteria": [
+        "opentabs tool schema slack_send_message outputs the tool's full JSON input schema",
+        "Output is always JSON (pretty-printed)",
+        "Unknown tool name shows an error with available tools hint",
+        "Includes the tool description alongside the schema"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/tool.ts (add subcommand to the tool command group)\n\nContext:\nThis is a subcommand of the `tool` command group from US-003.\n\n```ts\ntoolCmd\n  .command('schema')\n  .description('Show the full input schema for a tool')\n  .argument('<name>', 'Tool name (e.g., slack_send_message)')\n  .option('--port <number>', 'Server port', parsePort)\n  .action(async (name: string, _options: unknown, command: Command) => {\n    const opts = command.optsWithGlobals();\n    const port = resolvePort(opts);\n    const secret = await readAuthSecret();\n    // Fetch all tools and find the matching one\n    // Display: { name, description, inputSchema }\n  });\n```\n\nFetch from GET /tools, find the tool by name, print `{ name, description, inputSchema }` as pretty JSON.\n\nIf not found, print available tool names as suggestions.\n\nConstraints:\n- Reuse the server fetch pattern from US-003 (extract into a shared helper if it makes sense)"
+    },
+    {
+      "id": "US-005",
+      "title": "Add opentabs tool call CLI command",
+      "description": "Add 'opentabs tool call <name> [json]' CLI command that invokes a tool on the running server via POST /tools/:name/call and prints the result.",
+      "acceptanceCriteria": [
+        "opentabs tool call slack_send_message '{\"channel\":\"C123\",\"text\":\"hi\"}' invokes the tool and prints the result as JSON",
+        "Arguments can be passed as a positional JSON string or via --params flag",
+        "Exit code is 0 on success, 1 on tool error (isError: true), 2 on HTTP/connection errors",
+        "Result content is printed to stdout as JSON",
+        "Error messages are printed to stderr",
+        "Supports --instance and --tab-id flags that get merged into the arguments"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/tool.ts (add subcommand to the tool command group)\n\nContext:\nThis is the core command for CLI-mode tool invocation.\n\n```ts\ntoolCmd\n  .command('call')\n  .description('Invoke a tool on the running server')\n  .argument('<name>', 'Tool name (e.g., slack_send_message, browser_list_tabs)')\n  .argument('[json]', 'Tool arguments as a JSON string')\n  .option('--params <json>', 'Tool arguments as JSON (alternative to positional arg)')\n  .option('--instance <name>', 'Target a named instance (for multi-instance plugins)')\n  .option('--tab-id <id>', 'Target a specific browser tab by ID', parseInt)\n  .option('--port <number>', 'Server port', parsePort)\n  .action(async (name: string, jsonArg: string | undefined, _options: unknown, command: Command) => {\n    const opts = command.optsWithGlobals();\n    // Parse arguments from positional or --params\n    // Merge --instance and --tab-id into args\n    // POST to /tools/<name>/call\n    // Print result to stdout\n    // Set exit code based on isError\n  });\n```\n\nArgument parsing:\n- Positional JSON: `opentabs tool call slack_send_message '{\"channel\":\"C123\"}'`\n- Flag JSON: `opentabs tool call slack_send_message --params '{\"channel\":\"C123\"}'`\n- Flag takes precedence if both are provided\n- If neither, args = {} (empty object)\n\nInstance and tabId merging:\n```ts\nconst args = { ...parsedJson };\nif (opts.instance) args.instance = opts.instance;\nif (opts.tabId) args.tabId = opts.tabId;\n```\n\nOutput:\n- Success: print the content array's text fields, joined by newlines, to stdout\n- If the content is valid JSON, pretty-print it\n- Error: print to stderr, exit with code 1\n- Connection error: print 'Server not running' hint to stderr, exit with code 2\n\nConstraints:\n- Invalid JSON in the positional arg should give a clear error: 'Invalid JSON: ...' to stderr\n- Do NOT prompt for confirmation on `ask` tools — the server's ask flow works via the side panel. The HTTP endpoint handles this (US-002).\n- The output should be clean JSON to stdout with no decorative text, so it's pipeable: `opentabs tool call ... | jq '.field'`"
+    },
+    {
+      "id": "US-006",
+      "title": "Add MCP gateway endpoint at /mcp/gateway",
+      "description": "Add a second MCP endpoint at /mcp/gateway that registers only 2 meta-tools: opentabs_list_tools and opentabs_call. This gives AI agents full OpenTabs capability through minimal context footprint.",
+      "acceptanceCriteria": [
+        "Connecting to /mcp/gateway via MCP protocol shows exactly 2 tools: opentabs_list_tools and opentabs_call",
+        "opentabs_list_tools returns available tools with schemas, supports optional plugin filter",
+        "opentabs_call invokes any tool by name, returns the tool result",
+        "Both meta-tools use the same dispatch pipeline as full MCP (permissions, validation, tab targeting)",
+        "/mcp continues to work as before with all tools",
+        "Both endpoints require the same bearer auth"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/mcp-gateway.ts (new file)\n- platform/mcp-server/src/http-routes.ts (add /mcp/gateway route)\n\nContext:\nThe full MCP endpoint is handled by `handleMcp` in http-routes.ts (line 486). It creates an MCP server per session via `createMcpServer(state)` which calls `registerMcpHandlers` that registers tools/list and tools/call handlers.\n\nFor the gateway, we need a similar but different MCP server factory that registers only 2 tools.\n\nCreate `mcp-gateway.ts` with a `createGatewayMcpServer` function:\n\n```ts\nconst GATEWAY_TOOLS = [\n  {\n    name: 'opentabs_list_tools',\n    description: 'List available OpenTabs tools with their descriptions and input schemas. Use this to discover what tools are available before calling them with opentabs_call.',\n    inputSchema: {\n      type: 'object',\n      properties: {\n        plugin: {\n          type: 'string',\n          description: 'Filter by plugin name (e.g., \"slack\", \"browser\"). Omit to list all tools.',\n        },\n      },\n    },\n  },\n  {\n    name: 'opentabs_call',\n    description: 'Invoke any OpenTabs tool by name. Pass the tool name and its arguments. Use opentabs_list_tools first to discover available tools and their schemas.',\n    inputSchema: {\n      type: 'object',\n      properties: {\n        tool: {\n          type: 'string',\n          description: 'The tool name to invoke (e.g., \"slack_send_message\", \"browser_list_tabs\").',\n        },\n        arguments: {\n          type: 'object',\n          description: 'The tool arguments matching the tool\\'s input schema.',\n          additionalProperties: true,\n        },\n      },\n      required: ['tool'],\n    },\n  },\n];\n```\n\nThe tools/list handler returns `GATEWAY_TOOLS`.\n\nThe tools/call handler:\n- For `opentabs_list_tools`: call `getAllToolsList(state)`, annotate with plugin names (same logic as GET /tools), filter by plugin param, return as text content.\n- For `opentabs_call`: extract `tool` and `arguments`, route to the same dispatch functions (handleBrowserToolCall, handlePluginToolCall, etc.) — same logic as POST /tools/:name/call from US-002.\n\nFor the MCP server creation, follow the same pattern as `createMcpServer` in mcp-setup.ts but with a different `registerMcpHandlers` that only handles the 2 gateway tools.\n\nIn http-routes.ts, add a route for /mcp/gateway:\n```ts\nif (url.pathname === '/mcp/gateway') return handleGatewayMcp(req, server, state, gatewayTransports, gatewayServers);\n```\n\nThis needs separate transport and session maps from the full /mcp endpoint.\n\nThe gateway server instructions should be different from the full server instructions — explain that this is a gateway with 2 tools and how to use them.\n\nConstraints:\n- The gateway MCP server is completely independent from the full MCP server — separate sessions, separate transports\n- Both /mcp and /mcp/gateway work simultaneously\n- The gateway tools must reuse the EXACT same dispatch functions as the full MCP and HTTP endpoints — no logic duplication\n- The opentabs_call tool should return the same content format as normal MCP tool calls"
+    },
+    {
+      "id": "US-007",
+      "title": "Update opentabs start to show all three connection options",
+      "description": "Update the start command's MCP client configuration output to show full MCP, gateway MCP, and CLI-only options.",
+      "acceptanceCriteria": [
+        "opentabs start prints three clearly labeled sections: Full MCP, Gateway MCP, and CLI-only",
+        "Each section shows the correct URL/command for the respective mode",
+        "Gateway section shows /mcp/gateway URL for each client",
+        "CLI section shows example opentabs tool commands",
+        "opentabs config show also displays all three options"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/start.ts (getMcpClientConfigs, printMcpClientConfigs, printFirstTimeInstructions)\n\nContext:\nThe current `getMcpClientConfigs` (line 180) returns configs for Claude Code, OpenCode, Cursor, and Windsurf with the `/mcp` URL. `printMcpClientConfigs` (line 223) iterates and prints them.\n\nChanges:\nUpdate `printMcpClientConfigs` to print three sections:\n\n```\n  Connection modes:\n\n  Full MCP (all tools — recommended for most users):\n     claude mcp add --transport http opentabs http://127.0.0.1:9515/mcp \\\n       --header \"Authorization: Bearer abc123\"\n\n  Gateway MCP (2 meta-tools — minimal context footprint):\n     claude mcp add --transport http opentabs-gateway http://127.0.0.1:9515/mcp/gateway \\\n       --header \"Authorization: Bearer abc123\"\n\n  CLI only (no MCP registration — use shell commands):\n     opentabs tool list                              # discover tools\n     opentabs tool call <name> '{\"key\": \"value\"}'    # invoke a tool\n```\n\nFor the non-Claude clients, show the gateway URL option too.\n\nAlso update the first-time instructions (printFirstTimeInstructions, line 158) to include the gateway and CLI options.\n\nConstraints:\n- Keep the existing full MCP config as the primary/recommended option\n- Use picocolors for styling consistently with the current output\n- Do NOT change the server startup logic — just the printed instructions"
+    },
+    {
+      "id": "US-008",
+      "title": "Add unit tests for HTTP tool endpoints",
+      "description": "Add comprehensive unit tests for the GET /tools and POST /tools/:name/call HTTP endpoints.",
+      "acceptanceCriteria": [
+        "Tests for GET /tools: auth required, returns all tools, plugin filter works, annotates tools with plugin name",
+        "Tests for POST /tools/:name/call: auth required, rate limited, dispatches to correct handler, returns result, handles unknown tools, handles empty body",
+        "Tests follow existing patterns in http-routes.test.ts"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.test.ts (add test cases)\n\nContext:\nExisting test patterns in http-routes.test.ts:\n- Create state: `const state = createState();`\n- Set auth: `state.wsSecret = 'test-secret';`\n- Build registry with plugins: `state.registry = buildRegistry([createPlugin(...)]);`\n- Create handlers: `const { handleRequest } = createHandlers({ state, transports, sessionServers, getHotState });`\n- Make requests: `const req = new Request('http://localhost/tools', { headers: { Authorization: 'Bearer test-secret' } });`\n- Assert: `const res = await handleRequest(req, ...); expect(res.status).toBe(200);`\n\nThe `createPlugin` helper (from mcp-setup.test.ts) creates a minimal RegisteredPlugin. Import or duplicate it.\n\nTest cases for GET /tools:\n1. Without auth → 401\n2. With auth, no plugins → returns browser tools + platform tools only\n3. With auth, with plugins → returns all tools annotated with plugin names\n4. With ?plugin=slack filter → returns only slack tools\n5. With ?plugin=browser filter → returns only browser tools\n6. With ?plugin=nonexistent → returns empty array\n\nTest cases for POST /tools/:name/call:\n1. Without auth → 401\n2. Unknown tool → 404 with error message\n3. Invalid URL format (no /call suffix) → 404\n4. Valid browser tool call → dispatches and returns (mock the handler)\n5. Valid plugin tool call → dispatches and returns (mock the handler)\n6. Empty body → uses empty args\n7. Rate limiting after 30 calls → 429\n\nNote: For POST /tools/:name/call tests, the actual dispatch requires an extension connection. For unit tests, mock `dispatchToExtension` or test only the routing/validation logic. The E2E tests (US-010) will cover the full dispatch.\n\nConstraints:\n- Follow existing test patterns exactly\n- Do NOT use external test fixtures — create state inline"
+    },
+    {
+      "id": "US-009",
+      "title": "Add unit tests for MCP gateway meta-tools",
+      "description": "Add unit tests for the gateway MCP server's opentabs_list_tools and opentabs_call meta-tools.",
+      "acceptanceCriteria": [
+        "Tests verify opentabs_list_tools returns all tools with schemas",
+        "Tests verify opentabs_list_tools plugin filter works",
+        "Tests verify opentabs_call routes to the correct dispatch handler",
+        "Tests verify opentabs_call returns tool errors properly",
+        "Tests verify the gateway tools/list response has exactly 2 tools"
+      ],
+      "priority": 9,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/mcp-gateway.test.ts (new file)\n\nContext:\nFollow the pattern from mcp-setup.test.ts for creating mock state with plugins and browser tools.\n\nThe gateway module exports functions that can be tested directly:\n- The list_tools handler function\n- The call handler function\n- The GATEWAY_TOOLS constant (verify shape)\n\nTest cases for opentabs_list_tools:\n1. No plugin filter → returns all tools (plugins + browser + platform)\n2. Plugin filter 'slack' → returns only slack tools\n3. Plugin filter 'browser' → returns only browser tools\n4. Each tool in result has name, description, plugin, inputSchema\n\nTest cases for opentabs_call:\n1. Call with tool: 'browser_list_tabs' → routes to browser tool handler\n2. Call with tool: 'slack_send_message' → routes to plugin tool handler\n3. Call with unknown tool → returns error content\n4. Call without tool field → returns error\n5. Call with arguments → passes arguments through to handler\n\nTest cases for gateway server:\n1. Gateway tools/list → exactly 2 tools\n2. Tool names are 'opentabs_list_tools' and 'opentabs_call'\n\nConstraints:\n- Mock the dispatch functions to avoid needing an extension connection\n- Test the routing logic, not the actual dispatch (E2E tests cover that)"
+    },
+    {
+      "id": "US-010",
+      "title": "Add E2E test for CLI tool commands and gateway endpoint",
+      "description": "Add E2E tests that verify the complete CLI tool interface and gateway MCP endpoint work end-to-end with a real server, extension, and test plugin.",
+      "acceptanceCriteria": [
+        "E2E test verifies GET /tools returns tools from the test plugin",
+        "E2E test verifies POST /tools/e2e-test_get_status/call dispatches to the test plugin and returns a result",
+        "E2E test verifies the gateway endpoint serves exactly 2 tools",
+        "E2E test verifies opentabs_call through the gateway dispatches correctly",
+        "E2E test verifies opentabs_list_tools through the gateway returns plugin tools"
+      ],
+      "priority": 10,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/tool-http-api.e2e.ts (new file)\n- e2e/mcp-gateway.e2e.ts (new file)\n\nContext:\nExisting E2E patterns from fixtures.ts:\n- `mcpServer` fixture starts a real MCP server\n- `testServer` fixture starts a test HTTP server with a test plugin\n- `extensionContext` fixture launches Chrome with the extension\n- `mcpClient` fixture connects an MCP client to the server\n\nFor the HTTP API tests (tool-http-api.e2e.ts):\n1. Use the mcpServer fixture to get the server port and auth secret\n2. Use native fetch to call GET /tools and POST /tools/:name/call\n3. Verify tool list includes the e2e-test plugin's tools\n4. Verify tool call dispatches to the test plugin (need extension connected + test tab open)\n\nSetup sequence:\n```ts\ntest('GET /tools returns test plugin tools', async ({ mcpServer, testServer, extensionContext, mcpClient }) => {\n  test.slow();\n  // Setup: open test tab, wait for ready\n  await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n  \n  // Fetch tools via HTTP\n  const res = await fetch(`http://127.0.0.1:${mcpServer.port}/tools`, {\n    headers: { Authorization: `Bearer ${mcpServer.secret}` },\n  });\n  const tools = await res.json();\n  expect(tools.some(t => t.name === 'e2e-test_get_status')).toBe(true);\n});\n```\n\nFor the gateway tests (mcp-gateway.e2e.ts):\n1. Connect an MCP client to /mcp/gateway instead of /mcp\n2. List tools → verify exactly 2\n3. Call opentabs_list_tools → verify test plugin tools in result\n4. Call opentabs_call with tool: 'e2e-test_get_status' → verify success\n\nThe mcpClient fixture may need to accept a custom path. Check if it already supports this. If not, create the MCP client manually using the SDK.\n\nConstraints:\n- Use the existing test infrastructure (fixtures.ts, helpers.ts)\n- Each test file should be independent and self-contained\n- Follow the slow() marking for tests that involve extension setup"
+    },
+    {
+      "id": "US-011",
+      "title": "Register the tool command in CLI entry point and update exports",
+      "description": "Wire up the new tool command into the CLI entry point and ensure all exports are properly configured.",
+      "acceptanceCriteria": [
+        "opentabs tool shows help with list, schema, and call subcommands",
+        "opentabs tool list works end-to-end against a running server",
+        "opentabs --help includes the tool command in the command list",
+        "The new command is exported from commands/index.ts"
+      ],
+      "priority": 11,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/index.ts (add export for registerToolCommand)\n- platform/cli/src/cli.ts (add registerToolCommand(program) call)\n\nContext:\nThe current CLI entry point (cli.ts) registers commands at lines 46-54:\n```ts\nregisterStartCommand(program);\nregisterStopCommand(program);\nregisterStatusCommand(program);\nregisterAuditCommand(program);\nregisterDoctorCommand(program);\nregisterLogsCommand(program);\nregisterPluginCommand(program);\nregisterConfigCommand(program);\nregisterUpdateCommand(program);\n```\n\nThe index.ts file exports all register functions:\n```ts\nexport { registerStartCommand } from './start.js';\n// etc.\n```\n\nChanges:\n1. In commands/index.ts, add: `export { registerToolCommand } from './tool.js';`\n2. In cli.ts, add import and call: `registerToolCommand(program);`\n3. Place it logically after registerPluginCommand (tools are related to plugins)\n\nConstraints:\n- The command name is 'tool' (singular) to match the 'plugin' command pattern\n- Ensure `opentabs tool --help` shows all three subcommands with examples"
+    }
+  ]
+}
