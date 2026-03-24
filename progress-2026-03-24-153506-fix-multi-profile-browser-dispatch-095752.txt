@@ -1,0 +1,40 @@
+# Ralph Progress Log
+PRD: prd-2026-03-24-153506-fix-multi-profile-browser-dispatch-095752~running.json
+Started: Tue Mar 24 22:35:33 UTC 2026
+---
+
+## Codebase Patterns
+- Browser tab ownership for cross-profile routing is tracked in `state.browserTabOwnership` (Map<number, string>), populated by `browser_list_tabs` in `list-tabs.ts`
+- The disconnect handler lives in `http-routes.ts` (`createHandleWsClose`), NOT in `extension-protocol.ts` as the PRD notes suggested
+- `getConnectionForTab` in `state.ts` is the central routing function — it checks browserTabOwnership first, then falls back to plugin tabMappings
+- Tab objects from `browser.listTabs` use `.id` (Chrome tab ID), while plugin tab info uses `.tabId`
+
+## 2026-03-24 22:38 UTC - US-001
+- Implemented browser tab ownership indexing for cross-profile dispatch routing
+- Files changed:
+  - `platform/mcp-server/src/state.ts`: Added `browserTabOwnership` field to `ServerState`, initialized in `createState()`, updated `getConnectionForTab()` to check ownership index before plugin tabMappings
+  - `platform/mcp-server/src/browser-tools/list-tabs.ts`: Clears and rebuilds `browserTabOwnership` map after collecting results from all connections
+  - `platform/mcp-server/src/http-routes.ts`: Cleans up ownership entries in `createHandleWsClose` when a connection disconnects
+- **Learnings for future iterations:**
+  - The disconnect handler is in `http-routes.ts` (`createHandleWsClose`), not in `extension-protocol.ts` — the PRD notes pointed to the wrong file
+  - Iterating and deleting from a Map during `for...of` is safe in JS — the spec guarantees this works
+  - `resolveConnection` in `extension-protocol.ts` already calls `getConnectionForTab`, so the fix propagates to all browser tool dispatches automatically
+---
+
+## 2026-03-24 22:45 UTC - US-002
+- Added 5 E2E tests for cross-profile browser tool dispatch routing
+- Files changed:
+  - `e2e/multi-connection.e2e.ts`: Added tests in a new "Cross-profile browser tool dispatch tests" section
+- Tests added:
+  1. `browser_get_tab_content routes to the correct connection via browserTabOwnership` — verifies both alpha and beta tab routing
+  2. `browser_execute_script routes to the correct connection via browserTabOwnership` — verifies script execution routes correctly
+  3. `browser_navigate_tab routes to the correct connection via browserTabOwnership` — verifies navigation routes correctly
+  4. `browser tool with unknown tabId falls back gracefully` — verifies unknown tabIds don't crash, fall back to any connection
+  5. `after disconnect, browser tools targeting remaining connection tabs still work` — verifies post-disconnect routing
+- All 582 E2E tests pass (0 failures)
+- **Learnings for future iterations:**
+  - The test pattern for verifying dispatch routing: set up two raw WS connections → populate browserTabOwnership via browser_list_tabs → add method-specific handlers that return connection-specific markers → assert the marker in the result
+  - `mcpClient.callTool()` returns `{ content: string, isError: boolean }` where `content` is JSON-stringified concatenation of all text content blocks
+  - `browser_execute_script` dispatches `browser.executeScript` with `{ tabId, execFile }` — the `tabId` is used for routing via `resolveConnection`, and the fake handler just needs to respond to the method
+  - For unknown tabIds, `getConnectionForTab` returns `undefined` and `resolveConnection` falls back to `getAnyConnection` — the dispatch still succeeds
+---
