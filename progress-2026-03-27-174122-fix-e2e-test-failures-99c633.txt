@@ -1,0 +1,35 @@
+# Ralph Progress Log
+PRD: prd-2026-03-27-174122-fix-e2e-test-failures-99c633~running.json
+Started: Sat Mar 28 00:41:48 UTC 2026
+---
+
+## Codebase Patterns
+- E2E tests that depend on server-side async operations (npm install/uninstall, config persistence) should use `waitForLog(server, ...)` to confirm server-side completion before asserting UI state
+- The `plugins.changed` WebSocket notification triggers an async `getFullState()` round-trip in the side panel — UI updates are not instantaneous after the notification
+- Radix Dialog has close animations (200ms duration) — wait for `dialog.toBeHidden()` before subsequent assertions that depend on the dialog being gone
+- Server logs `Plugin "<name>" removed` after npm uninstall + rediscovery completes (extension-handlers.ts line 998)
+- Always use `expect.poll()` when reading config.json after server-side mutations — `onPluginPermissionsPersist` and `savePluginPermissions` are fire-and-forget async writes that race with synchronous reads
+
+## 2026-03-28 00:48 - US-001
+- Fixed the flaky uninstall E2E test in side-panel-npm-search.e2e.ts
+- Files changed: e2e/side-panel-npm-search.e2e.ts
+- Root cause: The test waited directly for the UI card to disappear after clicking Uninstall, without first confirming the server had completed the npm uninstall + rediscovery cycle. The async chain (npm uninstall → rediscovery → plugins.changed WS notification → getFullState → React re-render) could be slow under CI load.
+- Fix: Added three sequential steps: (1) wait for Radix Dialog close animation, (2) waitForLog for server-side confirmation of plugin removal, (3) then assert UI card is hidden with reduced timeout
+- Verified passing 3+ consecutive runs and full E2E suite (586 tests)
+- **Learnings for future iterations:**
+  - The uninstall flow involves multiple async steps: npm uninstall -g → onReload() (rediscovery) → queryExtension('plugin.uninstall') → sendToExtension('plugins.changed') → side panel getFullState() → applyFullState() → React re-render
+  - Always confirm server-side completion via waitForLog before asserting UI changes in E2E tests
+  - The `slackTrigger` locator `button[aria-expanded]` filter `hasText: 'Slack'` works correctly; the issue was timing, not locator strategy
+---
+
+## 2026-03-28 00:55 - US-002
+- Fixed the per-tool override clearing race condition in side-panel-plugin-toggle.e2e.ts
+- Files changed: e2e/side-panel-plugin-toggle.e2e.ts
+- Root cause: The test read config.json synchronously via `readTestConfig(configDir)` immediately after re-selecting the plugin permission. The server's `onPluginPermissionsPersist` is fire-and-forget (`savePluginPermissions(...).catch(() => {})`), so the async file write raced with the synchronous read.
+- Fix: Wrapped the config.json read in `expect.poll()` with a 10s timeout, matching the existing pattern at lines 218-229 in the same file where per-tool override persistence is verified.
+- All 586 E2E tests pass, full Phase 1 + Phase 2 green.
+- **Learnings for future iterations:**
+  - `onPluginPermissionsPersist` in http-routes.ts is intentionally fire-and-forget — config writes are best-effort and non-blocking
+  - Always use `expect.poll()` when reading config.json after server-side mutations in E2E tests — the write is async
+  - The same race pattern exists anywhere `onPluginPermissionsPersist` or `savePluginPermissions` is called followed by a synchronous config read
+---
