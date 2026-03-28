@@ -1,0 +1,36 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two failing E2E tests: the npm-search uninstall test and the plugin-toggle per-tool override clearing test. Both are real bugs — one is a flaky timing issue in the test, the other is a race condition between async config persistence and synchronous file reads.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix flaky uninstall E2E test in side-panel-npm-search",
+      "description": "The test 'uninstall plugin via three-dot menu and confirmation dialog' in side-panel-npm-search.e2e.ts fails intermittently. The test clicks Uninstall, confirms the dialog, then waits for the Slack plugin card to disappear. Investigate the exact failure mode and fix the timing or interaction issue.",
+      "acceptanceCriteria": [
+        "The test 'uninstall plugin via three-dot menu and confirmation dialog' passes reliably across 3 consecutive runs",
+        "The uninstall flow correctly removes the plugin card from the side panel UI",
+        "The MCP tools/list no longer contains slack_ tools after uninstall completes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-npm-search.e2e.ts (fix the uninstall test, lines 159-249)\n- Potentially: platform/mcp-server/src/extension-handlers.ts (handlePluginRemove, around line 971)\n- Potentially: platform/browser-extension/src/message-router.ts (plugin.uninstall handler, line 668)\n\nContext:\nThe test at line 159 does:\n1. Pre-installs Slack plugin via `execSync('npm install -g @opentabs-dev/opentabs-plugin-slack', ...)` into an isolated NPM_CONFIG_PREFIX\n2. Starts MCP server with npm auto-discovery enabled\n3. Waits for 'Discovered plugin: slack' in server logs (90s timeout)\n4. Opens side panel, waits for Slack card to appear\n5. Expands Slack card, clicks three-dot menu → 'Uninstall' → confirms dialog\n6. `await expect(slackTrigger).toBeHidden({ timeout: 60_000 })` — waits for card to disappear\n7. Verifies via MCP client that no slack_ tools remain\n\nThe server-side uninstall handler (`handlePluginRemove` in extension-handlers.ts) does:\n```\nconst result = await removePlugin(pluginName, state, callbacks.onReload);\nawait callbacks.queryExtension('plugin.uninstall', { name: pluginName }, 5000).catch(() => {});\nsendToExtension(state, { jsonrpc: '2.0', method: 'plugins.changed', params: { ...buildConfigStatePayload(state) } });\n```\n\nThe extension DOES have a `plugin.uninstall` handler registered at message-router.ts:668:\n`['plugin.uninstall', wrapAsync('plugin.uninstall', handlePluginUninstall)]`\n\nAnd it's rate-limit exempt (rate-limiter.ts:35).\n\nPossible failure modes to investigate:\n1. `npm uninstall -g` inside `removePlugin()` is slow/fails in the isolated prefix env\n2. The `plugins.changed` notification doesn't reach the side panel (WebSocket race)\n3. The side panel React state doesn't re-render after receiving `plugins.changed`\n4. The `slackTrigger` locator (`button[aria-expanded]` filter `hasText: 'Slack'`) becomes stale or doesn't match after state change\n5. The Radix dropdown menu overlay is blocking interaction\n\nDebugging approach:\n- Run the test with `--headed` and `PWDEBUG=1` to observe the UI\n- Add `await server.waitForLog('Plugin \"slack\" removed')` after the dialog click to confirm server-side completion\n- Check if `await expect(slackTrigger).toBeHidden()` needs a different locator strategy\n- Consider adding `await expect.poll()` around the config/tools verification for robustness\n\nConstraints:\n- Do NOT change the uninstall server-side logic (handlePluginRemove) unless it's genuinely broken\n- Do NOT increase timeouts as the primary fix — find the real issue\n- Do NOT skip the test or mark it as flaky"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix per-tool override clearing race condition in side-panel-plugin-toggle E2E test",
+      "description": "The test 're-selecting the current plugin permission clears per-tool overrides' fails at line 840 because it reads config.json synchronously before the async file write completes. The server correctly clears `tools` from in-memory state, but `onPluginPermissionsPersist` is fire-and-forget, so the file write races with the test's synchronous `readTestConfig()`.",
+      "acceptanceCriteria": [
+        "The test assertion `expect(pluginPerms?.tools).toBeUndefined()` passes reliably",
+        "The config.json read uses `expect.poll()` to wait for the async write to complete, matching the pattern used elsewhere in the same test file (e.g., lines 219-224)",
+        "No changes to the server-side persistence logic — the fix is in the test"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-plugin-toggle.e2e.ts (fix the test at line 797-851)\n\nContext:\nThe test starts with config: `{ permission: 'off', tools: { echo: 'ask' }, reviewedVersion: pluginVersion }`. It re-selects 'Off' on the plugin dropdown, which triggers `handleConfigSetPluginPermission` in extension-handlers.ts. That handler correctly destructures away `tools`:\n\n```typescript\nconst { tools: _cleared, ...rest } = pConfig;\nstate.pluginPermissions[pluginName] = { ...rest, permission: permission as ToolPermission, ... };\ncallbacks.onToolConfigChanged();\ncallbacks.onPluginPermissionsPersist();\n```\n\nThe in-memory state is correct (no `tools` field). BUT `onPluginPermissionsPersist` in http-routes.ts:80-83 is fire-and-forget:\n\n```typescript\nonPluginPermissionsPersist: () => {\n    savePluginPermissions(state, { ...state.pluginPermissions }).catch(() => {});\n},\n```\n\nThe test at line 838-840 reads synchronously:\n```typescript\nconst config = readTestConfig(configDir);\nconst pluginPerms = config.permissions?.['e2e-test'];\nexpect(pluginPerms?.tools).toBeUndefined();\n```\n\nThis races with the async `savePluginPermissions` write. The fix is to wrap the config.json read in `expect.poll()`, exactly like the existing pattern at lines 219-224 in the SAME file:\n\n```typescript\nawait expect\n  .poll(\n    () => {\n      const config = readTestConfig(configDir);\n      return config.permissions?.['e2e-test']?.tools;\n    },\n    { timeout: 10_000, message: 'per-tool overrides should be cleared from config.json' },\n  )\n  .toBeUndefined();\n```\n\nConstraints:\n- Do NOT change the server-side persistence logic (the fire-and-forget pattern is intentional — config writes are best-effort and non-blocking)\n- Do NOT change `handleConfigSetPluginPermission` — the in-memory clearing is correct\n- The fix is ONLY in the test file — use `expect.poll()` to handle the async write timing"
+    }
+  ]
+}
