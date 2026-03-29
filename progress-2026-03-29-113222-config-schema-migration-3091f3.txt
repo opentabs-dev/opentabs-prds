@@ -1,0 +1,98 @@
+# Ralph Progress Log
+PRD: prd-2026-03-29-113222-config-schema-migration-3091f3~running.json
+Started: Sun Mar 29 18:32:50 UTC 2026
+---
+
+## Codebase Patterns
+- OpentabsConfig interface is in platform/mcp-server/src/config.ts — all construction sites must include every field
+- savePluginPermissions and savePluginSettings build OpentabsConfig manually from `current` fields — any new field on OpentabsConfig must be added to both functions
+- E2E fixtures (e2e/fixtures.ts) have their own OpentabsConfig interface with optional fields — it's separate from the server's type
+- parseConfigRecord is the single parsing entry point for raw JSON → OpentabsConfig — all validation/defaults belong there
+- Config test pattern: use mkdtempSync + OPENTABS_CONFIG_DIR env override for test isolation
+- config-migrations.ts exports CURRENT_CONFIG_VERSION and migrateConfig — config.ts imports CURRENT_CONFIG_VERSION for the default config version
+- Migrations operate on raw Record<string, unknown>, not parsed OpentabsConfig — old shapes may not match the current type
+- The v1→v2 migration detects url-type fields heuristically: any string starting with http:// or https:// is wrapped as { default: value }
+- Migration mutates fields in-place on the structuredClone'd config — no need to return a new settings object
+- E2E tests for config migration should use raw JSON writes (not writeTestConfig) for full control over config shape
+- E2E tests can verify migration effects by reading config.json from disk after server.waitForHealth resolves
+
+## 2026-03-29 18:37 - US-001
+- Added `version: number` to OpentabsConfig interface
+- Updated parseConfigRecord to read version from raw JSON, defaulting to 1 when absent
+- Updated loadConfig default config to use version 2 (current schema version)
+- Updated savePluginPermissions and savePluginSettings to preserve version in output JSON
+- Updated all OpentabsConfig literals in config.test.ts to include version field
+- Added test assertions: default config has version 2, legacy config without version defaults to 1, round-trip preserves version
+- Files changed: platform/mcp-server/src/config.ts, platform/mcp-server/src/config.test.ts
+- **Learnings for future iterations:**
+  - The version field uses value 2 for the default/current config (not 1 — version 1 is for legacy configs without a version field)
+  - Biome auto-formatted the version parsing ternary during pre-commit (collapsed multiline to single line) — this is expected
+---
+
+## 2026-03-29 18:42 - US-002
+- Created platform/mcp-server/src/config-migrations.ts with migration runner framework
+- Exports CURRENT_CONFIG_VERSION (2) and migrateConfig function
+- Migration registry: Map<number, MigrationFn> mapping target version to pure migration functions
+- Sequential runner: iterates from config.version+1 to CURRENT_CONFIG_VERSION, calling each registered migration
+- Backup: creates config.json.backup via atomicWrite before any migration runs
+- Restore on failure: catches migration errors, restores original content, returns unmigrated config
+- No-op for current version configs (no backup created)
+- Downgrade protection: warns and returns config as-is when version > CURRENT_CONFIG_VERSION
+- Updated config.ts to import CURRENT_CONFIG_VERSION and use it in the default config creation
+- Fixed pre-existing lint warnings: optional chain in e2e/tool-dispatch.e2e.ts and plugin-tools/build.ts
+- Files changed: platform/mcp-server/src/config-migrations.ts (new), platform/mcp-server/src/config.ts, e2e/tool-dispatch.e2e.ts, platform/plugin-tools/src/commands/build.ts
+- **Learnings for future iterations:**
+  - New files must be imported somewhere or knip will flag them as unused — importing CURRENT_CONFIG_VERSION in config.ts resolved this
+  - The Edit tool requires a full Read (not offset/limit) before editing a file — for very large files, use Bash sed as a fallback
+  - Biome auto-formats the migrateConfig version ternary to a single line during pre-commit
+---
+
+## 2026-03-29 18:44 - US-003
+- Replaced v1→v2 migration placeholder with actual logic in config-migrations.ts
+- Migration iterates config.settings, for each plugin's settings converts any string value starting with http:// or https:// to { default: value }
+- Handles: missing settings field, non-object plugin settings, mixed state (some string, some already Record), non-URL strings preserved
+- Files changed: platform/mcp-server/src/config-migrations.ts
+- **Learnings for future iterations:**
+  - The migration mutates fields in-place on the structuredClone'd copy — this is safe because migrateConfig clones before calling migrations
+  - Biome auto-formatted tabs to spaces during pre-commit — this is the standard behavior
+---
+
+## 2026-03-29 18:47 - US-004
+- Wired migrateConfig into loadConfig: called after readConfigWithRetry and before parseConfigRecord
+- Migration only runs for existing configs — the fresh install branch (if !exists) creates with CURRENT_CONFIG_VERSION directly
+- Added migrateConfig to the existing CURRENT_CONFIG_VERSION import from config-migrations.js
+- Updated config.test.ts: two tests now expect post-migration values (version 2 instead of 1, URL strings converted to { default: url } records)
+- Files changed: platform/mcp-server/src/config.ts, platform/mcp-server/src/config.test.ts
+- **Learnings for future iterations:**
+  - Wiring migrateConfig into loadConfig causes existing tests that write v1 configs to get migrated — tests must expect post-migration values
+  - Tests writing configs without a version field will see version=2 after loadConfig (migration upgrades v1→v2)
+  - Tests writing URL strings as settings values will see { default: url } records after loadConfig (v1→v2 migration)
+---
+
+## 2026-03-29 18:52 - US-005
+- Created platform/mcp-server/src/config-migrations.test.ts with comprehensive unit tests
+- Tests cover: no migration needed (current version), downgrade protection (future version), backup creation with content verification, successful migration (version update, disk persistence, no mutation, missing/non-integer version), idempotency
+- Tests cover v1→v2: http:// and https:// string conversion, Record url preserved, mixed plugins (string + Record), missing settings, empty settings, non-url strings preserved, non-string values preserved, mixed url and non-url in same plugin
+- Used temp dir isolation with mkdtempSync and afterAll cleanup (matching config.test.ts pattern)
+- All 18 tests pass
+- Files changed: platform/mcp-server/src/config-migrations.test.ts (new)
+- **Learnings for future iterations:**
+  - migrateConfig tests don't need OPENTABS_CONFIG_DIR override — they take configPath directly, unlike loadConfig tests
+  - Biome warns on non-null assertions (!) — use optional chaining (?.) instead in test assertions
+  - Biome warns on string concatenation — use template literals (`${expr}\n`) instead
+  - The migrateConfig function returns the same reference (no clone) when no migration is needed — useful for identity assertions
+---
+
+## 2026-03-29 19:03 - US-006
+- Created e2e/config-migration.e2e.ts with 6 E2E tests across 5 describe blocks
+- Tests cover: legacy v1 config migration (string→Record URL, version field added), current version no-op (no backup created), backup creation with content verification, mixed settings (URL migrated + non-URL preserved), MCP tools availability after migration
+- Used raw JSON writes (writeRawConfig helper) instead of writeTestConfig to have full control over v1 config shape
+- Created createConfigDir helper to set up isolated config dirs with auth.json
+- All 590 E2E tests pass including the 6 new migration tests
+- Files changed: e2e/config-migration.e2e.ts (new)
+- **Learnings for future iterations:**
+  - writeTestConfig does NOT add a version field — but still use raw writes for migration tests to avoid auto-generated permissions
+  - The startMcpServer fixture creates extension/ dir and .opentabs-version marker — but auth.json must be pre-created for raw config dirs
+  - E2E tests reading config from disk after server start works reliably because migration runs synchronously in loadConfig before the server starts listening
+  - Health endpoint's pluginDetails does not expose urlPatterns directly — verify migration effects via reading config.json from disk instead
+---
