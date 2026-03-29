@@ -1,0 +1,110 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add a versioned config schema migration framework to ~/.opentabs/config.json. Existing configs without a version field are treated as version 1. Migrations run automatically on load, with backup/restore on failure. The first migration (v1→v2) converts url-type settings from plain strings to Record<string, string> maps. Follows patterns from Home Assistant (version field + sequential migrations), Terraform (chained intermediates), and the conf npm package (backup/restore on failure).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add version field to OpentabsConfig and config serialization",
+      "description": "Add a `version` number field to the config type and ensure it is read/written on every config operation.",
+      "acceptanceCriteria": [
+        "OpentabsConfig interface includes `version: number`",
+        "parseConfigRecord reads `version` from raw JSON, defaulting to 1 when absent",
+        "loadConfig writes version field when creating default config",
+        "saveConfig, savePluginPermissions, savePluginSettings all preserve the version field in output JSON",
+        "Existing config.json files without a version field parse successfully with version=1"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts (add version to OpentabsConfig, parseConfigRecord, loadConfig, saveConfig, savePluginPermissions, savePluginSettings)\n\nContext:\nThe OpentabsConfig interface at line 42 currently has: localPlugins, permissions, settings, additionalAllowedDirectories. No version field exists. The `parseConfigRecord` function at line 173 builds OpentabsConfig from raw JSON — it must read `record.version` (defaulting to 1 if absent or non-numeric). All write paths must include the version field.\n\nChanges:\n1. Add `version: number` to the OpentabsConfig interface (after `additionalAllowedDirectories`)\n2. In `parseConfigRecord`, add: `const version = typeof record.version === 'number' && Number.isInteger(record.version) && record.version >= 1 ? record.version : 1;` and include it in the return\n3. In `loadConfig` (line 197), the default config creation at line 209 must include `version: 2` (the current schema version — since this is a fresh install, use the latest)\n4. In `saveConfig` (line 237), `savePluginPermissions` (line 260), `savePluginSettings` (line 300) — the `updated` object already includes all OpentabsConfig fields, so adding version to the interface propagates automatically via `current.version`\n\nConstraints:\n- Do NOT change the order of existing fields in OpentabsConfig — add version at the end\n- Do NOT change the config file path, atomicWrite behavior, or mutex serialization\n- The version in the default config (fresh install) must be the CURRENT_VERSION constant (2), not 1. Version 1 is only for legacy configs without a version field.\n- Update the existing unit tests in config.test.ts to expect the version field in round-trip tests"
+    },
+    {
+      "id": "US-002",
+      "title": "Implement migration runner with backup/restore and sequential chaining",
+      "description": "Create config-migrations.ts with a migration registry, sequential runner, backup creation before migration, and restore on failure.",
+      "acceptanceCriteria": [
+        "CURRENT_CONFIG_VERSION constant exported and set to 2",
+        "Migration registry maps target version numbers to pure migration functions",
+        "migrateConfig runs migrations sequentially from config.version+1 to CURRENT_CONFIG_VERSION",
+        "config.json.backup is created before any migration runs",
+        "On migration error, backup is restored to config.json and the error is logged",
+        "If config.version equals CURRENT_CONFIG_VERSION, no migration runs and no backup is created",
+        "If config.version > CURRENT_CONFIG_VERSION (downgrade), a warning is logged and config is returned as-is",
+        "After successful migration, config.version is set to CURRENT_CONFIG_VERSION"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config-migrations.ts (new file — migration runner)\n\nContext:\nThis is the core migration framework. Design follows Home Assistant (version field + sequential migrations), Terraform (chained intermediates), and conf npm package (structuredClone backup + restore on failure). Migrations are pure functions: they receive a raw config object (Record<string, unknown>) and return the migrated object. They operate on raw JSON, not the parsed OpentabsConfig type, because migrations may need to handle arbitrary old shapes.\n\nChanges:\nCreate `platform/mcp-server/src/config-migrations.ts` with:\n\n```typescript\nimport { readFile } from 'node:fs/promises';\nimport { getConfigPath, atomicWrite } from '@opentabs-dev/shared';\nimport { log } from './logger.js';\n\nconst CURRENT_CONFIG_VERSION = 2;\n\ntype MigrationFn = (config: Record<string, unknown>) => Record<string, unknown>;\n\n// Registry: target version → migration function\nconst migrations: Map<number, MigrationFn> = new Map();\n\n// v1 → v2: convert url-type setting strings to Record<string, string>\nmigrations.set(2, (config) => { ... });\n\nasync function migrateConfig(configPath: string, raw: Record<string, unknown>): Promise<Record<string, unknown>> {\n  const currentVersion = typeof raw.version === 'number' ? raw.version : 1;\n  \n  if (currentVersion >= CURRENT_CONFIG_VERSION) {\n    if (currentVersion > CURRENT_CONFIG_VERSION) {\n      log.warn(`Config version ${currentVersion} is newer than supported ${CURRENT_CONFIG_VERSION} — loading as-is`);\n    }\n    return raw;\n  }\n\n  // Backup before migrating\n  const backupPath = `${configPath}.backup`;\n  const originalContent = await readFile(configPath, 'utf-8');\n  await atomicWrite(backupPath, originalContent, 0o600);\n  log.info(`Config backup created at ${backupPath}`);\n\n  let migrated = structuredClone(raw);\n  try {\n    for (let v = currentVersion + 1; v <= CURRENT_CONFIG_VERSION; v++) {\n      const fn = migrations.get(v);\n      if (fn) {\n        migrated = fn(migrated);\n        log.info(`Config migrated from v${v - 1} to v${v}`);\n      }\n    }\n    migrated.version = CURRENT_CONFIG_VERSION;\n    \n    // Persist migrated config\n    await atomicWrite(configPath, JSON.stringify(migrated, null, 2) + '\\n', 0o600);\n    return migrated;\n  } catch (err) {\n    log.error(`Config migration failed — restoring backup:`, err);\n    await atomicWrite(configPath, originalContent, 0o600);\n    return raw; // Return original unmigrated config\n  }\n}\n\nexport { CURRENT_CONFIG_VERSION, migrateConfig };\n```\n\nConstraints:\n- Migrations operate on raw `Record<string, unknown>`, NOT on the parsed `OpentabsConfig` type. This is intentional — old config shapes may not match the current type.\n- The backup file is `config.json.backup` — only one backup is kept (overwritten on each migration).\n- `structuredClone` before migrating so the original is not mutated (needed for restore path).\n- Import `atomicWrite` from `@opentabs-dev/shared` (already used in config.ts) and `log` from `./logger.js`.\n- Do NOT use the `conf` npm package — this is a custom implementation following the same patterns.\n- Export CURRENT_CONFIG_VERSION so US-001 can import it for the default config."
+    },
+    {
+      "id": "US-003",
+      "title": "Implement v1→v2 migration: convert url-type setting strings to Record maps",
+      "description": "Add the first concrete migration that converts url-type settings from plain string values to { default: url } record format.",
+      "acceptanceCriteria": [
+        "v1→v2 migration converts `settings.*.instanceUrl` from string to `{ \"default\": \"<url>\" }`",
+        "Migration handles mixed state: some plugins with string values, others already with Record values",
+        "Migration skips plugins with no settings or no url-type fields",
+        "Migration handles missing settings field gracefully",
+        "Non-url-type settings (string, number, boolean, select) are preserved unchanged"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config-migrations.ts (add migration logic inside the `migrations.set(2, ...)` handler)\n\nContext:\nThe v1→v2 migration must fix the exact breakage seen in production: plugins like retool and sqlpad have `settings.retool.instanceUrl` as a plain string (e.g., `\"https://retool-v3.infra.brexapps.io\"`), but the settings resolver at `settings-resolver.ts:66` expects `Record<string, string>` (e.g., `{ \"default\": \"https://retool-v3.infra.brexapps.io\" }`).\n\nThe challenge: we cannot rely on configSchema at migration time (plugins may not be loaded yet). Instead, the migration must detect url-type fields heuristically: any setting value that is a plain string AND looks like a URL (starts with `http://` or `https://`) should be converted to `{ \"default\": \"<url>\" }`. This is safe because:\n- string-type settings are plain strings that rarely start with http\n- number/boolean/select types are never strings that look like URLs\n- The only setting type that stores URLs is the url type\n\nChanges:\nThe migration function registered as `migrations.set(2, ...)` should:\n1. Check `config.settings` exists and is an object\n2. For each plugin in settings, iterate its key-value pairs\n3. For each value that is a string starting with `http://` or `https://`, wrap it as `{ \"default\": value }`\n4. Leave all other values untouched\n5. Return the modified config\n\nExample before:\n```json\n{ \"settings\": { \"retool\": { \"instanceUrl\": \"https://retool.example.com\" } } }\n```\n\nExample after:\n```json\n{ \"settings\": { \"retool\": { \"instanceUrl\": { \"default\": \"https://retool.example.com\" } } } }\n```\n\nConstraints:\n- Do NOT import or depend on plugin configSchema — migrations must work without plugin discovery\n- Do NOT convert strings that don't look like URLs (no `http://` or `https://` prefix)\n- Values that are already objects (Record<string, string>) must be left as-is (idempotency)"
+    },
+    {
+      "id": "US-004",
+      "title": "Wire migration runner into loadConfig",
+      "description": "Call migrateConfig in loadConfig after reading the raw JSON but before parseConfigRecord, so migrations run transparently on every server start.",
+      "acceptanceCriteria": [
+        "loadConfig calls migrateConfig after readConfigWithRetry and before parseConfigRecord",
+        "Migration only runs when loading existing configs (not on fresh installs where loadConfig creates the default)",
+        "After migration, parseConfigRecord receives the migrated raw object",
+        "loadConfig imports CURRENT_CONFIG_VERSION and uses it when creating default configs"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts (modify loadConfig to call migrateConfig)\n\nContext:\nCurrently `loadConfig` at line 197 does:\n1. Ensure config dir exists\n2. If config doesn't exist, create default and return\n3. `readConfigWithRetry` → get raw record\n4. `parseConfigRecord(record)` → return parsed config\n\nWe insert the migration between steps 3 and 4.\n\nChanges:\n1. Add import: `import { CURRENT_CONFIG_VERSION, migrateConfig } from './config-migrations.js';`\n2. After `const record = await readConfigWithRetry(configPath);` (line 220) and before `return parseConfigRecord(record);` (line 228), add:\n```typescript\nconst migrated = await migrateConfig(configPath, record);\nreturn parseConfigRecord(migrated);\n```\n3. In the default config creation block (line 209), change the version to use `CURRENT_CONFIG_VERSION`:\n```typescript\nconst config: OpentabsConfig = {\n  localPlugins: [],\n  permissions: {},\n  settings: {},\n  additionalAllowedDirectories: [],\n  version: CURRENT_CONFIG_VERSION,\n};\n```\n\nConstraints:\n- Do NOT call migrateConfig for freshly created configs (the `if (!exists)` branch) — they already have the current version\n- Do NOT change the retry/error handling logic\n- The migration runs BEFORE parseConfigRecord because migrations operate on raw JSON, not the parsed type"
+    },
+    {
+      "id": "US-005",
+      "title": "Unit tests for config migration framework and v1→v2 migration",
+      "description": "Comprehensive unit tests for the migration runner, backup/restore, sequential chaining, and the v1→v2 url-type migration.",
+      "acceptanceCriteria": [
+        "Tests cover: no migration needed (current version), downgrade protection (future version), backup creation, restore on failure, sequential chaining (v1→v2→v3 with mock v3), idempotency (running twice)",
+        "Tests cover v1→v2: string url converted, Record url preserved, mixed plugins, missing settings, non-url settings preserved",
+        "Tests use temp directories for isolation (matching config.test.ts pattern)",
+        "All tests pass with `npm run test`"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config-migrations.test.ts (new file)\n\nContext:\nFollow the test pattern from `config.test.ts`: use `mkdtempSync` for temp dirs, override `OPENTABS_CONFIG_DIR`, clean up in `afterAll`. Tests use Vitest (`describe`, `test`, `expect` from 'vitest').\n\nChanges:\nCreate comprehensive test suite covering:\n\n1. **migrateConfig — no migration needed**: Write config with `version: 2`, call `migrateConfig`, verify config unchanged and no backup created.\n2. **migrateConfig — downgrade protection**: Write config with `version: 99`, call `migrateConfig`, verify config returned as-is, no backup.\n3. **migrateConfig — backup creation**: Write v1 config, call `migrateConfig`, verify `config.json.backup` exists with original content.\n4. **migrateConfig — restore on failure**: Register a test migration that throws, verify original config is restored from backup.\n5. **migrateConfig — sequential chaining**: (may need to expose migration registry or test the v1→v2 migration indirectly by writing a v1 config and verifying v2 output)\n6. **migrateConfig — idempotency**: Migrate v1→v2, then call migrateConfig again on the result, verify output identical.\n7. **v1→v2 — string url converted**: `{ settings: { retool: { instanceUrl: \"https://example.com\" } } }` → `{ settings: { retool: { instanceUrl: { default: \"https://example.com\" } } } }`\n8. **v1→v2 — Record url preserved**: `{ settings: { retool: { instanceUrl: { prod: \"https://prod.example.com\" } } } }` → unchanged\n9. **v1→v2 — mixed plugins**: One plugin with string, another with Record, both handled correctly\n10. **v1→v2 — missing settings**: Config with no `settings` key → no error\n11. **v1→v2 — non-url settings preserved**: `{ settings: { myPlugin: { apiKey: \"abc123\", debug: true } } }` → unchanged\n12. **v1→v2 — non-http string preserved**: `{ settings: { myPlugin: { name: \"My Instance\" } } }` → unchanged (string but not a URL)\n\nConstraints:\n- Use `readFile` to verify backup file content, not just existence\n- Test the actual `migrateConfig` export, not internal functions\n- Each test must create its own config file in the temp dir for isolation"
+    },
+    {
+      "id": "US-006",
+      "title": "E2E tests for config migration",
+      "description": "End-to-end tests verifying that the MCP server migrates legacy config files on startup and that migrated settings resolve correctly.",
+      "acceptanceCriteria": [
+        "E2E test: v1 config with string instanceUrl → server starts, settings resolve, URL patterns derived",
+        "E2E test: v1 config with no version field → server starts, config.json on disk has version field after startup",
+        "E2E test: current version config → no backup created, config unchanged",
+        "E2E test: backup file created when migration runs",
+        "E2E test: config with mixed string and Record url settings → both migrate correctly",
+        "All E2E tests pass with `npm run test:e2e`"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/config-migration.e2e.ts (new file)\n\nContext:\nFollow the E2E test patterns from `plugin-settings.e2e.ts` and `config-watcher.e2e.ts`. Each test creates an isolated config dir with `mkdtempSync`, writes a test config using `writeTestConfig` or raw `fs.writeFileSync`, starts an MCP server, and verifies behavior.\n\nThe E2E test plugin at `plugins/e2e-test` has a `configSchema` with `instanceUrl: { type: 'url', ... }` — use this for testing url-type migration in the E2E context.\n\nChanges:\nCreate `e2e/config-migration.e2e.ts` with these test cases:\n\n1. **Legacy v1 config migrates on server start**:\n   - Write config WITHOUT version field, with `instanceUrl: \"http://localhost:PORT\"` as a plain string\n   - Start MCP server\n   - Read config.json from disk after startup\n   - Verify: version field is 2, instanceUrl is `{ \"default\": \"http://localhost:PORT\" }`\n   - Verify: health endpoint shows the plugin with derived URL patterns\n\n2. **Current version config is not modified**:\n   - Write config WITH `version: 2` and instanceUrl as Record\n   - Start MCP server\n   - Verify: no `config.json.backup` file created\n   - Verify: config.json content unchanged\n\n3. **Backup created during migration**:\n   - Write v1 config\n   - Start MCP server\n   - Verify: `config.json.backup` exists\n   - Verify: backup content matches original v1 config\n\n4. **Mixed url settings**:\n   - Write config with one plugin having string instanceUrl and settings already correct for another\n   - Start MCP server\n   - Verify both are correctly resolved\n\n5. **MCP tools work after migration**:\n   - Write v1 config with e2e-test plugin and string instanceUrl\n   - Start MCP server, create MCP client\n   - Call listTools — verify e2e-test tools are present\n   - This confirms the full pipeline: migration → settings resolution → tool registration\n\nTest infrastructure:\n- Import from `./fixtures.js`: `cleanupTestConfigDir`, `createMcpClient`, `E2E_TEST_PLUGIN_DIR`, `expect`, `startMcpServer`, `test`\n- Use `fs.mkdtempSync(path.join(os.tmpdir(), 'opentabs-e2e-migration-'))` for config dirs\n- Use `fs.writeFileSync` to write raw v1 configs (not `writeTestConfig` which may add version)\n- Read config back with `JSON.parse(fs.readFileSync(configPath, 'utf-8'))` to verify on-disk state\n- Clean up with `cleanupTestConfigDir` in finally blocks\n\nConstraints:\n- Do NOT use the standard `writeTestConfig` for v1 configs — it may add fields we don't want. Write raw JSON.\n- Each test must be independent — no shared state between tests\n- Use `server.waitForHealth(h => h.pluginDetails?.length > 0)` to wait for the server to finish loading after migration\n- The e2e-test plugin path is `E2E_TEST_PLUGIN_DIR` — use `path.resolve(E2E_TEST_PLUGIN_DIR)` for the localPlugins array"
+    }
+  ]
+}
