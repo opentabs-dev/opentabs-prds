@@ -1,0 +1,105 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-155231-chaos-network-auth-10224a~running.json
+Started: Mon Mar 30 22:53:20 UTC 2026
+---
+
+## Codebase Patterns
+- E2E tests that need custom server lifecycle (kill/restart) use `base` test from `@playwright/test` instead of fixtures, managing their own resources in try/finally
+- `startMcpServer(configDir, false)` (hot=false) provides clean kill semantics; hot=true uses dev proxy which complicates kill/restart
+- `startMcpServer(configDir, false, savedPort)` reuses a specific port for restart scenarios
+- `launchExtensionContext` returns `{ context, cleanupDir, extensionDir, mcpPort }`; use `setupAdapterSymlink(configDir, extensionDir)` to connect adapters
+- `createMcpClient` creates a standalone client; after server restart, create a NEW client since old sessions are invalid
+- `waitForToolResult` polls a tool call until it succeeds — preferred over fixed sleep for verifying readiness
+- `Promise.allSettled` is the correct pattern for in-flight calls during server kill — some will fail, some may succeed
+- Auth secret path: `path.join(configDir, 'extension', 'auth.json')` with format `{ secret: "<uuid>" }`; server reads it at startup
+- Secret rotation tests don't need extension/test server — only MCP client HTTP auth is tested, keeping them lightweight
+- Two-extension tests: symlink ext2's adapters dir to ext1's adapters dir (after `setupAdapterSymlink` on ext1) so both read from the same physical IIFE location
+
+---
+
+## 2026-03-30 22:58 UTC - US-001
+- Implemented WebSocket reconnect with pending tool calls stress test
+- Created `e2e/stress-network-auth.e2e.ts` with test that:
+  - Starts MCP server (hot=false), test server, and extension
+  - Opens a tab so e2e-test plugin reports ready
+  - Fires 3 concurrent `slow_with_progress` tool calls
+  - Kills server after 500ms while calls are in-flight
+  - Restarts server on same port/configDir
+  - Verifies extension reconnects (health extensionConnected=true)
+  - Verifies all 3 in-flight calls settle (no hangs)
+  - Verifies new echo call succeeds after reconnect
+- Files changed: `e2e/stress-network-auth.e2e.ts` (NEW)
+- **Learnings for future iterations:**
+  - `startMcpServer` with `hot=false` is essential for kill/restart tests — hot mode uses a proxy that complicates clean kill
+  - After killing and restarting the server, old MCP sessions are invalid — must create a new MCP client
+  - Extension reconnects automatically with exponential backoff (1s→2s→4s), timeout of 30s is sufficient
+  - Use `type McpServer` and `type TestServer` imports from fixtures for type safety without runtime usage
+---
+
+## 2026-03-30 23:05 UTC - US-002
+- Implemented secret rotation during active session stress test
+- Added to `e2e/stress-network-auth.e2e.ts`:
+  - `rotateSecret()` helper that writes a new `crypto.randomUUID()` to `configDir/extension/auth.json`
+  - Test that verifies old client with original secret gets 401 after rotation
+  - Test that verifies new client with rotated secret succeeds
+- Flow: start server → echo with old secret → kill server → rotate auth.json → restart server on same port → old client rejects with 401 → new client initializes and echoes successfully
+- Files changed: `e2e/stress-network-auth.e2e.ts`
+- **Learnings for future iterations:**
+  - Auth secret lives at `path.join(configDir, 'extension', 'auth.json')` as `{ secret: "<uuid>" }`
+  - `startMcpServer` reads `auth.json` at startup via `finalizeServer` — the server's `.secret` property reflects the file contents at boot time
+  - The MCP client's `request()` function throws `Error('MCP request failed (401): ...')` on auth failure — match with `/401/` regex
+  - Secret rotation test does NOT need an extension or test server — it only tests MCP client HTTP auth, keeping the test lightweight
+---
+
+## 2026-03-30 23:10 UTC - US-003
+- Implemented multi-connection isolation under concurrent dispatch stress test
+- Added to `e2e/stress-network-auth.e2e.ts`:
+  - Launches two separate Chrome extension contexts via `launchExtensionContext`
+  - Both connect to the same MCP server (verified via `extensionConnections >= 2`)
+  - Each opens a matching tab in the test server
+  - Two MCP clients fire concurrent `e2e-test_echo` calls with distinct messages
+  - Verifies each client receives its own message (no cross-contamination)
+  - Repeats 5 rounds for confidence
+- Files changed: `e2e/stress-network-auth.e2e.ts`
+- **Learnings for future iterations:**
+  - When launching two extension contexts sharing the same MCP server, symlink ext2's adapters dir to ext1's adapters dir so both read adapter IIFE files from the same physical location
+  - `setupAdapterSymlink` makes `configDir/extension/adapters` → symlink → `ext1.extensionDir/adapters`; for ext2, create a second symlink from `ext2.extensionDir/adapters` → `ext1.extensionDir/adapters`
+  - `server.waitForHealth(h => h.extensionConnections >= 2, 45_000)` verifies both extensions connected; 45s timeout accounts for two Chrome launches
+  - MCP clients are independent HTTP sessions — two clients to the same server route to whichever extension tab handles the dispatch, but echo results contain the caller's message
+---
+
+## 2026-03-30 23:15 UTC - US-004
+- Implemented health endpoint under rapid polling stress test
+- Added to `e2e/stress-network-auth.e2e.ts`:
+  - Starts MCP server (hot=false), waits for plugins to load
+  - Fires 5 batches of 20 concurrent GET /health requests (100 total) with Bearer auth
+  - Each request has AbortSignal.timeout(5000) for timeout detection
+  - Parses all 100 responses as JSON and verifies validity
+  - Verifies all responses have status='ok'
+  - Verifies all responses show consistent plugin count (no partially-loaded state)
+  - Verifies at least 1 plugin present (e2e-test)
+- Files changed: `e2e/stress-network-auth.e2e.ts`
+- **Learnings for future iterations:**
+  - Health endpoint stress test is lightweight — no extension or test server needed, just MCP server with plugins
+  - `server.waitForHealth(h => h.status === 'ok' && h.plugins >= 1, 15_000)` ensures server is fully ready before rapid polling
+  - Batching concurrent requests (20 per batch, 5 batches) avoids file descriptor exhaustion while still testing concurrency
+  - The health response `plugins` field contains the plugin count; use `Set` on mapped values to verify consistency
+---
+
+## 2026-03-30 23:35 UTC - US-005
+- Implemented audit log under rapid tool calls stress test
+- Added to `e2e/stress-network-auth.e2e.ts`:
+  - Starts MCP server (hot=false) + test server + extension + matching tab
+  - Fires 50 sequential `e2e-test_echo` calls (tests ordering, not throughput)
+  - Fetches GET /audit?limit=100 and verifies all 50 echo entries are present
+  - Verifies each echo entry has correct tool name and success=true
+  - Verifies timestamps are in descending order (newest first) across all entries
+  - Verifies GET /health auditSummary.totalInvocations >= 50
+- Files changed: `e2e/stress-network-auth.e2e.ts`
+- **Learnings for future iterations:**
+  - Audit endpoint: GET /audit?limit=N with Bearer auth returns entries as a JSON array
+  - Audit may contain entries from non-echo tools (e.g., get_status from warmup) — filter by `tool` field when checking specific tool counts
+  - The audit response type has `tool` (not `toolName`) as the field name for the tool identifier
+  - Sequential calls are important for ordering tests — parallel calls make timestamp ordering non-deterministic
+  - This test requires full extension + test server setup because echo tool dispatches through the extension to the adapter
+---
