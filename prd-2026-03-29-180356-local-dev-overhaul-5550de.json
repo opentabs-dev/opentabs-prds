@@ -1,0 +1,238 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Overhaul the local development experience: add directory-based plugin discovery (localPluginDirs), fix the reload storm with coalescing debounce and batch suppression, move checkForUpdates out of the reload hot path, write portable ~/paths in auto-registration, add unknown config key warnings with Levenshtein suggestions, and add --filter/--affected flags for plugin builds. Each feature includes comprehensive E2E test coverage.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Config schema v2→v3: add localPluginDirs field + portable path normalization",
+      "description": "Add a new localPluginDirs field to OpentabsConfig and create the v2→v3 config migration that introduces the field and normalizes existing absolute paths under HOME to ~/ prefix.",
+      "acceptanceCriteria": [
+        "OpentabsConfig interface includes localPluginDirs?: string[]",
+        "parseConfigRecord parses record.localPluginDirs the same way it parses localPlugins (array of strings, filter non-strings)",
+        "New configs created by loadConfig include localPluginDirs: [] in the default object",
+        "CURRENT_CONFIG_VERSION is 3 in config-migrations.ts",
+        "v2→v3 migration normalizes localPlugins entries: absolute paths starting with os.homedir() are converted to ~/... prefix",
+        "v2→v3 migration does NOT convert already-relative paths (starting with ./ or ../)",
+        "v2→v3 migration does NOT convert paths not under HOME (e.g., /tmp/...)",
+        "v2→v3 migration is idempotent: ~/... paths stay as ~/ on re-migration",
+        "v2→v3 migration does NOT auto-consolidate localPlugins into localPluginDirs — users opt in manually",
+        "ServerState includes localPluginDirs: string[] field",
+        "Existing config-migrations unit tests still pass",
+        "New unit tests cover the v2→v3 migration edge cases"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts (add localPluginDirs to interface, parseConfigRecord, loadConfig default)\n- platform/mcp-server/src/config-migrations.ts (bump CURRENT_CONFIG_VERSION to 3, add v2→v3 migration)\n- platform/mcp-server/src/state.ts (add localPluginDirs field to ServerState)\n- platform/mcp-server/src/config-migrations.test.ts (add v2→v3 migration tests)\n\nContext:\nThe config system uses a versioned migration framework added recently. Current version is 2 (config-migrations.ts line 19: `const CURRENT_CONFIG_VERSION = 2;`). The v1→v2 migration at line 27 converts url-type setting strings to Record<string, string>. The migration framework runs before parseConfigRecord in loadConfig (config.ts line 235: `const migrated = await migrateConfig(configPath, record);`).\n\nChanges:\n\n1. In config.ts, the OpentabsConfig interface (line 43) currently has:\n```\ninterface OpentabsConfig {\n  localPlugins: string[];\n  permissions: Record<string, PluginPermissionConfig>;\n  settings: Record<string, Record<string, unknown>>;\n  additionalAllowedDirectories?: string[];\n  version: number;\n}\n```\nAdd `localPluginDirs?: string[];` after localPlugins.\n\n2. In parseConfigRecord (line 176), after the localPlugins parsing block (lines 177-179), add identical parsing for localPluginDirs:\n```\nconst localPluginDirs = Array.isArray(record.localPluginDirs)\n  ? (record.localPluginDirs as unknown[]).filter((p): p is string => typeof p === 'string')\n  : [];\n```\nInclude it in the return object.\n\n3. In loadConfig's default config creation (line 215-221), add `localPluginDirs: []`.\n\n4. In config-migrations.ts, bump `CURRENT_CONFIG_VERSION` to 3. Add the v2→v3 migration:\n```\nmigrations.set(3, config => {\n  // Normalize absolute paths under HOME to ~/\n  const home = homedir();\n  const localPlugins = config.localPlugins;\n  if (Array.isArray(localPlugins)) {\n    config.localPlugins = localPlugins.map(p => {\n      if (typeof p !== 'string') return p;\n      // Only convert absolute paths starting with homedir\n      if (p.startsWith(home + '/') || p.startsWith(home + '\\\\')) {\n        return '~/' + p.slice(home.length + 1);\n      }\n      return p;\n    });\n  }\n  return config;\n});\n```\nImport `homedir` from `node:os`.\n\n5. In state.ts, add `localPluginDirs: string[];` to the ServerState interface. Initialize it to `[]` in createServerState.\n\nConstraints:\n- Do NOT touch resolver.ts or reload.ts — the discovery integration is a separate story.\n- Do NOT auto-consolidate localPlugins into localPluginDirs. The migration only normalizes paths.\n- Do NOT remove the v1→v2 migration — migrations are cumulative.\n- The saveConfig function must include localPluginDirs when writing (it serializes the full OpentabsConfig).\n- The configWriteMutex pattern must not change.\n\nTraps:\n- The migration operates on raw `Record<string, unknown>`, not the parsed OpentabsConfig type. Access config.localPlugins as unknown and type-check it.\n- `homedir()` on macOS returns `/Users/username`. On Linux it returns `/home/username`. The migration must work on both.\n- Paths that are already `~/...` must not be double-prefixed. The startsWith(home) check handles this since `~/` does not start with `/Users/...`."
+    },
+    {
+      "id": "US-002",
+      "title": "scanLocalPluginDir + discovery pipeline integration",
+      "description": "Add scanLocalPluginDir function to resolver.ts and integrate localPluginDirs expansion into the reload pipeline with path-level deduplication before calling discoverPlugins.",
+      "acceptanceCriteria": [
+        "scanLocalPluginDir(dir) returns absolute paths of immediate child directories containing package.json with opentabs field",
+        "scanLocalPluginDir skips children without package.json or without opentabs field",
+        "scanLocalPluginDir returns empty array for non-existent directory (logs warning)",
+        "scanLocalPluginDir does NOT recurse into subdirectories of subdirectories",
+        "reloadCore expands localPluginDirs into individual paths between loadConfig and discoverPlugins",
+        "Path-level deduplication resolves symlinks via realpath before comparing",
+        "localPlugins entries take precedence over localPluginDirs-scanned entries (appear first in deduped list)",
+        "state.localPluginDirs is populated from config during reload"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/resolver.ts (add scanLocalPluginDir, export hasOpentabsField)\n- platform/mcp-server/src/reload.ts (expand localPluginDirs in reloadCore)\n\nContext:\nThe discovery pipeline is in discovery.ts. The discoverPlugins function (discovery.ts line 34) accepts `localPlugins: string[]` as its first argument — an array of individual plugin paths. The expansion of localPluginDirs into individual paths should happen BEFORE calling discoverPlugins, in reloadCore (reload.ts).\n\nIn resolver.ts, `hasOpentabsField` is a private function at line 198:\n```\nconst hasOpentabsField = async (dir: string): Promise<boolean> => {\n  try {\n    const raw = JSON.parse(await readFile(join(dir, 'package.json'), 'utf-8')) as Record<string, unknown>;\n    return typeof raw.opentabs === 'object' && raw.opentabs !== null && !Array.isArray(raw.opentabs);\n  } catch (e) {\n    log.debug(`Failed to read package.json at ${join(dir, 'package.json')}: ${toErrorMessage(e)}`);\n    return false;\n  }\n};\n```\nIt is NOT exported (line 320: `export { discoverGlobalNpmPlugins, isAllowedPluginPath, resetGlobalPathsCache, resolvePluginPath };`). Either export it or place scanLocalPluginDir in the same file.\n\nChanges:\n\n1. In resolver.ts, add scanLocalPluginDir after hasOpentabsField:\n```\nconst scanLocalPluginDir = async (dir: string): Promise<string[]> => {\n  let entries: Dirent[];\n  try {\n    entries = await readdir(dir, { withFileTypes: true });\n  } catch (e) {\n    log.warn(`Cannot scan localPluginDirs entry ${dir}: ${toErrorMessage(e)}`);\n    return [];\n  }\n  if (entries.length > 200) {\n    log.warn(`localPluginDirs entry ${dir} has ${entries.length} children — scanning may be slow`);\n  }\n  const results: string[] = [];\n  const checks = entries\n    .filter(e => e.isDirectory())\n    .map(async e => {\n      const childPath = join(dir, e.name);\n      if (await hasOpentabsField(childPath)) results.push(childPath);\n    });\n  await Promise.all(checks);\n  return results;\n};\n```\nAdd to exports: `export { discoverGlobalNpmPlugins, isAllowedPluginPath, resetGlobalPathsCache, resolvePluginPath, scanLocalPluginDir };`\n\n2. In reload.ts reloadCore, after `const config = await loadConfig();` (around line 267), add localPluginDirs expansion:\n```\n// Expand localPluginDirs into individual paths\nconst expandedDirPaths: string[] = [];\nfor (const dirSpec of config.localPluginDirs ?? []) {\n  const resolved = resolveLocalPath(dirSpec, configDir);\n  const scanned = await scanLocalPluginDir(resolved);\n  expandedDirPaths.push(...scanned);\n}\n\n// Deduplicate: localPlugins entries take precedence (appear first)\nconst allLocalPaths = [...config.localPlugins, ...expandedDirPaths];\nconst seen = new Set<string>();\nconst dedupedPaths: string[] = [];\nfor (const p of allLocalPaths) {\n  const resolved = await safeRealpath(resolveLocalPath(p, configDir)).catch(() => resolveLocalPath(p, configDir));\n  if (!seen.has(resolved)) {\n    seen.add(resolved);\n    dedupedPaths.push(p);\n  }\n}\n\nstate.localPluginDirs = config.localPluginDirs ?? [];\n```\nThen pass `dedupedPaths` instead of `config.localPlugins` to `discoverPlugins`.\n\nConstraints:\n- Do NOT modify discovery.ts — it receives a flat list of plugin paths as before.\n- The resolveLocalPath function must be imported. It is currently not exported from resolver.ts. Check if it already is; if not, you may need to resolve paths inline using the same logic (expand ~/, resolve relative to configDir).\n- safeRealpath handles symlinks. Import from node:fs/promises as `realpath`.\n- Do NOT change the discoverPlugins signature.\n\nTraps:\n- resolveLocalPath is NOT exported from resolver.ts. You need to either export it or implement the ~/ expansion and relative path resolution inline in reload.ts. Check the export list at line 320.\n- The configDir variable is already available in reloadCore — it comes from `getConfigDir()`. Find where it's used in the existing code and reference it."
+    },
+    {
+      "id": "US-003",
+      "title": "Server-side reload coalescing on POST /reload",
+      "description": "Replace the rate limiter on POST /reload with a 500ms coalescing debounce. Multiple callers within the window share one reload. Auth is checked per-request before coalescing.",
+      "acceptanceCriteria": [
+        "POST /reload no longer returns 429 Too Many Requests",
+        "Concurrent POST /reload requests within 500ms are coalesced into a single performConfigReload call",
+        "The debounce timer resets on each new request (waits 500ms after the LAST request)",
+        "All coalesced callers receive the same JSON response with ok, plugins, durationMs",
+        "Auth (checkBearerAuth) is checked per-request BEFORE entering the coalesce pool — invalid auth returns 401 immediately",
+        "Coalescing state is stored on ServerState (survives hot reload)",
+        "Rate limiters on other endpoints (/extension/reload, /plugin-settings, etc.) are unchanged"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.ts (replace rate limiter with coalescing in handleReload)\n- platform/mcp-server/src/state.ts (add pendingReload field)\n\nContext:\nThe current handleReload at http-routes.ts line 524:\n```\nconst handleReload = async (\n  req: Request,\n  state: ServerState,\n  sessionServers: McpServerInstance[],\n  transports: Map<string, WebStandardStreamableHTTPServerTransport>,\n): Promise<Response> => {\n  const authError = checkBearerAuth(req, state.wsSecret);\n  if (authError) return authError;\n  if (!checkEndpointRateLimit(state, '/reload', 10)) {\n    return new Response('Too Many Requests', { status: 429, headers: { 'Retry-After': '60' } });\n  }\n  try {\n    const result = await performConfigReload(state, sessionServers, transports);\n    return Response.json({\n      ok: true,\n      plugins: result.plugins,\n      durationMs: result.durationMs,\n    });\n  } catch (err) {\n    log.error('Config reload failed:', err);\n    const rawMsg = toErrorMessage(err);\n    return Response.json({ ok: false, error: sanitizeErrorMessage(rawMsg) }, { status: 500 });\n  }\n};\n```\n\nThe rate limiter uses `checkEndpointRateLimit(state, '/reload', 10)` which checks `state.endpointCallTimestamps` (Map<string, number[]>). Other endpoints also use this function — do NOT remove the function itself.\n\nChanges:\n\n1. In state.ts, add a pendingReload field to ServerState:\n```\npendingReload: {\n  promise: Promise<{ plugins: number; durationMs: number }>;\n  resolve: (result: { plugins: number; durationMs: number }) => void;\n  reject: (err: Error) => void;\n  timer: ReturnType<typeof setTimeout>;\n} | null;\n```\nInitialize to `null` in createServerState.\n\n2. In http-routes.ts, replace the rate limiter with coalescing logic in handleReload:\n```\nconst RELOAD_COALESCE_MS = 500;\n\nconst handleReload = async (req, state, sessionServers, transports) => {\n  // Auth checked per-request BEFORE coalescing\n  const authError = checkBearerAuth(req, state.wsSecret);\n  if (authError) return authError;\n\n  // If a pending coalesced reload exists, reset the debounce timer and share its promise\n  if (state.pendingReload) {\n    clearTimeout(state.pendingReload.timer);\n    const pending = state.pendingReload;\n    pending.timer = setTimeout(() => executeCoalescedReload(state, sessionServers, transports), RELOAD_COALESCE_MS);\n    try {\n      const result = await pending.promise;\n      return Response.json({ ok: true, plugins: result.plugins, durationMs: result.durationMs });\n    } catch (err) {\n      return Response.json({ ok: false, error: sanitizeErrorMessage(toErrorMessage(err)) }, { status: 500 });\n    }\n  }\n\n  // First request: create the coalescing entry\n  let resolve!: (r: { plugins: number; durationMs: number }) => void;\n  let reject!: (e: Error) => void;\n  const promise = new Promise<{ plugins: number; durationMs: number }>((res, rej) => {\n    resolve = res;\n    reject = rej;\n  });\n  const timer = setTimeout(() => executeCoalescedReload(state, sessionServers, transports), RELOAD_COALESCE_MS);\n  state.pendingReload = { promise, resolve, reject, timer };\n\n  try {\n    const result = await promise;\n    return Response.json({ ok: true, plugins: result.plugins, durationMs: result.durationMs });\n  } catch (err) {\n    return Response.json({ ok: false, error: sanitizeErrorMessage(toErrorMessage(err)) }, { status: 500 });\n  }\n};\n\nconst executeCoalescedReload = async (state, sessionServers, transports) => {\n  const pending = state.pendingReload;\n  if (!pending) return;\n  state.pendingReload = null;\n  try {\n    const result = await performConfigReload(state, sessionServers, transports);\n    pending.resolve(result);\n  } catch (err) {\n    pending.reject(err instanceof Error ? err : new Error(String(err)));\n  }\n};\n```\n\nConstraints:\n- Do NOT remove checkEndpointRateLimit function — other endpoints use it.\n- Do NOT change rate limiting on any other endpoint.\n- The coalescing state MUST be on ServerState (not module-level) to survive hot reload.\n- The response shape { ok, plugins, durationMs } must be identical to current behavior.\n- performConfigReload's serialization chain (reload.ts) still applies — coalescing happens at the HTTP layer before performConfigReload is called.\n\nTraps:\n- The timer callback must handle the case where state.pendingReload is already null (e.g., if the server shuts down mid-debounce).\n- Error handling: if performConfigReload throws, ALL coalesced callers must receive the error response."
+    },
+    {
+      "id": "US-004",
+      "title": "Client-side batch reload suppression",
+      "description": "Add OPENTABS_SKIP_NOTIFY env var to notifyServer in build.ts. Update scripts/plugins.ts to set it during batch builds and fire a single POST /reload at the end.",
+      "acceptanceCriteria": [
+        "notifyServer() in build.ts returns early when OPENTABS_SKIP_NOTIFY=1 is set",
+        "scripts/plugins.ts passes OPENTABS_SKIP_NOTIFY=1 in the spawn environment for each plugin build",
+        "scripts/plugins.ts sends a single POST /reload after all plugins are built",
+        "The single POST /reload reads port from ~/.opentabs/server.port and secret from ~/.opentabs/extension/auth.json",
+        "When the server is not running, the final reload fails silently (build still succeeds)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-tools/src/commands/build.ts (check env var in notifyServer)\n- scripts/plugins.ts (set env var, add final reload)\n\nContext:\nnotifyServer in build.ts at line 236:\n```\nconst notifyServer = async (): Promise<void> => {\n  const authJsonPath = join(getConfigDir(), 'extension', 'auth.json');\n  // ... reads secret, reads port from server.port, calls POST /reload\n};\n```\n\nscripts/plugins.ts builds plugins using spawn (line 52):\n```\nconst runInPlugin = (pluginName: string, cmd: string[]): Promise<boolean> => {\n  const [bin = '', ...args] = cmd;\n  const proc = spawn(platformExec(bin), args, {\n    cwd: join(pluginsDir, pluginName),\n    stdio: ['ignore', 'inherit', 'inherit'],\n  });\n  return new Promise(resolve => {\n    proc.on('close', code => resolve(code === 0));\n  });\n};\n```\n\nChanges:\n\n1. In build.ts notifyServer, add at the very start:\n```\nif (process.env.OPENTABS_SKIP_NOTIFY === '1') return;\n```\n\n2. In scripts/plugins.ts, update the spawn call to pass the env var:\n```\nconst proc = spawn(platformExec(bin), args, {\n  cwd: join(pluginsDir, pluginName),\n  stdio: ['ignore', 'inherit', 'inherit'],\n  env: { ...process.env, OPENTABS_SKIP_NOTIFY: '1' },\n});\n```\n\n3. After the build loop in scripts/plugins.ts, add a final reload notification:\n```\n// Notify server once after all plugins are built\nconst notifyServerOnce = async (): Promise<void> => {\n  const { getConfigDir } = await import('@opentabs-dev/shared');\n  const configDir = getConfigDir();\n  const authJsonPath = join(configDir, 'extension', 'auth.json');\n  const portFilePath = join(configDir, 'server.port');\n  // Read secret and port, call POST /reload — same logic as build.ts notifyServer\n  // Fail silently if server is not running\n};\n\nif (failed.length === 0) {\n  await notifyServerOnce().catch(() => {});\n}\n```\n\nAlternatively, since scripts/plugins.ts runs from the monorepo root, it can import the notifyServer function from plugin-tools if it's exported. Check if notifyServer is exported — at build.ts it is likely NOT exported (it's used only in handleBuild). If not, duplicate the logic or extract a shared helper.\n\nConstraints:\n- Do NOT change the behavior of individual plugin builds when OPENTABS_SKIP_NOTIFY is not set.\n- The env var must only be set for the spawned child processes, not the parent process itself.\n- scripts/plugins.ts is NOT a workspace package — it cannot directly import from platform/* packages via bare specifiers. Use dynamic import with the resolved path or duplicate the minimal fetch logic.\n\nTraps:\n- scripts/plugins.ts uses `spawn` with `platformExec(bin)`. The env object passed to spawn replaces the default env entirely — use `{ ...process.env, OPENTABS_SKIP_NOTIFY: '1' }` to inherit the parent env.\n- The port file path uses the convention `~/.opentabs/server.port`. Import getConfigDir from @opentabs-dev/shared (scripts/plugins.ts already imports platformExec from @opentabs-dev/shared at line 12)."
+    },
+    {
+      "id": "US-005",
+      "title": "Move checkForUpdates out of reload path",
+      "description": "Remove checkForUpdates calls from both performReload and performConfigReload. Run version check once at startup (fire-and-forget) and on a 6-hour periodic timer stored on ServerState.",
+      "acceptanceCriteria": [
+        "performReload does NOT call checkForUpdates",
+        "performConfigReload does NOT call checkForUpdates",
+        "The plugins.changed notification after checkForUpdates is removed from both functions",
+        "A new runVersionCheck function is exported from reload.ts",
+        "runVersionCheck is called fire-and-forget after initial performReload in index.ts",
+        "A 6-hour periodic timer calls runVersionCheck, stored as state.versionCheckTimerId",
+        "The timer is cleared in installShutdownHandlers",
+        "The timer is stored on ServerState (not module-level) to survive hot reload correctly",
+        "Existing unit test at reload.test.ts that asserts checkForUpdates during performConfigReload is updated"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/reload.ts (remove checkForUpdates from performReload + performConfigReload, add runVersionCheck)\n- platform/mcp-server/src/index.ts (schedule runVersionCheck after startup)\n- platform/mcp-server/src/state.ts (add versionCheckTimerId)\n- platform/mcp-server/src/reload.test.ts (update existing test)\n\nContext:\ncheckForUpdates is called in TWO places:\n\n1. performReload (line 505-518):\n```\ntry {\n  await checkForUpdates(state);\n} catch {\n  // Update check is best-effort — failures are not actionable\n}\n\nif (state.outdatedPlugins.length > 0 && isExtensionConnected(state)) {\n  sendToExtension(state, {\n    jsonrpc: '2.0',\n    method: 'plugins.changed',\n    params: { ...buildConfigStatePayload(state) },\n  });\n}\n```\n\n2. performConfigReload (line 562-579):\n```\ntry {\n  await checkForUpdates(state);\n} catch {\n  // Update check is best-effort — failures are not actionable\n}\n\nif (state.outdatedPlugins.length > 0 && isExtensionConnected(state)) {\n  sendToExtension(state, {\n    jsonrpc: '2.0',\n    method: 'plugins.changed',\n    params: { ...buildConfigStatePayload(state) },\n  });\n}\n```\n\nThe timer pattern already exists in the codebase: sweepTimerId (state.ts line 306) is `ReturnType<typeof setInterval> | null`.\n\nChanges:\n\n1. In reload.ts, remove the checkForUpdates block (lines 505-518) from performReload and the corresponding block (lines 562-579) from performConfigReload.\n\n2. Add a new exported function:\n```\nconst runVersionCheck = async (state: ServerState): Promise<void> => {\n  try {\n    await checkForUpdates(state);\n  } catch {\n    // best-effort\n  }\n  if (state.outdatedPlugins.length > 0 && isExtensionConnected(state)) {\n    sendToExtension(state, {\n      jsonrpc: '2.0',\n      method: 'plugins.changed',\n      params: { ...buildConfigStatePayload(state) },\n    });\n  }\n};\n```\n\n3. In state.ts, add `versionCheckTimerId: ReturnType<typeof setInterval> | null;` near sweepTimerId. Initialize to null.\n\n4. In index.ts, after the performReload call and before setHotState, add:\n```\nvoid runVersionCheck(state);\nstate.versionCheckTimerId = setInterval(() => void runVersionCheck(state), 6 * 60 * 60 * 1000);\n```\n\n5. In shutdown handler (find installShutdownHandlers), clear the timer: `if (state.versionCheckTimerId) clearInterval(state.versionCheckTimerId);`\n\n6. In reload.test.ts, find the test at line ~839 that asserts checkForUpdates is called during performConfigReload. Update it to verify checkForUpdates is NOT called.\n\nConstraints:\n- Do NOT remove the checkForUpdates import from reload.ts — it's still used by runVersionCheck.\n- Do NOT change the checkForUpdates function itself (in version-check.ts).\n- The sync.full message sent by reloadCore already includes outdatedPlugins from state — but on a fresh startup, state.outdatedPlugins is empty. The fire-and-forget runVersionCheck after performReload fills it in asynchronously. The extension will get the data when it connects (via sync.full on WebSocket connect) or on the next plugins.changed notification.\n\nTraps:\n- In index.ts, the startup code uses hot state detection (checking if state already exists from a previous hot reload). The timer must be set ONLY once — check if versionCheckTimerId already exists from a previous hot reload iteration and clear it before setting a new one.\n- Look at how sweepTimerId is managed in reload.ts (restartSweepTimer function) for the pattern."
+    },
+    {
+      "id": "US-006",
+      "title": "Portable paths in registerInConfig",
+      "description": "Update registerInConfig in build.ts to write ~/  prefix for plugin paths under HOME instead of absolute paths.",
+      "acceptanceCriteria": [
+        "toPortablePath function converts absolute paths starting with homedir() to ~/... prefix",
+        "toPortablePath returns absolute paths unchanged when not under HOME",
+        "registerInConfig writes the portable path to config.json",
+        "Duplicate detection still works: existing absolute /Users/... entry prevents re-registration of the same path as ~/...",
+        "Both / and \\\\ separators are handled for cross-platform compatibility"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-tools/src/commands/build.ts (add toPortablePath, use in registerInConfig)\n\nContext:\nregisterInConfig at build.ts line 215-230:\n```\nconst absolutePath = resolve(projectDir);\nconst configDir = dirname(configPath);\n\n// Check for duplicates by comparing resolved absolute paths\nconst alreadyRegistered = plugins.some(\n  existing => resolvePluginPathForComparison(existing, configDir) === absolutePath,\n);\nif (alreadyRegistered) return false;\n\nplugins.push(absolutePath);\nawait atomicWriteConfig(configPath, `${JSON.stringify(config, null, 2)}\\n`);\nreturn true;\n```\n\nChanges:\n\n1. Add toPortablePath function:\n```\nconst toPortablePath = (absolutePath: string): string => {\n  const home = homedir();\n  if (absolutePath.startsWith(home + '/') || absolutePath.startsWith(home + '\\\\')) {\n    return '~/' + absolutePath.slice(home.length + 1);\n  }\n  return absolutePath;\n};\n```\nImport `homedir` from `node:os`.\n\n2. Replace `plugins.push(absolutePath)` with `plugins.push(toPortablePath(absolutePath))`.\n\nConstraints:\n- The duplicate detection (resolvePluginPathForComparison) compares resolved absolute paths. Since existing entries may be absolute and new entries are ~/..., the comparison resolves both to absolute before comparing. Verify that resolvePluginPathForComparison handles ~/... correctly — it should, since it calls resolveLocalPath which expands ~/.\n- Do NOT change the duplicate detection logic itself.\n\nTraps:\n- homedir() returns a path WITHOUT a trailing slash. The check `absolutePath.startsWith(home + '/')` is correct. Do NOT use `path.startsWith(home)` alone — that would match `/Users/xuzhang2` when home is `/Users/xuzhang`."
+    },
+    {
+      "id": "US-007",
+      "title": "Unknown config key warnings with Levenshtein suggestions",
+      "description": "Add validation to parseConfigRecord that warns about unrecognized top-level config keys, with Levenshtein distance suggestions for likely typos.",
+      "acceptanceCriteria": [
+        "KNOWN_CONFIG_KEYS set includes: version, localPlugins, localPluginDirs, permissions, settings, additionalAllowedDirectories",
+        "Unknown top-level keys in config.json produce a log.warn with the key name",
+        "When an unknown key has Levenshtein distance <= 3 from a known key, the warning includes 'did you mean X?'",
+        "Known keys do NOT produce warnings",
+        "Server starts successfully despite unknown keys (warning, not error)",
+        "Unit tests cover the Levenshtein function and the warning behavior"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts (add KNOWN_CONFIG_KEYS, levenshtein, validation in parseConfigRecord)\n- platform/mcp-server/src/config.test.ts (add tests)\n\nContext:\nparseConfigRecord at config.ts line 176-192 parses the raw record and returns an OpentabsConfig. The validation should happen at the START of this function, before any parsing, so it logs warnings about unrecognized keys.\n\nChanges:\n\n1. Add KNOWN_CONFIG_KEYS constant:\n```\nconst KNOWN_CONFIG_KEYS = new Set([\n  'version',\n  'localPlugins',\n  'localPluginDirs',\n  'permissions',\n  'settings',\n  'additionalAllowedDirectories',\n]);\n```\n\n2. Add a minimal Levenshtein distance function (no dependencies):\n```\nconst levenshtein = (a: string, b: string): number => {\n  const m = a.length;\n  const n = b.length;\n  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>\n    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)),\n  );\n  for (let i = 1; i <= m; i++) {\n    for (let j = 1; j <= n; j++) {\n      dp[i][j] =\n        a[i - 1] === b[j - 1]\n          ? dp[i - 1][j - 1]\n          : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);\n    }\n  }\n  return dp[m][n];\n};\n```\n\n3. At the start of parseConfigRecord, add:\n```\nfor (const key of Object.keys(record)) {\n  if (!KNOWN_CONFIG_KEYS.has(key)) {\n    let suggestion = '';\n    for (const known of KNOWN_CONFIG_KEYS) {\n      if (levenshtein(key, known) <= 3) {\n        suggestion = ` — did you mean '${known}'?`;\n        break;\n      }\n    }\n    log.warn(`Unknown config key \"${key}\" in config.json${suggestion}`);\n  }\n}\n```\n\nConstraints:\n- Warning only, not error. The function must still return a valid OpentabsConfig.\n- The KNOWN_CONFIG_KEYS set must be kept in sync with the OpentabsConfig interface. If future stories add new fields, they must be added here too.\n- Do NOT add nested key validation (e.g., keys inside permissions or settings objects) — only top-level.\n\nTraps:\n- The Levenshtein function must handle empty strings correctly.\n- When multiple known keys are within distance 3, suggest only the closest one. The loop should track the minimum distance."
+    },
+    {
+      "id": "US-008",
+      "title": "File watcher for localPluginDirs parent directories",
+      "description": "Add a new watcher category in file-watcher.ts that watches localPluginDirs parent directories for new plugin subdirectories appearing, triggering re-discovery in dev mode.",
+      "acceptanceCriteria": [
+        "In dev mode, each localPluginDirs directory gets a parent-level watcher",
+        "When a new subdirectory is created in a watched localPluginDirs directory, a reload is triggered",
+        "The parent-level watcher is separate from the existing dist/ file watchers",
+        "Parent-level watchers are cleaned up in stopFileWatching",
+        "Watcher handles non-existent directories gracefully (skips them)"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/file-watcher.ts (add parent directory watcher category)\n\nContext:\nThe file watcher system in file-watcher.ts is complex. It manages multiple watcher types: plugin dist/ watchers, config file watcher, and mtime polling fallback. The FileWatchingState (defined in file-watcher.ts or state.ts) groups these together.\n\nstartFileWatching receives resolved plugin paths and sets up watchers on each plugin's dist/ directory. The new watcher category watches at a HIGHER level — the parent directory itself (e.g., ~/workspace/src/opentabs/plugins/) for new children appearing.\n\nChanges:\nRead file-watcher.ts carefully before implementing. The existing watcher architecture uses:\n- `fs.watch` on directories with debouncing\n- Generation counters to safely ignore stale callbacks after hot reload\n- An `onConfigChanged` callback for triggering reloads\n\nAdd a new function (e.g., `startPluginDirWatchers`) that:\n1. Takes the localPluginDirs array and the onConfigChanged callback\n2. For each dir, calls fs.watch on the parent directory\n3. On change events, filters for directory creation (not file changes)\n4. Debounces and calls onConfigChanged to trigger rediscovery\n5. Stores watchers in FileWatchingState for cleanup\n\nIntegrate this into the startFileWatching function so it's called alongside the existing watchers.\n\nConstraints:\n- This watcher is dev mode ONLY (same as existing file watchers).\n- Do NOT modify the existing plugin dist/ watchers.\n- Do NOT trigger a full reload on every file change in the parent dir — only when the directory listing changes (new child dir appeared or was removed).\n- The debounce should be longer than the dist/ watcher debounce (e.g., 1000ms) since directory creation + plugin build takes time.\n\nTraps:\n- fs.watch on macOS with FSEvents can fire multiple times for a single change. The existing code already handles this with debouncing — follow the same pattern.\n- The watcher should NOT fire for changes INSIDE existing plugin directories (those are handled by the dist/ watchers). Only fire for new/removed immediate children."
+    },
+    {
+      "id": "US-009",
+      "title": "Filtered plugin builds: --filter and --affected flags",
+      "description": "Add --filter=name1,name2 and --affected flags to scripts/plugins.ts to support building a subset of plugins instead of all 113+.",
+      "acceptanceCriteria": [
+        "--filter=slack,discord builds only the named plugins (exact match on directory name)",
+        "--filter with non-existent name prints available plugins and exits 1",
+        "--affected compares SDK version in each plugin's package-lock.json against current platform/plugin-sdk/package.json version",
+        "--affected skips plugins whose installed SDK version matches current (prints 'up to date')",
+        "--affected treats plugins without package-lock.json as affected",
+        "--affected when all plugins are up to date prints message and exits 0",
+        "--filter and --affected combined uses intersection (must match name AND be affected)",
+        "build:plugins:affected npm script is added to root package.json"
+      ],
+      "priority": 9,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- scripts/plugins.ts (add --filter and --affected flag parsing and filtering logic)\n- package.json (add build:plugins:affected script)\n\nContext:\nscripts/plugins.ts at lines 17-33:\n```\nconst mode = process.argv.includes('--build') ? 'build' : process.argv.includes('--check') ? 'check' : null;\n\nif (!mode) {\n  console.error('Usage: tsx scripts/plugins.ts --build | --check');\n  process.exit(1);\n}\n\nconst pluginDirs: string[] = [];\nfor (const entry of readdirSync(pluginsDir, { withFileTypes: true })) {\n  if (entry.isDirectory()) {\n    const pkgPath = join(pluginsDir, entry.name, 'package.json');\n    if (existsSync(pkgPath)) {\n      pluginDirs.push(entry.name);\n    }\n  }\n}\n\npluginDirs.sort();\n```\n\nChanges:\n\n1. After pluginDirs.sort() (line 35), add filter logic:\n```\n// --filter=name1,name2: build only named plugins\nconst filterArg = process.argv.find(a => a.startsWith('--filter='));\nif (filterArg) {\n  const names = new Set(filterArg.slice('--filter='.length).split(','));\n  const unknown = [...names].filter(n => !pluginDirs.includes(n));\n  if (unknown.length > 0) {\n    console.error(`Unknown plugin(s): ${unknown.join(', ')}`);\n    console.error(`Available: ${pluginDirs.join(', ')}`);\n    process.exit(1);\n  }\n  pluginDirs = pluginDirs.filter(d => names.has(d));\n}\n\n// --affected: only plugins with mismatched SDK version\nif (process.argv.includes('--affected')) {\n  const sdkPkgPath = join(repoRoot, 'platform/plugin-sdk/package.json');\n  const currentSdkVersion = JSON.parse(readFileSync(sdkPkgPath, 'utf-8')).version;\n  pluginDirs = pluginDirs.filter(name => {\n    const lockPath = join(pluginsDir, name, 'package-lock.json');\n    if (!existsSync(lockPath)) return true; // no lockfile = needs rebuild\n    try {\n      const lock = JSON.parse(readFileSync(lockPath, 'utf-8'));\n      const installed = lock.packages?.['node_modules/@opentabs-dev/plugin-sdk']?.version;\n      return installed !== currentSdkVersion;\n    } catch {\n      return true; // can't parse = needs rebuild\n    }\n  });\n  if (pluginDirs.length === 0) {\n    console.log(`All plugins are up to date with SDK v${currentSdkVersion}`);\n    process.exit(0);\n  }\n}\n```\nNote: `pluginDirs` is declared with `const` currently — change to `let` to allow reassignment.\n\n2. In root package.json, add:\n```\n\"build:plugins:affected\": \"tsx scripts/plugins.ts --build --affected\"\n```\n\nConstraints:\n- The --filter and --affected flags apply ONLY to the build loop filtering. They do NOT affect the --check mode (but could be extended later).\n- The scripts/plugins.ts is NOT in a workspace package. It imports only from node builtins and @opentabs-dev/shared (for platformExec). Reading the SDK package.json directly from the filesystem is fine.\n\nTraps:\n- pluginDirs is currently declared as `const pluginDirs: string[] = [];` at line 25. The filter/affected logic reassigns it. Change to `let pluginDirs: string[] = [];` or use splice/filter in-place.\n- readFileSync must be imported from node:fs (already imported at line 11 for existsSync/readdirSync).\n- The SDK version in package-lock.json is at `packages['node_modules/@opentabs-dev/plugin-sdk'].version` in lockfile v3 format."
+    },
+    {
+      "id": "US-010",
+      "title": "E2E tests for localPluginDirs discovery and config migration",
+      "description": "Write comprehensive E2E tests covering localPluginDirs directory scanning, path deduplication, the v2→v3 config migration, and portable path normalization.",
+      "acceptanceCriteria": [
+        "Test: plugins in localPluginDirs directories are auto-discovered and appear in /health",
+        "Test: localPlugins entries take precedence over localPluginDirs-scanned duplicates",
+        "Test: non-existent localPluginDirs entry is silently skipped",
+        "Test: empty directory discovers zero additional plugins",
+        "Test: directories without opentabs field are skipped",
+        "Test: v2→v3 migration normalizes absolute paths to ~/",
+        "Test: migration preserves relative paths unchanged",
+        "Test: migration is idempotent",
+        "Test: server resolves ~/ paths correctly",
+        "All tests use isolated configDir and temporary plugin directories"
+      ],
+      "priority": 10,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/local-plugin-dirs.e2e.ts (new file)\n- e2e/portable-paths.e2e.ts (new file)\n\nContext:\nExisting E2E test patterns to follow:\n- e2e/config-migration.e2e.ts — the most relevant example. It creates isolated configDirs, writes v1 configs, starts the server, and verifies migration happened.\n- e2e/tool-dispatch.e2e.ts — shows how to start the server with custom env, create minimal plugins, call /health.\n\nKey infrastructure:\n- Tests create temporary directories for configDir and plugin dirs\n- Tests start the MCP server as a child process with OPENTABS_CONFIG_DIR env var\n- Tests use dynamic ports (port 0 or read from server output)\n- Tests call /health endpoint to verify plugin discovery\n- Tests read config.json after server startup to verify migration\n\nThe test for localPluginDirs should:\n1. Create a temp parent dir with 2-3 minimal plugin subdirectories (package.json with opentabs field + dist/adapter.iife.js + dist/tools.json)\n2. Write config.json with localPluginDirs pointing to the parent dir\n3. Start the server\n4. Call /health and verify all plugins are discovered\n\nThe test for path deduplication should:\n1. Create a parent dir with plugin 'foo'\n2. Write config with both localPlugins: ['<parent>/foo'] AND localPluginDirs: ['<parent>']\n3. Start server, verify 'foo' appears exactly once in /health\n\nFor migration tests:\n1. Write a v2 config with absolute paths under HOME\n2. Start server (triggers migration)\n3. Read config.json, verify paths are now ~/...\n4. Verify version is 3\n\nConstraints:\n- Each test must be fully isolated (own configDir, own temp dirs).\n- Clean up temp dirs after each test.\n- Use the createMinimalPlugin helper if it exists, or create one following existing patterns.\n- Tests must work in CI (no hardcoded paths, no user-specific assumptions)."
+    },
+    {
+      "id": "US-011",
+      "title": "E2E tests for reload coalescing and batch suppression",
+      "description": "Write E2E tests covering reload coalescing behavior, concurrent request handling, and the OPENTABS_SKIP_NOTIFY batch suppression.",
+      "acceptanceCriteria": [
+        "Test: concurrent POST /reload requests are coalesced (fire 5 simultaneously, all get 200)",
+        "Test: rapid sequential reloads within 500ms are coalesced",
+        "Test: reload after 600ms gap performs a separate reload",
+        "Test: auth is checked per-request (invalid auth returns 401 even during coalescing)",
+        "Test: POST /reload no longer returns 429",
+        "All tests use isolated configDir and dynamic ports"
+      ],
+      "priority": 11,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/reload-coalescing.e2e.ts (new file)\n\nContext:\nFollow the patterns in existing E2E tests. The tests need to:\n1. Start an MCP server with a known config\n2. Send multiple concurrent POST /reload requests\n3. Verify all get 200 responses with correct plugin counts\n4. Verify server logs show only one reload (not 5)\n\nFor concurrent requests:\n```\nconst results = await Promise.all([\n  fetch(`http://localhost:${port}/reload`, { method: 'POST', headers: { Authorization: `Bearer ${secret}` } }),\n  fetch(`http://localhost:${port}/reload`, { method: 'POST', headers: { Authorization: `Bearer ${secret}` } }),\n  // ... 3 more\n]);\nfor (const r of results) expect(r.status).toBe(200);\n```\n\nFor the 429 regression test:\n- Fire 15 rapid requests\n- ALL should return 200 (not 429), since rate limiting is replaced by coalescing\n\nFor auth test:\n- Fire one request with valid auth and one with invalid auth simultaneously\n- Valid gets 200, invalid gets 401\n\nConstraints:\n- Timing-dependent tests should use generous timeouts and retry logic.\n- The coalescing window is 500ms — tests that verify coalescing should fire requests within 200ms of each other.\n- Tests that verify separate reloads should wait >600ms between requests."
+    },
+    {
+      "id": "US-012",
+      "title": "E2E tests for version check timing, unknown config keys, and filtered builds",
+      "description": "Write E2E tests covering checkForUpdates removal from reload path, unknown config key warnings, and filtered plugin builds.",
+      "acceptanceCriteria": [
+        "Test: POST /reload does NOT trigger npm view calls (version check absent from reload logs)",
+        "Test: unknown config key produces warning in server output",
+        "Test: close-match unknown key includes 'did you mean' suggestion",
+        "Test: server starts successfully with unknown keys and plugins are still discovered",
+        "Test: --filter=name builds only the named plugin",
+        "Test: --affected skips up-to-date plugins",
+        "All tests use isolated environments"
+      ],
+      "priority": 12,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/version-check-timing.e2e.ts (new file)\n- e2e/unknown-config-keys.e2e.ts (new file)\n- e2e/plugin-build-filter.e2e.ts (new file)\n\nContext:\nThese are three separate test files testing independent features. Each should be a focused test suite.\n\nFor version-check-timing:\n- Start server, wait for startup\n- POST /reload\n- Capture server logs (read from stderr/stdout)\n- Verify no 'npm view' or version check activity appears after the reload\n- Note: The startup version check runs async — it may appear in early logs. The test should verify it does NOT appear in logs AFTER the POST /reload timestamp.\n\nFor unknown-config-keys:\n- Write config with unknown key like { localPlugins: [], permissions: {}, settings: {}, typo_field: true }\n- Start server\n- Capture server output\n- Verify warning about 'typo_field'\n- Write config with { localPlugin: [] } (close match)\n- Start server\n- Verify warning includes 'did you mean localPlugins'\n\nFor plugin-build-filter:\n- This tests scripts/plugins.ts directly, not the MCP server\n- Create a temp plugins directory with 3 minimal plugins\n- Run `tsx scripts/plugins.ts --build --filter=plugin1` with modified pluginsDir\n- Verify only plugin1 was built (check stdout)\n- Run with --affected and a matching SDK version — verify plugin is skipped\n\nNote: Testing --affected requires creating a minimal plugin with a package-lock.json that has a specific SDK version. This may be complex — focus on the --filter tests as the primary coverage and add --affected tests if feasible.\n\nConstraints:\n- The plugin-build-filter tests run scripts/plugins.ts as a child process, not the MCP server.\n- Version check timing tests need to distinguish between startup version check (expected) and reload version check (should not happen).\n- Use unique prefixes in temp directories to avoid collisions with parallel test workers."
+    }
+  ]
+}
