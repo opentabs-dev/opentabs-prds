@@ -1,0 +1,58 @@
+# Ralph Progress Log
+PRD: prd-2026-03-29-203759-extension-audit-fixes-984f91~running.json
+Started: Mon Mar 30 03:38:31 UTC 2026
+---
+
+## Codebase Patterns
+- confirmation-badge.ts uses module-level state (Map, constants) — tests reset via clearAllConfirmationBadges() in beforeEach
+- Chrome API mocks (chrome.action, chrome.notifications) must be set up on globalThis before importing the module under test
+- Duplicate handling in notifyConfirmationRequest: if Map already has the id, update params but skip badge increment
+
+## 2026-03-30 03:43 UTC - US-001
+- Removed `pendingConfirmationCount` variable from confirmation-badge.ts
+- Replaced all reads with `pendingConfirmations.size` derivation
+- Made `clearConfirmationBadge(undefined)` a no-op (early return when id is undefined or not found)
+- Simplified `syncConfirmationNotification` — removed dead branch for count/size mismatch
+- Updated tests: renamed "does not underflow" to "is a no-op when id is undefined" with stronger assertions, renamed "resets count so subsequent clears do not underflow" to verify no-op behavior
+- Files changed: platform/browser-extension/src/confirmation-badge.ts, platform/browser-extension/src/confirmation-badge.test.ts
+- **Learnings for future iterations:**
+  - The old code had a subtle desync bug: `clearConfirmationBadge()` without an id always decremented the counter but only deleted from the Map when id was defined. Deriving count from Map.size makes this impossible.
+  - `syncConfirmationNotification` had a fallback branch (`else { message = '1 tool awaiting approval' }`) that was unreachable when count and size were in sync — removing the separate counter made it safe to simplify to a two-branch if/else.
+---
+
+## 2026-03-30 03:47 UTC - US-002
+- Added `clearSeenId(id)` and `clearAllSeenIds()` functions to `useServerNotifications` hook return value
+- Called `clearSeenId(id)` in `handleConfirmationRespond` in App.tsx after removing the confirmation from pending state
+- Called `clearAllSeenIds()` on disconnect in App.tsx alongside `setPendingConfirmations([])`
+- Added `clearAllSeenIds` to the useEffect dependency array in App.tsx
+- Files changed: platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts, platform/browser-extension/src/side-panel/App.tsx
+- **Learnings for future iterations:**
+  - The `useServerNotifications` hook encapsulates the `seenConfirmationIds` ref — cleanup functions must be exposed via the hook's return value rather than manipulating the ref directly from App.tsx
+  - The disconnect handler in App.tsx (inside `sp:connectionState` listener) is the canonical place to reset all side panel state — any new ref-backed state that accumulates over a session needs cleanup there
+---
+
+## 2026-03-30 03:50 UTC - US-003
+- Replaced `preToggleRef` (shared `WireToolDef[]` ref) with `pendingToolRollbacks` (`Map<number, { toolName, prev }>`)
+- Replaced `prePluginPermRef` (shared `ToolPermission` ref) with `pendingPluginRollbacks` (`Map<number, ToolPermission>`)
+- Each optimistic update now stores its own rollback state keyed by the toggle counter version
+- On failure, each operation rolls back only its specific tool/permission change, independent of other in-flight operations
+- `.finally()` cleans up the Map entry after each operation completes to prevent unbounded growth
+- Removed the `toggleCounter.current === myVersion` staleness guard — per-operation rollback makes it unnecessary
+- Files changed: platform/browser-extension/src/side-panel/components/PluginCard.tsx
+- **Learnings for future iterations:**
+  - The core bug: shared refs (`preToggleRef`, `prePluginPermRef`) are overwritten by each new operation. When operation A fails after operation B has already overwritten the ref, A's rollback either doesn't happen (version check) or uses B's snapshot (which includes A's optimistic update).
+  - The fix pattern: store per-operation rollback data in a Map<operationId, rollbackData>. Each operation captures only what it needs to undo (the specific tool name + its previous permission), not the entire state array. This makes rollbacks composable and independent.
+  - The `toggleCounter` is still useful as a unique key generator for Map entries, but it should NOT be used as a staleness guard (`if (counter === myVersion)`) for rollback — stale operations still need their rollback applied.
+---
+
+## 2026-03-30 03:55 UTC - US-004
+- Extended `tab.stateChanged` handler in useServerNotifications.ts to extract and apply `params.tabs` alongside `tabState`
+- Added type-only import for `PluginTabInfo` from `@opentabs-dev/shared` (safe for CSP — erased at compile time)
+- When `params.tabs` is an array, updates the plugin's `tabs` field (empty array → `undefined` to match `bg:getFullState` convention)
+- When `params.tabs` is absent or not an array, only `tabState` is updated (backwards compatible)
+- Files changed: platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts
+- **Learnings for future iterations:**
+  - The `tab.stateChanged` notification from the background script includes a `tabs: PluginTabInfo[]` array alongside `state`. The side panel `PluginState` type (derived from `ConfigStatePlugin`) already has a `tabs?: PluginTabInfo[]` field — no type changes needed.
+  - Convention: empty tabs arrays are stored as `undefined` (not `[]`) to match `bg:getFullState` behavior. Use `newTabs.length > 0 ? newTabs : undefined`.
+  - Type-only imports from `@opentabs-dev/shared` are safe in the side panel bundle — they're erased by TypeScript and never reach the bundler. Only value imports from barrel files risk pulling in Node.js APIs.
+---
