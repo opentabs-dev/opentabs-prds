@@ -1,0 +1,23 @@
+{
+  "project": "OpenTabs Plugin — twitch",
+  "description": "Fix dead code in the Twitch GQL function where auth cache clearing on HTTP 401/403 is unreachable because fetchFromPage auto-throws before the response.ok check.",
+  "workingDirectory": "plugins/twitch",
+  "qualityChecks": "cd plugins/twitch && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Move auth cache clearing to the catch block where fetchFromPage errors are handled",
+      "description": "The gql() function has dead code: lines 96-101 check response.ok after fetchFromPage, but fetchFromPage auto-throws ToolError on non-ok status, making these lines unreachable. Move the clearAuthCache call to a catch block that handles ToolError from fetchFromPage.",
+      "acceptanceCriteria": [
+        "The `if (!response.ok)` block (lines 96-101) is removed",
+        "A try/catch wraps the fetchFromPage call, and the catch block checks for auth-category ToolError and calls clearAuthCache('twitch')",
+        "The httpStatusToToolError import is removed if no longer used elsewhere in the file"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/twitch/src/twitch-api.ts (fix gql function)\n\nContext:\nThe `gql()` function calls `fetchFromPage` on line 85. `fetchFromPage` (SDK) auto-throws `ToolError` on non-ok HTTP status with the appropriate category (auth for 401/403, rate_limit for 429, etc.). This means the `if (!response.ok)` block on lines 96-101 is dead code:\n\n```typescript\nif (!response.ok) {\n  if (response.status === 401 || response.status === 403) {\n    clearAuthCache('twitch');\n  }\n  throw httpStatusToToolError(response, 'Twitch GQL request failed');\n}\n```\n\nThe consequence is that when Twitch returns HTTP 401/403, `fetchFromPage` throws, the `clearAuthCache` never executes, and the stale auth token stays cached. Subsequent calls keep using the stale token.\n\nChanges:\nWrap the `fetchFromPage` call in a try/catch. In the catch, check if the error is a `ToolError` with `category === 'auth'` and call `clearAuthCache('twitch')` before re-throwing:\n\n```typescript\nlet response: Response;\ntry {\n  response = await fetchFromPage(GQL_URL, { ... });\n} catch (error) {\n  if (error instanceof ToolError && error.category === 'auth') {\n    clearAuthCache('twitch');\n  }\n  throw error;\n}\n```\n\nRemove the dead `if (!response.ok)` block entirely.\n\nConstraints:\n- Do NOT change the GraphQL error handling below (lines 103-114) — those handle GraphQL-level errors (status 200 with errors in body)\n- Keep the ToolError import (it's used for the GraphQL error handling and the catch block)\n- Remove the `httpStatusToToolError` import only if it's not used elsewhere in the file"
+    }
+  ]
+}

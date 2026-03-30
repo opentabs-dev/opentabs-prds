@@ -1,0 +1,37 @@
+{
+  "project": "OpenTabs Plugin — netflix",
+  "description": "Fix three broken Netflix tools: get_title_details discards fetched data, get_title_details returns synopsis as genres, and get_notifications always returns empty.",
+  "workingDirectory": "plugins/netflix",
+  "qualityChecks": "cd plugins/netflix && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix get_title_details to re-read Apollo cache after pathEvaluator fetch and fix genres field",
+      "description": "The get_title_details tool fetches data via pathEvaluator when the Apollo cache is empty but never re-reads the cache afterward. Also, the genres and synopsis fields both read from the same textEvidence source, and cast/creators/is_original are hardcoded to empty/false.",
+      "acceptanceCriteria": [
+        "After the pathEvaluator fetch, the tool re-reads apolloData from the Apollo cache before building the response",
+        "The genres field reads from a different source than synopsis (or is honestly set to empty string if no genre data is available)",
+        "cast, creators, and is_original fields are populated from apolloData when available (or the output schema is updated to remove these fields if the data is genuinely unavailable)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/netflix/src/tools/get-title-details.ts (fix cache re-read and field mapping)\n- plugins/netflix/src/tools/schemas.ts (reference for mapTitle pattern)\n\nContext:\nThe tool has three bugs:\n\n1. **pathEvaluator result discarded** (lines 60-73): When `!apolloData && !titleVal`, the tool calls `pe.get(...)` to fetch data into the Falcor/Apollo cache, but then never re-reads `apolloData`. All field extractions on lines 76+ operate on the original null `apolloData`, producing empty results.\n\nFix: After the `pe.get()` call on line 71, re-read the Apollo cache:\n```typescript\nif (apolloClient?.cache) {\n  const cacheData = apolloClient.cache.extract();\n  apolloData = cacheData[`Movie:{\"videoId\":${videoId}}`] ?? cacheData[`Show:{\"videoId\":${videoId}}`] ?? null;\n}\nif (!apolloData) apolloData = readApolloTitle(params.video_id);\n```\n\n2. **genres = synopsis** (lines 89, 93): Both fields read `textEvidence?.[0]?.text`:\n```typescript\nsynopsis: textEvidence?.[0]?.text ?? '',\ngenres: textEvidence?.[0]?.text ?? '',\n```\nThe same bug exists in schemas.ts `mapTitle` (line 55). Fix: Set genres to empty string since the Apollo cache textEvidence doesn't contain genre information, or try to extract from a different cache field like `evidence` or `genres`.\n\n3. **Empty cast/creators/is_original** (lines 94-96): These are hardcoded:\n```typescript\ncast: [],\ncreators: [],\nis_original: false,\n```\nIf the Apollo cache genuinely doesn't contain this data, update the output schema description to honestly reflect this limitation rather than promising it in the tool description.\n\nConstraints:\n- Do NOT change the Apollo client access pattern (getPageGlobal)\n- Do NOT change the pathEvaluator fetch approach\n- The readApolloTitle function is in netflix-api.ts — do NOT modify it"
+    },
+    {
+      "id": "US-002",
+      "title": "Remove non-functional get_notifications tool or make it return accurate data",
+      "description": "The get_notifications tool always returns an empty notifications array. Either fix it to return real notifications or remove it from the plugin.",
+      "acceptanceCriteria": [
+        "The notifications field in the response is either populated with real data OR the tool is removed from the plugin's tools array in index.ts",
+        "If removed, the tool file is deleted and the import is removed from index.ts"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/netflix/src/tools/get-notifications.ts (fix or remove)\n- plugins/netflix/src/index.ts (remove import if tool is deleted)\n\nContext:\nThe tool is non-functional — it promises 'new release notifications, recommendations, and other alerts' but the notifications array is always empty (lines 33-41):\n```typescript\nconst notifications: z.infer<typeof notificationSchema>[] = [];\n// ... no code populates this array ...\nreturn { unread_count: unreadCount, notifications };\n```\n\nThe recommended fix is to remove the tool entirely. Falcor cache notification data requires complex reference resolution that's not worth implementing for minimal value.\n\nIf removing:\n1. Delete `plugins/netflix/src/tools/get-notifications.ts`\n2. In `plugins/netflix/src/index.ts`, remove the import and the entry in the tools array\n\nConstraints:\n- If keeping the tool, the notifications array must actually contain data\n- If removing, ensure no other tool references or imports from this file"
+    }
+  ]
+}

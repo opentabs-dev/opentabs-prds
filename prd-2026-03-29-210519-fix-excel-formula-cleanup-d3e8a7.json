@@ -1,0 +1,23 @@
+{
+  "project": "OpenTabs Plugin — excel-online",
+  "description": "Fix the evaluate_formula tool to clean up the temp cell ZZ9999 even when the read step fails, preventing leftover formulas in the user's workbook.",
+  "workingDirectory": "plugins/excel-online",
+  "qualityChecks": "cd plugins/excel-online && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Wrap evaluate_formula in try/finally to ensure temp cell cleanup",
+      "description": "The write→read→clear sequence in evaluate_formula has no error recovery. If the read step fails, the formula persists in cell ZZ9999.",
+      "acceptanceCriteria": [
+        "The clear operation runs in a finally block that executes regardless of whether the read succeeds or fails",
+        "If the clear operation itself fails, the error is not swallowed — it should be logged or included in the response",
+        "The tool still returns the correct result on success"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- plugins/excel-online/src/tools/evaluate-formula.ts (add try/finally)\n\nContext:\nThe handle function performs three sequential API calls (lines 28-43):\n```typescript\n// Write formula\nawait workbookApi(`/worksheets('${ws}')/range(address='${tempCell}')`, {\n  method: 'PATCH',\n  body: { formulas: [[params.formula]] },\n});\n\n// Read result\nconst result = await workbookApi<{...}>(`/worksheets('${ws}')/range(address='${tempCell}')`);\n\n// Clear\nawait workbookApi(`/worksheets('${ws}')/range(address='${tempCell}')/clear`, {\n  method: 'POST',\n  body: { applyTo: 'All' },\n});\n```\n\nIf the read on line 34 throws (network timeout, API error), the clear on line 40 never runs. The formula remains in the user's workbook.\n\nFix: Wrap the read and result-building in a try block, with the clear in a finally block:\n```typescript\nawait workbookApi(/* write formula */);\n\nlet result;\ntry {\n  result = await workbookApi<{...}>(/* read result */);\n} finally {\n  await workbookApi(/* clear */).catch(() => {});\n}\n```\n\nThe `.catch(() => {})` on the clear prevents a double-throw if both read and clear fail.\n\nConstraints:\n- Do NOT change the workbookApi function\n- The temp cell address ZZ9999 is fine — don't change it\n- Keep the existing result extraction logic after the try/finally"
+    }
+  ]
+}

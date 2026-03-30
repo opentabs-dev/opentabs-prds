@@ -1,0 +1,23 @@
+{
+  "project": "OpenTabs Plugin — linear",
+  "description": "Fix GraphQL injection vulnerability in batch_update_issues where user-provided issue IDs are interpolated directly into the GraphQL query string via template literals.",
+  "workingDirectory": "plugins/linear",
+  "qualityChecks": "cd plugins/linear && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Use GraphQL variables for issue IDs in batch_update_issues",
+      "description": "Replace string interpolation of issue IDs in the GraphQL query with proper GraphQL variables to prevent injection.",
+      "acceptanceCriteria": [
+        "Issue IDs are passed as GraphQL variables, not interpolated into the query string with double quotes",
+        "No template literal interpolation of user-provided values appears in the GraphQL query body",
+        "The mutation still executes correctly for a batch of issue IDs with the same aliased pattern"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/linear/src/tools/batch-update-issues.ts (fix GraphQL injection)\n\nContext:\nThe `batch_update_issues` tool builds a GraphQL mutation with aliased fields for each issue ID. Currently, the issue IDs are interpolated directly into the query string using template literals with double quotes:\n\n```\nconst aliases = params.issue_ids.map(\n  (id, i) =>\n    `issue${i}: issueUpdate(id: \"${id}\", input: $input) {\n    success\n    issue { ${ISSUE_FIELDS} }\n  }`,\n);\n```\n\nA crafted issue ID containing a double-quote character (`\"`) could break out of the GraphQL string literal and inject arbitrary GraphQL operations.\n\nChanges:\nThe fix requires passing each issue ID as a separate GraphQL variable. Change the approach to:\n1. Build a variables object with `$id0: ID!, $id1: ID!, ...` for each issue\n2. Reference these variables in the mutation aliases: `issueUpdate(id: $id0, input: $input)`\n3. Pass the actual ID values in the variables dict alongside `input`\n\nExample approach:\n```typescript\nconst varDefs = params.issue_ids.map((_, i) => `$id${i}: String!`).join(', ');\nconst aliases = params.issue_ids.map(\n  (_, i) =>\n    `issue${i}: issueUpdate(id: $id${i}, input: $input) {\n    success\n    issue { ${ISSUE_FIELDS} }\n  }`,\n);\nconst query = `mutation BatchUpdateIssues($input: IssueUpdateInput!, ${varDefs}) {\n  ${aliases.join('\\n')}\n}`;\nconst vars: Record<string, unknown> = { input };\nparams.issue_ids.forEach((id, i) => { vars[`id${i}`] = id; });\nconst data = await graphql<...>(query, vars);\n```\n\nConstraints:\n- Do NOT change the aliased mutation pattern (issue0, issue1, ...) — the result parsing depends on these alias names\n- Do NOT change the ISSUE_FIELDS constant\n- The $input variable must remain as-is"
+    }
+  ]
+}

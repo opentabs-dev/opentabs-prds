@@ -1,0 +1,40 @@
+{
+  "project": "OpenTabs Plugin — robinhood",
+  "description": "Fix URL encoding issues in multiple Robinhood tools where query parameters are string-interpolated into URLs without encoding, and fix mapOrder always returning empty symbol.",
+  "workingDirectory": "plugins/robinhood",
+  "qualityChecks": "cd plugins/robinhood && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Use query option in api() for URL parameters instead of string interpolation",
+      "description": "Multiple tools interpolate user-provided values directly into URL strings without encoding. Use the api() function's query option or buildQueryString to properly encode parameters.",
+      "acceptanceCriteria": [
+        "search-instruments.ts uses the api() query option instead of string interpolation in the URL",
+        "get-quote.ts uses the api() query option for the symbols parameter",
+        "get-earnings.ts uses the api() query option for the symbol parameter",
+        "get-ratings.ts uses the api() query option for the ids parameter",
+        "get-historicals.ts uses the api() query option for symbols, interval, span, and bounds parameters",
+        "No tool file contains raw string interpolation of params in URL paths for query parameters"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- plugins/robinhood/src/tools/search-instruments.ts (fix URL encoding)\n- plugins/robinhood/src/tools/get-quote.ts (fix URL encoding)\n- plugins/robinhood/src/tools/get-earnings.ts (fix URL encoding)\n- plugins/robinhood/src/tools/get-ratings.ts (fix URL encoding)\n- plugins/robinhood/src/tools/get-historicals.ts (fix URL encoding)\n\nContext:\nThe `api()` function in robinhood-api.ts accepts a `query` option that uses `buildQueryString` to properly encode parameters. But several tools bypass this by interpolating values directly into the URL string.\n\nCurrent code examples:\n\nsearch-instruments.ts line 21:\n```typescript\nconst data = await api<{ results: RawInstrument[] }>(`/instruments/?query=${params.query}`);\n```\n\nget-quote.ts line 21:\n```typescript\nconst data = await api<{ results: RawQuote[] }>(`/marketdata/quotes/?symbols=${params.symbols}`);\n```\n\nFix pattern — change each to use the query option:\n```typescript\n// search-instruments.ts\nconst data = await api<{ results: RawInstrument[] }>('/instruments/', { query: { query: params.query } });\n\n// get-quote.ts\nconst data = await api<{ results: RawQuote[] }>('/marketdata/quotes/', { query: { symbols: params.symbols } });\n```\n\nFirst check the api() function signature in robinhood-api.ts to confirm it supports a query option. If it doesn't, add one using buildQueryString from the SDK.\n\nConstraints:\n- Do NOT change the api() function signature if it already supports query — only update the callers\n- The endpoint path should not contain a trailing `?` — the query option handles the separator"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix mapOrder to extract symbol from the raw order data",
+      "description": "The mapOrder function always sets symbol to empty string. Either extract the symbol from available data or remove the field if not available.",
+      "acceptanceCriteria": [
+        "mapOrder extracts a meaningful symbol value from the raw order data, or the symbol field in orderSchema is removed if the data is genuinely unavailable",
+        "The orderSchema description accurately reflects what data is available"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/robinhood/src/tools/schemas.ts (fix mapOrder)\n- plugins/robinhood/src/tools/list-orders.ts (reference for how mapOrder is called)\n\nContext:\nThe `mapOrder` function on line 331 always returns `symbol: ''`:\n```typescript\nexport const mapOrder = (o: RawOrder) => ({\n  id: o.id ?? '',\n  instrument_id: o.instrument_id ?? '',\n  symbol: '',\n  ...\n});\n```\n\nThe Robinhood API returns orders with an `instrument` field that is a URL (e.g., `https://api.robinhood.com/instruments/UUID/`). To get the symbol, one would need to either:\n1. Extract the instrument UUID from the URL and look up the symbol\n2. Check if the raw API response contains a `symbol` field that RawOrder doesn't declare\n3. Remove the `symbol` field from the schema if it cannot be populated\n\nThe most pragmatic fix is to check whether the raw order response contains fields not currently in `RawOrder` (like `symbol` or `instrument_id`), and map them if available. If the API truly doesn't return a symbol, remove the field from the output schema rather than returning misleading empty strings.\n\nConstraints:\n- Do NOT make additional API calls per order to resolve instrument URLs to symbols (this would be N+1 and very slow)\n- The orderSchema is used by list-orders.ts — keep it consistent"
+    }
+  ]
+}

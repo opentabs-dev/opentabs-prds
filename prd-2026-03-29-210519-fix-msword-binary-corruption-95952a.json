@@ -1,0 +1,39 @@
+{
+  "project": "OpenTabs Plugin — microsoft-word",
+  "description": "Fix binary data corruption in .docx ZIP extraction where DEFLATE-compressed entries are round-tripped through TextDecoder/TextEncoder, and fix Retry-After header parsing using wrong utility.",
+  "workingDirectory": "plugins/microsoft-word",
+  "qualityChecks": "cd plugins/microsoft-word && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix decompressDeflateRaw to return Uint8Array instead of string",
+      "description": "The decompressDeflateRaw function converts decompressed bytes to a UTF-8 string via TextDecoder, which corrupts non-UTF-8 binary data (images, OLE objects). Change it to return raw Uint8Array bytes.",
+      "acceptanceCriteria": [
+        "decompressDeflateRaw returns Uint8Array instead of string",
+        "extractAllZipEntries no longer round-trips through TextEncoder after decompression",
+        "extractTextFromDocumentXml still works correctly (it receives string content from the ZIP entry data decoded as needed)",
+        "Binary ZIP entries (images, etc.) are preserved byte-for-byte through decompression"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/microsoft-word/src/docx-utils.ts (fix decompressDeflateRaw and extractAllZipEntries)\n\nContext:\nThe `decompressDeflateRaw` function (around line 60-86) decompresses data and returns a string:\n```typescript\nasync function decompressDeflateRaw(compressed: Uint8Array): Promise<string> {\n  const ds = new DecompressionStream('deflate-raw');\n  // ... writes compressed data, reads chunks ...\n  return new TextDecoder().decode(result);  // line 85 — converts binary to UTF-8 string\n}\n```\n\nIn `extractAllZipEntries` (line 123+), this string is converted back to bytes:\n```typescript\nif (compressionMethod === 8) {\n  const text = await decompressDeflateRaw(rawData);  // line 143\n  data = new TextEncoder().encode(text);  // line 144 — converts back to bytes\n}\n```\n\nThe TextDecoder→TextEncoder round-trip corrupts any non-UTF-8 bytes (images, binary OLE objects) because invalid byte sequences are replaced with U+FFFD.\n\nChanges:\n1. Change `decompressDeflateRaw` to return `Promise<Uint8Array>` — remove the `TextDecoder().decode()` call and instead concatenate the chunks into a single Uint8Array directly\n2. In `extractAllZipEntries`, remove the `TextEncoder().encode(text)` call — just assign the Uint8Array directly: `data = await decompressDeflateRaw(rawData);`\n3. Callers that need string content (like `extractTextFromDocumentXml`) should decode the Uint8Array to string at the call site using `new TextDecoder().decode(entry.data)`\n\nCheck all callers of decompressDeflateRaw to ensure they handle the Uint8Array return type. Also check all consumers of ZipEntry.data to ensure they decode to string where needed.\n\nConstraints:\n- Do NOT change the ZipEntry interface — `data: Uint8Array` is already the correct type\n- The `extractTextFromDocumentXml` function takes a string argument — callers must decode the entry data to string before passing it\n- Do NOT change the DecompressionStream approach — it's the correct API for browser-side DEFLATE decompression"
+    },
+    {
+      "id": "US-002",
+      "title": "Use SDK parseRetryAfterMs for Retry-After header parsing",
+      "description": "Replace Number.parseInt for Retry-After header with the SDK's parseRetryAfterMs utility which handles both numeric seconds and HTTP-date formats.",
+      "acceptanceCriteria": [
+        "The Retry-After header parsing uses parseRetryAfterMs from @opentabs-dev/plugin-sdk",
+        "parseRetryAfterMs is imported from the SDK",
+        "Number.parseInt is no longer used for Retry-After parsing"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- plugins/microsoft-word/src/microsoft-word-api.ts (fix Retry-After parsing)\n\nContext:\nLine 148 parses the Retry-After header with parseInt:\n```typescript\nconst retryAfter = response.headers.get('Retry-After');\nconst retryMs = retryAfter ? Number.parseInt(retryAfter, 10) * 1000 : undefined;\n```\n\nThis fails for HTTP-date format Retry-After values (e.g., `Sat, 29 Mar 2026 12:00:00 GMT`), producing NaN.\n\nFix: Use `parseRetryAfterMs` from the SDK:\n```typescript\nimport { parseRetryAfterMs } from '@opentabs-dev/plugin-sdk';\n// ...\nconst retryAfter = response.headers.get('Retry-After');\nconst retryMs = retryAfter !== null ? parseRetryAfterMs(retryAfter) : undefined;\n```\n\nCheck if `parseRetryAfterMs` is already imported at the top of the file. If not, add it to the import statement.\n\nConstraints:\n- Do NOT change the error classification logic around this line\n- Only change the Retry-After parsing, not the surrounding rate-limit handling"
+    }
+  ]
+}
