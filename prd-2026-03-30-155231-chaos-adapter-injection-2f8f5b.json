@@ -1,0 +1,70 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add stress tests for adapter injection: rapid re-injection after IIFE changes, injection during tab navigation, hash verification under concurrent tab opens, and adapter file corruption recovery.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Rapid adapter re-injection (5 IIFE changes in 5 seconds)",
+      "description": "Modify the adapter IIFE file 5 times in rapid succession, verify the final injection uses the latest hash and tools work.",
+      "acceptanceCriteria": [
+        "New test file e2e/stress-adapter-injection.e2e.ts exists",
+        "Test modifies the e2e-test adapter IIFE 5 times with 1s between changes",
+        "After all changes, extension_check_adapter reports the latest hash",
+        "Tool calls succeed with the final adapter version",
+        "npx playwright test e2e/stress-adapter-injection.e2e.ts passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-adapter-injection.e2e.ts (NEW file)\n\nContext:\nWhen an adapter IIFE file changes (e.g., plugin rebuild), the server detects it and sends plugin.update to the extension, which re-injects the new adapter. The iife-injection.e2e.ts file tests single re-injection. We need rapid sequential re-injections.\n\nChanges:\nSetup: standard server + extension + test server + matching tab. Verify initial tool call works. Read the current adapter IIFE content. Loop 5 times: append a harmless comment (`// change-${i}`) to the IIFE file, POST /reload, wait 1s. After all changes, use mcpClient to call extension_check_adapter for e2e-test. Verify hash matches the final file. Call e2e-test_echo to verify tools still work.\n\nConstraints:\n- Adapter files are in configDir/extension/adapters/ (symlinked from extension dir)\n- Modifying the IIFE file + POST /reload triggers re-injection\n- The comment change should be enough to change the hash\n- Reference iife-injection.e2e.ts for the exact adapter file path pattern"
+    },
+    {
+      "id": "US-002",
+      "title": "Adapter injection during tab navigation",
+      "description": "Open a matching tab, trigger navigation to a different URL mid-injection cycle, verify no crash and adapter either completes or cleanly fails.",
+      "acceptanceCriteria": [
+        "Test opens a tab, triggers adapter injection, then navigates the tab to a non-matching URL",
+        "No uncaught extension errors (check extension_get_logs for errors)",
+        "After navigating back to matching URL, adapter re-injects and tools work"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-adapter-injection.e2e.ts (add to same file)\n\nContext:\nWhen a tab navigates away from a matching URL, the extension should detect it and not try to inject into the non-matching page. When navigating back, re-injection should occur. The tricky part is navigation DURING injection — chrome.scripting.executeScript may fail if the page is mid-navigation.\n\nChanges:\nSetup: standard server + extension + test server. Open tab to testServer.url. Wait for ready state. Start a tool call (don't await). Immediately navigate the tab to 'about:blank'. The tool call should resolve (success or error). Then navigate back to testServer.url. Wait for ready state again. Verify tool calls work.\n\nConstraints:\n- Use `page.goto('about:blank')` for navigation away\n- Wait for health to show tab state = 'ready' before making tool calls\n- Check extension_get_logs for error-level entries that indicate crashes (ignore expected injection warnings)"
+    },
+    {
+      "id": "US-003",
+      "title": "Multiple tabs opening simultaneously with adapter injection",
+      "description": "Open 5 matching tabs simultaneously, verify all get injected and tools can dispatch to each.",
+      "acceptanceCriteria": [
+        "Test opens 5 browser tabs to testServer.url via Promise.all",
+        "All 5 tabs reach ready state (verified via health endpoint plugin details)",
+        "Tool calls with explicit tabId succeed for each of the 5 tabs",
+        "No adapter hash mismatches across tabs"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-adapter-injection.e2e.ts (add to same file)\n\nContext:\nWhen multiple tabs open simultaneously, the extension must inject the adapter into each. The injection pipeline may queue or parallelize. We need to verify no race conditions in hash checking or adapter file reading.\n\nChanges:\nSetup: standard server + extension + test server. Open 5 tabs via `Promise.all(Array.from({length: 5}, () => { const p = context.newPage(); return p.then(page => page.goto(testServer.url)); }))`. Poll health endpoint until pluginDetails shows e2e-test with 5+ tabs all ready. Then for each tab, call e2e-test_echo with explicit tabId. Verify all succeed.\n\nConstraints:\n- Tab IDs can be read from health endpoint pluginDetails[].tabs[].tabId\n- Use tabId parameter on tool calls to target specific tabs\n- Some tabs may take longer to become ready — poll with timeout"
+    },
+    {
+      "id": "US-004",
+      "title": "Adapter file missing during injection (corruption recovery)",
+      "description": "Delete the adapter IIFE file while a tab is open, verify the extension logs an error but doesn't crash, then restore the file and verify recovery.",
+      "acceptanceCriteria": [
+        "Test deletes the adapter IIFE file from the adapters directory",
+        "Extension logs a warning about missing adapter file (check extension_get_logs)",
+        "Server health remains ok",
+        "After restoring the file + POST /reload, adapter re-injects and tools work"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-adapter-injection.e2e.ts (add to same file)\n\nContext:\nIf an adapter IIFE file is deleted (e.g., disk error, race condition during plugin rebuild), the extension's injection attempt will fail. The extension should log a warning and not crash. When the file is restored, re-injection should work.\n\nChanges:\nSetup: standard server + extension + test server + matching tab at ready state. Verify tool call works. Find the adapter IIFE file path in configDir/extension/adapters/ (glob for *.js). Read and save its content. Delete the file. Open a new matching tab — injection should fail. Check extension_get_logs for the warning. Verify server health ok. Write the saved content back. POST /reload. Wait for the new tab to reach ready. Verify tool calls work on the new tab.\n\nConstraints:\n- The adapter file name includes a hash suffix (e.g., e2e-test-abc123.js)\n- Use fs.readdirSync to find the file, not a hardcoded name\n- The original tab may still work (adapter already injected) — test on a NEW tab"
+    }
+  ]
+}

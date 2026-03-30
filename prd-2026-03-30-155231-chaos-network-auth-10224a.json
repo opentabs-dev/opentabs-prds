@@ -1,0 +1,89 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add stress tests for WebSocket reconnection under load, secret rotation during active sessions, multi-connection isolation under concurrent dispatch, and auth bootstrap race conditions.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "WebSocket reconnect with pending tool calls",
+      "description": "Start tool calls, force WebSocket disconnect by killing server, restart server, verify extension reconnects and subsequent calls succeed.",
+      "acceptanceCriteria": [
+        "New test file e2e/stress-network-auth.e2e.ts exists",
+        "Test starts 3 slow tool calls, kills MCP server after 500ms, restarts server",
+        "The 3 in-flight calls resolve (success or error, no infinite hang)",
+        "Extension auto-reconnects (verified via health extensionConnected=true)",
+        "New tool calls after reconnect succeed",
+        "npx playwright test e2e/stress-network-auth.e2e.ts passes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-network-auth.e2e.ts (NEW file)\n\nContext:\nWhen the server dies, the WebSocket closes, extension enters reconnect backoff. In-flight tool calls should fail with a dispatch error (not hang for 30s). After server restarts on the same port, extension reconnects.\n\nChanges:\nSetup: standard server (hot=false for clean kill/restart) + extension + test server + matching tab. Start 3 slow_with_progress calls (durationMs=5000) via Promise.allSettled. After 500ms, kill the server. Start a NEW server on the same port (save the port, create new server with PORT=savedPort). Wait for extension to reconnect (poll health for extensionConnected=true). Verify the 3 calls all settled. Make a fresh echo call to verify recovery.\n\nConstraints:\n- Use startMcpServer with hot=false for clean kill semantics\n- The new server must use the SAME port and SAME configDir/secret\n- Extension backoff: 1s→2s→4s... may take up to 10s to reconnect\n- Use Promise.allSettled for in-flight calls (some will fail)"
+    },
+    {
+      "id": "US-002",
+      "title": "Secret rotation during active session",
+      "description": "Rotate the auth secret while MCP client has an active session, verify the client gets auth errors on next call and can re-auth with new secret.",
+      "acceptanceCriteria": [
+        "Test creates MCP client with original secret, makes successful tool call",
+        "Rotates secret by writing new auth.json + restarting server",
+        "Old client gets auth error on next call",
+        "New client with new secret succeeds"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-network-auth.e2e.ts (add to same file)\n\nContext:\nThe auth secret is stored in configDir/extension/auth.json. When the server restarts with a new secret, existing sessions with old secret should be rejected. The MCP client uses Bearer auth in HTTP headers.\n\nChanges:\nSetup: standard server + MCP client. Verify echo call works. Kill server. Write new auth.json with different secret (crypto.randomUUID()). Start new server on same port with same configDir (reads new secret from auth.json). Create new MCP client with NEW secret. Verify old client's call fails (401 or auth error). Verify new client's initialize + echo succeeds.\n\nConstraints:\n- Auth secret path: path.join(configDir, 'extension', 'auth.json')\n- Write as JSON: { secret: newUUID }\n- The old client will get 401 Unauthorized"
+    },
+    {
+      "id": "US-003",
+      "title": "Multi-connection isolation under concurrent dispatch",
+      "description": "Connect two browser profiles (extensions) to the same server, dispatch tools from both simultaneously, verify responses route to correct connection.",
+      "acceptanceCriteria": [
+        "Test connects two extension contexts to the same MCP server (different connectionIds)",
+        "Both extensions reach connected state",
+        "Concurrent tool calls from both connections return correct results to correct clients",
+        "No cross-contamination of results between connections"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-network-auth.e2e.ts (add to same file)\n\nContext:\nThe multi-connection.e2e.ts file already tests basic two-connection scenarios. This stress test adds concurrent dispatch from BOTH connections simultaneously to verify response routing isolation.\n\nChanges:\nSetup: start MCP server + test server. Launch TWO extension contexts via launchExtensionContext (each gets its own Chrome instance with different user data dir). Each has its own matching tab open. Create two MCP clients. Fire concurrent calls: client1 calls e2e-test_echo with message 'from-conn-1' and client2 calls e2e-test_echo with message 'from-conn-2' via Promise.all. Verify client1's result contains 'from-conn-1' and client2's contains 'from-conn-2'. Repeat 5 times for confidence.\n\nConstraints:\n- Each launchExtensionContext creates a separate Chrome instance\n- Both share the same MCP server (same port/secret)\n- Each needs its own adapter symlink setup\n- Reference multi-connection.e2e.ts for the exact two-context pattern"
+    },
+    {
+      "id": "US-004",
+      "title": "Health endpoint under rapid polling",
+      "description": "Poll the health endpoint 100 times in rapid succession, verify all responses are valid JSON with consistent data and no timeouts.",
+      "acceptanceCriteria": [
+        "Test fires 100 GET /health requests via Promise.all (batches of 20)",
+        "All 100 responses are valid JSON with status field",
+        "No request times out (all complete within 5s)",
+        "All responses show consistent plugin count (no partially-loaded state)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-network-auth.e2e.ts (add to same file)\n\nContext:\nThe health endpoint is polled by monitoring tools, MCP clients, and E2E tests themselves. Under high polling rates, it must remain fast and consistent.\n\nChanges:\nSetup: standard server with e2e-test plugin. Fire 5 batches of 20 concurrent health requests (100 total) with Authorization header. Parse all responses as JSON. Verify all have status='ok'. Verify all show same pluginCount (value consistency). Verify no request threw or timed out.\n\nConstraints:\n- Health endpoint: GET http://localhost:${port}/health with Bearer auth\n- Use fetch with AbortSignal.timeout(5000) per request\n- Batch to avoid file descriptor exhaustion (20 concurrent is plenty)"
+    },
+    {
+      "id": "US-005",
+      "title": "Audit log under rapid tool calls",
+      "description": "Fire 50 tool calls in quick succession, verify the audit log captures all of them with correct ordering and no missing entries.",
+      "acceptanceCriteria": [
+        "Test fires 50 e2e-test_echo calls sequentially (not parallel, to test log ordering)",
+        "GET /audit returns all 50 entries",
+        "Entries are in newest-first order (timestamps decreasing)",
+        "Each entry has correct tool name and success flag",
+        "auditSummary in health shows totalInvocations >= 50"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-network-auth.e2e.ts (add to same file)\n\nContext:\nThe audit log records every tool invocation. Under rapid calls, entries must not be lost or reordered. The audit-logging.e2e.ts file tests basic CRUD but not high-volume scenarios.\n\nChanges:\nSetup: standard server + extension + test server + matching tab. Fire 50 echo calls sequentially (for loop with await). Then GET /audit?limit=100. Parse response. Verify length >= 50. Verify the first 50 entries all have toolName matching 'e2e-test_echo'. Verify timestamps are in descending order (newest first). GET /health and verify auditSummary.totalInvocations >= 50.\n\nConstraints:\n- Audit endpoint: GET http://localhost:${port}/audit with Bearer auth\n- Sequential calls (not parallel) to test ordering, not throughput\n- The audit may have entries from other tools (browser tools) — filter by toolName"
+    }
+  ]
+}
