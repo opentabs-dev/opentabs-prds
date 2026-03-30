@@ -1,0 +1,89 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-155231-chaos-cross-system-04524d~running.json
+Started: Mon Mar 30 22:53:12 UTC 2026
+---
+
+## Codebase Patterns
+- Cross-system tests that need both side panel AND MCP client use manual setup (not fixtures): `startMcpServer` with `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''` env override + `createMcpClient` + `launchExtensionContext` + `setupAdapterSymlink` + `startTestServer`
+- Plugin must be marked as reviewed (`reviewedVersion` in config permissions) to avoid unreviewed dialog blocking
+- `getPluginVersion()` reads from `E2E_TEST_PLUGIN_DIR/package.json` to get version for `reviewedVersion`
+- `selectPermission(page, ariaLabel, optionText)` clicks Radix Select trigger + picks option — the aria-label for plugin permission is `"Permission for e2e-test plugin"`
+- `openTestAppTab` waits for adapter injection; `waitForToolResult` polls until tool is callable — together they ensure the tab is ready
+- Use `Promise.allSettled` for chaos orchestration where some calls are expected to fail
+- `collectPageErrors(page)` registers a `pageerror` listener and returns an array to check at the end
+- POST /reload pattern: `fetch(\`http://localhost:${port}/reload\`, { method: 'POST', headers: { Authorization: \`Bearer ${secret}\` } })`
+- After removing + re-adding a plugin via config + /reload, must open a new tab for adapter re-injection (existing tabs don't get re-injected automatically)
+- `server.waitForHealth(h => h.plugins >= 1, 15_000)` polls until the plugin is rediscovered after /reload
+
+---
+
+## 2026-03-30 22:56 UTC - US-001
+- Implemented: MCP client tool call while side panel toggles permission
+- New file: `e2e/stress-cross-system.e2e.ts`
+- Test setup: MCP server (skipPermissions disabled) + extension + test server + test app tab + side panel + MCP client
+- Starts `e2e-test_slow_with_progress` (3s) via MCP, toggles e2e-test plugin permission Off→Auto in side panel concurrently
+- Verifies: slow call resolves, permission UI shows Auto, listTools shows echo enabled, fresh echo call succeeds, zero page errors
+- **Learnings for future iterations:**
+  - The slow tool (`slow_with_progress`) is different from echo, so toggling the plugin permission Off→Auto during the slow call tests cross-concern interaction without directly killing the in-flight call
+  - Must use `startMcpServer(configDir, false, undefined, { OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: '' })` — the `false` for hot mode + explicit empty string for skip permissions
+  - `openTestAppTab` requires the test server instance — it polls for adapter injection with diagnostics
+---
+
+## 2026-03-30 23:00 UTC - US-002
+- Implemented: Multiple MCP sessions calling tools concurrently
+- Added test to `e2e/stress-cross-system.e2e.ts`
+- Creates 3 independent MCP clients to same server, each with unique session ID
+- Fires 15 echo calls in parallel (5 per client with unique prefixed messages c1-*, c2-*, c3-*)
+- Verifies all 15 succeed, no cross-session contamination (each client's results contain only its prefix)
+- **Learnings for future iterations:**
+  - `createMcpClient` returns independent client instances — each gets its own session ID after `initialize()`
+  - No need for `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''` env override when not testing permission UI — default `startMcpServer(configDir)` with auto permissions works fine
+  - `Promise.all` (not `allSettled`) is appropriate when all calls are expected to succeed
+  - `waitForToolResult` with client1 is sufficient to warm up — all clients share the same server/extension/tab state
+---
+
+## 2026-03-30 23:05 UTC - US-003
+- Implemented: CLI config change during active MCP dispatch
+- Added test to `e2e/stress-cross-system.e2e.ts`
+- Starts 3 slow_with_progress calls (5s), then after 500ms removes plugin from config + POST /reload
+- In-flight calls settle via Promise.allSettled (some/all may fail — expected)
+- Verifies server health ok after disruption
+- Restores config with plugin, POST /reload, waits for rediscovery, opens new tab, verifies echo call succeeds
+- **Learnings for future iterations:**
+  - POST /reload requires Bearer auth header with server secret
+  - After removing a plugin via config + /reload, in-flight tool calls may fail with plugin-not-found — use Promise.allSettled
+  - After restoring config, need `server.waitForHealth(h => h.plugins >= 1)` to wait for rediscovery
+  - Must open a new test app tab after plugin restore — existing tabs don't get adapter re-injected automatically
+  - `waitForToolResult` with a 20s timeout is needed for post-restore verification since rediscovery + adapter injection takes time
+---
+
+## 2026-03-30 23:10 UTC - US-004
+- Implemented: Side panel search while MCP client installs plugin
+- Added test to `e2e/stress-cross-system.e2e.ts`
+- Starts server with NO plugins, opens side panel, verifies browser tools visible but E2E Test not
+- Types 'test' in search input, then adds e2e-test plugin via config + POST /reload
+- Waits for server rediscovery + side panel update — search results show 'E2E Test' since 'test' matches
+- Clears search, verifies E2E Test visible in full unfiltered list, zero page errors
+- **Learnings for future iterations:**
+  - Starting with empty `localPlugins: []` in config means only browser tools appear — useful for testing plugin addition
+  - Search input is accessible via `sp.locator('input[placeholder="Search plugins and tools..."]')` — more reliable than `input[type="text"]` which could match other inputs
+  - Side panel search bar is always visible when connected (`showSearchBar = connected && !loading`), regardless of plugin count
+  - `plugins.changed` notification triggers `getFullState()` refresh — search results auto-update when plugin list changes
+  - Clear search button is accessible via `button[aria-label="Clear search"]` — appears when search has text
+  - No MCP client needed when the test doesn't call tools — only server + extension + side panel
+---
+
+## 2026-03-30 23:30 UTC - US-005
+- Implemented: Full system stress test with 3 MCP clients + side panel + config changes simultaneously
+- Added test to `e2e/stress-cross-system.e2e.ts`
+- 5 concurrent streams: 3 MCP clients each making 10 echo calls (500ms spacing), side panel toggling theme + expand/collapse cards, config mutation (remove plugin → reload → restore → reload)
+- Uses `Promise.allSettled` for outer orchestration since some tool calls will fail during config removal
+- After chaos settles, verifies: server health ok, plugin rediscovered, at least 1 client can make successful recovery call, side panel shows plugin, zero page errors
+- All 231 E2E tests passed (including this new test) — full Phase 2 verification complete
+- **Learnings for future iterations:**
+  - `Promise.allSettled` is essential for the outer orchestration — some MCP calls WILL fail during config removal, and `Promise.all` would short-circuit
+  - Side panel interactions during chaos should use simple clicks (theme toggle, card expand/collapse) — avoid `selectPermission` which requires Radix dropdown and can interfere with other concurrent interactions
+  - After config restoration + /reload, must open a fresh tab for adapter re-injection — existing tabs don't get re-injected automatically (same pattern as US-003)
+  - Recovery verification uses `waitForToolResult` with 20s timeout per client, wrapped in `Promise.allSettled` — at least 1 client recovering is sufficient to prove system survived
+  - The `themeToggle` and card clicks use `.catch(() => {})` to swallow errors during chaos since the DOM may be in flux from plugin list changes
+---

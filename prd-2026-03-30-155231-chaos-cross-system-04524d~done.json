@@ -16,7 +16,7 @@
         "npx playwright test e2e/stress-cross-system.e2e.ts passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-cross-system.e2e.ts (NEW file)\n\nContext:\nThis is the most realistic chaos scenario: Claude is calling tools via MCP while the user is changing settings in the side panel. The permission change propagates through background script → MCP server → config.json. The in-flight tool call may or may not be affected depending on timing.\n\nChanges:\nSetup: standard server (OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS='') + extension + test server + matching tab. Open side panel. Create MCP client, initialize. Expand the e2e-test plugin card in side panel.\n\nStart slow_with_progress (durationMs=3000) via mcpClient (don't await). While it's running, toggle the echo tool permission Off→Auto via selectPermission in the side panel. Wait for the slow call to settle (Promise.allSettled). Verify the side panel's permission select shows 'Auto'. Verify mcpClient.listTools() shows echo tool enabled. Make a fresh echo call to verify system is healthy. Collect page errors from side panel and assert zero.\n\nConstraints:\n- Need both side panel page AND MCP client connected to same server\n- selectPermission is a Playwright helper from helpers.js\n- The slow tool is NOT the echo tool — so permission change on echo shouldn't affect the slow call\n- Mark plugin as reviewed in config to avoid unreviewed dialog"
@@ -33,7 +33,7 @@
         "Session IDs are different for each client"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-cross-system.e2e.ts (add to same file)\n\nContext:\nIn production, multiple AI agents (e.g., multiple Claude sessions) may connect to the same MCP server simultaneously. Each gets its own session via Streamable HTTP. Response routing must be session-scoped.\n\nChanges:\nSetup: standard server + extension + test server + matching tab. Create 3 MCP clients: client1, client2, client3. Initialize all 3 (each gets unique sessionId). Fire in parallel:\n- client1: 5 echo calls with message 'c1-0' through 'c1-4'\n- client2: 5 echo calls with message 'c2-0' through 'c2-4'\n- client3: 5 echo calls with message 'c3-0' through 'c3-4'\n\nAll 15 via Promise.all. Verify all succeed. For each client, parse its 5 results and verify all messages start with the correct prefix ('c1-', 'c2-', 'c3-'). Verify sessionIds are all different.\n\nConstraints:\n- createMcpClient returns a new client each time — each has independent session state\n- All 3 clients point to same port/secret\n- The echo tool returns { message: <input> } — parse JSON to verify"
@@ -50,7 +50,7 @@
         "After config restored, new tool calls succeed"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-cross-system.e2e.ts (add to same file)\n\nContext:\nA user might run `opentabs plugin remove <name>` from the CLI while Claude is actively using that plugin's tools. The CLI modifies config.json and sends POST /reload. The server must handle the plugin disappearing mid-dispatch gracefully.\n\nChanges:\nSetup: standard server + extension + test server + matching tab. Start 3 slow_with_progress calls (durationMs=5000). After 500ms, writeTestConfig WITHOUT the e2e-test plugin (empty localPlugins). POST /reload. Let the slow calls settle via Promise.allSettled. Some/all will fail (plugin gone). Verify server health ok. Write config back with plugin. POST /reload. Wait for extension to reconnect + tab ready. Verify fresh echo call succeeds.\n\nConstraints:\n- POST /reload: fetch POST to http://localhost:${port}/reload with auth header\n- The slow calls may fail with 'plugin not found' or similar — that's expected\n- After restoring config, must wait for extension to re-inject adapter"
@@ -67,7 +67,7 @@
         "No JS errors on side panel"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-cross-system.e2e.ts (add to same file)\n\nContext:\nThe side panel receives plugins.changed notifications when the server's plugin list changes. If the user is mid-search, the notification should update the underlying plugin list but the search filter should still work correctly.\n\nChanges:\nSetup: start server with NO plugins. Open side panel, verify empty/minimal state. Type 'test' in the search input. While search is active, writeTestConfig adding e2e-test plugin + POST /reload. Wait for side panel to receive the update (e2e-test should appear in search results since 'test' matches). Clear search. Verify E2E Test plugin card is visible in the full list.\n\nConstraints:\n- Start with no plugins so the addition is clearly observable\n- The search input is `sp.locator('input[type=\"text\"]').first()`\n- plugins.changed notification triggers getFullState() refresh in side panel"
@@ -86,7 +86,7 @@
         "Zero JS errors on side panel"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-cross-system.e2e.ts (add to same file)\n\nContext:\nThis is the ultimate integration stress test. In production, multiple Claude sessions, a user on the side panel, and CLI commands can all be active simultaneously. The system must not deadlock, crash, or corrupt state.\n\nChanges:\nSetup: server (OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS='') + extension + test server + matching tab. Open side panel. Create 3 MCP clients. Mark plugin as reviewed.\n\nRun all of these concurrently for ~5 seconds:\n1. Client 1: loop calling echo 10 times with 500ms between\n2. Client 2: loop calling echo 10 times with 500ms between\n3. Client 3: loop calling echo 10 times with 500ms between\n4. Side panel: toggle theme 5 times, expand/collapse cards 5 times\n5. Config: write config without plugin, POST /reload, wait 1s, write config with plugin, POST /reload\n\nUse Promise.allSettled to run all 5 concurrent streams. After all settle:\n- Verify server health ok\n- Verify at least ONE of the 3 clients can make a successful echo call (system recovered)\n- Verify side panel page has zero pageerror events\n- Verify side panel shows the e2e-test plugin (config was restored)\n\nConstraints:\n- Use Promise.allSettled for the outer orchestration (some streams WILL have failures during config removal)\n- The config removal will cause tool call failures — that's expected and correct behavior\n- After config restoration + /reload, the system must recover\n- Keep theme toggle and accordion interactions simple (just click, no selectPermission that requires Radix dropdown)\n- Mark plugin as reviewed in initial config to avoid unreviewed dialog blocking"
