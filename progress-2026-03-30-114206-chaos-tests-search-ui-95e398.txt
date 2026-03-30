@@ -1,0 +1,84 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-114206-chaos-tests-search-ui-95e398~running.json
+Started: Mon Mar 30 18:42:48 UTC 2026
+---
+
+## Codebase Patterns
+- E2E search tests use `sidePanel.getByPlaceholder('Search plugins and tools...')` for the search input locator
+- Manual setup pattern: mkdtempSync + writeTestConfig + startMcpServer + launchExtensionContext + setupAdapterSymlink, with try/finally cleanup
+- `test.slow()` is needed for tests that do repeated UI interactions with ticks
+- Import `type { Page }` from `@playwright/test` for page error collection typing
+
+---
+
+## 2026-03-30 18:45 - US-001
+- Added stress test block `test.describe('Side panel search stress')` to `e2e/side-panel-search-details.e2e.ts`
+- Test 1: Rapid type/clear (10x fill/clear with 50ms ticks) + progressive typing (s→sl→sla→slac→slack)
+- Test 2: Long input (200 chars) + nonsense string recovery
+- Both tests use `collectPageErrors` helper and assert zero errors
+- Files changed: `e2e/side-panel-search-details.e2e.ts`
+- **Learnings for future iterations:**
+  - Existing search tests use `getByPlaceholder('Search plugins and tools...')` not `locator('input[type="text"]')` — follow the existing pattern
+  - The `collectPageErrors` + `tick` helper pattern is reusable for other stress test files in this PRD
+---
+
+## 2026-03-30 18:50 - US-002
+- Added stress test block `test.describe('Side panel accordion stress')` to `e2e/side-panel-accordion-persist.e2e.ts`
+- Test: Rapid accordion toggling — clicks e2e card 20x, browser card 20x, interleaves 10x, then verifies both cards expand and show content (Echo tool, browser_list_tabs)
+- Uses `collectPageErrors` helper and asserts zero errors
+- Files changed: `e2e/side-panel-accordion-persist.e2e.ts`
+- **Learnings for future iterations:**
+  - The accordion test file uses `readPluginToolNames()` + `tools` map for config (not `permissions` with plugin-level `permission: 'auto'`)
+  - After rapid toggling, must check `aria-expanded` and conditionally click to expand before verifying content — the final state depends on the even/odd number of clicks
+  - `getByText('Echo', { exact: true })` is the standard locator for the Echo tool in expanded e2e cards
+  - `getByText('browser_list_tabs')` is visible in the expanded browser tools card
+  - Theme toggle locator: `sp.locator('[aria-label="Switch to dark mode"], [aria-label="Switch to light mode"]')` — handles both states
+  - Check `html` element class for `dark` to determine current theme state
+  - After even number of clicks, theme returns to starting state (deterministic)
+  - `openSidePanel(context)` returns a new page reference after reopen — must re-create locators on the new page
+---
+
+## 2026-03-30 18:52 - US-003
+- Added stress test block `test.describe('Side panel theme stress')` to `e2e/side-panel-theme.e2e.ts`
+- Test 1: Rapid theme toggle 20x with 30ms ticks, verifies deterministic end state (even clicks = same as start), plugin card still visible
+- Test 2: Fast close persistence — toggles theme, closes within 100ms, reopens, verifies new theme persisted
+- Both tests use `collectPageErrors` helper and assert zero errors
+- Files changed: `e2e/side-panel-theme.e2e.ts`
+- **Learnings for future iterations:**
+  - Theme toggle locator: `sp.locator('[aria-label="Switch to dark mode"], [aria-label="Switch to light mode"]')` handles both states
+  - Check `html` element class for `dark` to determine current theme state
+  - After even number of clicks, theme returns to starting state (deterministic)
+  - `openSidePanel(context)` returns a new page reference after reopen — must re-create locators on the new page
+  - The existing theme test file uses `readPluginToolNames()` + `tools` map for config, same as accordion
+---
+
+## 2026-03-30 18:55 - US-004
+- Added stress test block `test.describe('Side panel port stress')` to `e2e/side-panel-port-change.e2e.ts`
+- Test 1: Boundary values — fills '0' and verifies clamping to >= 1 on blur, fills '99999' and verifies clamping to <= 65535, restores original port
+- Test 2: Same port — fills the current port value and blurs, verifies no disconnect (E2E Test card still visible, 'Cannot Reach MCP Server' not visible)
+- Both tests use `collectPageErrors` helper and assert zero errors
+- Files changed: `e2e/side-panel-port-change.e2e.ts`
+- **Learnings for future iterations:**
+  - The port input is located via `sp.getByLabel('Server port')` (not `locator('input[type="number"]')`)
+  - NumberStepper commits on blur — must call `portInput.blur()` after `fill()` to trigger clamping
+  - NumberStepper clamps values to min=1, max=65535 in its `commit()` function
+  - The existing port change test uses `readPluginToolNames()` + `tools` map for config (same as accordion/theme tests)
+  - Always restore original port at end of boundary test to avoid breaking the server connection for cleanup
+---
+
+## 2026-03-30 19:20 - US-005
+- Created new file `e2e/side-panel-stress.e2e.ts` with cross-domain barrage test
+- Single test interleaves permission toggles (Off/Ask/Auto), theme toggles, search fill/clear, and accordion expand/collapse across 3 rounds
+- Round 1: permission toggles + theme; Round 2: accordion + search + theme; Round 3: rapid permission + accordion
+- Post-barrage verification: permission selects show 'Auto', mcpClient.listTools() confirms tools not disabled, plugin cards visible, zero page errors
+- Uses `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''` to make permissions interactive (not skipped)
+- Uses `reviewedVersion: pluginVersion` in config to prevent review dialog from interfering
+- Files changed: `e2e/side-panel-stress.e2e.ts` (NEW)
+- **Learnings for future iterations:**
+  - When testing permissions interactively, set `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''` via envOverrides in `startMcpServer` (4th arg)
+  - Must set `reviewedVersion` in permissions config to prevent the plugin review dialog from blocking permission selects
+  - Use `sp.getByText('Browser', { exact: true }).first()` to avoid strict mode violation since tool descriptions contain 'browser'
+  - Do not use search fill while Radix Select dropdowns may be interacting — search can hide plugin cards and break the select flow
+  - For cross-domain tests, use `startMcpServer(configDir, false, ...)` (non-hot mode) since we don't need hot reload
+  - The `selectPermission` helper from helpers.ts handles Radix Select click + option selection cleanly
+---
