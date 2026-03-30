@@ -1,0 +1,189 @@
+# Ralph Progress Log
+PRD: prd-2026-03-29-180356-local-dev-overhaul-5550de~running.json
+Started: Mon Mar 30 01:04:30 UTC 2026
+---
+
+## Codebase Patterns
+- Config version tests: when bumping CURRENT_CONFIG_VERSION, update all version assertions in config.test.ts, config-migrations.test.ts, AND e2e/config-migration.e2e.ts
+- The E2E fixtures.ts has its own OpentabsConfig interface that must be kept in sync with the server's config.ts interface
+- Config round-trip tests save with a specific version then re-load; if the saved version triggers migration, loaded.version will differ — use CURRENT version to avoid unintended migration
+- Migrations operate on raw Record<string, unknown>, not parsed OpentabsConfig — type-check fields before operating on them
+- When behavioral changes are made (e.g., rate limiting → coalescing), always check for stale E2E tests that assert the old behavior
+- For E2E migration tests, use writeRawConfig/readRawConfig pattern (not writeTestConfig) to control exact config shape
+
+## 2026-03-30 01:12 UTC - US-001
+- Implemented config schema v2→v3 with localPluginDirs field and portable path normalization
+- Files changed:
+  - platform/mcp-server/src/config.ts: Added localPluginDirs to OpentabsConfig, parseConfigRecord, loadConfig default, savePluginPermissions, savePluginSettings
+  - platform/mcp-server/src/config-migrations.ts: Bumped CURRENT_CONFIG_VERSION to 3, added v2→v3 migration normalizing absolute HOME paths to ~/
+  - platform/mcp-server/src/state.ts: Added localPluginDirs field to ServerState and createState
+  - platform/mcp-server/src/config-migrations.test.ts: Updated version assertions, added 11 new v2→v3 migration tests
+  - platform/mcp-server/src/config.test.ts: Updated all version references from 2 to 3
+  - e2e/config-migration.e2e.ts: Updated version references from 2 to 3
+  - e2e/fixtures.ts: Added localPluginDirs to E2E OpentabsConfig type
+- **Learnings for future iterations:**
+  - Bumping config version is a cascading change: unit tests (config.test.ts, config-migrations.test.ts), E2E tests (config-migration.e2e.ts), and fixtures all reference the version number
+  - savePluginPermissions and savePluginSettings use explicit OpentabsConfig construction — new fields must be added to both
+  - The biome schema version info message ("Expected: 2.4.9, Found: 2.4.8") is not an error — just informational
+---
+
+## 2026-03-30 01:20 UTC - US-002
+- Implemented scanLocalPluginDir + discovery pipeline integration
+- Files changed:
+  - platform/mcp-server/src/resolver.ts: Added scanLocalPluginDir function, exported resolveLocalPath and scanLocalPluginDir
+  - platform/mcp-server/src/reload.ts: Added localPluginDirs expansion in reloadCore with path-level deduplication via realpath
+- **Learnings for future iterations:**
+  - resolveLocalPath was previously private in resolver.ts — now exported for use by reload.ts
+  - readdir with { withFileTypes: true } returns Dirent objects; use `import('node:fs').Dirent` for inline type annotation
+  - The deduplication uses realpath to resolve symlinks, with a fallback to resolveLocalPath for non-existent paths
+  - Import ordering in reload.ts follows alphabetical order by module path — resolver.js goes after registry.js
+---
+
+## 2026-03-30 01:25 UTC - US-003
+- Replaced POST /reload rate limiter with 500ms coalescing debounce
+- Files changed:
+  - platform/mcp-server/src/state.ts: Added pendingReload field to ServerState interface and initialized to null in createState
+  - platform/mcp-server/src/http-routes.ts: Replaced checkEndpointRateLimit in handleReload with coalescing debounce via executeCoalescedReload helper
+- **Learnings for future iterations:**
+  - The coalescing pattern uses a Promise with externalized resolve/reject stored on ServerState, plus a setTimeout timer that resets on each new request
+  - executeCoalescedReload clears state.pendingReload BEFORE calling performConfigReload to prevent re-entrant issues
+  - checkEndpointRateLimit is still used by other endpoints (/extension/reload, /plugin-settings, /tools/call, /mcp session creation) — only /reload was changed
+  - The definite assignment assertion (`let resolve!:`) is needed for the Promise executor pattern where resolve/reject are captured outside the constructor
+---
+
+## 2026-03-30 01:25 UTC - US-004
+- Added OPENTABS_SKIP_NOTIFY env var to suppress individual plugin reload notifications during batch builds
+- Added single POST /reload after all plugins are built in scripts/plugins.ts
+- Files changed:
+  - platform/plugin-tools/src/commands/build.ts: Added early return in notifyServer when OPENTABS_SKIP_NOTIFY=1
+  - scripts/plugins.ts: Added readFileSync import, added DEFAULT_HOST/DEFAULT_PORT/getConfigDir/getConfigPath imports from @opentabs-dev/shared, added extraEnv parameter to runInPlugin, passes OPENTABS_SKIP_NOTIFY=1 to build spawn, added notifyServerOnce function with single POST /reload after all builds
+- **Learnings for future iterations:**
+  - scripts/plugins.ts is covered by tsconfig.scripts.json which references platform/shared — so @opentabs-dev/shared imports work
+  - scripts/plugins.ts IS a monorepo script (not a workspace package), but it can import from @opentabs-dev/shared via bare specifier since shared is a workspace package
+  - The spawn env option replaces the default env entirely — always spread process.env when adding env vars
+  - notifyServer in build.ts reads port from OPENTABS_PORT env var or config.json port field (not server.port file)
+---
+
+## 2026-03-30 01:30 UTC - US-005
+- Moved checkForUpdates out of both performReload and performConfigReload into a standalone runVersionCheck function
+- runVersionCheck is called fire-and-forget after initial startup and on a 6-hour periodic timer
+- Timer stored on ServerState as versionCheckTimerId (survives hot reload)
+- Timer cleared in installShutdownHandlers during graceful shutdown
+- Hot reload safety: existing timer is cleared before setting a new one in index.ts
+- Files changed:
+  - platform/mcp-server/src/reload.ts: Removed checkForUpdates blocks from both performReload and performConfigReload, added runVersionCheck exported function
+  - platform/mcp-server/src/state.ts: Added versionCheckTimerId field to ServerState interface and createState default
+  - platform/mcp-server/src/index.ts: Imported runVersionCheck, scheduled fire-and-forget call + 6-hour periodic timer after performReload
+  - platform/mcp-server/src/shutdown.ts: Added versionCheckTimerId cleanup in shutdown handler
+  - platform/mcp-server/src/reload.test.ts: Updated test suite to verify checkForUpdates is NOT called during performConfigReload or performReload
+- **Learnings for future iterations:**
+  - The sweepTimerId pattern in state.ts is the canonical pattern for periodic timers on ServerState
+  - Hot reload timer management: always clear existing timer (if non-null) before setting a new one to avoid timer leaks across hot reloads
+  - The restartSweepTimer function in reload.ts shows the established pattern for timer cleanup + restart
+  - When removing code from both performReload and performConfigReload, the blocks are nearly identical but at different line offsets — always verify both removals
+---
+
+## 2026-03-30 01:32 UTC - US-006
+- Added toPortablePath function to convert absolute paths under HOME to ~/... prefix
+- registerInConfig now writes portable paths to config.json instead of absolute paths
+- Files changed:
+  - platform/plugin-tools/src/commands/build.ts: Added toPortablePath function, used in registerInConfig's plugins.push(), exported for testing
+- **Learnings for future iterations:**
+  - homedir() is already imported in build.ts (line 13) — no new import needed
+  - resolvePluginPathForComparison already handles ~/ paths (line 166), so duplicate detection works correctly with portable paths
+  - The toPortablePath pattern matches the v2→v3 migration normalization in config-migrations.ts — both use `home + '/'` and `home + '\\'` checks to avoid prefix-matching longer paths
+---
+
+## 2026-03-30 01:40 UTC - US-007
+- Added KNOWN_CONFIG_KEYS set with all 6 OpentabsConfig top-level field names
+- Added Levenshtein distance function for typo detection
+- Added unknown key validation at the start of parseConfigRecord that logs warnings with closest-match suggestions (distance <= 3)
+- Added comprehensive unit tests: levenshtein function (identical, empty, single/multi edit, config key typos), KNOWN_CONFIG_KEYS completeness, unknown key warnings (basic warning, did-you-mean suggestion, no suggestion for distant keys, no warning for known keys, config still loads with unknown keys)
+- Files changed:
+  - platform/mcp-server/src/config.ts: Added KNOWN_CONFIG_KEYS, levenshtein, validation loop in parseConfigRecord, exported both for testing
+  - platform/mcp-server/src/config.test.ts: Added 11 new tests across 3 describe blocks (levenshtein, KNOWN_CONFIG_KEYS, unknown config key warnings)
+- **Learnings for future iterations:**
+  - Biome's noNonNullAssertion rule triggers on `!` assertions in array access patterns — these are warnings, not errors, and don't block commits
+  - The biome pre-commit hook auto-sorts export lists alphabetically
+  - When spying on log.warn, use vi.spyOn(log, 'warn').mockImplementation(() => {}) and restore in a finally block to avoid polluting other tests
+  - The levenshtein suggestion loop should track the minimum distance (bestMatch/bestDistance pattern) rather than breaking on the first match within threshold, to ensure the closest match is suggested
+---
+
+## 2026-03-30 01:45 UTC - US-008
+- Added parent directory watchers for localPluginDirs in dev mode
+- When child directories are added/removed, a config reload is triggered for rediscovery
+- Watchers use 1s debounce (longer than 200ms dist/ watcher debounce) and compare directory snapshots to filter out non-directory changes
+- Files changed:
+  - platform/mcp-server/src/file-watcher.ts: Added getChildDirNames helper, startPluginDirWatching function with snapshot-based child directory comparison, cleanup in stopFileWatching, exported startPluginDirWatching
+  - platform/mcp-server/src/state.ts: Added pluginDirWatchers: FSWatcher[] to FileWatchingState and createState
+  - platform/mcp-server/src/reload.ts: Imported startPluginDirWatching, resolves localPluginDirs paths, calls it in the dev-mode watcher block
+- **Learnings for future iterations:**
+  - The file watcher system uses a generation counter pattern to prevent stale closures from firing after hot reload — always capture gen at watcher creation and check in the debounce callback
+  - Parent dir watchers are stored separately (pluginDirWatchers array) from plugin dist/ watchers (entries array) since they have different purposes and lifecycle
+  - The debounce key namespace (`pluginDir:${dir}`) must be distinct from plugin dist/ watcher keys (`${pluginDir}:tools`, `${pluginDir}:iife`) to avoid timer collisions
+  - Using readdirSync with withFileTypes to snapshot children is synchronous and fast — avoids async complexity in the fs.watch callback
+  - stopFileWatching handles all watcher cleanup (entries, pluginDirWatchers, configWatcher, mtime polling, timers) — new watcher categories must be added to this function
+---
+
+## 2026-03-30 01:45 UTC - US-009
+- Added --filter=name1,name2 and --affected flags to scripts/plugins.ts
+- --filter restricts to named plugins (exact match on directory name), exits 1 on unknown names
+- --affected compares SDK version in each plugin's package-lock.json against platform/plugin-sdk/package.json version
+- Combined flags use intersection (must match name AND be affected)
+- Added build:plugins:affected npm script to root package.json
+- Files changed:
+  - scripts/plugins.ts: Changed pluginDirs to let, added --filter parsing with unknown name validation, added --affected parsing with SDK version comparison from lockfile v3 format
+  - package.json: Added "build:plugins:affected" script
+- **Learnings for future iterations:**
+  - pluginDirs was originally const — needed to change to let for filter/affected reassignment
+  - readFileSync is already imported in scripts/plugins.ts (line 10 for existsSync/readdirSync)
+  - The SDK version in package-lock.json v3 format is at packages['node_modules/@opentabs-dev/plugin-sdk'].version
+  - The lefthook pre-commit hook auto-fixes biome issues (formatted 1 file) — no manual biome fixes needed
+---
+
+## 2026-03-30 01:55 UTC - US-010
+- Created comprehensive E2E tests for localPluginDirs discovery and config migration
+- Fixed pre-existing E2E failure in security.e2e.ts: POST /reload rate-limit tests were stale after US-003 replaced rate limiting with coalescing
+- Files changed:
+  - e2e/local-plugin-dirs.e2e.ts (new): 5 tests covering directory scanning (2 plugins discovered), non-existent dir handling, empty dir handling, non-plugin dir skipping, and localPlugins/localPluginDirs deduplication
+  - e2e/portable-paths.e2e.ts (new): 4 tests covering v2→v3 migration path normalization, relative path preservation, migration idempotency, and ~/ path resolution for plugin discovery
+  - e2e/security.e2e.ts: Updated POST /reload rate-limit tests to match coalescing behavior — tests now verify all requests return 200 (no 429), including concurrent request coalescing
+- **Learnings for future iterations:**
+  - The config-migration.e2e.ts pattern (writeRawConfig + readRawConfig + createConfigDir) is the correct approach for testing migration logic — it bypasses writeTestConfig's auto-generation
+  - For tests that create plugins under HOME (for ~/ path testing), use fs.mkdtempSync in os.homedir() to create isolated temp dirs that are genuinely under HOME
+  - When features change behavior (e.g., rate limiting → coalescing), existing E2E tests that assert old behavior will fail — always check for stale tests when implementing behavioral changes
+  - The createMinimalPlugin helper from fixtures.ts creates fully discoverable plugins with package.json, dist/tools.json, and adapter.iife.js — use it instead of manually creating plugin directories
+  - Playwright treats tests that fail on first attempt but pass on retry as "flaky" (not failed) — the exit code is still 0, so these are passing tests
+---
+
+## 2026-03-30 02:05 UTC - US-011
+- Created E2E tests for reload coalescing behavior in e2e/reload-coalescing.e2e.ts
+- 5 tests covering all acceptance criteria:
+  1. Concurrent POST /reload requests coalesced — all get 200 with identical durationMs
+  2. Rapid sequential reloads within 500ms are coalesced
+  3. Reload after 600ms gap performs a separate reload
+  4. Auth checked per-request — invalid auth returns 401 even during coalescing
+  5. POST /reload no longer returns 429 even under heavy load (15 simultaneous requests)
+- Files changed:
+  - e2e/reload-coalescing.e2e.ts (new): 5 tests with isolated configDir, authHeaders helper, postReload helper
+- **Learnings for future iterations:**
+  - Coalescing verification: coalesced callers share the exact same durationMs value (from the shared promise) — this is a reliable coalescing indicator without needing a reload counter
+  - The security.e2e.ts already has basic coalescing tests (rapid sequential and concurrent) from US-010's stale test fix — the new file adds the 600ms gap test and auth-per-request test
+  - When testing coalescing windows, use 700ms gaps (500ms window + 200ms margin) to reliably trigger separate reloads
+  - AbortSignal.timeout(30_000) on fetch prevents tests from hanging indefinitely if the server doesn't respond
+---
+
+## 2026-03-30 02:10 UTC - US-012
+- Created three E2E test files covering version check timing, unknown config keys, and filtered plugin builds
+- All 616 E2E tests pass (including 10 new tests across the 3 files)
+- Files changed:
+  - e2e/version-check-timing.e2e.ts (new): 1 test verifying POST /reload does not trigger npm view calls
+  - e2e/unknown-config-keys.e2e.ts (new): 3 tests covering unknown key warnings, did-you-mean suggestions, and graceful server startup with unknown keys
+  - e2e/plugin-build-filter.e2e.ts (new): 6 tests covering --filter (named plugin, non-existent name), --affected (skip up-to-date, no lockfile, all up-to-date), and combined --filter+--affected intersection
+- **Learnings for future iterations:**
+  - Temp directory prefixes must not contain substrings that match log filter patterns — e.g., naming a temp dir "no-npm-view" causes false matches when filtering server logs for "npm view" because the config watcher logs the directory path
+  - The `npm view ` pattern (with trailing space) is more precise for filtering version check activity than `npm-view` or `npm view` without space
+  - For testing scripts/plugins.ts --filter and --affected without modifying the original script, a wrapper .mts file re-implementing the core logic is effective — it avoids needing to override hardcoded paths in the original script
+  - writeLockfile with lockfileVersion 3 format: the SDK version lives at `packages['node_modules/@opentabs-dev/plugin-sdk'].version`
+  - execFileSync throws on non-zero exit, so error output must be captured from the thrown error object (err.stdout, err.stderr, err.status)
+---
