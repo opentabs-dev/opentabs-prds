@@ -1,0 +1,69 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix four bugs found during browser extension audit: confirmation badge count desync, unbounded seenConfirmationIds growth, permission rollback race condition in PluginCard, and stale tab count in side panel from ignored tabs array in tab.stateChanged handler.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Derive confirmation badge count from Map size instead of separate counter",
+      "description": "Replace the separate pendingConfirmationCount counter with pendingConfirmations.size to eliminate count/map desync when clearConfirmationBadge is called without a valid id.",
+      "acceptanceCriteria": [
+        "pendingConfirmationCount variable is removed from confirmation-badge.ts",
+        "All reads of pendingConfirmationCount use pendingConfirmations.size instead",
+        "clearConfirmationBadge(undefined) does not change the badge count or Map contents",
+        "clearAllConfirmationBadges still clears both the Map and the badge",
+        "Existing unit tests pass and cover the undefined-id edge case"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/confirmation-badge.ts (remove counter, derive from Map)\n- platform/browser-extension/src/confirmation-badge.test.ts (add test for undefined id)\n\nContext:\n`pendingConfirmationCount` (line 14) is a separate number that must stay in sync with `pendingConfirmations` Map (line 19). The bug: `clearConfirmationBadge(id?: string)` at line 97 has this flow:\n```ts\nconst clearConfirmationBadge = (id?: string): void => {\n  if (id !== undefined) {\n    if (!pendingConfirmations.has(id)) {\n      return;\n    }\n    pendingConfirmations.delete(id);\n  }\n  pendingConfirmationCount = Math.max(0, pendingConfirmationCount - 1);\n```\nWhen `id` is undefined, the `if (id !== undefined)` block is skipped entirely, so no map entry is removed, but the counter is still decremented. The caller `handleSpConfirmationResponse` in background-message-handlers.ts (line 358-360) extracts id as:\n```ts\nconst data = message.data as Record<string, unknown> | undefined;\nconst id = typeof data?.id === 'string' ? data.id : undefined;\n```\nA malformed confirmation response (data.id not a string) passes undefined.\n\nChanges:\n1. Delete `let pendingConfirmationCount = 0;`\n2. In `updateConfirmationBadge`, replace `pendingConfirmationCount > 0` with `pendingConfirmations.size > 0` and `String(pendingConfirmationCount)` with `String(pendingConfirmations.size)`\n3. In `syncConfirmationNotification`, replace `pendingConfirmationCount <= 0` with `pendingConfirmations.size === 0`, and `pendingConfirmationCount > 1` / `pendingConfirmationCount === 1` with `pendingConfirmations.size > 1` / `pendingConfirmations.size === 1`. Also update the message template: `${pendingConfirmationCount} tools` → `${pendingConfirmations.size} tools`\n4. In `notifyConfirmationRequest`, remove `pendingConfirmationCount++`\n5. In `clearConfirmationBadge`, remove `pendingConfirmationCount = Math.max(0, pendingConfirmationCount - 1)`. Also: when `id` is undefined, the function should be a no-op (return early) since there's nothing to clear without an id.\n6. In `clearAllConfirmationBadges`, remove `pendingConfirmationCount = 0`\n\nConstraints:\n- Do NOT change the function signatures — `clearConfirmationBadge(id?: string)` must still accept an optional id\n- Do NOT change the Map key type or the PendingConfirmationParams interface\n- `getPendingConfirmations()` return value must not change shape"
+    },
+    {
+      "id": "US-002",
+      "title": "Clean up seenConfirmationIds when confirmations are responded to",
+      "description": "Remove confirmation IDs from the seenConfirmationIds deduplication Set when the corresponding confirmation is responded to, preventing unbounded growth.",
+      "acceptanceCriteria": [
+        "seenConfirmationIds entries are removed when setPendingConfirmations removes the corresponding confirmation",
+        "Duplicate confirmations are still prevented while a confirmation is pending",
+        "seenConfirmationIds is cleared on disconnect (when setPendingConfirmations is reset to empty)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts (add cleanup)\n- platform/browser-extension/src/side-panel/App.tsx (clear seenIds on disconnect)\n\nContext:\n`seenConfirmationIds` is a `useRef<Set<string>>` at line 29 of useServerNotifications.ts. It accumulates every confirmation ID to prevent duplicates (line 48-49):\n```ts\nif (seenConfirmationIds.current.has(params.id)) return;\nseenConfirmationIds.current.add(params.id);\n```\nBut IDs are never removed. The side panel can stay open for hours/days with hundreds of tool approvals.\n\nChanges:\nThe cleanest approach is to expose a cleanup function from the hook that the caller uses when responding to confirmations. In `useServerNotifications`, return an additional `clearSeenId` function:\n```ts\nconst clearSeenId = (id: string): void => {\n  seenConfirmationIds.current.delete(id);\n};\n```\nIn App.tsx, `handleConfirmationRespond` (line 382) already calls `setPendingConfirmations(prev => prev.filter(c => c.id !== id))`. After that line, also call `clearSeenId(id)` to clean up the dedup set.\n\nFor the disconnect case, App.tsx line 341 already does `setPendingConfirmations([])`. Add a call to clear the entire set at that point. The hook should expose a `clearAllSeenIds` function that does `seenConfirmationIds.current.clear()`.\n\nConstraints:\n- Do NOT change the deduplication behavior — confirmations must still be deduped while pending\n- The handleNotification function signature and return type from useServerNotifications must remain compatible with existing callers"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix permission rollback race in PluginCard by storing per-operation rollback state",
+      "description": "Replace shared preToggleRef/prePluginPermRef refs with per-operation rollback tracking so concurrent permission changes don't lose each other's rollback state.",
+      "acceptanceCriteria": [
+        "When two tool permission changes are in-flight and the first fails, the first change is correctly rolled back without affecting the second",
+        "When two plugin permission changes are in-flight and the first fails, the first change is correctly rolled back",
+        "preToggleRef is replaced with a per-operation mechanism (e.g., Map keyed by version or operation id)",
+        "prePluginPermRef is replaced with a per-operation mechanism"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/PluginCard.tsx (fix rollback mechanism)\n\nContext:\nThe current code uses shared refs for rollback state:\n```ts\nconst preToggleRef = useRef<WireToolDef[]>([]);\nconst prePluginPermRef = useRef<ToolPermission>('off');\nconst toggleCounter = useRef(0);\n```\n\nFor tool permissions, `applyToolPermission` (line 114-126):\n```ts\nconst applyToolPermission = (toolName: string, newPermission: ToolPermission) => {\n  const myVersion = ++toggleCounter.current;\n  updatePluginTools(prev => {\n    preToggleRef.current = prev;\n    return prev.map(t => (t.name === toolName ? { ...t, permission: newPermission } : t));\n  });\n  void setToolPermission(plugin.name, toolName, newPermission).catch(() => {\n    if (toggleCounter.current === myVersion) {\n      updatePluginTools(() => preToggleRef.current);\n    }\n    showToggleError(`Failed to update ${toolName}`);\n  });\n};\n```\n\nThe race: if two rapid tool changes fire, the second overwrites `preToggleRef.current` with the array that already includes the first's optimistic update. If only the first fails, its rollback is skipped (counter check). But if the second then fails, it rolls back to pre-second state (which includes first's optimistic update that the server rejected).\n\nThe same pattern exists for `prePluginPermRef` in `applyPluginPermission` (line 73-91).\n\nChanges:\nReplace the shared refs with per-operation rollback tracking. The simplest approach:\n\n1. For tool permissions: Instead of storing the entire tools array, store only the previous permission value of the specific tool being changed. Use a Map<number, { toolName: string; previousPermission: ToolPermission }> keyed by the toggle counter version.\n\nExample approach:\n```ts\nconst pendingToolRollbacks = useRef<Map<number, { toolName: string; prev: ToolPermission }>>(new Map());\n\nconst applyToolPermission = (toolName: string, newPermission: ToolPermission) => {\n  const myVersion = ++toggleCounter.current;\n  const currentPerm = pluginTools.find(t => t.name === toolName)?.permission ?? 'off';\n  pendingToolRollbacks.current.set(myVersion, { toolName, prev: currentPerm });\n  updatePluginTools(prev => prev.map(t => (t.name === toolName ? { ...t, permission: newPermission } : t)));\n  void setToolPermission(plugin.name, toolName, newPermission).catch(() => {\n    const rollback = pendingToolRollbacks.current.get(myVersion);\n    if (rollback) {\n      updatePluginTools(prev => prev.map(t => (t.name === rollback.toolName ? { ...t, permission: rollback.prev } : t)));\n    }\n    showToggleError(`Failed to update ${toolName}`);\n  }).finally(() => {\n    pendingToolRollbacks.current.delete(myVersion);\n  });\n};\n```\n\n2. For plugin permissions: Same pattern — store the previous permission per operation.\n```ts\nconst pendingPluginRollbacks = useRef<Map<number, ToolPermission>>(new Map());\n```\n\nConstraints:\n- Do NOT change the optimistic update behavior — UI must still update immediately on click\n- Do NOT change the public API (handlePluginPermissionChange, handleToolPermissionChange signatures)\n- The unreviewed plugin dialog flow (pendingChange state) must continue to work\n- Remove preToggleRef and prePluginPermRef entirely — do not leave dead code"
+    },
+    {
+      "id": "US-004",
+      "title": "Update tab.stateChanged handler to include tabs array from notification",
+      "description": "Extend the tab.stateChanged handler in useServerNotifications to also update the plugin's tabs array from the notification params, so the side panel shows correct tab counts without waiting for getFullState.",
+      "acceptanceCriteria": [
+        "When tab.stateChanged arrives with params.tabs, the plugin's tabs field is updated in addition to tabState",
+        "Tab count tooltip in PluginCard reflects the correct count immediately after tab open/close events",
+        "When params.tabs is absent or not an array, only tabState is updated (backwards compatible)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/hooks/useServerNotifications.ts (extend handler)\n\nContext:\nThe tab.stateChanged handler at line 65-76:\n```ts\nif (data.method === 'tab.stateChanged' && data.params) {\n  const params = data.params as Record<string, unknown>;\n  if (\n    typeof params.plugin === 'string' &&\n    typeof params.state === 'string' &&\n    validTabStates.has(params.state) &&\n    VALID_PLUGIN_NAME.test(params.plugin)\n  ) {\n    const pluginName = params.plugin;\n    const newState = params.state as TabState;\n    setPlugins(prev => prev.map(p => (p.name === pluginName ? { ...p, tabState: newState } : p)));\n  }\n}\n```\n\nThe notification params contain a `tabs` array (type `PluginTabInfo[]` with fields `tabId`, `url`, `title`, `ready`) that is being ignored. The side panel uses `plugin.tabs?.length` for the tab count tooltip in PluginCard.tsx (line 148: `const tabCount = plugin.tabs?.length ?? 0`).\n\nThe `tabs` array is sent by `sendTabStateNotification` in messaging.ts:\n```ts\nconst params = {\n  plugin: pluginName,\n  state: stateInfo.state,\n  tabs: stateInfo.tabs,\n};\n```\n\nChanges:\nIn the handler, extract and validate the tabs array, then include it in the state update:\n```ts\nconst pluginName = params.plugin;\nconst newState = params.state as TabState;\nconst newTabs = Array.isArray(params.tabs) ? params.tabs as PluginTabInfo[] : undefined;\nsetPlugins(prev => prev.map(p => (\n  p.name === pluginName\n    ? { ...p, tabState: newState, ...(newTabs !== undefined ? { tabs: newTabs.length > 0 ? newTabs : undefined } : {}) }\n    : p\n)));\n```\n\nNote: import `PluginTabInfo` from `@opentabs-dev/shared`. This is a type-only import so it won't cause CSP issues in the side panel bundle.\n\nConstraints:\n- Do NOT validate individual tab entries — trust the background script's data\n- When tabs is absent (backwards compat), do not clear the existing tabs array — only tabState is updated\n- When tabs is an empty array, set tabs to undefined (matches the convention in bg:getFullState where empty tabs are omitted)"
+    }
+  ]
+}
