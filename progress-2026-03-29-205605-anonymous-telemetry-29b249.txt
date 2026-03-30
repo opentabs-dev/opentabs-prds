@@ -1,0 +1,119 @@
+## Codebase Patterns
+- platform/shared/src/index.ts uses explicit named exports (not `export * from`), so new constants must be added to the exports list manually
+- knip's `ignoreDependencies` is used for dependencies whose consuming module hasn't been created yet (e.g., adding a dep in story N before implementing its module in story N+1)
+- posthog-node added to platform/mcp-server (dynamic import planned in telemetry.ts, US-002); knip ignoreDependencies entry should be removed in US-002 when telemetry.ts is created
+- Vitest module-level state reset: use `vi.resetModules()` + `await import('./module.js')` per test; template literal dynamic imports fail in Vite
+- Mock constructors with `class` in `vi.mock()` factory, not `vi.fn().mockImplementation()` — Vitest warns about non-class mocks used with `new`
+- Test isolation for path helpers: set `OPENTABS_CONFIG_DIR` to a per-test temp directory via `mkdtempSync`
+
+# Ralph Progress Log
+PRD: prd-2026-03-29-205605-anonymous-telemetry-29b249~running.json
+Started: Mon Mar 30 03:56:38 UTC 2026
+---
+
+## 2026-03-30 - US-001
+- Added `getTelemetryIdPath` helper to `platform/shared/src/constants.ts` following the existing path helper pattern
+- Added `getTelemetryIdPath` to the explicit named exports in `platform/shared/src/index.ts`
+- Added `posthog-node: ^4.17.0` to `platform/mcp-server/package.json` dependencies
+- Added `posthog-node` to `ignoreDependencies` in `knip.ts` for the mcp-server workspace (to be removed when telemetry.ts is created in US-002)
+- Ran `npm install` from repo root to regenerate lockfile
+- All Phase 1 checks pass (build, type-check, lint, knip, test)
+- **Learnings for future iterations:**
+  - platform/shared/src/index.ts uses explicit named exports — always add new constants both to constants.ts AND to the exports list in index.ts
+  - knip detects unused dependencies; when adding a dep before its consumer module, use `ignoreDependencies` in knip.ts and remove it when the module is created
+  - US-002 must remove the `posthog-node` entry from `knip.ts` ignoreDependencies for platform/mcp-server
+---
+
+## 2026-03-30 - US-002
+- Created `platform/mcp-server/src/telemetry.ts` with complete telemetry implementation:
+  - PostHog client init via dynamic `import('posthog-node')` (safe if missing)
+  - `isTelemetryEnabled()`: checks OPENTABS_TELEMETRY_DISABLED, DO_NOT_TRACK, config.json telemetry field
+  - `getOrCreateAnonymousId()`: reads/creates UUIDv4 at ~/.opentabs/telemetry-id
+  - `trackEvent()`: fire-and-forget capture with silent error handling; debug mode prints to stderr
+  - `shutdownTelemetry()`: flushes with 2s timeout via Promise.race
+  - `initTelemetry()`: orchestrates enabled check, ID creation, PostHog client setup
+- Updated `knip.ts`: replaced posthog-node `ignoreDependencies` with `src/telemetry.ts` as an entry point (knip resolves dynamic imports from entry points)
+- All Phase 1 checks pass (build, type-check, lint, knip, test)
+- **Learnings for future iterations:**
+  - Dynamic `import()` is recognized by knip when the file is reachable (as an entry point or via import chain) — no need for ignoreDependencies
+  - telemetry.ts uses module-level `let` variables for client/state — these persist across calls within a single process but reset on hot reload (new worker process)
+  - The PostHog client type is inlined as a structural type to avoid importing posthog-node at the top level
+  - Config reading in telemetry.ts uses direct `readFile` + `JSON.parse` (not the retry-based `readConfigWithRetry`) — telemetry doesn't need retry resilience
+---
+
+## 2026-03-30 - US-003
+- Created `platform/mcp-server/src/telemetry.test.ts` with 17 unit tests across 6 describe blocks:
+  - `isTelemetryEnabled`: 6 tests covering OPENTABS_TELEMETRY_DISABLED, DO_NOT_TRACK, config telemetry:false, default enabled, missing config file, env var priority over config
+  - `getOrCreateAnonymousId`: 3 tests covering new UUID creation, existing file read, empty file regeneration
+  - `initTelemetry + trackEvent`: 3 tests covering enabled init+capture, disabled no-op, pre-init no-op
+  - `trackEvent error resilience`: 1 test verifying PostHog capture errors don't propagate
+  - `debug mode`: 1 test verifying stderr output and no PostHog calls
+  - `shutdownTelemetry`: 3 tests covering client shutdown, no-client safety, rejection resilience
+- All Phase 1 checks pass (build, type-check, lint, knip, test — 3500 tests including 17 new)
+- **Learnings for future iterations:**
+  - `vi.resetModules()` is the correct way to get fresh module-level state per test in Vitest — template literal dynamic imports don't work with Vite's module resolution
+  - When mocking a constructor (used with `new`), use a `class` in the mock factory, not `vi.fn().mockImplementation()` — Vitest warns about arrow/plain fn mocks used as constructors
+  - `vi.hoisted()` + `vi.mock()` with a class that assigns hoisted mock fns as instance properties is the clean pattern for mocking module constructors
+  - `mockClear()` preserves implementation (just clears call history), `mockReset()` clears both — use `mockClear()` when the implementation must survive across re-imports
+  - OPENTABS_CONFIG_DIR env var provides test isolation for all path helpers in @opentabs-dev/shared
+---
+
+## 2026-03-30 - US-004
+- Wired `initTelemetry()` into `platform/mcp-server/src/index.ts`:
+  - Called with `void` (fire-and-forget) before `performReload`, only when `!isHotReload`
+  - `trackEvent('server_started', ...)` fired after server starts with properties: version, os, arch, nodeVersion, pluginCount, mode
+- Wired `shutdownTelemetry()` into `platform/mcp-server/src/shutdown.ts`:
+  - Called with `void` between WebSocket close and process.exit (step 6 in shutdown sequence)
+  - The 150ms setTimeout before process.exit gives the 2s-timeout flush time to complete
+- Files changed: `platform/mcp-server/src/index.ts`, `platform/mcp-server/src/shutdown.ts`
+- All Phase 1 checks pass (build, type-check, lint, knip, test — 3500 tests)
+- **Learnings for future iterations:**
+  - index.ts has a clear first-load vs hot-reload distinction via `isHotReload` — new first-load-only logic goes in `if (!isHotReload)` blocks
+  - `void` prefix on async calls is the pattern for fire-and-forget in this codebase (see also `void runVersionCheck(state)`)
+  - shutdown.ts uses a numbered step sequence in comments — new steps should follow the numbering convention
+  - The `trackEvent` call is placed after `performReload` completes so `state.registry.plugins.size` is populated
+---
+
+## 2026-03-30 - US-005
+- Created `platform/cli/src/commands/telemetry.ts` with three subcommands:
+  - `opentabs telemetry status` (also default when no subcommand): shows enabled/disabled state, reason, anonymous ID, docs link
+  - `opentabs telemetry enable`: deletes `telemetry` key from config.json
+  - `opentabs telemetry disable`: sets `telemetry: false` in config.json
+- Added `registerTelemetryCommand` export to `platform/cli/src/commands/index.ts`
+- Registered command in `platform/cli/src/cli.ts`
+- Status checks env vars first (OPENTABS_TELEMETRY_DISABLED, DO_NOT_TRACK) before config, matching the priority order in telemetry.ts
+- All Phase 1 checks pass (build, type-check, lint, knip, test — 3500 tests)
+- **Learnings for future iterations:**
+  - CLI commands follow a consistent pattern: `handleX` function + `registerXCommand` function exported from the command file
+  - `commands/index.ts` is a barrel that re-exports `registerXCommand` from each command file — keep it alphabetically sorted
+  - `readConfig` returns `{ config, error }` — handle `config: null` by defaulting to `{}` for new config creation
+  - `atomicWriteConfig` handles atomic file writes with restrictive permissions — always use it for config changes
+  - Commander's `.command()` chaining supports parent command with `.action()` as the default (no-subcommand) handler
+---
+
+## 2026-03-30 - US-006
+- Added `showTelemetryNoticeIfNeeded` async function to `platform/cli/src/commands/start.ts`
+- The function reads config.json, checks `telemetryNoticeShown`, env var overrides, and `telemetry: false` before showing notice
+- Notice uses `pc.dim()` styling (subtle, not alarming) with 4 lines: what is collected, why, opt-out command, docs link
+- After displaying, writes `telemetryNoticeShown: true` to config.json via `atomicWriteConfig`
+- Called with `await` after `printSetupHints()` in both background and foreground modes
+- Entire function is wrapped in try/catch — non-fatal, best-effort
+- Added imports: `atomicWriteConfig`, `getConfigPath`, `readConfig` from `../config.js`
+- Files changed: `platform/cli/src/commands/start.ts`
+- All Phase 1 checks pass (build, type-check, lint, knip, test — 3500 tests)
+- **Learnings for future iterations:**
+  - `showTelemetryNoticeIfNeeded` is defined as a closure inside `handleStart` to capture `configDir` scope — same pattern as `printSetupHints`
+  - The notice skips display when telemetry is already explicitly disabled (env or config) — user already knows about telemetry
+  - `readConfig` returns `{ config: null, error: 'missing' }` for missing files — use `result.config ?? {}` to handle gracefully
+  - `atomicWriteConfig` uses `atomicWrite` from shared which does write-to-temp + rename for crash safety
+---
+
+## 2026-03-30 - US-007
+- Updated `platform/cli/src/cli.ts` `.addHelpText` block to add three telemetry environment variables
+- Re-aligned all env var descriptions to a common column (position 31) to accommodate the longest new entry (`OPENTABS_TELEMETRY_DISABLED` at 27 chars)
+- Added: `OPENTABS_TELEMETRY_DISABLED`, `OPENTABS_TELEMETRY_DEBUG`, `DO_NOT_TRACK`
+- All Phase 1 checks pass (build, type-check, lint, knip, test — 3500 tests)
+- **Learnings for future iterations:**
+  - When adding env vars longer than existing ones, re-align ALL entries together (not just new ones) to maintain consistent column alignment
+  - The addHelpText block uses a template literal — spacing is literal, no padding helpers available
+---
