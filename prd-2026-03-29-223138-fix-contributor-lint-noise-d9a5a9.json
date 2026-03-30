@@ -1,0 +1,51 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix lint noise and deprecation warnings that confuse platform contributors: update biome.json schema version, eliminate 13 noNonNullAssertion warnings, and suppress Node.js DEP0190 deprecation in tests.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Update biome.json schema version from 2.4.8 to 2.4.9",
+      "description": "The biome.json $schema URL references 2.4.8 but the installed @biomejs/biome is 2.4.9. Every lint and format run prints a confusing info message telling contributors to run 'biome migrate'.",
+      "acceptanceCriteria": [
+        "biome.json $schema URL references biomejs.dev/schemas/2.4.9/schema.json",
+        "npm run lint no longer prints 'Expected: 2.4.9, Found: 2.4.8' info message",
+        "npm run format:check no longer prints the biome migrate suggestion"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- biome.json (update $schema URL)\n\nContext:\nThe `$schema` field in biome.json is a version-pinned URL that Biome checks on every invocation. When it doesn't match the installed binary version, Biome prints an info message suggesting migration.\n\nChanges:\nLine 2 of biome.json currently reads:\n```json\n\"$schema\": \"https://biomejs.dev/schemas/2.4.8/schema.json\",\n```\nChange to:\n```json\n\"$schema\": \"https://biomejs.dev/schemas/2.4.9/schema.json\",\n```\n\nConstraints:\n- Do NOT change any other biome.json content — only the schema URL version number.\n- Do NOT run `biome migrate` — it may change rule configurations. The only change needed is the schema URL."
+    },
+    {
+      "id": "US-002",
+      "title": "Eliminate noNonNullAssertion warnings in levenshtein function and config test",
+      "description": "The levenshtein function in config.ts uses 12 non-null assertions (!) on array accesses that trigger Biome's noNonNullAssertion warning. One additional warning exists in config.test.ts. Together these produce 13 warnings on every npm run lint, creating noise for contributors.",
+      "acceptanceCriteria": [
+        "npm run lint reports 0 warnings (previously 12 warnings + 1 info)",
+        "The levenshtein function returns identical results for all inputs (same algorithm, no behavioral change)",
+        "No biome-ignore comments are added — the code itself must be restructured to avoid the warnings"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts (restructure levenshtein function, lines 170-184)\n- platform/mcp-server/src/config.test.ts (line 571, replace `!` with `?.`)\n\nContext:\nThe `noUncheckedIndexedAccess` tsconfig option makes array index access return `T | undefined`. The levenshtein function initializes a full 2D array `dp` but TypeScript doesn't know the indices are safe, so `!` is used 12 times.\n\nChanges for config.ts:\nCurrent code (lines 170-184):\n```typescript\nconst levenshtein = (a: string, b: string): number => {\n  const m = a.length;\n  const n = b.length;\n  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>\n    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)),\n  );\n  for (let i = 1; i <= m; i++) {\n    for (let j = 1; j <= n; j++) {\n      dp[i]![j] =\n        a[i - 1] === b[j - 1] ? dp[i - 1]![j - 1]! : 1 + Math.min(dp[i - 1]![j]!, dp[i]![j - 1]!, dp[i - 1]![j - 1]!);\n    }\n  }\n  return dp[m]![n]!;\n};\n```\n\nRecommended approach: Use a flat 1D array with index math to avoid all `!` assertions:\n```typescript\nconst levenshtein = (a: string, b: string): number => {\n  const m = a.length;\n  const n = b.length;\n  // Flat 1D array avoids noUncheckedIndexedAccess warnings on 2D access\n  const dp = new Int32Array((m + 1) * (n + 1));\n  const idx = (i: number, j: number) => i * (n + 1) + j;\n  for (let i = 0; i <= m; i++) dp[idx(i, 0)] = i;\n  for (let j = 0; j <= n; j++) dp[idx(0, j)] = j;\n  for (let i = 1; i <= m; i++) {\n    for (let j = 1; j <= n; j++) {\n      dp[idx(i, j)] =\n        a[i - 1] === b[j - 1]\n          ? dp[idx(i - 1, j - 1)]\n          : 1 + Math.min(dp[idx(i - 1, j)], dp[idx(i, j - 1)], dp[idx(i - 1, j - 1)]);\n    }\n  }\n  return dp[idx(m, n)];\n};\n```\n`Int32Array` access never returns `undefined` (it returns 0 for out-of-bounds), so no `!` assertions are needed and Biome is happy. Alternatively, a `Uint32Array` or regular typed approach works too.\n\nChanges for config.test.ts:\nLine 571 currently reads:\n```typescript\n      expect(warning![0]).not.toContain('did you mean');\n```\nChange to:\n```typescript\n      expect(warning?.[0]).not.toContain('did you mean');\n```\n\nConstraints:\n- Do NOT add biome-ignore comments — the CLAUDE.md explicitly forbids them.\n- The levenshtein function must return identical results for all inputs.\n- Do NOT touch any other functions in config.ts.\n- The `Int32Array` approach is recommended but any approach that eliminates all `!` assertions while keeping the same algorithm is acceptable."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix Node.js DEP0190 deprecation warnings in create-plugin tests",
+      "description": "The create-plugin integration test uses spawnSync with shell:true and array args, triggering Node.js 24's DEP0190 deprecation warning during npm run test. Contributors see alarming warnings that look like something is broken.",
+      "acceptanceCriteria": [
+        "npm run test produces no DEP0190 deprecation warnings",
+        "All create-plugin tests still pass (scaffold, build, lint, format:check)",
+        "The spawnSync calls no longer use shell:true with separate args array"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/create-plugin/src/index.test.ts (4 spawnSync calls with shell:true)\n\nContext:\nNode.js 24 added DEP0190 which warns when `spawnSync` (or `spawn`) is called with both `args` and `shell: true`, because the args are concatenated unsafely. The fix is to remove `shell: true` since these calls don't need shell features — they invoke `npm` directly.\n\nChanges:\nThere are 4 `spawnSync` calls that use `shell: true`:\n\n1. Line 267-271 (npm install):\n```typescript\nconst install = spawnSync('npm', ['install'], {\n  cwd: projectDir,\n  env: buildEnv,\n  shell: true,\n});\n```\nRemove `shell: true`:\n```typescript\nconst install = spawnSync('npm', ['install'], {\n  cwd: projectDir,\n  env: buildEnv,\n});\n```\n\n2. Line 279 (npm run build):\n```typescript\nconst build = spawnSync('npm', ['run', 'build'], { cwd: projectDir, env: buildEnv, shell: true });\n```\nRemove `shell: true`:\n```typescript\nconst build = spawnSync('npm', ['run', 'build'], { cwd: projectDir, env: buildEnv });\n```\n\n3. Line 287 (npm run lint):\n```typescript\nconst lint = spawnSync('npm', ['run', 'lint'], { cwd: projectDir, env: buildEnv, shell: true });\n```\nRemove `shell: true`.\n\n4. Line 295 (npm run format:check):\n```typescript\nconst formatCheck = spawnSync('npm', ['run', 'format:check'], { cwd: projectDir, env: buildEnv, shell: true });\n```\nRemove `shell: true`.\n\nConstraints:\n- Do NOT change the runCli helper at the top of the file (line 14) — it correctly uses `shell: false` (implicit default).\n- Do NOT change the test logic, assertions, or error handling — only remove `shell: true`.\n- These tests run on Linux (Docker) and macOS. `npm` is directly executable on both without shell. Windows is not a concern for these tests (separate E2E suite for Windows)."
+    }
+  ]
+}
