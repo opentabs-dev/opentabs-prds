@@ -1,0 +1,73 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-114206-chaos-tests-lifecycle-a92a66~running.json
+Started: Mon Mar 30 18:42:40 UTC 2026
+---
+
+## Codebase Patterns
+- E2E test files use local helpers (e.g., `postReload`) defined at file scope — reuse them in new test blocks
+- `writeTestConfig` + `postReload` is the standard pattern for triggering config-driven side panel updates
+- `setupAdapterSymlink` is required after `launchExtensionContext` to enable adapter injection
+- `waitForExtensionConnected` + `waitForLog(server, 'Config watcher: Watching')` is the standard setup sequence before interacting with the side panel
+- Page error tracking uses `sidePanelPage.on('pageerror', ...)` with an array collector
+
+## 2026-03-30 - US-001
+- Added stress test describe block to e2e/side-panel-live-update.e2e.ts
+- Test rapidly cycles 3x between removing and adding a plugin via writeTestConfig + postReload with 200ms delays
+- Verifies final state shows plugin visible and zero page errors
+- Files changed: e2e/side-panel-live-update.e2e.ts
+- **Learnings for future iterations:**
+  - `postReload` in this file takes `(port, configDir)` not `(port, secret)` — it reads the secret from auth.json in the config dir
+  - The existing tests follow a try/finally pattern with explicit cleanup of context, server, cleanupDir, and configDir
+  - `E2E_TEST_PLUGIN_DIR` and `readPluginToolNames()` from fixtures provide the standard e2e-test plugin path and tool names
+---
+
+## 2026-03-30 - US-002
+- Added stress test describe block to e2e/side-panel-reload.e2e.ts
+- Test fires 3 sequential POST /reload requests with 200ms between each, then waits 1s for settle
+- Verifies E2E Test plugin still visible, exactly 1 plugin card (no duplicates via getByText exact match), and zero page errors
+- Files changed: e2e/side-panel-reload.e2e.ts
+- **Learnings for future iterations:**
+  - `postReload` in side-panel-reload.e2e.ts takes `(port, configDir)` — reads secret from auth.json internally (same pattern as side-panel-live-update.e2e.ts)
+  - No `data-testid` attributes exist on PluginCard components — use `getByText('E2E Test', { exact: true })` with `toHaveCount(1)` to verify no duplicate cards
+  - `buildToolsMap()` is a local helper in side-panel-reload.e2e.ts that reads tool names from the e2e-test plugin
+---
+
+## 2026-03-30 - US-003
+- Added stress test describe block to e2e/side-panel-plugin-update.e2e.ts
+- Test injects fake outdated data via `setOutdatedPlugins`, opens menu, clicks Update, immediately re-opens menu and attempts second Update click
+- Verifies only one error alert appears (confirms single update execution) and zero page errors
+- Files changed: e2e/side-panel-plugin-update.e2e.ts
+- **Learnings for future iterations:**
+  - `setOutdatedPlugins` takes an array of `{ name, currentVersion, latestVersion, updateCommand }` objects — the PRD called it `injectOutdated` but the actual helper is `setOutdatedPlugins`
+  - `simulateUpdate(port, secret, pluginName, newVersion)` is available for simulating successful updates server-side
+  - After clicking a `[role="menuitem"]`, the menu closes automatically (Radix-style dropdown behavior)
+  - Local plugin updates fail because `npm update -g` doesn't work for local plugins — this produces an error alert via `[role="alert"]`
+  - `getPluginPackageInfo()` reads the e2e-test plugin's package.json for `name` and `version`
+---
+
+## 2026-03-30 - US-004
+- Added stress test describe block to e2e/side-panel-npm-search.e2e.ts
+- Test types 10 different queries ('a', 'ab', 'abc', ..., 'todoist') with 50ms between each, then waits 2s for debounce to settle
+- Verifies side panel still responsive, checks Available section if visible, clears search and verifies clean state
+- Asserts zero pageerror events
+- Files changed: e2e/side-panel-npm-search.e2e.ts
+- **Learnings for future iterations:**
+  - The search uses `npmSearchFindsPlugins()` (checks `npm search "keywords:opentabs-plugin" --json`) and `npmSlackPluginHasArtifacts()` as skip conditions — use `searchAvailable` for general search tests
+  - Search input placeholder is `'Search plugins and tools...'` — use `getByPlaceholder()` to locate it
+  - Search has a 400ms debounce — wait at least 2s after last query for results to settle
+  - The "Available" section heading appears when npm search results are present — use `getByText('Available')` to check for results
+  - Follow try/finally pattern with cleanup: context.close(), server.kill(), rmSync(cleanupDir), cleanupTestConfigDir(configDir)
+---
+
+## 2026-03-30 - US-005
+- Added stress test describe block to e2e/side-panel-auth-failed.e2e.ts
+- Test starts with wrong secret (auth failed state), then writes correct secret to extension's auth.json
+- Extension auto-recovers: offscreen document re-reads auth.json on reconnect and authenticates successfully
+- Verifies "Authentication Failed" disappears, "E2E Test" plugin card becomes visible, and zero page errors
+- Files changed: e2e/side-panel-auth-failed.e2e.ts
+- **Learnings for future iterations:**
+  - `launchExtensionContext` returns `extensionDir` — the path to the extension's temp copy. Writing auth.json there updates the secret the offscreen document reads
+  - The extension has exponential backoff reconnect — after writing correct auth.json, use `waitForExtensionConnected(server, 30_000)` with generous timeout
+  - `setupAdapterSymlink(configDir, extensionDir)` is needed for plugin discovery after auth recovery — without it, the side panel won't show plugin cards
+  - The offscreen document automatically re-reads auth.json from `chrome.runtime.getURL('auth.json')` when /ws-info returns 401
+---
