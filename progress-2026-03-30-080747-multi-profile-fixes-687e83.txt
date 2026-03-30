@@ -1,0 +1,105 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-080747-multi-profile-fixes-687e83~running.json
+Started: Mon Mar 30 15:08:21 UTC 2026
+---
+
+## Codebase Patterns
+- resolveConnection in extension-protocol.ts is a private const — tests must go through dispatchToExtension
+- Multi-connection tests use createMockConnection helper (defined at ~line 3408 in extension-protocol.test.ts) to create mock connections with trackable WsHandle
+- Test pattern for dispatch routing: call dispatchToExtension, check which mock WS has messages in .sent array, then settle pending dispatch to prevent timeout leaks
+- DispatchOptions can be a string (label) or an object — dispatchToExtension normalizes both
+- TabMapping.state is 'ready' | 'unavailable' | 'closed' (from state.ts TabState type)
+- Browser tool description/summary changes require updating the catalog at platform/shared/src/generated/browser-tools-catalog.ts — the build validates catalog matches definitions at import time
+- dispatchToAllConnections returns `{ connectionId: string; result: unknown }[]` — use it for tools that should aggregate across all profiles
+- Adding a required field to ExtensionConnection requires updating 12+ test files that construct mock connections — every createMockConnection helper and inline object literal needs the new field
+- Raw WS connections can act as fake extensions in E2E tests: they receive JSON-RPC requests (e.g., tool.dispatch) and respond with results using `{ result: { output: <tool result> } }` wrapper
+- waitForWsMessage predicates must filter by specific msg.method to avoid matching sync.full notifications sent on connect
+- plugin_list_tabs reads directly from server-side tabMapping (no extension round-trip), so no dispatch handler is needed
+- setupAutoResponder pattern: for dispatchToAllConnections tests, set up persistent message handlers that auto-respond to specific JSON-RPC methods — cleaner than waitForWsMessage when both WS connections receive independent requests simultaneously
+
+## 2026-03-30 15:12 - US-001
+- Implemented plugin-aware dispatch routing in resolveConnection
+- Added `pluginName?: string` to DispatchOptions interface
+- Modified resolveConnection to accept optional pluginName and scan tabMappings (preference: ready > unavailable > closed > getAnyConnection)
+- Threaded pluginName from dispatchToExtension into resolveConnection via opts.pluginName
+- Added pluginName to handlePluginToolCall's dispatch options in mcp-tool-dispatch.ts
+- Added 5 unit tests covering: ready-state routing, unavailable preference, fallback to getAnyConnection, single-connection fast path, tabId priority over pluginName
+- Files changed: extension-protocol.ts, mcp-tool-dispatch.ts, extension-protocol.test.ts
+- **Learnings for future iterations:**
+  - The resolveConnection priority chain is: single conn fast path → connectionId → tabId → pluginName → getAnyConnection
+  - Tests follow a consistent pattern of settling pending dispatches (resolve + clearTimeout) to prevent timeout leaks
+---
+
+## 2026-03-30 15:17 - US-002
+- Rewrote extension_get_state to use dispatchToAllConnections for multi-profile aggregation
+- Removed connectionId input parameter (tool now always returns all profiles)
+- Response shape changed from flat object to `{ connections: [{ connectionId, ...state }] }`
+- Updated tool description and summary to reflect multi-profile behavior
+- Updated browser-tools-catalog.ts to match new description/summary
+- Files changed: extension-get-state.ts, browser-tools-catalog.ts
+- **Learnings for future iterations:**
+  - Browser tool description/summary/icon/group changes require updating the generated catalog at platform/shared/src/generated/browser-tools-catalog.ts
+  - The build validates catalog matches definitions at import time (index.ts validation loop) — the build will fail if they're out of sync
+  - `npm run generate:browser-tools-catalog` can auto-regenerate it, but it imports from dist/ which also does the validation, so manually updating the catalog is easier when you know the exact change
+---
+
+## 2026-03-30 15:20 - US-003
+- Rewrote extension_get_logs to use dispatchToAllConnections for multi-profile aggregation
+- Removed connectionId input parameter from extension_get_logs
+- Merges log entries from all profiles into sorted array (newest-first by timestamp), annotates each entry with connectionId
+- Sums stats (totalBackground, totalOffscreen, bufferSize) across all connections
+- Rewrote extension_check_adapter to use dispatchToAllConnections
+- Returns `{ connections: [{ connectionId, ...adapterStatus }] }` for check adapter
+- Updated browser-tools-catalog.ts descriptions and summaries for both tools
+- Files changed: extension-get-logs.ts, extension-check-adapter.ts, browser-tools-catalog.ts
+- **Learnings for future iterations:**
+  - The pattern for aggregating across profiles is consistent: use dispatchToAllConnections, map results with connectionId annotation, return in a `connections` array (for simple results) or merge entries with sorting (for logs)
+  - extension_get_logs has a more complex merge: entries are spread with connectionId added per-entry, stats are summed numerically
+  - extension_check_adapter follows the same simple pattern as extension_get_state
+---
+
+## 2026-03-30 15:28 - US-004
+- Added profileLabel field to ExtensionConnection interface
+- Added nextProfileLabel counter and profileLabelMap to ServerState interface and createState()
+- Added assignProfileLabel helper that assigns sequential labels ('A', 'B', 'C', ...) and reuses labels on reconnect
+- Updated createHandleWsOpen to assign profileLabel and include in connect log
+- Updated createHandleWsClose to include profileLabel in disconnect log
+- Updated tab.syncAll and tab.stateChanged log messages to include profileLabel
+- Added profileLabel to all mock ExtensionConnection objects across 12 test files
+- Files changed: state.ts, http-routes.ts, extension-handlers.ts, + 12 test files
+- **Learnings for future iterations:**
+  - Adding a required field to ExtensionConnection requires updating ALL test files that construct mock connections — there are 12+ files with mock connection helpers
+  - The perl/sed regex for adding fields works well for string literal connectionIds but misses variable references like `connectionId: id`
+  - profileLabelMap entries are never cleaned up on disconnect (by design) so reconnecting profiles get the same label
+---
+
+## 2026-03-30 15:52 - US-005
+- Created e2e/multi-profile-routing.e2e.ts with 4 E2E tests for plugin-aware dispatch routing
+- Test 1: Plugin tool routes to the connection with the plugin in ready state (conn-beta has e2e-test ready, conn-alpha has nothing — dispatch goes to conn-beta)
+- Test 2: Plugin tool succeeds when both profiles have the plugin ready (dispatch handler on both, either responds)
+- Test 3: Plugin tool fails when neither profile has the plugin in ready state (both respond with error)
+- Test 4: plugin_list_tabs returns tabs from both connections with correct connectionId annotations
+- Used novel pattern: raw WebSocket acts as fake extension, receives tool.dispatch JSON-RPC requests and responds with results (output wrapper required for mcp-tool-dispatch.ts extraction)
+- Files changed: e2e/multi-profile-routing.e2e.ts (new)
+- **Learnings for future iterations:**
+  - Raw WS connections can act as fake extensions for E2E tests — they receive JSON-RPC requests and respond with results
+  - The tool.dispatch response must use `{ result: { output: <tool result> } }` wrapper because mcp-tool-dispatch.ts extracts via `.output ?? result`
+  - waitForWsMessage predicates must filter by `msg.method === 'tool.dispatch'` to avoid matching sync.full notifications sent on connect
+  - sendJsonRpc and waitForWsMessage are defined locally in each test file (not exported from multi-connection.e2e.ts)
+  - plugin_list_tabs reads directly from server-side state (no extension round-trip), so it works without dispatch handlers
+---
+
+## 2026-03-30 16:20 - US-006
+- Created e2e/multi-profile-diagnostics.e2e.ts with 5 E2E tests for aggregated extension diagnostics
+- Test 1: extension_get_state returns connections array from both profiles with distinct connectionIds
+- Test 2: extension_get_logs merges entries from both profiles sorted by timestamp descending, with correct connectionId attribution and summed stats
+- Test 3: extension_check_adapter returns connections array with adapter status from both profiles
+- Test 4: Single connection returns connections array with one element (fallback)
+- Test 5: extension_get_state reflects distinct plugin states per profile (ready vs unavailable)
+- Used setupAutoResponder helper pattern: persistent message handler auto-responds to specific JSON-RPC methods, filtering out sync.full
+- Files changed: e2e/multi-profile-diagnostics.e2e.ts (new)
+- **Learnings for future iterations:**
+  - setupAutoResponder is cleaner than waitForWsMessage for dispatchToAllConnections tests — both connections receive independent requests simultaneously
+  - waitForWsMessage isn't needed when using setupAutoResponder pattern — removed unused helper to avoid lint issues
+  - TypeScript strict mode catches `array[0].property` as possibly undefined — use optional chaining `array[0]?.property`
+---
