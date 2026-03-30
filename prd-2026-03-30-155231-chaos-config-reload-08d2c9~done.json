@@ -14,7 +14,7 @@
         "npx playwright test e2e/stress-config-reload.e2e.ts passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-config-reload.e2e.ts (NEW file)\n\nContext:\nThe config watcher uses fs.watch/chokidar to detect config.json changes. POST /reload also triggers a full rediscovery. If both fire simultaneously, the server must coalesce or sequence them — not run two discoveries in parallel producing duplicate plugins.\n\nChanges:\nSetup: start MCP server with empty config (no plugins). Create MCP client. Then simultaneously: writeTestConfig adding e2e-test plugin + fetch POST /reload. Use Promise.all for both. Wait 2s for both triggers to settle. Call mcpClient.listTools() and verify e2e-test tools appear exactly once. Call server.health() and verify pluginCount is correct.\n\nConstraints:\n- The config watcher debounce is typically 200-500ms — the race window is real\n- POST /reload returns 200 immediately but processing is async\n- Use the reload-coalescing pattern from reload-coalescing.e2e.ts as reference"
@@ -30,7 +30,7 @@
         "Server health remains ok throughout"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-config-reload.e2e.ts (add to same file)\n\nContext:\nRapid config writes test the file watcher's debouncing. If the watcher fires on every write, the server could be processing an old config while a new one arrives. The server must handle this gracefully — either debounce or queue.\n\nChanges:\nSetup: start server with e2e-test plugin. Loop 10 times: odd iterations write config WITHOUT plugin, even iterations write WITH plugin. 200ms delay between writes. After loop, the last write (i=9, odd) has no plugins. Wait 3s for all watcher events to settle. Verify mcpClient.listTools() returns only browser tools (no e2e-test). Then write config WITH plugin, wait 2s, verify e2e-test tools appear.\n\nConstraints:\n- writeTestConfig is synchronous (fs.writeFileSync) — each write triggers a watcher event\n- Must wait long enough after final write for all debounced events to process\n- Do NOT use POST /reload — let the file watcher handle it naturally"
@@ -46,7 +46,7 @@
         "No orphaned node processes from old workers (check via health endpoint worker PID if available)"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-config-reload.e2e.ts (add to same file)\n\nContext:\nThe dev proxy handles SIGUSR1 by killing the old worker and forking a new one. Rapid reloads could leave orphaned workers if the kill/fork sequence isn't atomic. The dev-proxy.e2e.ts already tests 'concurrent overlapping SIGUSR1 signals' but only 2x — we need 5x.\n\nChanges:\nSetup: start server in hot mode. Send 5 triggerHotReload() with 500ms between each. After the 5th, wait for 'Hot reload complete' in logs. Verify health returns ok. Verify listTools returns expected tools. Make a tool call to verify dispatch works.\n\nConstraints:\n- Each triggerHotReload() sends SIGUSR1 to the proxy PID\n- The proxy should kill the current worker before forking a new one\n- Wait for the FINAL 'Hot reload complete' log, not the first one"
@@ -62,7 +62,7 @@
         "Writing valid config.json restores correct plugin state"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-config-reload.e2e.ts (add to same file)\n\nContext:\nWhen a user or CLI writes config.json, a partial write (crash mid-write, disk full) could leave invalid JSON. The config watcher fires, server tries to parse, must not crash.\n\nChanges:\nSetup: start server with e2e-test plugin, verify tools available. Write '{ \"localPlugins\": [' (truncated JSON) to config.json directly via fs.writeFileSync. Wait 2s for watcher. Verify server.health() returns ok. Check server.logs for config parse warning. Write valid config back via writeTestConfig. Wait 2s. Verify tools restored.\n\nConstraints:\n- Write raw string to config path, NOT via writeTestConfig (which always writes valid JSON)\n- Config path is `path.join(configDir, 'config.json')`\n- Server should keep the previous valid state on parse error"

@@ -1,0 +1,60 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-155231-chaos-config-reload-08d2c9~running.json
+Started: Mon Mar 30 22:53:08 UTC 2026
+---
+
+## Codebase Patterns
+- E2E stress tests go in `e2e/stress-config-reload.e2e.ts` — a single file for all config reload resilience tests
+- Use `writeTestConfig` for valid config writes, raw `fs.writeFileSync` for corruption tests
+- `waitForLog(server, 'Config watcher: Watching')` ensures the watcher is ready before testing
+- `waitForToolList` with a predicate is the correct polling pattern for verifying tool list state changes
+- `startMcpServer(configDir, true)` starts in hot mode with isolated config; second param controls hot reload
+- Use `authHeaders(server.secret)` and `postReload(port, headers)` for POST /reload calls
+- Avoid non-null assertions (`!`) — use optional chaining (`?.`) per Biome lint rules
+- For corruption tests, write raw strings via `fs.writeFileSync` and check for `'Reload failed, keeping previous state'` in server logs
+
+---
+
+## 2026-03-30 - US-001
+- Implemented config watcher + POST /reload simultaneous race stress test
+- Files created: e2e/stress-config-reload.e2e.ts
+- **Learnings for future iterations:**
+  - The reload-coalescing.e2e.ts and config-watcher.e2e.ts are the key reference files for config reload patterns
+  - `Promise.all` with config write + POST /reload works to trigger both simultaneously
+  - Server correctly coalesces/sequences concurrent discovery triggers — no duplicates observed
+  - Must capture `configDir` in a const before using inside closures to avoid Biome non-null assertion warnings
+---
+
+## 2026-03-30 - US-002
+- Implemented rapid config writes (10x in 2 seconds) stress test
+- Files changed: e2e/stress-config-reload.e2e.ts (added new test.describe block)
+- **Learnings for future iterations:**
+  - The `delay` helper was added to the file for cleaner async wait calls — reuse it for subsequent tests
+  - Config watcher debouncing handles rapid alternating writes gracefully — final state always matches last write
+  - `waitForToolList` with a negation predicate (checking tools DON'T exist) works well for verifying plugin removal
+  - The recovery pattern (write final config → poll for expected state) confirms the watcher remains functional after rapid writes
+---
+
+## 2026-03-30 - US-003
+- Implemented hot reload spam (5x rapid SIGUSR1) stress test
+- Files changed: e2e/stress-config-reload.e2e.ts (added new test.describe block, added `createTestConfigDir` import)
+- **Learnings for future iterations:**
+  - `createTestConfigDir()` from fixtures.ts sets up a config dir with the e2e-test plugin already registered — use it for tests that don't need custom config setup
+  - The dev proxy's `triggerHotReload()` sends SIGUSR1 to the proxy PID — each intermediate worker gets killed before reporting ready
+  - `waitForLog(server, 'Hot reload complete', 30_000)` with a generous timeout is needed since 5 reloads with 500ms spacing means ~2s of reloads plus worker startup time
+  - The existing dev-proxy.e2e.ts 'concurrent overlapping SIGUSR1 signals' test fires 2 reloads simultaneously (no delay) — the stress test adds 5 reloads with 500ms spacing for a different race pattern
+  - Error pattern checking (`deadlock`, `state corruption`, `uncaughtException`) follows the same convention used in dev-proxy.e2e.ts
+---
+
+## 2026-03-30 - US-004
+- Implemented config corruption recovery (invalid JSON mid-write) stress test
+- Files changed: e2e/stress-config-reload.e2e.ts (added new test.describe block)
+- **Learnings for future iterations:**
+  - `readConfigWithRetry` in config.ts retries 3 times with 100/200/400ms exponential backoff before returning null
+  - When config parsing fails, `loadConfig` throws `Config at ... is unreadable after retries`
+  - `reloadCore` catches the error and logs `'Reload failed, keeping previous state'` — this is the key log message to assert on
+  - The server preserves its previous valid registry/state when config parsing fails — plugin tools remain available
+  - Write raw corrupted JSON via `fs.writeFileSync(path.join(configDir, 'config.json'), ...)` — NOT via `writeTestConfig` which always writes valid JSON
+  - 3s delay after corruption write is sufficient for watcher debounce + retry backoff (~700ms total) to complete
+  - E2E checkpoint passed with all 235 tests passing
+---
