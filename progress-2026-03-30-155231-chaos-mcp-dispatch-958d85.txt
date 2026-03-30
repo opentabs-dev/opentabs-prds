@@ -1,0 +1,69 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-155231-chaos-mcp-dispatch-958d85~running.json
+Started: Mon Mar 30 22:53:16 UTC 2026
+---
+
+## Codebase Patterns
+- E2E tests use fixtures from `e2e/fixtures.ts` (mcpServer, testServer, extensionContext, mcpClient) with automatic setup/teardown
+- `setupToolTest` helper handles the standard preamble: wait for extension, open tab, poll until plugin is ready
+- Use `for...of` with `.entries()` instead of indexed access with `!` non-null assertions to satisfy Biome lint
+- `parseToolResult` parses JSON text content from tool call results
+- The e2e-test plugin's echo tool returns `{ message: <input> }` matching its input
+- `readTestConfig` / `writeTestConfig` are in fixtures.ts (not helpers.ts) — use them for config changes in tests
+- Plugin permission `'off'` returns "has not been reviewed yet" for plugin tools (not "currently disabled" which is browser-only)
+- `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS=1` does NOT override `'off'` — it only upgrades `'ask'` to `'auto'`
+
+---
+
+## 2026-03-30 - US-001
+- Created `e2e/stress-mcp-dispatch.e2e.ts` with two stress tests for concurrent dispatch
+- Test 1: 10 concurrent echo calls via Promise.all, verifies all return correct unique results
+- Test 2: 20 concurrent echo calls via Promise.all, verifies all return correct unique results
+- Both tests verify 1:1 positional mapping (each result matches its input) and no duplicates (Set.size === count)
+- Files changed: e2e/stress-mcp-dispatch.e2e.ts (NEW)
+- **Learnings for future iterations:**
+  - Biome enforces `noNonNullAssertion` — use `for...of` with `.entries()` instead of indexed `results[i]!` access
+  - The fixture-based approach (`test` from `./fixtures.js`) handles all infrastructure (config dir, MCP server, test server, extension, MCP client) automatically — no need for manual setup like the PRD notes suggested
+  - `test.slow()` is needed for tests that may take longer than the default timeout
+---
+
+## 2026-03-30 - US-002
+- Added "Tool dispatch during tab close" test to `e2e/stress-mcp-dispatch.e2e.ts`
+- Test fires `e2e-test_slow_with_progress` (3s, 3 steps), waits for dispatch to reach extension via log polling, closes the tab, verifies isError=true within 10s
+- Verifies server health returns status='ok' after the failed dispatch
+- Verifies recovery: opens new tab, confirms subsequent echo tool call succeeds
+- Files changed: e2e/stress-mcp-dispatch.e2e.ts (modified)
+- **Learnings for future iterations:**
+  - `waitFor` with log polling (`mcpServer.logs.some(...)`) is effective for confirming a dispatch is in-flight before triggering an interruption — avoids brittle fixed `setTimeout` delays
+  - The `slow_with_progress` tool runs entirely inside the tab's execution context (no test server HTTP calls), so you can't use `testServer.invocations()` to detect when execution has started — use server log polling instead
+  - `mcpServer.health()` returns `HealthResponse | null` — use `expect(health).not.toBeNull()` then optional chaining for type safety
+---
+
+## 2026-03-30 - US-003
+- Added "Hot reload during active tool dispatch" test to `e2e/stress-mcp-dispatch.e2e.ts`
+- Test fires 5 `e2e-test_slow_with_progress` calls (2s each, 2 steps), waits for dispatch to reach extension, triggers `mcpServer.triggerHotReload()`
+- Uses `Promise.allSettled` (not `Promise.all`) since some calls may reject during worker restart
+- Verifies all 5 calls settle (no hang), each fulfilled result has a boolean `isError` field
+- Waits for `'Hot reload complete'` log + extension reconnect, then verifies server health is ok
+- Verifies recovery: subsequent echo call succeeds via `waitForToolResult` with 20s timeout
+- Files changed: e2e/stress-mcp-dispatch.e2e.ts (modified)
+- **Learnings for future iterations:**
+  - `Promise.allSettled` is the correct choice for in-flight calls during hot reload — `Promise.all` would short-circuit on the first rejection
+  - After `triggerHotReload()`, must wait for both `'Hot reload complete'` log AND `waitForExtensionConnected` before verifying recovery — the extension needs time to reconnect and resync tab state
+  - `waitForToolResult` with a generous timeout (20s) is needed for post-reload verification since the MCP client auto-reinitializes the session and the extension may still be resyncing
+  - The dev-proxy.e2e.ts already tests similar scenarios — the stress test here focuses specifically on multiple concurrent in-flight calls (5 simultaneous) rather than a single SSE stream
+---
+
+## 2026-03-30 - US-004
+- Added "Permission change mid-dispatch" test to `e2e/stress-mcp-dispatch.e2e.ts`
+- Test fires `e2e-test_slow_with_progress` (3s, 3 steps), waits for dispatch to reach extension, changes e2e-test permission to 'off' via `writeTestConfig` + `triggerHotReload()`
+- Verifies the in-flight call completes (either success or clean error — it passed permission check before dispatch)
+- Verifies a subsequent `e2e-test_echo` call returns `isError: true` with 'currently disabled' or 'not been reviewed' message
+- Restores permission to 'auto' via config + hot reload, verifies echo tool works again
+- Files changed: e2e/stress-mcp-dispatch.e2e.ts (modified — added imports from fixtures.js, added test)
+- **Learnings for future iterations:**
+  - For plugin tools (not browser tools), permission `'off'` returns "has not been reviewed yet" message (with review flow guidance), NOT "currently disabled" — the "currently disabled" message is only for browser tools
+  - `readTestConfig` / `writeTestConfig` are exported from fixtures.ts (not helpers.ts) — they read/write `config.json` in the isolated test config directory
+  - `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS=1` (set by default in E2E fixtures) makes `'ask'` behave as `'auto'` but does NOT override `'off'` — so setting permission to `'off'` still blocks tool calls even with skipPermissions
+  - The `McpClient.callTool()` return type has `content: string` (already concatenated text), not the raw array — no need for array extraction logic
+---

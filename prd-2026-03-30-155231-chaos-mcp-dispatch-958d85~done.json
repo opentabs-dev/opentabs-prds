@@ -14,7 +14,7 @@
         "npx playwright test e2e/stress-mcp-dispatch.e2e.ts passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (NEW file)\n\nContext:\nThe dispatch-resilience.e2e.ts file already tests 5 concurrent calls, but we need higher concurrency and verification that response routing is correct. The e2e-test plugin's echo tool returns `{ message: <input> }` so we can verify each response matches its input.\n\nChanges:\nCreate new file with manual setup pattern: createTestConfigDir, writeTestConfig with e2e-test plugin at auto+reviewed, startMcpServer, startTestServer, launchExtensionContext, setupAdapterSymlink. Open matching tab via openTestAppTab. Wait for extension connected + tab.syncAll. Create MCP client, initialize.\n\nTest: Fire 10 calls `Promise.all(Array.from({length: 10}, (_, i) => mcpClient.callTool('e2e-test_echo', { message: `concurrent-${i}` })))`. Verify all results are non-error. Parse each result JSON and verify `message` field matches the input. Collect all messages into a Set and verify Set.size === 10 (no duplicates).\n\nThen fire 20 calls to verify higher concurrency. Same verification.\n\nConstraints:\n- Must have a matching tab open (test server running) for plugin dispatch to work\n- Use OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS=1 to avoid permission dialogs\n- Follow existing manual setup/teardown pattern from dispatch-resilience.e2e.ts"
@@ -30,7 +30,7 @@
         "Server remains healthy after the failed dispatch (health endpoint returns ok)"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (add to same file)\n\nContext:\nThe e2e-test plugin has a `slow_with_progress` tool that takes `durationMs` and `steps` params. When the tab closes mid-execution, the extension should detect it and send an error response back through the dispatch chain. The dispatch-resilience.e2e.ts file already tests 'tool call during extension reconnect window' but not tab closure specifically.\n\nChanges:\nAdd test that: opens matching tab, starts slow_with_progress with durationMs=3000. After 500ms (via setTimeout + Promise race), closes the tab page. The tool call should resolve with isError=true. Verify the error content mentions the tab or dispatch failure. Then verify server.health() still returns status='ok'.\n\nConstraints:\n- Use Promise.race or separate Promise for the tab close timing\n- The e2e-test plugin's slow_with_progress tool signature: { durationMs: number, steps: number }\n- Do NOT use page.close() on the side panel — close the TEST APP tab"
@@ -47,7 +47,7 @@
         "Server health returns ok after reload"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (add to same file)\n\nContext:\nHot reload (SIGUSR1 to dev proxy) kills the worker process and forks a new one. In-flight tool calls go through the extension WebSocket which disconnects and reconnects. The dev-proxy buffers HTTP requests during restart, but WebSocket messages in flight may be lost.\n\nChanges:\nStart 5 slow_with_progress calls (durationMs=2000, steps=2) via Promise.allSettled (not Promise.all — some may fail). After 500ms, call server.triggerHotReload(). Wait for all calls to settle. Verify none are stuck (all resolved/rejected). Count successes and failures. Then wait for 'Hot reload complete' in server logs. Make a fresh tool call to verify the server is back.\n\nConstraints:\n- Use Promise.allSettled, not Promise.all (some calls WILL fail during reload)\n- Must wait for 'Hot reload complete' log before making verification call\n- The MCP client may need to re-initialize after reload (session lost)"
@@ -63,7 +63,7 @@
         "Changing permission back to 'auto' restores tool availability"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (add to same file)\n\nContext:\nPermission changes propagate via config.json write + POST /reload or config watcher. The MCP server checks permission at dispatch time. An in-flight call that already passed the permission check should complete; the permission change only affects new calls.\n\nChanges:\nSetup with e2e-test at 'auto'. Start slow_with_progress (3s). After 500ms, write config changing e2e-test permission to 'off', then POST /reload. Wait for the slow call to settle. Then try calling e2e-test_echo — should fail with disabled message. Write config back to 'auto', POST /reload, verify echo works again.\n\nConstraints:\n- Must use writeTestConfig + POST /reload (not side panel) to change permission\n- The POST /reload helper: fetch(`http://localhost:${port}/reload`, { method: 'POST', headers: { Authorization: `Bearer ${secret}` } })\n- Use readTestConfig to verify config persistence"
