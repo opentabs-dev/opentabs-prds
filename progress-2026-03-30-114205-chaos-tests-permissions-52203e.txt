@@ -1,0 +1,65 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-114205-chaos-tests-permissions-52203e~running.json
+Started: Mon Mar 30 18:42:36 UTC 2026
+---
+
+## Codebase Patterns
+- E2E test files use manual setup/teardown in try/finally blocks: mkdtempSync, writeTestConfig, startMcpServer, createMcpClient, launchExtensionContext, setupAdapterSymlink
+- Permission selects use Radix Select with aria-labels: `Permission for <name> plugin`, `Permission for <name> tool`, `Permission for browser tools`
+- OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS='' makes permission selects interactive (empty string disables skip)
+- Plugin cards are expanded via `button[aria-expanded]` locators filtered by plugin name
+- Browser tool rows require expanding the "Browser" card first
+- Use `readTestConfig(configDir)` to verify config.json state changes (permissions, tools overrides)
+- `page.on('pageerror')` collects uncaught JS errors for assertion at test end
+
+## 2026-03-30 - US-001
+- Implemented stress test.describe block in side-panel-plugin-toggle.e2e.ts
+- Added `import type { Page } from '@playwright/test'` for the collectPageErrors helper
+- Added inline helpers: `tick(ms)` for delays and `collectPageErrors(page)` for JS error monitoring
+- Test 1: Rapid permission cycling — 3 full Off→Ask→Auto cycles interleaving plugin, echo tool, and browser selects with 50ms delays, then verifies final UI state and MCP server state
+- Test 2: Override clearing — pre-seeds per-tool override, changes plugin permission, verifies override cleared in UI and config.json, then creates fresh override and clears again
+- Files changed: e2e/side-panel-plugin-toggle.e2e.ts
+- **Learnings for future iterations:**
+  - Biome auto-sorts imports during pre-commit, so placement order of new `import type` statements doesn't matter
+  - The existing test patterns are consistent — follow the try/finally cleanup pattern exactly
+  - `selectPermission` helper handles opening dropdown + selecting option atomically
+---
+
+## 2026-03-30 - US-002
+- Implemented stress test.describe block in side-panel-realtime-state.e2e.ts
+- Added `import type { Page } from '@playwright/test'` and `selectPermission` import
+- Added inline helpers: `tick(ms)` for delays and `collectPageErrors(page)` for JS error monitoring
+- Test: Rapid permission changes — toggles plugin permission 5x (Off→Auto→Off→Auto→Off) with 100ms delays, verifies final UI shows 'Off', then switches to 'Auto' and polls mcpClient.listTools() to verify tools are enabled
+- Files changed: e2e/side-panel-realtime-state.e2e.ts
+- **Learnings for future iterations:**
+  - The realtime state file uses `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''` to make permission selects interactive (same pattern as plugin-toggle stress tests)
+  - The existing realtime tests don't import `selectPermission` — they use `writeTestConfig` for config-file-driven permission changes. Stress tests using UI-driven changes need the `selectPermission` import added
+  - Follow exact same try/finally cleanup pattern with mcpClient.close(), context.close(), server.kill(), rmSync, cleanupTestConfigDir
+---
+
+## 2026-03-30 - US-003
+- Implemented stress test.describe block in side-panel-data-flow.e2e.ts
+- Added `import type { Page } from '@playwright/test'` for the collectPageErrors helper
+- Added inline helper: `collectPageErrors(page)` for JS error monitoring
+- Test: Simultaneous tool calls — sets slow mode (3s), calls e2e-test_echo and e2e-test_greet in parallel via Promise.all, verifies activity border flash appears during execution and clears after both complete
+- Used `toHaveCount(0)` instead of `toBeHidden` for activity border assertions to avoid Playwright strict-mode violations when multiple elements match (PluginIcon + ToolIcons all get the flash class)
+- Used `.first()` on the activity border locator for `toBeVisible` assertion for the same reason
+- Files changed: e2e/side-panel-data-flow.e2e.ts
+- **Learnings for future iterations:**
+  - The `animate-activity-border-flash` class is applied to both PluginIcon and ToolIcon elements simultaneously — when checking visibility, scope carefully or use `.first()` to avoid strict-mode violations
+  - `toHaveCount(0)` is the correct Playwright assertion for "no elements match" — `toBeHidden` requires exactly one element
+  - The data-flow test file uses `context.newPage()` + `appTab.goto()` instead of `openTestAppTab` helper for opening matching tabs
+  - `testServer.setSlow(ms)` adds an artificial delay to ALL tool call responses from the test server, useful for observing transient UI states like activity borders
+---
+
+## 2026-03-30 - US-004
+- Implemented stress test.describe block in side-panel-error-states.e2e.ts
+- Added `import type { Page } from '@playwright/test'` for the collectPageErrors helper
+- Added inline helpers: `tick(ms)` for delays and `collectPageErrors(page)` for JS error monitoring
+- Test: Rapid permission changes while error card visible — creates broken plugin (no dist/) alongside e2e-test plugin, verifies error card visible, toggles e2e-test permission 5x (Off→Auto→Off→Auto→Off) with 100ms delays, verifies final UI shows 'Off', verifies config.json persisted 'off', verifies broken plugin error card remained visible
+- Files changed: e2e/side-panel-error-states.e2e.ts
+- **Learnings for future iterations:**
+  - The error-states file uses a broken plugin (no dist/) alongside a working plugin — same pattern as the existing "permission change alongside error states" test in the file
+  - `reviewedVersion` is not needed when using `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''` — the realtime-state stress test confirms this pattern works without it
+  - The `e2eCheckpoint: true` flag requires running the full E2E suite (226 tests, ~18 min) — all must pass before committing
+---
