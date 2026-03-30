@@ -1,0 +1,52 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-155231-chaos-adapter-injection-2f8f5b~running.json
+Started: Mon Mar 30 22:53:04 UTC 2026
+---
+
+## Codebase Patterns
+- Use `setupIsolatedIifeTest` for tests that need to modify the IIFE file — it creates a per-test plugin copy, config dir, server, test server, extension, and MCP client
+- Use `writeAndWaitForWatcher` to modify the IIFE and wait for the file watcher to process the change (waits for "IIFE updated for" log)
+- Use `replaceIifeClosing` to inject code before the main IIFE closing `})();` — it targets the boundary between the main IIFE and the freeze block
+- `extension_check_adapter` returns `{ expectedHash, matchingTabs: [{ hashMatch, adapterPresent, ... }] }` — use it to verify hash consistency after changes
+- Adapter files in configDir/extension/adapters/ use content-hashed filenames like `e2e-test-a1b2c3d4.js`
+
+## 2026-03-30 22:57 - US-001
+- Implemented rapid adapter re-injection stress test (5 IIFE changes in 5 seconds)
+- Files changed: e2e/stress-adapter-injection.e2e.ts (NEW)
+- **Learnings for future iterations:**
+  - `writeAndWaitForWatcher` handles the full cycle: waits for "File watcher: Watching" log, writes the file, polls for "IIFE updated for" log
+  - Each loop iteration uses `replaceIifeClosing` on the original IIFE (not the previously modified version) so the comment is replaced each time, not accumulated
+  - The test verifies settlement via `extension_check_adapter` polling for `hashMatch: true` on all tabs, rather than computing the hash manually
+---
+
+## 2026-03-30 23:03 - US-002
+- Implemented adapter injection during tab navigation stress test
+- Files changed: e2e/stress-adapter-injection.e2e.ts (added new test.describe block)
+- **Learnings for future iterations:**
+  - Fire-and-forget tool call + immediate `page.goto('about:blank')` tests the mid-injection race condition; the tool call resolves with either success or error — both are acceptable
+  - After navigating back, poll `page.evaluate` for `__openTabs.adapters['e2e-test']` presence before calling `waitForToolResult` — this avoids tool dispatch errors before the adapter is injected
+  - `extension_get_logs` returns `{ entries: [{level, message, ...}], stats: {...} }` — filter error-level entries but exclude expected messages like "No tab found" or "navigation" to avoid false positives
+  - `parseToolResult` from helpers.ts parses the JSON text content from a tool call result
+---
+
+## 2026-03-30 23:08 - US-003
+- Implemented stress test for 5 tabs opening simultaneously with adapter injection
+- Files changed: e2e/stress-adapter-injection.e2e.ts (added new test.describe block)
+- **Learnings for future iterations:**
+  - `openTestAppTab` accepts a custom timeout parameter (5th arg) — use 30s for multi-tab scenarios since simultaneous opens take longer
+  - `plugin_list_tabs` with `{ plugin: 'e2e-test' }` returns `PluginTabsEntry[]` where each entry has `.tabs[].tabId` for targeted dispatch
+  - Use `callToolExpectSuccess` with `tabId` in args to dispatch to specific tabs — the platform injects `tabId` into every plugin tool's input schema automatically
+  - `extension_check_adapter` returns `matchingTabs` array where each entry has `hashMatch` and `adapterPresent` — use to verify all tabs have consistent adapter hashes
+  - Poll with `waitFor` for all tabs to be ready before dispatching, since concurrent tab opens may have varying injection timing
+---
+
+## 2026-03-30 23:30 - US-004
+- Implemented stress test for adapter file corruption recovery
+- Files changed: e2e/stress-adapter-injection.e2e.ts (added new test.describe block)
+- **Learnings for future iterations:**
+  - Adapter files in `configDir/extension/adapters/` have content-hashed filenames (e.g., `e2e-test-a1b2c3d4.js`) — use `fs.readdirSync` with `.filter(f => f.startsWith('e2e-test') && f.endsWith('.js'))` to find them
+  - Deleting the adapter IIFE file and opening a new tab verifies the extension handles missing files gracefully — the extension logs a warning but doesn't crash
+  - After restoring the adapter file, `triggerHotReload()` + `waitForLog('Hot reload complete')` triggers re-discovery and re-injection
+  - The original tab retains its already-injected adapter — test on a NEW tab to verify the missing-file scenario
+  - Biome warns on non-null assertions (`!`) even after `expect(arr.length).toBeGreaterThan(0)` — use a guard with `throw` instead
+---
