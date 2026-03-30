@@ -1,0 +1,37 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two CLI UX issues discovered during fresh-user testing: the `update` command shows a Node.js deprecation warning (DEP0190), and `config set tool-permission` silently accepts nonexistent tool names.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Remove shell:true from spawnSync calls in update command to fix DEP0190 warning",
+      "description": "Remove `shell: true` from two `spawnSync` calls in the update command that trigger Node.js DEP0190 deprecation warning on Node 24+.",
+      "acceptanceCriteria": [
+        "Running `opentabs update` on Node 24+ produces no DEP0190 deprecation warning on stderr",
+        "Both `getLatestVersion()` and `performUpdate()` call `spawnSync` without `shell: true`",
+        "`opentabs update` still correctly reports 'Already up to date' when current version matches latest"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/update.ts (two spawnSync calls to fix)\n\nContext:\nOn Node.js 24+, passing `shell: true` with an args array to `spawnSync` triggers DEP0190: \"Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.\" Users see this on every `opentabs update` run.\n\nChanges:\n1. In `getLatestVersion()` (line 35), remove `shell: true`:\n   Current: `const result = spawnSync('npm', ['view', CLI_PACKAGE_NAME, 'version'], { stdio: ['ignore', 'pipe', 'pipe'], shell: true });`\n   Change to: `const result = spawnSync('npm', ['view', CLI_PACKAGE_NAME, 'version'], { stdio: ['ignore', 'pipe', 'pipe'] });`\n\n2. In `performUpdate()` (line 176), remove `shell: true`:\n   Current: `const result = spawnSync('npm', ['install', '-g', target], { stdio: 'inherit', shell: true });`\n   Change to: `const result = spawnSync('npm', ['install', '-g', target], { stdio: 'inherit' });`\n\nConstraints:\n- Do NOT change any other spawnSync calls in the file (e.g., the one at line 145 in `restartBackgroundServer` which correctly does NOT use `shell: true`)\n- The `spawnSync` calls with a string command and args array work correctly without `shell: true` — Node resolves `npm` from PATH automatically"
+    },
+    {
+      "id": "US-002",
+      "title": "Warn when config set tool-permission targets a nonexistent tool",
+      "description": "Add validation to `handleSetToolPermission` that warns users when the specified tool name does not exist in the running server's tool registry, preventing typos from silently writing useless config entries.",
+      "acceptanceCriteria": [
+        "Setting a permission for a nonexistent tool prints a yellow warning like 'Warning: tool \"nonexistent_tool\" not found in plugin \"browser\". The permission was saved but may have no effect.'",
+        "Setting a permission for an existing tool (e.g., `tool-permission.browser.browser_execute_script off`) does NOT show any warning",
+        "When the server is not running, the permission is saved without validation (no warning about the tool, since tools cannot be checked offline)",
+        "The permission is still written to config even when the warning is shown (user may be pre-configuring for a plugin they haven't installed yet)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/config.ts (handleSetToolPermission function)\n\nContext:\nCurrently `handleSetToolPermission` (starting at line 249) validates the key format and permission value but does NOT validate that the tool name actually exists. A user who types `tool-permission.browser.browser_exeecute_script off` (typo) will see success output `browser.browser_exeecute_script: off` and think they've configured the permission, but it has no effect.\n\nCurrent code at lines 249-289:\n```typescript\nconst handleSetToolPermission = async (key: string, value: string, options: { port?: number }): Promise<void> => {\n  const rest = key.slice(TOOL_PERMISSION_PREFIX.length);\n  const dotIdx = rest.indexOf('.');\n  // ... key format validation ...\n  const pluginName = rest.slice(0, dotIdx);\n  const toolName = rest.slice(dotIdx + 1);\n\n  if (!VALID_PERMISSIONS.has(value)) {\n    // ... permission value validation ...\n  }\n  const permission = value as ToolPermission;\n\n  const { config, configPath } = await loadConfig();\n  const entry = ensurePluginEntry(config, pluginName);\n  // ... writes to config without validating tool exists ...\n  await atomicWriteConfig(configPath, `${JSON.stringify(config, null, 2)}\\n`);\n  console.log(`${pluginName}.${toolName}: ${colorPermission(permission)}`);\n  await notifyServer({ port: options.port, warnIfNotRunning: true });\n};\n```\n\nChanges:\nAfter writing the config and printing the success message, but before or after `notifyServer`, query the server's `/health` endpoint to get the list of tool names. If the server is reachable and the tool name is not in the tool list for that plugin, print a yellow warning.\n\nApproach:\n1. After the `console.log` at line 287 and before `notifyServer`, try to fetch the health endpoint\n2. Parse the response to get `browserToolNames` (for plugin \"browser\") or `pluginDetails[].tools` (for other plugins)\n3. If the server is reachable and the tool is not found, print: `console.log(pc.yellow(`Warning: tool \"${toolName}\" not found in plugin \"${pluginName}\". The permission was saved but may have no effect.`))`\n4. If the server is not reachable, skip validation silently (the notifyServer call already handles the 'server not running' warning)\n\nLook at how `handlePluginList` (further down in the same file, or in plugin.ts) fetches from `/health` for the pattern of reading tool names from the health response. The health endpoint returns `browserToolNames` (string array) and `pluginDetails` (array with `tools` field).\n\nConstraints:\n- Do NOT make the validation blocking — always save the permission even if the tool doesn't exist. Users may be pre-configuring for plugins they'll install later.\n- Do NOT add validation when the server is not running — there's no way to check offline.\n- The warning should be yellow (use `pc.yellow`), not red — it's advisory, not an error.\n- Keep the existing behavior of `notifyServer` unchanged."
+    }
+  ]
+}
