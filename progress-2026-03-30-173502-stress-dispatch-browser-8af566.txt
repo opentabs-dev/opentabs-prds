@@ -1,0 +1,77 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-173502-stress-dispatch-browser-8af566~running.json
+Started: Tue Mar 31 00:35:31 UTC 2026
+---
+
+## Codebase Patterns
+- E2E stress tests go in `test.describe('stress')` blocks at the end of existing E2E files
+- Use `setupToolTest` for standard fixture setup (waits for extension connected, tab sync, opens test app tab, polls until tool is callable)
+- `mcpServer.health()` returns a HealthResponse with `status` field for health checks
+- Navigate to non-matching URL with `testServer.url.replace('localhost', '127.0.0.1')` pattern
+- `parseToolResult` parses JSON string content from tool results into objects
+- MCP protocol returns errors as fulfilled promises with `isError: true`, not rejected promises
+- `Promise.allSettled` is preferred for concurrent calls where some may fail
+
+## 2026-03-31 00:38 - US-001
+- Implemented stress test: 10 concurrent echo calls interleaved with tab navigation
+- Files changed: e2e/dispatch-resilience.e2e.ts (added stress test block)
+- **Learnings for future iterations:**
+  - The `setupToolTest` helper handles all boilerplate: extension connection, tab sync, test server reset, tab open, and tool readiness polling
+  - For concurrent + navigation tests, fire all tool calls first (don't await), then navigate — this creates the race condition
+  - All acceptance criteria map directly to `expect` assertions: wall-clock bound, positional message matching, unique success set, health check
+---
+
+## 2026-03-31 00:42 - US-002
+- Implemented stress test: 5 concurrent browser_execute_script calls on same tab return distinct results
+- Files changed: e2e/browser-tools.e2e.ts (added stress test block at end of file)
+- **Learnings for future iterations:**
+  - browser_execute_script results have nested structure: `parseToolResult(result.content).value.value` to get the actual return value
+  - `initAndListTools` + `openTestServerTab` is the standard setup pattern for browser tools tests
+  - Promise.all is the right choice (vs allSettled) when all calls MUST succeed
+  - The exec file pipeline uses unique nonces per call, so concurrent calls on the same tab are safe
+---
+
+## 2026-03-31 00:44 - US-003
+- Implemented stress test: browser_execute_script on tab closed mid-execution returns error within 5s
+- Files changed: e2e/browser-tools.e2e.ts (added test in existing stress block)
+- **Learnings for future iterations:**
+  - Fire slow script (don't await), wait 500ms, close tab, then await the script promise — this creates the mid-execution tab closure race
+  - Measure elapsed time from close operation to result arrival for timing assertions
+  - Use JSON.stringify(result.content) to get full error text for regex matching
+  - After testing destructive scenarios (tab closure), verify system recovery by opening a fresh tab and running a script on it
+  - `openTestServerTab` handles all the load-waiting logic, reusable for recovery verification
+---
+
+## 2026-03-31 00:47 - US-004
+- Implemented stress test: tab churn 5 cycles with dispatch recovery verification
+- Files changed: e2e/tool-dispatch.e2e.ts (added stress test block)
+- **Learnings for future iterations:**
+  - `page` variable must be `let` (not `const`) when reassigning across loop iterations after close/reopen
+  - `test.slow()` is needed for multi-cycle tests that involve repeated tab open/close with adapter injection
+  - Health endpoint's `pluginDetails` array contains per-plugin tab info: `tabState`, `tabs` (with tabId, url, title, ready)
+  - Use optional chaining (`?.`) instead of non-null assertions (`!`) in test assertions — biome lint enforces this
+  - The pattern for tab churn: close page → waitForToolResult(isError:true) → openTestAppTab → waitForToolResult(isError:false) — no explicit health polling needed between cycles since waitForToolResult handles the polling
+---
+
+## 2026-03-31 00:50 - US-005
+- Implemented stress test: auth toggle mid-execution — in-flight call completes, next call fails
+- Files changed: e2e/tool-dispatch.e2e.ts (added test in existing stress block)
+- **Learnings for future iterations:**
+  - `testServer.setSlow(ms)` adds artificial delay to tool call responses — use to create in-flight windows for mid-execution state changes
+  - Fire tool call (don't await), wait, change state, then await — this creates the race between dispatch and state change
+  - Auth is checked ONCE at dispatch entry (isReady gate). Once the check passes and the fetch begins, toggling auth off does not affect in-flight calls
+  - `waitForToolResult` with `isError: true` is the right pattern to poll until auth-off takes effect on subsequent calls
+  - `test.slow()` needed since the test has a 3s delay built into the in-flight call plus polling for recovery
+---
+
+## 2026-03-31 00:53 - US-006
+- Implemented stress test: 5 concurrent POST /reload does not corrupt browser permission
+- Files changed: e2e/browser-permission-persist.e2e.ts (added stress test)
+- **Learnings for future iterations:**
+  - `postReload` helper reads auth.json from the config dir for Bearer token auth
+  - `readBrowserPermissionFromDisk` reads config.json directly to verify on-disk state
+  - Capture `server.port` and `configDir` in local variables before passing to closures to avoid non-null assertions (`!`) which biome may flag
+  - `waitForLog(server, 'Config reload complete', ...)` is the right way to wait for reload to finish
+  - The test pattern: start server with known config → fire concurrent operations → verify config integrity + tool availability
+  - No `test.describe('stress')` wrapper needed — the test fits naturally within the existing permission persistence describe block
+---
