@@ -1,0 +1,74 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-173502-stress-plugin-config-db10c0~running.json
+Started: Tue Mar 31 00:35:40 UTC 2026
+---
+
+## Codebase Patterns
+- WebSocket JSON-RPC helpers (`connectWs`, `sendRequest`) are defined locally in plugin-management.e2e.ts, not imported from fixtures
+- `createMinimalPlugin` creates a discoverable plugin with package.json (opentabs field), dist/tools.json, and no-op adapter IIFE
+- `writeTestConfig` auto-generates `permission: 'auto'` entries when `permissions` is not provided, but you need to explicitly add permissions for new plugins if the config already has a `permissions` field
+- `plugin.install` is npm-only — local plugins are "installed" by adding to config.json localPlugins. `plugin.remove` handles both local and npm plugins.
+- `Promise.allSettled` is used for concurrent operations where either may fail — tests verify settlement (no hangs) and final state, not individual responses
+
+## 2026-03-31 - US-001
+- Implemented install + immediate remove race stress test in e2e/plugin-management.e2e.ts
+- Creates a local minimal plugin ("raceable" with 2 tools), adds to config, starts server
+- Sends plugin.install and plugin.remove concurrently via Promise.allSettled
+- Verifies final state: plugin absent from health pluginDetails, tools/list, and config.json localPlugins
+- Files changed: e2e/plugin-management.e2e.ts
+- **Learnings for future iterations:**
+  - `plugin.install` calls npm install globally — for local plugins, it will fail with a known error (no npm package exists). This is fine per acceptance criteria ("either success or known error").
+  - Biome warns on non-null assertion (`!.`) — use optional chaining (`?.`) instead
+  - The test pattern for custom server setup: createTestConfigDir → readTestConfig → modify → writeTestConfig → startMcpServer → connectWs + createMcpClient
+---
+
+## 2026-03-31 - US-002
+- Implemented 10 rapid config writes convergence stress test in e2e/config-watcher.e2e.ts
+- Creates 3 minimal plugins (alpha: 2 tools, beta: 1 tool, gamma: 3 tools)
+- Writes config.json 10 times at ~200ms intervals with varying plugin combinations
+- Last write configures all 3 plugins; verifies tools/list converges to exactly 6 tools within 5s
+- Asserts no duplicates and no leftover tools from intermediate configs
+- Files changed: e2e/config-watcher.e2e.ts
+- **Learnings for future iterations:**
+  - `writeTestConfig` with just `{ localPlugins: [...] }` (no `tools` or `permissions`) auto-generates permissions from plugin dir basenames — no need to manually build the tools map for minimal plugins
+  - TypeScript array index access returns `T | undefined` — use `?? []` fallback instead of non-null assertion to satisfy Biome
+  - The `tools` field in OpentabsConfig is legacy and "Ignored by the server" — only `permissions` matters for discovery
+  - Platform tool names (`plugin_inspect`, `plugin_mark_reviewed`, `plugin_get_workflow`) must be included in built-in tool sets when filtering for plugin-only tools
+---
+
+## 2026-03-31 - US-003
+- Implemented 3 broken + 2 valid plugins isolation stress test in e2e/discovery-edge-cases.e2e.ts
+- Creates 3 broken plugins manually: (a) missing dist/tools.json, (b) corrupt tools.json with invalid JSON, (c) package.json missing opentabs field
+- Creates 2 valid plugins via createMinimalPlugin: valid-alpha (2 tools), valid-beta (3 tools)
+- Configures all 5 plus e2e-test plugin, starts server, verifies health
+- Asserts: failedPlugins.length >= 3 with all 3 broken found, pluginDetails has both valid with exact toolCount (2 and 3), tools/list exact count, no duplicates, no phantom broken-plugin tools
+- Files changed: e2e/discovery-edge-cases.e2e.ts
+- **Learnings for future iterations:**
+  - `parsePluginPackageJson` (from shared) validates the opentabs field — missing it causes a loader error that ends up in failedPlugins
+  - `BROWSER_TOOL_NAMES` from helpers.ts + platform tool names form the complete built-in tool set to filter out when counting plugin tools
+  - `configWithPlugins` helper in discovery-edge-cases.e2e.ts builds config with e2e-test plugin and extra locals — but for this test we built config manually for more control over the 5-plugin setup
+---
+
+## 2026-03-31 - US-004
+- Implemented IIFE re-injection during active slow_with_progress dispatch stress test in e2e/iife-injection.e2e.ts
+- Uses setupIsolatedIifeTest, starts 5s slow_with_progress call, waits 1s, modifies IIFE with global marker
+- Uses writeAndWaitForWatcher to ensure file watcher detects the change ('IIFE updated for')
+- Asserts in-flight call resolves (not hang) with 60s timeout, new adapter marker present, subsequent echo succeeds
+- Files changed: e2e/iife-injection.e2e.ts
+- **Learnings for future iterations:**
+  - `callTool` accepts a 3rd options arg `{ timeout }` for long-running calls — the existing "in-flight" test at line 576 uses `testServer.setSlow` with echo, which is a different approach (server-side delay vs plugin-native slow tool)
+  - `writeAndWaitForWatcher` is more robust than raw `fs.writeFileSync` + `waitForLog` — it handles FSEvents registration races by retrying writes
+  - The in-flight call settling behavior: re-injection runs teardown() on the old adapter but the in-flight tool handler continues in its existing execution context — it doesn't get killed by re-injection
+---
+
+## 2026-03-31 - US-005
+- Implemented 3-reload coalescing precision + 4th-reload separation stress test in e2e/reload-coalescing.e2e.ts
+- Records baseline 'Plugin discovery complete' log count, fires 3 POST /reload at 0/200/400ms (within 500ms coalescing window)
+- All 3 return 200 with ok:true; after settling, log count is exactly baseline+1 (not 2 or 3)
+- Waits 700ms to exit coalescing window, fires 4th reload, verifies log count is exactly baseline+2
+- Files changed: e2e/reload-coalescing.e2e.ts
+- **Learnings for future iterations:**
+  - The POST /reload coalescing uses a debounce pattern: each new request within the window resets the 500ms timer. The timer fires `executeCoalescedReload` which clears `state.pendingReload` before executing discovery. So after all coalesced callers resolve, the state is clean for the next batch.
+  - `server.logs` is a string[] that accumulates all stdout/stderr lines. Counting occurrences of 'Plugin discovery complete' is the ground truth for how many discovery cycles ran.
+  - `Promise.all` on the reload promises already waits for discovery to complete (the response is sent after `performConfigReload` finishes), but extra sleep buffers help in case log writes are slightly async.
+---
