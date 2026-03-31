@@ -1,0 +1,56 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-233525-fix-stress-failures-dispatch-b7715d~running.json
+Started: Tue Mar 31 06:36:07 UTC 2026
+---
+
+## Codebase Patterns
+- MAX_CONCURRENT_DISPATCHES_PER_PLUGIN = 5 in platform/mcp-server/src/mcp-tool-dispatch.ts — stress tests must batch concurrent calls in groups of 5
+- setupToolTest() in e2e/helpers.ts already handles the full warmup sequence: waitForExtensionConnected → waitForLog('plugin(s) mapped') → openTestAppTab → poll until tool is callable
+- The tab.syncAll log message was changed to "tab.syncAll [A]: N plugin(s) mapped" by commit 303ce451 (profile labels). All E2E waitForLog calls must use 'plugin(s) mapped' not 'tab.syncAll received'.
+- Server dispatch logs (tool.dispatch, tool.call: dispatching) are at debug level — NOT visible in E2E test logs at default info level. Use time-based delays instead of log polling to wait for dispatch.
+- The e2e-test plugin's slow_with_progress tool only accepts durationMs + steps (additionalProperties: false). Do NOT pass message or other extra params.
+- Tests using setupToolTest get proper extension readiness out of the box — no need for manual warmup
+- triggerHotReload() kills the worker process — use POST /reload for config-only changes (permissions, settings) when in-flight calls must survive. Wait for 'Config reload complete' log.
+- Test server's setSlow(delayMs) delays BEFORE requireAuth() — use slow_with_progress for in-flight tests that toggle auth mid-execution
+
+## 2026-03-31 06:38 UTC - US-001
+- Fixed '10 concurrent echo calls' and '20 concurrent echo calls' stress tests
+- Root cause: tests fired 10/20 calls simultaneously but MAX_CONCURRENT_DISPATCHES_PER_PLUGIN=5 rejects the 6th+ concurrent call
+- Fix: batch calls into sequential groups of BATCH_SIZE=5, each batch fired via Promise.all. Still tests concurrent dispatch + response routing within the server's design limits.
+- Files changed: e2e/stress-mcp-dispatch.e2e.ts
+- **Learnings for future iterations:**
+  - The concurrency limit is by design — tests must respect it, not bypass it
+  - Batching with sequential Promise.all groups is the clean pattern for testing >5 concurrent calls
+  - setupToolTest already handles all warmup/readiness — the concurrent tests didn't need additional warmup, just respecting the concurrency limit
+---
+
+## 2026-03-31 06:52 UTC - US-002
+- Fixed hot-reload stress test and updated E2E log matching across 42 files
+- Root cause 1: commit 303ce451 changed tab.syncAll log format from "tab.syncAll received" to "tab.syncAll [A]: N plugin(s) mapped", breaking ALL E2E waitForLog calls
+- Root cause 2: stress tests polled for 'tool.dispatch' in server logs, but dispatch logs are at debug level (invisible at default info level), causing permanent timeouts
+- Root cause 3: hot-reload test passed invalid `message` param to slow_with_progress (schema has additionalProperties: false)
+- Fix: updated all 42 E2E files to use 'plugin(s) mapped' substring, replaced log-polling with 1s delays, removed invalid params
+- Files changed: e2e/helpers.ts + 41 E2E test files
+- **Learnings for future iterations:**
+  - When a server log format changes, ALL E2E waitForLog calls using that substring must be updated — grep for the old string across e2e/
+  - Server dispatch logs are debug-level only. Never rely on them in E2E tests. Use time-based delays or tool result polling instead.
+  - Always check a tool's schema (tools.json additionalProperties) before passing extra params in tests
+  - The permission-change stress test (US-003) still fails: the hot reload kills the worker and rejects in-flight calls, so the assertion that in-flight calls survive permission changes is incorrect when hot reload is involved
+---
+
+## 2026-03-31 07:10 UTC - US-003
+- Fixed permission-change and auth-toggle stress tests across 3 E2E files
+- Root cause 1 (permission tests): `triggerHotReload()` (SIGUSR1) kills the worker process, interrupting in-flight calls. Tests expected in-flight calls to survive permission changes, but hot reload destroys them.
+- Fix 1: Use `POST /reload` (config reload) instead of `triggerHotReload()`. Config reload re-reads config.json and updates permissions in-place without restarting the worker. In-flight calls that already passed permission check at dispatch entry survive.
+- Root cause 2 (auth toggle test in tool-dispatch.e2e.ts): `setSlow(3000)` delays the test server response BEFORE `requireAuth()` check. Toggling auth during the delay means the auth check (which runs after the delay) finds auth=false and rejects.
+- Fix 2: Use `slow_with_progress` tool instead of `echo + setSlow`. `slow_with_progress` sleeps on the adapter side without calling the test server, so auth changes don't affect it.
+- Also fixed the same permission test pattern in permissions.e2e.ts (identical triggerHotReload bug)
+- Tab-close test already worked with existing `setupToolTest` warmup (no changes needed)
+- Files changed: e2e/stress-mcp-dispatch.e2e.ts, e2e/permissions.e2e.ts, e2e/tool-dispatch.e2e.ts
+- **Learnings for future iterations:**
+  - `triggerHotReload()` kills the worker process — NEVER use it when you need in-flight calls to survive. Use `POST /reload` for config-only changes.
+  - `POST /reload` triggers `performConfigReload()` which calls `reloadCore()` — it re-reads config.json, rediscovers plugins, and updates permissions without restarting the worker process.
+  - Wait for `'Config reload complete'` log after `POST /reload` (not `'Hot reload complete'` which is for SIGUSR1).
+  - The test server's `setSlow(delayMs)` adds delay BEFORE `requireAuth()` check in the request handler. Don't use setSlow for "in-flight" tests that toggle auth — use `slow_with_progress` instead (sleeps on adapter side).
+  - `mcpServer.secret` is available on the fixture object for authenticating POST /reload calls.
+---
