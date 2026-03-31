@@ -1,0 +1,67 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-173502-stress-lifecycle-reload-556558~running.json
+Started: Tue Mar 31 00:35:36 UTC 2026
+---
+
+## Codebase Patterns
+- Lifecycle hook tests use fixture-based `test` from `./fixtures.js` with `mcpServer`, `testServer`, `extensionContext`, `mcpClient` fixtures
+- `setupToolTest` sets up adapter injection and waits for the tool to be callable
+- The adapter records onNavigate URLs in `globalThis.__opentabs_onNavigate_urls` (array of URL strings)
+- The adapter monkey-patches `history.pushState` to fire onNavigate synchronously — no debouncing, so rapid calls are recorded without drops
+- Use `waitFor` with a predicate for polling conditions instead of fixed sleeps
+- For tests needing [Disabled] prefix on tools, pass `{ OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: '' }` as env override to `startMcpServer`
+- Count-based `waitFor` with log filtering is preferred for rapid sequential operations (e.g., waiting for N hot reload completions)
+- Standalone tests needing extension + modifiable plugin: use `copyE2eTestPlugin` + `launchExtensionContext` + `setupAdapterSymlink` + manual auth.json symlink + `startTestServer`
+
+---
+
+## 2026-03-31 00:37 - US-001
+- Implemented stress test: 20 rapid synchronous pushState calls, verifying all 20 onNavigate hooks fire in order
+- Files changed: `e2e/lifecycle-hooks.e2e.ts`
+- **Learnings for future iterations:**
+  - The existing onNavigate tests use the fixture-based test pattern (not `setupIsolatedIifeTest`) — follow the same pattern for consistency
+  - `__opentabs_onNavigate_urls` must be cleared before the test to avoid setup noise
+  - The pushState monkey-patch fires synchronously, so all 20 URLs are available immediately after `page.evaluate` returns — the `waitFor` is defensive against CDP latency
+---
+
+## 2026-03-31 00:41 - US-002
+- Implemented stress test: 10 concurrent HTTP requests fired during hot reload, all must resolve within 15s as either 200 or 503
+- Files changed: `e2e/dev-proxy.e2e.ts`
+- **Learnings for future iterations:**
+  - Dev proxy standalone tests use `createTestConfigDir` + `startMcpServer(configDir, true)` pattern — no browser/extension needed for HTTP-level tests
+  - `server.triggerHotReload()` triggers SIGUSR1 on the proxy process; `server.health()` is a convenience wrapper for fetching /health with auth
+  - Fetch-level errors (AbortSignal timeout, ECONNREFUSED) should be caught with `.then(success, error)` pattern to distinguish from HTTP-level 503 responses
+  - The proxy's `whenReady()` buffers HTTP requests in `pending[]` during worker restart and drains them when the new worker reports ready via IPC
+---
+
+## 2026-03-31 00:44 - US-003
+- Implemented stress test: 5 rapid config-changing hot reloads, verifying final tools/list matches the last-written config exactly
+- Files changed: `e2e/hot-reload-dynamic.e2e.ts`
+- **Learnings for future iterations:**
+  - Standalone config dir tests (not using mcpServer fixture) need manual server+client creation with `startMcpServer(configDir, true, undefined, { OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: '' })` to see [Disabled] prefixes
+  - Count-based log waiting (`waitFor` with a filter count predicate) is more robust than `waitForLog` for rapid sequential operations — it waits for N total occurrences rather than just the first
+  - `createMinimalPlugin` creates plugins with `opentabs-plugin-<name>` npm name but the short name (for permissions) is just the directory basename
+  - `writeTestConfig` auto-generates `permission: 'auto'` for localPlugins when `permissions` is not provided — pass explicit permissions to control the [Disabled] behavior
+---
+
+## 2026-03-31 00:49 - US-004
+- Implemented stress test: hot reload during active tool dispatch, verifying in-flight slow_with_progress settles cleanly and post-reload echo succeeds
+- Files changed: `e2e/lifecycle.e2e.ts`
+- **Learnings for future iterations:**
+  - The lifecycle.e2e.ts tests use fixture-based `test` with `mcpServer`, `testServer`, `extensionContext`, `mcpClient` — use `setupToolTest` for tests needing tool dispatch
+  - `Promise.allSettled` is the correct pattern for in-flight calls during hot reload — calls may reject at transport level, fulfil with isError=true, or even succeed
+  - A 500ms delay before triggering hot reload is sufficient to ensure the slow_with_progress call is in-flight (the dispatch reaches the extension within ~100ms)
+  - `mcpServer.logs.length = 0` before `triggerHotReload()` ensures `waitForLog('Hot reload complete')` finds the new occurrence, not a stale one
+  - The existing `stress-mcp-dispatch.e2e.ts` has a similar but different test (5 concurrent slow calls) — US-004 is a single-call variant focused on settlement behavior
+---
+
+## 2026-03-31 00:55 - US-005
+- Implemented stress test: file watcher manifest change during active `slow_with_progress` tool dispatch — verifies in-flight call completes successfully, new dynamic tool appears in tools/list, and existing tools remain callable
+- Files changed: `e2e/hot-reload-dynamic.e2e.ts`
+- **Learnings for future iterations:**
+  - Standalone tests that need both extension dispatch AND modifiable plugin files require: `copyE2eTestPlugin` for the plugin copy, `launchExtensionContext` + `setupAdapterSymlink` + auth.json symlink for the extension, and `startTestServer` for the test web server
+  - The auth.json symlink setup is NOT included in `setupAdapterSymlink` — it must be done separately: remove extension's auth.json, then `symlinkCrossPlatform(serverAuthJson, extensionAuthJson, 'file')`
+  - To detect that `slow_with_progress` is actually in-flight, poll server logs for lines containing both 'slow_with_progress' and 'progress' — this confirms the call has been dispatched and is actively reporting
+  - The `writeAndWaitForWatcher` helper retries manifest writes (FSEvents race), so it's safe to call during active dispatch without additional synchronization
+  - Full E2E suite (238 tests) passed on first run — the file watcher manifest change does not interfere with active tool dispatch
+---
