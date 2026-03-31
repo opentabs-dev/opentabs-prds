@@ -1,0 +1,84 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-173502-stress-security-sessions-4635a4~running.json
+Started: Tue Mar 31 00:35:44 UTC 2026
+---
+
+## Codebase Patterns
+- E2E concurrency tests use `test.slow()` to extend Playwright timeout for long-running dispatch tests
+- `setupToolTest()` returns a page handle that must be closed at the end of the test
+- `parseToolResult()` parses JSON text content from tool results into objects
+- Concurrency limit is `MAX_CONCURRENT_DISPATCHES_PER_PLUGIN = 5` in `mcp-tool-dispatch.ts`
+- Error format includes plugin name and limit: `Too many concurrent dispatches for plugin "e2e-test" (limit: 5)`
+- `callTool` returns `{ isError, content }` — content is a string, not pre-parsed JSON
+- Multi-connection dispatch routing: `tab.syncAll` populates `conn.tabMapping`, pass `tabId` to route to a specific connection
+- Disconnect cleanup in `http-routes.ts` `makeWsClose`: rejects pending dispatches with `'Extension disconnected'` immediately
+- Raw WS can simulate extension by handling `tool.dispatch` and responding with `{ jsonrpc: '2.0', id, result }`
+
+## 2026-03-31 00:37 - US-001
+- Added concurrency limit boundary stress test to `e2e/security.e2e.ts`
+- Test fires 5 slow calls (10s each), verifies 6th is rejected immediately with specific error text, waits for batch completion, then fires 5 new calls that all succeed (slot leak verification)
+- Files changed: `e2e/security.e2e.ts`
+- **Learnings for future iterations:**
+  - The 6th dispatch is rejected synchronously at dispatch entry — no need for timeout-based assertions
+  - A 1s delay between starting the batch and firing the 6th call gives enough time for dispatch registration
+  - `e2eCheckpoint: false` means Phase 1 (build, type-check, lint, knip, test) is sufficient
+---
+
+## 2026-03-31 00:42 - US-002
+- Expanded config mutex concurrent permission writes test from 5 to 10 tools
+- Added 5 more e2e-test tool names: failing_tool, get_status, error_auth, error_timeout, log_levels
+- Used data-driven `toolPermissions.every()` for polling and `for...of` loop for final assertions
+- Added JSON parse error log check (`server.logs.filter(...)`)
+- Files changed: `e2e/security.e2e.ts`
+- **Learnings for future iterations:**
+  - The existing WebSocket + JSON-RPC sendRequest pattern in security.e2e.ts is reusable for any config.* method
+  - Config writes are fire-and-forget (async via configWriteMutex), so polling with `waitFor` is necessary to verify persistence
+  - Data-driven assertions (looping over the expected list) are cleaner than individual expect() calls for N > 5 items
+---
+
+## 2026-03-31 00:45 - US-003
+- Added rapid hot reload session persistence stress test to `e2e/mcp-session-persistence.e2e.ts`
+- Test fires 5 hot reloads with 500ms spacing, waits for all 5 "Hot reload complete" log entries, verifies sessionId remains identical, and verifies listTools works without re-initialization
+- Files changed: `e2e/mcp-session-persistence.e2e.ts`
+- **Learnings for future iterations:**
+  - `waitForLog` only checks for the first occurrence — for counting multiple occurrences, use `server.logs.filter().length` with a polling loop
+  - `client.sessionId` is a getter on the `McpClient` interface that reads the internal state — it reflects the proxy's stable session ID, not the worker's internal session ID
+  - `test.slow()` is needed for tests with multiple hot reloads since each reload takes several seconds
+  - 60s timeout for 5 rapid reloads is generous but safe — each reload can take up to ~10s under load
+---
+
+## 2026-03-31 00:50 - US-004
+- Added permission auto→off mid-flight stress test to `e2e/permissions.e2e.ts`
+- Test fires `slow_with_progress` (5s) with 'auto' permission, changes permission to 'off' mid-flight via config + hot reload, verifies in-flight call completes successfully, verifies next call is rejected
+- Files changed: `e2e/permissions.e2e.ts`
+- **Learnings for future iterations:**
+  - The permissions.e2e.ts fixture starts without `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS` (set to empty string), making it the correct place to test real permission behavior
+  - `createTestConfigDir()` defaults to `'e2e-test': { permission: 'auto' }`, so no initial config change needed to start with 'auto'
+  - The pattern for testing e2e-test plugin tools in permissions tests requires: `waitForExtensionConnected` → `openTestAppTab` → `waitForToolResult(get_status)` to get the plugin tab ready
+  - `waitFor(() => mcpServer.logs.some(...), ...)` is the standard way to wait for a dispatch to reach the extension before triggering mid-flight changes
+  - `test.slow()` is needed for tests involving hot reloads + in-flight dispatches since they exceed default Playwright timeout
+---
+
+## 2026-03-31 00:55 - US-005
+- Added double secret rotation (A→B→C) stress test to `e2e/secret-rotation.e2e.ts`
+- Test starts with secret A, rotates to B (verifying A rejected, B works), then rotates to C (verifying both A and B rejected, only C works)
+- Final verification: MCP client with secret C initializes and lists tools successfully
+- Files changed: `e2e/secret-rotation.e2e.ts`
+- **Learnings for future iterations:**
+  - POST /reload authenticates with the CURRENT in-memory secret, not the new one written to disk
+  - `server.logs.length = 0` clears logs before each reload to get a clean `waitForLog` match
+  - The `/audit` endpoint is the lightest way to test auth — returns 200 with valid secret, 401 without
+  - The existing single-rotation test already validates MCP client rejection with old secret; the double rotation test focuses on verifying no secret accumulation
+---
+
+## 2026-03-31 00:58 - US-006
+- Added mid-dispatch disconnect stress test to `e2e/multi-connection.e2e.ts`
+- Test creates two raw WS connections (Alpha, Beta), registers plugin tabs on each via `tab.syncAll`, sends a tool dispatch targeting Alpha's tab (Alpha doesn't respond), disconnects Alpha after 500ms, verifies error arrives within 5s with 'Extension disconnected', then verifies Beta still handles dispatches
+- Files changed: `e2e/multi-connection.e2e.ts`
+- **Learnings for future iterations:**
+  - Disconnect cleanup is in `http-routes.ts` `makeWsClose` handler: iterates `state.pendingDispatches`, rejects dispatches owned by the closed connection with `'Extension disconnected'`
+  - For plugin tool dispatch routing with multiple connections, `tab.syncAll` populates `conn.tabMapping`, and `resolveConnection` scans tabMappings when `tabId` is passed
+  - The raw WS can handle `tool.dispatch` by responding with `{ jsonrpc: '2.0', id: msg.id, result: {...} }` — the dispatch ID is the JSON-RPC request ID
+  - `mcpClient.callTool` converts dispatch errors to `{ content: 'Tool dispatch error: Extension disconnected', isError: true }` (via the catch branch in mcp-tool-dispatch.ts)
+  - `test.slow()` is needed because the test involves WebSocket lifecycle + dispatch timing
+---
