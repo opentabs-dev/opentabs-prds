@@ -13,7 +13,7 @@
         "npx playwright test e2e/stress-network-auth.e2e.ts --grep 'audit' passes"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-network-auth.e2e.ts (fix audit log test)\n\nContext:\nThe test fires 50 sequential echo calls. The first call fails with isError=true because the extension hasn't connected or the matching tab isn't ready. All subsequent calls may also fail.\n\nThe error at line 314:\n```\nexpect(result.isError).toBe(false);\n```\n\nFix: Check how the test sets up. It likely uses fixtures or manual setup but doesn't wait for the full pipeline. Add:\n```typescript\nawait waitForExtensionConnected(mcpServer);\nawait waitForLog(mcpServer, 'tab.syncAll received', 15_000);\n// Warmup call to verify dispatch works\nconst warmup = await mcpClient.callTool('e2e-test_echo', { message: 'warmup' });\nexpect(warmup.isError).toBe(false);\n```\n\nBefore the 50-call loop.\n\nConstraints:\n- The test needs a matching tab open (test server + openTestAppTab or context.newPage to testServer.url)\n- If the test uses base test (not fixtures), it must manually start test server and open matching tab\n- Check the existing test setup carefully — it may be missing the test server entirely"
@@ -31,7 +31,7 @@
         "npx playwright test e2e/stress-network-auth.e2e.ts --grep 'secret rotation' passes"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-network-auth.e2e.ts (fix secret rotation test)\n\nContext:\nThe error at line 391:\n```\nconst echoResult = await oldClient.callTool('e2e-test_echo', { message: 'before-rotation' });\nexpect(echoResult.isError).toBe(false); // FAILS — isError is true\n```\n\nThe echo fails because the e2e-test plugin has no matching tab in 'ready' state. The test sets up the MCP server and extension but doesn't open a tab matching the e2e-test plugin's URL pattern (http://localhost/*).\n\nFix: Add a test server and open a matching tab:\n```typescript\nconst testServer = await startTestServer();\nconst appTab = await context.newPage();\nawait appTab.goto(testServer.url, { waitUntil: 'load' });\nawait waitForExtensionConnected(server);\nawait waitForLog(server, 'tab.syncAll received', 15_000);\n```\n\nThen the echo call will have a tab to dispatch to.\n\nConstraints:\n- Must add startTestServer to the setup\n- Must clean up testServer in the finally block\n- The matching tab must stay open throughout the rotation test\n- After server restart (rotation), the extension reconnects but the tab is still there"
@@ -47,7 +47,7 @@
         "npx playwright test e2e/stress-adapter-injection.e2e.ts --grep 'missing' passes"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-adapter-injection.e2e.ts (fix adapter file missing test)\n\nContext:\nThis test deletes the adapter IIFE file, opens a new tab (expects injection to fail), restores the file, and expects recovery. The failure could be:\n1. The file restoration path doesn't match what the server expects (different hash in filename)\n2. The hot reload doesn't trigger adapter file re-creation\n3. The new tab needs longer to reach ready state\n\nInvestigation steps for the worker:\n1. Read the full test to understand the exact flow\n2. Check the error message to identify which assertion fails\n3. Look at the adapter file naming: the hash in the filename changes when content changes, so restoring the exact same content should produce the same filename\n4. Verify the hot reload triggers adapter file writing (check server logs for 'Adapter files written')\n5. Ensure the test waits long enough for re-injection after restore\n\nConstraints:\n- The adapter filename includes a content hash — restoring the same content should produce the same filename\n- triggerHotReload may be needed after file restoration\n- Use waitForLog and polling with generous timeouts for recovery"
