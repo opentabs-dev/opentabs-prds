@@ -1,0 +1,87 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-173502-stress-tab-adapter-1ad0a3~running.json
+Started: Tue Mar 31 00:35:48 UTC 2026
+---
+
+## Codebase Patterns
+- E2E tests use fixtures (mcpServer, testServer, extensionContext, mcpClient) for isolated parallel test execution
+- `waitFor` from helpers.ts is the standard polling pattern — avoids fixed sleeps
+- `plugin_list_tabs` returns `PluginTabsEntry[]` with per-tab readiness info
+- Array destructuring with a guard (`if (!tab0 || ...)`) avoids non-null assertions that biome warns about
+- Use `test.slow()` for tests that need longer timeouts (3x default)
+- `waitForExtensionConnected` + `waitForLog('tab.syncAll received')` + `testServer.reset()` is the manual setup preamble (when not using setupToolTest)
+- Adapter files on disk: `<configDir>/extension/adapters/{pluginName}-{sha256first8}.js` — use `fs.readdirSync` + regex to find them
+- Embedded adapter hash: 64-char SHA-256 extracted from `__adapterHash="..."` in the IIFE — matches `expectedHash` from `extension_check_adapter`
+
+## 2026-03-31 - US-001
+- Implemented 5-tab churn stress test in e2e/tab-state-sync.e2e.ts
+- Opens 5 tabs in parallel via Promise.all, closes tabs 0/2/4 immediately
+- Polls plugin_list_tabs for exactly 2 tabs with ready=true, verifies distinct tabIds
+- Verifies tool dispatch succeeds on a remaining tab
+- Files changed: e2e/tab-state-sync.e2e.ts
+- **Learnings for future iterations:**
+  - `Promise.all` with `Array.from({ length: N })` creates tabs concurrently while TypeScript-safe destructuring avoids non-null assertion lint warnings
+  - `void page.goto(...)` is used to fire navigation without awaiting — the tab creation is the important part
+  - The `PluginTabsEntry` interface is defined locally in each test file that needs it (multi-tab-targeting, tab-state-sync) — not shared in helpers.ts
+---
+
+## 2026-03-31 - US-002
+- Implemented targeted dispatch to closed tab stress test in e2e/multi-tab-targeting.e2e.ts
+- Opens 2 tabs, records tabIds, closes tab A, verifies dispatch to closed tab returns isError=true
+- Verifies dispatch to tab B succeeds with correct message (no fallback to B when A's call fails)
+- Uses page markers via browser_execute_script to map tabIds to Playwright pages for correct cleanup
+- Files changed: e2e/multi-tab-targeting.e2e.ts
+- **Learnings for future iterations:**
+  - When closing a specific tab by tabId, use browser_execute_script to set page markers and identify which Playwright page object corresponds to which tabId — plugin_list_tabs ordering doesn't match page creation order
+  - waitFor polling on plugin_list_tabs tab count is the reliable way to confirm a tab has been fully removed from the server state before asserting on dispatch errors
+  - The existing `waitForTabCount` helper only checks `>= count`, so for waiting on exact count decreases, use a custom waitFor predicate with `=== count`
+---
+
+## 2026-03-31 - US-003
+- Implemented concurrent dispatch stress test in e2e/multi-instance.e2e.ts
+- Fires echo calls to alpha and beta instances concurrently via Promise.all
+- Verifies each server received exactly 1 echo with the correct message body (no cross-routing)
+- Files changed: e2e/multi-instance.e2e.ts
+- **Learnings for future iterations:**
+  - The test server records invocation bodies, so you can verify the exact message content via `invocations()` → filter by path → cast body to `{ message?: string }`
+  - Multi-instance tests follow a consistent pattern: setupMultiInstanceTest → openTestAppTab for alpha → manual page open + waitForFunction for beta (since beta uses 127.0.0.1) → waitForReadyTabs(client, 2) → reset servers → test assertions → cleanup
+  - `testServer.reset()` clears invocation history, making it safe to assert exact invocation counts after concurrent calls
+---
+
+## 2026-03-31 - US-004
+- Implemented disk hash ground truth stress test in e2e/adapter-hash.e2e.ts
+- After 3 consecutive hot reloads, reads adapter file from `<configDir>/extension/adapters/`, extracts embedded `__adapterHash`, and verifies it matches `expectedHash` from `extension_check_adapter`
+- Verifies per-tab `adapterHash` also matches, and tool dispatch still works
+- Files changed: e2e/adapter-hash.e2e.ts
+- **Learnings for future iterations:**
+  - The embedded `__adapterHash` is a 64-char SHA-256 hex extracted via regex `\.__adapterHash="([0-9a-f]{64})"` — this is the hash of the IIFE *before* the hash-setter snippet was appended, not the hash of the full file
+  - Adapter files on disk use content-hashed filenames: `{pluginName}-{sha256first8}.js` (e.g., `e2e-test-a1b2c3d4.js`) — use `fs.readdirSync` + regex filter to find them
+  - `mcpServer.configDir` gives access to the isolated config directory where adapter files are stored at `extension/adapters/`
+  - `extension_check_adapter` result has `expectedHash` (server-side from registry) and per-tab `adapterHash` (from page runtime) — both should be the same 64-char embedded hash
+  - The `connections` wrapper from `dispatchToAllConnections` is transparent in existing test patterns — `callToolExpectSuccess` returns the parsed result with `matchingTabs`, `expectedHash`, etc. accessible directly
+---
+
+## 2026-03-31 - US-005
+- Implemented adapter file cleanup stress test in e2e/adapter-files-eager.e2e.ts
+- Verifies that removing a plugin from config + hot reload deletes adapter files (0 for e2e-test)
+- Verifies that re-adding the plugin + hot reload recreates exactly 1 adapter file with valid IIFE content
+- Uses `readTestConfig`/`writeTestConfig` to modify config.json between hot reloads
+- Files changed: e2e/adapter-files-eager.e2e.ts
+- **Learnings for future iterations:**
+  - `readTestConfig` and `writeTestConfig` are exported from fixtures.ts for tests that need to modify the config between reloads
+  - The `cleanupStaleAdapterFiles` function in `adapter-files.ts` handles removing adapter files for plugins no longer in the registry — it's called from `writeAllAdapterFiles` during `reloadCore`
+  - When removing a plugin from config, also remove its permissions entry to avoid stale permission state
+  - The pattern for config modification stress tests: createTestConfigDir → startMcpServer(hot) → readTestConfig → writeTestConfig(modified) → triggerHotReload → waitForLog('Hot reload complete') → assert
+---
+
+## 2026-03-31 - US-006
+- Implemented navigate-away-and-back stress test in e2e/tab-state-sync.e2e.ts
+- Opens matching tab, waits for ready, navigates to about:blank, waits for 0 tabs, navigates back, waits for exactly 1 ready tab
+- Verifies plugin_list_tabs reports exactly 1 tab (no duplicate registration from navigate-back)
+- Verifies tool dispatch (echo) succeeds after navigating back
+- Files changed: e2e/tab-state-sync.e2e.ts
+- **Learnings for future iterations:**
+  - `about:blank` is a reliable non-matching URL for the e2e-test plugin's `http://localhost/*` pattern
+  - When testing navigate-away-and-back, wait for 0 tabs after navigating away before navigating back — this ensures the extension has fully processed the removal
+  - The `waitFor` helper with explicit tab count === 0 and === 1 checks is more precise than polling /health for state transitions
+---
