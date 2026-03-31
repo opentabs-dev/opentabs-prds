@@ -14,7 +14,7 @@
         "npx playwright test e2e/side-panel-port-change.e2e.ts passes with --retries=2"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/side-panel-port-change.e2e.ts (the stress tests)\n- platform/browser-extension/src/side-panel/Footer.tsx (NumberStepper component)\n- platform/browser-extension/src/side-panel/retro/NumberStepper.tsx (if separate)\n\nContext:\nThese tests were added by a recent stress PRD. They pass locally on a Linux server but fail in GitHub Actions CI on macOS. The boundary test types '0' into the port input and expects it to clamp to >= 1 on blur. The same-port test enters the current port value and expects no WebSocket reconnect.\n\nInvestigation approach:\n1. Read the NumberStepper component to understand the blur/commit behavior\n2. Read the port-changed message handler in the background script\n3. Check if the handler compares old vs new port before triggering reconnect\n4. If the handler always reconnects (even for same port), add a same-value check — that's a real bug\n5. For boundary clamping, verify the NumberStepper's onBlur handler calls Math.max(min, Math.min(max, value))\n6. The test may need `await portInput.press('Tab')` instead of `await portInput.blur()` for headless compatibility\n\nConstraints:\n- Do NOT just skip or delete the tests — they test real user scenarios\n- If the platform needs fixing, fix it\n- If the test needs better Playwright interactions for headless, fix the test"
@@ -31,7 +31,7 @@
         "npx playwright test e2e/side-panel-reload.e2e.ts passes with --retries=2"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/side-panel-reload.e2e.ts (the stress test)\n- platform/browser-extension/src/side-panel/App.tsx (plugins.changed handler, getFullState)\n- platform/browser-extension/src/background/background-message-handlers.ts (bg:getFullState)\n- platform/mcp-server/src/reload.ts (reload coalescing)\n\nContext:\nThe test fires 3 POST /reload requests with 200ms between each, then checks that the side panel shows the plugin card. It times out at 36s waiting for the card to appear. The reload coalescing should produce exactly 1 discovery cycle, but the side panel may not receive or process the final plugins.changed notification.\n\nInvestigation approach:\n1. Read the test to understand exactly what it asserts\n2. Check if the side panel receives the plugins.changed notification after rapid reloads\n3. The issue may be that the side panel calls getFullState() on plugins.changed, but the server hasn't finished updating its state yet\n4. Or the WebSocket message is lost during rapid reload cycles\n5. Add proper polling: instead of waiting for a fixed element, poll getFullState or the plugin card visibility\n\nConstraints:\n- The test must verify the side panel shows correct state after rapid reloads\n- If the notification pipeline has a bug, fix the pipeline\n- Do NOT just increase timeouts — find and fix the root cause"
@@ -48,7 +48,7 @@
         "npx playwright test e2e/hot-reload-dynamic.e2e.ts --grep 'manifest change' passes with --retries=2"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/hot-reload-dynamic.e2e.ts (the stress test at line 1474)\n- platform/mcp-server/src/plugin-registry.ts (replacePluginRegistry)\n- platform/mcp-server/src/mcp-tool-dispatch.ts (dispatch pipeline)\n- platform/mcp-server/src/file-watcher.ts (manifest change detection)\n\nContext:\nThe test starts a slow_with_progress call (3s), then modifies the plugin manifest via writeAndWaitForWatcher to add a new tool. The in-flight call should complete, and the new tool should appear in tools/list. The test fails at ~19s, suggesting either:\n1. The in-flight call hangs because the handler reference was invalidated by the registry rebuild\n2. The new tool never appears because the file watcher didn't trigger a rediscovery\n3. The writeAndWaitForWatcher helper's timing doesn't work in CI\n\nInvestigation approach:\n1. Read the test and the writeAndWaitForWatcher helper\n2. Check if replacePluginRegistry invalidates in-flight dispatch handler references\n3. If the dispatch holds a closure over the old handler and the registry rebuild creates a new one, the old handler may become null/undefined\n4. The fix may be to capture the handler reference at dispatch start (before the async operation) so the registry rebuild doesn't affect it\n\nConstraints:\n- The in-flight call MUST complete (success or identifiable error, not hang)\n- The new tool MUST appear after the manifest change\n- If this is a real dispatch pipeline bug, fix it — don't skip the test"
@@ -65,7 +65,7 @@
         "npx playwright test e2e/browser-tools.e2e.ts --grep 'tab closed mid-execution' passes with --retries=2"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/browser-tools.e2e.ts (stress test at line 3310)\n- platform/mcp-server/src/browser-tools/ (execute_script implementation)\n- platform/browser-extension/src/background/ (tab removal detection)\n\nContext:\nThe test calls execute_script with a 3s async operation, closes the tab after 500ms, and expects an error within 5s. On macOS CI, the timing may differ — the tab close event may arrive later, or the exec file cleanup may be slower.\n\nInvestigation approach:\n1. Read the test to understand the exact timing\n2. Check how execute_script detects tab closure — does it poll? Does it listen for chrome.tabs.onRemoved?\n3. The 5s timeout may be too tight for CI — the exec file polling interval + tab removal event propagation may take longer\n4. If the platform's tab close detection is slow, improve it (e.g., add a chrome.tabs.onRemoved listener that cancels pending exec results)\n5. If it's just timing, relax to 10s — still proves it's not hanging for 30s\n\nConstraints:\n- The test MUST verify fast error return (not 30s timeout)\n- Relaxing from 5s to 10s is acceptable if the detection path is genuinely slower on macOS\n- Do NOT remove the test — it tests a real user scenario"
@@ -82,7 +82,7 @@
         "npx playwright test e2e/tab-state-sync.e2e.ts --grep '5-tab churn' passes with --retries=2"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/tab-state-sync.e2e.ts (stress test at line 441)\n- platform/browser-extension/src/background/tab-state.ts (tab state machine, pluginLocks)\n- platform/browser-extension/src/background/adapter-injection.ts (injection on tab update)\n\nContext:\nThe test opens 5 tabs to a matching URL in a tight loop, then immediately closes tabs at index 0, 2, 4. It expects plugin_list_tabs to show exactly 2 tabs with ready=true. The failure in CI suggests the tab state machine doesn't handle the rapid open/close correctly.\n\nInvestigation approach:\n1. Read the test to understand exact tab open/close sequence\n2. Read tab-state.ts to understand the pluginLocks serialization and checkTabStateChanges debouncing\n3. The issue may be: tabs are closed before their onUpdated/status=complete event fires, causing the extension to never register them as 'ready', so the 2 remaining tabs may also show as not-ready\n4. Or: the close events interleave with open events, causing phantom tab entries\n5. The fix may be to add a small delay (200ms) between opening all 5 tabs and closing 3, giving the extension time to process the open events\n6. Or fix the platform to handle the race correctly\n\nConstraints:\n- The test MUST verify exact tab count (2) — not >= 2\n- If adding a delay between open and close makes the test pass, that's acceptable — it still tests rapid close behavior\n- If the platform has a genuine race, fix it"
@@ -98,7 +98,7 @@
         "npx playwright test e2e/browser-tools.e2e.ts --grep 'await fetch' passes with --retries=2"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "Files:\n- e2e/browser-tools.e2e.ts (test at line 853)\n\nContext:\nThis test predates the stress testing effort. It calls browser_execute_script with code that does an async fetch and checks the HTTP status. The 29.6s timeout suggests the fetch hangs — possibly due to a DNS resolution timeout or the target URL being unreachable in CI.\n\nInvestigation approach:\n1. Read the test to see what URL it fetches\n2. If it fetches an external URL (e.g., httpbin.org, example.com), replace with a local test server endpoint\n3. If it fetches a local URL, check why it hangs — maybe the test server isn't started\n4. The exec file pipeline may also have a bug with async operations that involve network I/O\n\nConstraints:\n- Do NOT just increase the timeout — fix the root cause\n- If the test fetches an external URL, make it local for CI reliability\n- The test must still verify that async fetch works in execute_script"
