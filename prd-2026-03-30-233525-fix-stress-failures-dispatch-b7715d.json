@@ -1,0 +1,54 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix 5 failing stress tests in stress-mcp-dispatch.e2e.ts. Root cause: tests fire 10-20 concurrent calls expecting all to succeed, but MAX_CONCURRENT_DISPATCHES_PER_PLUGIN=5 rejects the 6th+. Also fix hot-reload, tab-close, and permission-change tests that fail due to test setup issues (calling tools before extension is ready).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix concurrent dispatch tests to respect MAX_CONCURRENT_DISPATCHES_PER_PLUGIN=5",
+      "description": "The '10 concurrent echo calls' and '20 concurrent echo calls' tests fire more calls than the per-plugin limit of 5, causing calls 6+ to be rejected with 'Too many concurrent dispatches'. Fix by either: (a) sending calls in batches of 5, or (b) testing the limit behavior explicitly (5 succeed, 6th rejected, then second batch of 5 succeeds after first batch completes).",
+      "acceptanceCriteria": [
+        "The '10 concurrent echo calls' test passes — either by batching into 2 sequential batches of 5, or by asserting exactly 5 succeed and 5 get concurrency errors",
+        "The '20 concurrent echo calls' test passes — same approach",
+        "Response routing is still verified: each successful result's message matches its input (no cross-contamination)",
+        "npx playwright test e2e/stress-mcp-dispatch.e2e.ts --grep 'concurrent echo' passes on all retries"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (fix the two concurrent dispatch tests)\n\nContext:\nThe server has `MAX_CONCURRENT_DISPATCHES_PER_PLUGIN = 5` in `platform/mcp-server/src/mcp-tool-dispatch.ts`. When 10 calls fire concurrently, calls 6-10 are immediately rejected with 'Too many concurrent dispatches for plugin \"e2e-test\" (limit: 5)'.\n\nThe error at line 42/79:\n```\nError: result 5 should not be an error: Too many concurrent dispatches for plugin \"e2e-test\" (limit: 5).\n```\n\nFix approach — option A (recommended): Change the tests to fire calls in sequential batches of 5. First batch of 5 via Promise.all, verify all succeed with correct messages. Then second batch of 5, verify. This still tests concurrent dispatch (5 at a time) and response routing correctness.\n\nFix approach — option B: Test the limit explicitly. Fire 6 calls. Assert exactly 5 succeed and 1 fails with the concurrency error. Then after the 5 complete, fire 5 more — all must succeed (proves slot cleanup).\n\nEither approach is valid. The key is: the test must reflect the ACTUAL system design (5 concurrent max), not assume unlimited concurrency.\n\nConstraints:\n- Do NOT change MAX_CONCURRENT_DISPATCHES_PER_PLUGIN — the limit is correct by design\n- Response routing verification (positional message matching) must still work\n- Keep the test meaningful — it should still verify concurrent dispatch correctness, just within the limit"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix hot-reload during dispatch test — ensure extension is connected before tool calls",
+      "description": "The hot-reload test fails because tool calls are made before the extension has fully connected and synced. Fix by adding proper waitForExtensionConnected + waitForLog('tab.syncAll received') + waitForToolResult warmup before starting the slow calls.",
+      "acceptanceCriteria": [
+        "Test waits for extension connection and tab.syncAll before starting slow tool calls",
+        "A warmup echo call succeeds before the hot-reload chaos begins",
+        "The hot-reload test passes on all retries",
+        "npx playwright test e2e/stress-mcp-dispatch.e2e.ts --grep 'hot reload' passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (fix hot-reload test)\n\nContext:\nThe test uses Playwright fixtures which auto-setup the server and extension, but the tool calls may fire before the extension WebSocket is connected and tab.syncAll has been processed. The existing passing tests in dispatch-resilience.e2e.ts use `waitForExtensionConnected(server)` and `waitForLog(server, 'tab.syncAll received')` before making calls.\n\nThe test currently starts slow_with_progress calls right after opening the side panel or setting up, without confirming the dispatch pipeline is ready. Fix by adding the standard warmup sequence:\n```typescript\nawait waitForExtensionConnected(server);\nawait waitForLog(server, 'tab.syncAll received', 15_000);\n// Warmup: verify dispatch works before starting chaos\nawait waitForToolResult(mcpClient, 'e2e-test_echo', { message: 'warmup' }, { isError: false }, 15_000);\n```\n\nConstraints:\n- Check whether the test uses fixtures or manual setup — add the waitFor calls accordingly\n- The warmup call proves the pipeline is ready before starting the real test\n- Do NOT change the hot-reload logic or the in-flight assertion logic — only fix the setup"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix tab-close and permission-change dispatch tests — same warmup issue",
+      "description": "The 'tab close during dispatch' and 'permission change mid-dispatch' tests fail for the same reason: tool calls fire before the dispatch pipeline is ready. Add proper extension connection + warmup before chaos.",
+      "acceptanceCriteria": [
+        "Both tests have proper waitForExtensionConnected + tab.syncAll + warmup echo before chaos",
+        "The tab-close test passes: slow call interrupted by tab close returns error within 10s",
+        "The permission-change test passes: in-flight call completes, subsequent call rejected",
+        "npx playwright test e2e/stress-mcp-dispatch.e2e.ts passes on all tests"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (fix tab-close and permission-change tests)\n\nContext:\nSame root cause as US-002. These tests call tools before the extension WebSocket pipeline is established. The existing fixture-based setup starts the server and extension but doesn't wait for them to fully sync.\n\nFor the permission-change test, also check that the test correctly uses `OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: ''` (empty string, not '1') to ensure permission selects are interactive and the permission system is enabled.\n\nAdd the standard warmup:\n```typescript\nawait waitForExtensionConnected(mcpServer);\nawait waitForLog(mcpServer, 'tab.syncAll received', 15_000);\nconst warmup = await waitForToolResult(mcpClient, 'e2e-test_echo', { message: 'warmup' }, { isError: false }, 15_000);\n```\n\nConstraints:\n- Both tests need warmup BEFORE the chaos starts\n- The permission test may need `writeTestConfig` with explicit OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS override\n- Check if the fixture-based test provides access to mcpServer.logs for waitForLog"
+    }
+  ]
+}
