@@ -14,7 +14,7 @@
         "The test adds a timing assertion: all in-flight calls must settle within 15 seconds of the hot reload trigger (not the full 30s dispatch timeout)"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (modify hot-reload test)\n\nContext:\nThe current code at lines 145-148 asserts `typeof result.isError === 'boolean'` which is a tautology — it checks the JS type of a property, not the correctness of the system's behavior. This always passes.\n\nThe correct behavior during hot reload: the dev proxy kills the worker and forks a new one. In-flight tool calls go through the extension WebSocket which disconnects. The server's `ws.close` handler rejects pending dispatches with 'Extension disconnected'. So calls should fail with a specific error, not succeed silently.\n\nCurrent weak code:\n```typescript\nif (outcome.status === 'fulfilled') {\n  const result = outcome.value;\n  expect(\n    typeof result.isError === 'boolean',\n    `call ${i}: expected isError to be a boolean, got ${typeof result.isError}`,\n  ).toBe(true);\n}\n// 'rejected' is also acceptable\n```\n\nReplace with:\n```typescript\nif (outcome.status === 'fulfilled') {\n  const result = outcome.value;\n  if (result.isError) {\n    // Error must be identifiable — not empty or generic\n    expect(\n      /disconnected|timed out|dispatch|worker/i.test(result.content),\n      `call ${i}: error message must identify the failure cause, got: ${result.content.slice(0, 100)}`,\n    ).toBe(true);\n  } else {\n    // Success must have valid content\n    expect(result.content.length).toBeGreaterThan(0);\n  }\n} else {\n  // Rejected = transport error (acceptable during hot reload)\n  // but log it for debugging\n  const err = (outcome as PromiseRejectedResult).reason;\n  console.log(`call ${i} rejected: ${String(err).slice(0, 100)}`);\n}\n```\n\nAlso add timing: record `Date.now()` before hot reload trigger, and after all settle verify `elapsed < 15_000`.\n\nConstraints:\n- Do NOT change the test setup or teardown\n- Do NOT change the recovery verification (fresh echo call) — it's already correct\n- The hot reload test title and describe block must not change"
@@ -29,7 +29,7 @@
         "If the system incorrectly kills in-flight calls on permission change, this test FAILS (that's the point — it would be a bug to fix)"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (modify permission-change test)\n\nContext:\nThe MCP server checks permission ONCE at dispatch entry (`mcp-tool-dispatch.ts`). After the check passes, the call is dispatched to the extension. Changing permission afterward does NOT retroactively kill in-flight calls. So the in-flight call MUST succeed.\n\nCurrent weak code at line 289:\n```typescript\nexpect(typeof slowResult.isError === 'boolean').toBe(true);\n```\n\nReplace with:\n```typescript\n// The in-flight call already passed the permission check before dispatch.\n// It MUST complete successfully — permission changes only affect NEW calls.\nexpect(slowResult.isError).not.toBe(true);\n```\n\nConstraints:\n- Do NOT change the subsequent rejection test (it's already correct — checks exact error message)\n- Do NOT change the recovery test\n- If this assertion fails in CI, it means the system has a real bug: in-flight calls are being killed by permission changes, which is incorrect behavior"
@@ -46,7 +46,7 @@
         "The post-navigation recovery assertion (echo after navigating back) remains unchanged"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-adapter-injection.e2e.ts (modify navigation test)\n\nContext:\nWhen a tab navigates away during a tool call, the extension detects the navigation and the adapter context is lost. The tool call should resolve with an error — not hang for the full dispatch timeout.\n\nCurrent weak code at line 132:\n```typescript\nconst midNavResult = await toolPromise;\nexpect(typeof midNavResult.isError).toBe('boolean');\n```\n\nReplace with:\n```typescript\n// Tool call must resolve within 10s — not hang for 30s dispatch timeout\nconst midNavResult = await Promise.race([\n  toolPromise,\n  new Promise((_, reject) => setTimeout(() => reject(new Error('tool call hung for 10s after tab navigation')), 10_000)),\n]) as { isError?: boolean; content: string };\n\nif (midNavResult.isError) {\n  // Error must identify the cause (tab navigation/closure)\n  expect(\n    /tab|closed|navigat|disconnect/i.test(midNavResult.content),\n    `error should identify navigation as cause, got: ${midNavResult.content.slice(0, 100)}`,\n  ).toBe(true);\n} else {\n  // If it succeeded (raced before navigation), content must be valid\n  expect(midNavResult.content.length).toBeGreaterThan(0);\n}\n```\n\nConstraints:\n- Do NOT change the post-navigation recovery test\n- Do NOT change the test setup\n- The Promise.race timeout is the key correctness check: a 30s hang is a bug"
@@ -63,7 +63,7 @@
         "The post-restart recovery verification (fresh echo on new server) remains unchanged"
       ],
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-network-auth.e2e.ts (modify server restart test)\n\nContext:\nWhen the server dies, the WebSocket closes. The server's `createHandleWsClose` handler rejects all pending dispatches with 'Extension disconnected'. So in-flight calls should fail with that specific error, not silently succeed or hang.\n\nCurrent weak code at lines 91-96:\n```typescript\nfor (const result of results) {\n  expect(['fulfilled', 'rejected']).toContain(result.status);\n}\n```\n\nReplace with:\n```typescript\nconst settleTime = Date.now();\nfor (const [i, result] of results.entries()) {\n  if (result.status === 'fulfilled') {\n    const val = result.value;\n    if (val.isError) {\n      // Error must identify the disconnect\n      expect(\n        /disconnected|timed out|dispatch/i.test(val.content),\n        `call ${i}: error should identify disconnect, got: ${val.content.slice(0, 100)}`,\n      ).toBe(true);\n    }\n    // If somehow succeeded (raced before kill), that's also valid\n  } else {\n    // Transport-level rejection (expected during server death)\n    console.log(`call ${i} rejected: ${String(result.reason).slice(0, 100)}`);\n  }\n}\n// Timing: calls must not hang for 30s dispatch timeout\nexpect(settleTime - killTime).toBeLessThan(15_000);\n```\n\nRecord `killTime = Date.now()` right before server.kill().\n\nConstraints:\n- Do NOT change the recovery section\n- Add killTime variable before server kill\n- Add settleTime after Promise.allSettled resolves"
@@ -78,7 +78,7 @@
         "If the system incorrectly cancels unrelated in-flight calls during permission changes, this test FAILS"
       ],
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-cross-system.e2e.ts (modify permission toggle test)\n\nContext:\nThe test starts a slow_with_progress call, then toggles the ECHO tool's permission. Since the running tool is slow_with_progress (not echo), the permission change should not affect it at all.\n\nCurrent weak code at line 111:\n```typescript\nexpect(slowResult.status).toBe('fulfilled');\n```\n\nReplace with:\n```typescript\n// The slow call is on slow_with_progress, NOT echo.\n// Permission change on echo must NOT affect unrelated in-flight calls.\nexpect(slowResult.status).toBe('fulfilled');\nconst slowValue = (slowResult as PromiseFulfilledResult<{ isError?: boolean; content: string }>).value;\nexpect(slowValue.isError).not.toBe(true);\n```\n\nConstraints:\n- Keep the existing `expect(slowResult.status).toBe('fulfilled')` but ADD the isError check\n- Do NOT change the rest of the test"
@@ -94,7 +94,7 @@
         "If ALL 3 calls succeed despite the plugin being removed, the test FAILS (the removal didn't take effect, which is a bug)"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-cross-system.e2e.ts (modify config-change-during-dispatch test)\n\nContext:\nThe test removes the plugin from config while 3 slow calls are in-flight. At least one call MUST fail — otherwise the plugin removal didn't take effect, which means the config change was silently ignored.\n\nCurrent weak code at lines 209-211:\n```typescript\nfor (const result of slowResults) {\n  expect(['fulfilled', 'rejected']).toContain(result.status);\n}\n```\n\nReplace with:\n```typescript\nlet failCount = 0;\nfor (const [i, result] of slowResults.entries()) {\n  if (result.status === 'rejected') {\n    failCount++;\n  } else if (result.value.isError) {\n    failCount++;\n    // Error must identify the cause\n    expect(\n      /not found|unavailable|removed|disconnected|no matching tab|plugin/i.test(result.value.content),\n      `call ${i}: error should identify plugin removal, got: ${result.value.content.slice(0, 100)}`,\n    ).toBe(true);\n  }\n}\n// At least one call MUST have failed — proving the plugin removal took effect\nexpect(failCount).toBeGreaterThanOrEqual(1);\n```\n\nConstraints:\n- Do NOT change the recovery section (plugin restore + fresh echo)\n- The key insight: if zero calls fail, the config removal didn't work, which is a system bug"
@@ -110,7 +110,7 @@
         "Side panel assertions remain unchanged (zero pageerror, plugin visible)"
       ],
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": true,
       "model": "opus",
       "notes": "Files:\n- e2e/stress-cross-system.e2e.ts (modify full system stress test)\n\nContext:\nThe current client loop at lines 406-411:\n```typescript\ntry {\n  const r = await client.callTool('e2e-test_echo', { message: `${prefix}${i}` });\n  results.push(r);\n} catch {\n  // Tool call may fail during config removal — expected\n}\n```\n\nReplace with:\n```typescript\ntry {\n  const r = await client.callTool('e2e-test_echo', { message: `${prefix}${i}` });\n  results.push(r);\n  if (r.isError) errorCount++;\n} catch (err) {\n  errorCount++;\n  // Log for debugging, but don't fail — errors during config removal are expected\n  console.log(`${prefix}: call ${i} error: ${String(err).slice(0, 80)}`);\n}\n```\n\nFor recovery at lines 486-492:\n```typescript\nconst recoveredCount = recoveryResults.filter(r => r.status === 'fulfilled').length;\nexpect(recoveredCount).toBeGreaterThanOrEqual(1);\n```\n\nReplace with:\n```typescript\n// ALL 3 clients MUST recover after chaos subsides — not just 1\nfor (const [i, result] of recoveryResults.entries()) {\n  expect(result.status, `client ${i + 1} failed to recover after chaos`).toBe('fulfilled');\n}\n```\n\nConstraints:\n- Keep errorCount as a per-client variable returned from clientLoop\n- Log total errors per client after Promise.allSettled for debugging visibility\n- The recovery assertion is the critical change: ALL 3 must work, not just 1"

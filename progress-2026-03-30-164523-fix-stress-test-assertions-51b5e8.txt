@@ -1,0 +1,93 @@
+# Ralph Progress Log
+PRD: prd-2026-03-30-164523-fix-stress-test-assertions-51b5e8~running.json
+Started: Mon Mar 30 23:45:59 UTC 2026
+---
+
+## Codebase Patterns
+- E2E stress tests are in `e2e/stress-*.e2e.ts` files
+- Tool call results have `isError` (boolean) and `content` (string) fields
+- `Promise.allSettled` is used for in-flight calls during chaos scenarios; fulfilled results have `.value`, rejected have `.reason`
+- Regex pattern matching is used to validate error messages identify specific failure causes
+- The `PromiseRejectedResult` type must be cast explicitly when accessing `.reason` from allSettled results
+
+## 2026-03-30 23:48 - US-001
+- Replaced tautological `typeof result.isError === 'boolean'` with concrete assertions in hot-reload test
+- Error results now validated against `/disconnected|timed out|dispatch|worker/i` regex
+- Success results verified to have non-empty content
+- Rejected promises logged with `console.log` for debugging visibility
+- Added 15s timing bound (`reloadTime` before trigger, `settleElapsed` after settle)
+- Files changed: `e2e/stress-mcp-dispatch.e2e.ts`
+- **Learnings for future iterations:**
+  - The hot-reload test has a recovery section after the in-flight checks that must not be modified
+  - `PromiseRejectedResult` needs explicit cast: `(outcome as PromiseRejectedResult).reason`
+---
+
+## 2026-03-30 23:50 - US-002
+- Replaced tautological `typeof slowResult.isError === 'boolean'` with `expect(slowResult.isError).not.toBe(true)`
+- The permission-change test now concretely asserts the in-flight call succeeds (not just that isError is a boolean)
+- Files changed: `e2e/stress-mcp-dispatch.e2e.ts`
+- **Learnings for future iterations:**
+  - Permission is checked once at dispatch entry in the MCP server — in-flight calls that already passed the check are not affected by subsequent permission changes
+  - The subsequent rejection test (line 302-307) was already correct and didn't need changes
+---
+
+## 2026-03-30 23:52 - US-003
+- Replaced tautological `typeof midNavResult.isError` assertion with concrete correctness checks in navigation test
+- Added `Promise.race` with 10s timeout to detect tool calls that hang after tab navigation
+- Error results validated against `/tab|closed|navigat|disconnect/i` regex to ensure cause identification
+- Success results verified to have non-empty content
+- Post-navigation recovery assertions left unchanged
+- Files changed: `e2e/stress-adapter-injection.e2e.ts`
+- **Learnings for future iterations:**
+  - `Promise.race` with a timeout is the correct pattern for detecting tool calls that hang (not just fail) — the timeout itself is a correctness assertion
+  - When casting the Promise.race result, use `as { isError?: boolean; content: string }` since the toolPromise result shape needs to be specified
+  - The navigation test has post-navigation recovery (navigate back + re-inject + echo) that must not be modified
+---
+
+## 2026-03-30 23:56 - US-004
+- Replaced tautological `['fulfilled', 'rejected'].toContain(result.status)` with concrete disconnect error validation
+- Added `killTime = Date.now()` before server kill for timing measurement
+- Added `settleTime = Date.now()` after `Promise.allSettled` resolves
+- Fulfilled results with `isError: true` validated against `/disconnected|timed out|dispatch/i`
+- Rejected results logged with `console.log` for debugging visibility
+- Added timing assertion: `settleTime - killTime < 15_000` to detect hangs
+- Post-restart recovery section (new client + echo) left unchanged
+- Files changed: `e2e/stress-network-auth.e2e.ts`
+- **Learnings for future iterations:**
+  - The server-restart test uses `startMcpServer(configDir, false, savedPort)` to restart on the same port — the third arg is the port override
+  - The `server.kill()` call is async and the old server ref is set to `undefined` after kill to prevent double-kill in the `finally` block
+  - The pattern of `killTime` before action + `settleTime` after settle + `expect(elapsed).toBeLessThan(threshold)` is the standard timing bound pattern for these stress tests
+---
+
+## 2026-03-30 23:57 - US-005
+- Added concrete `isError` assertion to the permission toggle test in `stress-cross-system.e2e.ts`
+- Kept existing `expect(slowResult.status).toBe('fulfilled')` and added `expect(slowValue.isError).not.toBe(true)` after unwrapping the result
+- The test now verifies that permission changes on echo do NOT affect in-flight calls on slow_with_progress
+- Files changed: `e2e/stress-cross-system.e2e.ts`
+- **Learnings for future iterations:**
+  - The `PromiseFulfilledResult<T>` type needs to be cast with the full value shape: `(result as PromiseFulfilledResult<{ isError?: boolean; content: string }>).value`
+  - Permission toggle tests use `selectPermission(sp, ...)` helper to change permissions via the side panel UI
+  - The test deliberately toggles permission on a DIFFERENT tool (echo) than the one running (slow_with_progress) — this is the key design point
+---
+
+## 2026-03-30 23:59 - US-006
+- Replaced tautological `['fulfilled', 'rejected'].toContain(result.status)` with concrete failure validation in config-change test
+- Added `failCount` tracking: rejected results increment count, fulfilled results with `isError: true` increment count and validate error message against `/not found|unavailable|removed|disconnected|no matching tab|plugin/i`
+- Added `expect(failCount).toBeGreaterThanOrEqual(1)` — proving plugin removal actually took effect during dispatch
+- Files changed: `e2e/stress-cross-system.e2e.ts`
+- **Learnings for future iterations:**
+  - The config-change test uses `writeTestConfig` + `postReload()` to simulate CLI plugin removal — the reload endpoint triggers server-side plugin rediscovery
+  - The `result.value.isError` and `result.value.content` are directly accessible on fulfilled `Promise.allSettled` results without explicit type casting (TypeScript infers the shape from the `callTool` return type)
+  - The recovery section (restore config + reopen tab + fresh echo) is the structural pattern for all cross-system chaos tests
+---
+
+## 2026-03-31 00:20 - US-007
+- Replaced blanket `.catch(() => {})` in clientLoop with error counting and logging: caught errors increment `errorCount`, and `r.isError` responses also increment it
+- Added per-client `console.log` after the loop to report total errors during chaos for debugging visibility
+- Replaced `expect(recoveredCount).toBeGreaterThanOrEqual(1)` with a `for` loop asserting ALL 3 clients recover (`expect(result.status).toBe('fulfilled')` with per-client failure message)
+- Files changed: `e2e/stress-cross-system.e2e.ts`
+- **Learnings for future iterations:**
+  - The `clientLoop` function returns `results` (array of successful responses) but errors are now tracked via `errorCount` — the function's return value doesn't include error info, only the console.log reports it
+  - The recovery assertion using `waitForToolResult` with 20s timeout is robust — all 3 clients recovered successfully in E2E
+  - E2E checkpoint story: Phase 2 (full E2E suite) ran successfully — 237 passed, 0 failed
+---
