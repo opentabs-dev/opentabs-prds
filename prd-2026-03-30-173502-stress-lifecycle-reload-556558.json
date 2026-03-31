@@ -1,0 +1,92 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add correctness-focused stress tests to lifecycle, lifecycle-hooks, dev-proxy, and hot-reload-dynamic E2E files. Tests define exact behavior specs for rapid navigation hooks, worker crash recovery, concurrent HTTP+WS during restart, and manifest changes during dispatch.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "20 rapid pushState calls — all 20 onNavigate hooks MUST fire in order",
+      "description": "Execute 20 pushState calls in a tight synchronous loop. The adapter MUST fire onNavigate for every call. The recorded URL array MUST contain exactly 20 entries matching /burst-0 through /burst-19 in order.",
+      "acceptanceCriteria": [
+        "page.evaluate executes 20 pushState calls synchronously in a for loop",
+        "Within 10s, __opentabs_onNavigate_urls.length === 20",
+        "urls[i] ends with /burst-${i} for all i in 0..19 (order preserved)",
+        "urls.length is exactly 20 (no duplicates, no drops)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/lifecycle-hooks.e2e.ts (add stress test)\n\nContext:\nThe adapter monkey-patches history.pushState to fire onNavigate. If the adapter uses debouncing or requestAnimationFrame, rapid calls would lose intermediate navigations. This test proves zero drops.\n\nChanges:\nAdd stress test after the existing onNavigate tests. Use the same setupIsolatedIifeTest pattern. Execute `for (let i = 0; i < 20; i++) history.pushState({}, '', '/burst-' + i)` in a single page.evaluate. Wait for the adapter's URL recording array to reach length 20.\n\nConstraints:\n- The global __opentabs_onNavigate_urls must already exist (set up by the adapter's onNavigate hook)\n- Check how the existing onNavigate tests access this data — use the same pattern"
+    },
+    {
+      "id": "US-002",
+      "title": "10 concurrent HTTP requests during dev proxy restart all resolve",
+      "description": "Fire 10 HTTP requests at the exact moment of hot reload. Every request MUST resolve within 15s — either 200 (buffered) or 503 (timeout). Zero hangs.",
+      "acceptanceCriteria": [
+        "Hot reload triggered, then 10 concurrent fetch() calls to /health fire immediately",
+        "All 10 promises resolve within 15s (AbortSignal.timeout)",
+        "Each response status is either 200 or 503 (no other codes)",
+        "Responses with 200 have body.status === 'ok'",
+        "After all resolve, 'Hot reload complete' appears in logs",
+        "A fresh /health returns 200"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/dev-proxy.e2e.ts (add stress test)\n\nContext:\nThe dev proxy buffers HTTP requests during worker restart via a pending[] array and whenReady() drain logic. If the drain callback is lost, requests hang forever. This test proves all 10 are either buffered+forwarded or timeout cleanly.\n\nChanges:\nAdd stress test using the existing dev-proxy test pattern (startMcpServer with hot=true). Trigger reload, immediately fire 10 concurrent fetches. Validate each response.\n\nConstraints:\n- Use fetch with AbortSignal.timeout(15_000) per request\n- The hot reload test pattern from the existing file uses server.triggerHotReload()"
+    },
+    {
+      "id": "US-003",
+      "title": "5 rapid config-changing hot reloads — final state reflects last config exactly",
+      "description": "Trigger 5 hot reloads in rapid succession, each with a different plugin config. The final tools/list MUST exactly match the last-written config — no stale intermediate state.",
+      "acceptanceCriteria": [
+        "5 hot reloads fire without awaiting between them, each preceded by a config write",
+        "The last config has plugins B and C (not A), with a specific tool set to 'off'",
+        "After the final 'Hot reload complete' log, tools/list contains B and C tools, NOT A tools",
+        "The disabled tool has [Disabled] prefix",
+        "Health shows correct plugin count matching the final config"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/hot-reload-dynamic.e2e.ts (add stress test)\n\nContext:\nThis tests that rapid reloads converge to the last-written config. If the worker forked by reload N reads config version N-1 (because the file write hasn't flushed), the final state will be wrong.\n\nChanges:\nAdd stress test. Create 3 minimal plugins (A, B, C) using createMinimalPlugin. Write 5 configs in sequence: [A], [A,B], [B], [B,C], [B,C + tool off]. Trigger hot reload after each write (no await between triggers). Wait for the final 'Hot reload complete'. Verify tools/list matches the last config.\n\nConstraints:\n- Use createMinimalPlugin from fixtures.js\n- Only wait for the LAST 'Hot reload complete' log (count-based)\n- The disabled tool test uses tools/list [Disabled] prefix check"
+    },
+    {
+      "id": "US-004",
+      "title": "Hot reload during active tool dispatch — tool resolves, post-reload call succeeds",
+      "description": "Start a slow tool call, trigger hot reload mid-execution. The in-flight call MUST settle within 30s (not hang forever). After reload + reconnect, a fresh call MUST succeed.",
+      "acceptanceCriteria": [
+        "slow_with_progress (5s) starts, hot reload triggered after 500ms",
+        "The in-flight call promise settles within 30s (success or structured error, no raw rejection hang)",
+        "If error, text contains 'disconnected' or 'timed out' or 'dispatch' (identifiable cause)",
+        "'Hot reload complete' appears in logs within 20s",
+        "Extension reconnects (health shows extensionConnected=true)",
+        "Fresh echo call succeeds with correct message within 20s"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/lifecycle.e2e.ts (add stress test)\n\nContext:\nThe lifecycle.e2e.ts file tests server kill+restart and hot reload independently, but not hot reload during active dispatch. When the worker dies, the WebSocket closes and pending dispatches should be rejected.\n\nChanges:\nAdd stress test using the existing lifecycle test pattern. Start slow_with_progress via mcpClient, trigger hot reload after 500ms, await the call via Promise.allSettled, then verify recovery.\n\nConstraints:\n- Use Promise.allSettled for the in-flight call (it may reject at transport level)\n- Must re-initialize MCP client if session was lost\n- Follow the existing lifecycle.e2e.ts test pattern for server setup"
+    },
+    {
+      "id": "US-005",
+      "title": "File watcher manifest change during active tool dispatch — no interference",
+      "description": "Start a slow tool call, modify the plugin manifest via file watcher while it runs. The in-flight call MUST complete successfully. The new tool MUST appear in tools/list after the watcher processes.",
+      "acceptanceCriteria": [
+        "slow_with_progress (3s) starts and is in-flight",
+        "A new tool is written to dist/tools.json via writeAndWaitForWatcher",
+        "The in-flight slow call completes successfully (isError=false)",
+        "The new tool appears in tools/list within 15s",
+        "Existing tools remain callable after the manifest change"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/hot-reload-dynamic.e2e.ts (add stress test)\n\nContext:\nThe file watcher triggers a registry rebuild (replacePluginRegistry). If the in-flight dispatch holds a reference to the old handler and the rebuild nullifies it, the dispatch would fail. This test proves the dispatch pipeline correctly completes with the old handler.\n\nChanges:\nAdd stress test using callToolWithProgress for the slow call. While it runs, use writeAndWaitForWatcher to add a new tool. The slow call must complete before asserting the new tool appears.\n\nConstraints:\n- Use writeAndWaitForWatcher helper from helpers.js\n- The in-flight call MUST succeed (hard assertion, not 'success or error')\n- Follow the existing hot-reload-dynamic.e2e.ts test pattern"
+    }
+  ]
+}

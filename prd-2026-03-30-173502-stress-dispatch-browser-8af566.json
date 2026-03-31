@@ -1,0 +1,105 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add correctness-focused stress tests to dispatch-resilience, browser-tools, tool-dispatch, and browser-permission-persist E2E files. Every test defines what the system MUST do — if it fails, the system has a bug to fix.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Rapid tool calls interleaved with tab navigation in dispatch-resilience",
+      "description": "Fire 10 concurrent echo calls while navigating the matching tab away. Each call MUST resolve within 20s. Successful calls MUST have correct messages (1:1 positional). Failed calls MUST have errors matching /unavailable|not ready|closed|no matching tab/i.",
+      "acceptanceCriteria": [
+        "10 concurrent echo calls with messages 'rapid-0' through 'rapid-9' are fired via Promise.allSettled",
+        "Immediately after firing, the matching tab is navigated to a non-matching URL",
+        "All 10 promises settle within 20s wall-clock (no 30s dispatch timeout hang)",
+        "Each fulfilled result is either: isError=false with parsed message exactly equal to 'rapid-N' for its index, OR isError=true with error matching /unavailable|not ready|closed|no matching tab/i",
+        "No two successful results contain the same message (Set of successful messages has size equal to success count)",
+        "After test, server health returns status='ok'"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/dispatch-resilience.e2e.ts (add stress test)\n\nContext:\nThe file already tests 5 concurrent dispatch and tab closure during dispatch. This new test combines concurrency with mid-dispatch navigation — a real scenario where a user navigates while Claude is calling tools.\n\nChanges:\nAdd a new test in a `test.describe('stress')` block. Setup: standard isolated IIFE test with extension + test server + matching tab. Fire 10 concurrent echo calls via Promise.allSettled, then immediately navigate the page to a non-matching URL. Wait for all to settle. Validate each result per the criteria.\n\nConstraints:\n- Use the same `setupIsolatedIifeTest` pattern as existing tests in this file\n- Do NOT modify existing tests\n- The 20s wall-clock bound is the key correctness check — it catches hung dispatches"
+    },
+    {
+      "id": "US-002",
+      "title": "5 concurrent browser_execute_script calls on same tab return distinct results",
+      "description": "Fire 5 concurrent execute_script calls on the same tab, each returning a unique value. Each result MUST match its input positionally — no cross-contamination between concurrent scripts.",
+      "acceptanceCriteria": [
+        "5 concurrent browser_execute_script calls fire via Promise.all, each with code returning 'result-0' through 'result-4'",
+        "All 5 return isError=false",
+        "Result values match positionally: result[0].value.value === 'result-0', etc.",
+        "No two results contain the same value (proves no exec file namespace collision)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/browser-tools.e2e.ts (add stress test)\n\nContext:\nbrowser_execute_script uses a file-based execution pipeline with unique nonces. Concurrent calls to the same tab must produce distinct exec files. The existing tests only call one script at a time.\n\nChanges:\nAdd a stress test using the existing fixture pattern (mcpServer, testServer, extensionContext, mcpClient). Open a tab, fire 5 concurrent execute_script calls via Promise.all. Verify positional result matching.\n\nConstraints:\n- Use the existing test fixture pattern from browser-tools.e2e.ts\n- Each script is simple: `return 'result-N'`\n- Do NOT modify existing tests"
+    },
+    {
+      "id": "US-003",
+      "title": "browser_execute_script on tab closed mid-execution returns error within 5s",
+      "description": "Call execute_script with a 3s async operation, close the tab after 500ms. The call MUST return isError=true within 5s of tab closure. Error MUST reference the tab being gone, not be a generic timeout.",
+      "acceptanceCriteria": [
+        "browser_execute_script fires with code: 'return new Promise(resolve => setTimeout(() => resolve(\"slow\"), 3000))'",
+        "Tab is closed 500ms after the call starts",
+        "Result arrives within 5s of tab closure with isError=true",
+        "Error content matches /tab|cannot access/i (not /timed out/)",
+        "A fresh execute_script on a different tab succeeds afterward (system not corrupted)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/browser-tools.e2e.ts (add stress test)\n\nContext:\nWhen a tab closes during script execution, the exec file pipeline must detect the tab removal and fail fast. The 5s bound ensures it doesn't hang for the full 25s SCRIPT_TIMEOUT_MS.\n\nChanges:\nAdd stress test. Open tab, fire slow execute_script, close tab after 500ms via mcpClient.callTool('browser_close_tab', {tabId}). Measure elapsed time. Verify error within 5s. Then open new tab and verify execute_script works on it.\n\nConstraints:\n- Timing is measured from tab close to result arrival\n- The error must NOT be a generic timeout — must identify tab loss"
+    },
+    {
+      "id": "US-004",
+      "title": "Tab churn 5 cycles — tool dispatch always recovers",
+      "description": "Close and reopen the matching tab 5 times. After each cycle, tool dispatch MUST recover. The final state MUST have exactly 1 matching tab and tools MUST work immediately.",
+      "acceptanceCriteria": [
+        "Loop 5 times: close matching tab, verify tool call fails with isError=true within 10s, open new matching tab, verify tool call succeeds within 15s with correct message",
+        "After all 5 cycles, a final echo call succeeds in under 3s (immediate, no recovery delay)",
+        "Health endpoint shows exactly 1 matching tab with tabState='ready'"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/tool-dispatch.e2e.ts (add stress test)\n\nContext:\nThis tests the tab state machine under rapid churn. Each close must clean up state, each open must re-inject and reach ready. The 3s bound on the final call ensures no accumulated recovery latency.\n\nChanges:\nAdd stress test using setupToolTest. Loop: close page, waitForToolResult with isError=true, open new tab via openTestAppTab, waitForToolResult with isError=false. After 5 cycles, make final call with tight timeout.\n\nConstraints:\n- Must wait for server health to confirm tab state between cycles\n- Use the existing openTestAppTab and waitForToolResult helpers"
+    },
+    {
+      "id": "US-005",
+      "title": "Auth toggle mid-execution — in-flight call MUST complete, next call MUST fail",
+      "description": "Start a slow tool call, toggle auth off while it's running. The in-flight call MUST succeed (auth checked once at dispatch entry). The next call MUST return unavailable/not ready.",
+      "acceptanceCriteria": [
+        "Slow tool call (3s via testServer.setSlow) starts and is in-flight",
+        "testServer.setAuth(false) called 500ms after dispatch",
+        "In-flight call completes with isError=false and correct message 'in-flight'",
+        "Subsequent call returns isError=true matching /unavailable|not ready/",
+        "After setAuth(true), tool call recovers with correct message 'recovered'"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/tool-dispatch.e2e.ts (add stress test)\n\nContext:\nThe extension checks isReady() BEFORE dispatching the tool to the page. Once the check passes and the fetch to the test server begins, toggling auth off should not affect the in-flight HTTP request. The isReady check is a one-time gate, not continuous monitoring.\n\nChanges:\nAdd stress test using setupToolTest. Set testServer.setSlow(3000). Fire echo with message 'in-flight' (don't await). Wait 500ms. setAuth(false). Await the call — MUST succeed. Reset slow. Call echo again — MUST fail. setAuth(true). waitForToolResult — MUST succeed.\n\nConstraints:\n- The in-flight call MUST succeed (hard assertion, not 'success or error')\n- If it fails, the system incorrectly re-checks auth during dispatch — that's a bug"
+    },
+    {
+      "id": "US-006",
+      "title": "5 rapid POST /reload does not corrupt browser permission",
+      "description": "Fire 5 concurrent POST /reload requests. After all complete, browser permission MUST still be 'auto' on disk, tools/list MUST be non-empty, and config.json MUST be valid JSON.",
+      "acceptanceCriteria": [
+        "5 concurrent POST /reload requests all return HTTP 200",
+        "After all complete, config.json on disk parses as valid JSON without error",
+        "Browser permission in config.json is 'auto' (not corrupted or missing)",
+        "mcpClient.listTools() returns a non-empty array"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/browser-permission-persist.e2e.ts (add stress test)\n\nContext:\nThis file was created to catch permissions lost during reload. Concurrent reloads could cause read-modify-write races on config.json. The test proves the config mutex serialization works.\n\nChanges:\nAdd stress test. Start with browser permission 'auto'. Fire 5 POST /reload via Promise.all. After all settle, read config.json, verify JSON.parse succeeds, verify permissions.browser.permission === 'auto', verify listTools returns tools.\n\nConstraints:\n- All 5 reloads fire concurrently (not sequentially)\n- The config file must be valid JSON after (no partial writes)"
+    }
+  ]
+}

@@ -1,0 +1,107 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add correctness-focused stress tests to tab-state-sync, multi-tab-targeting, multi-instance, adapter-hash, and adapter-files-eager E2E files. Tests cover tab churn, targeted dispatch on closed tabs, instance isolation, hash verification, and adapter file integrity.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "5-tab churn produces exact final tab count",
+      "description": "Open 5 tabs, close 3 immediately. The final health MUST show exactly 2 tabs with ready=true. No phantom tabs from race conditions.",
+      "acceptanceCriteria": [
+        "5 tabs opened in tight loop to matching URL",
+        "Tabs 1, 3, 5 closed immediately (no await between closes)",
+        "Within 30s, plugin_list_tabs reports exactly 2 tabs, both ready=true",
+        "The 2 remaining tabIds are distinct",
+        "e2e-test_echo dispatches successfully to one of the remaining tabs"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/tab-state-sync.e2e.ts (add stress test)\n\nContext:\nRapid tab open/close stresses the pluginLocks serialization and checkTabStateChanges debouncing. Race conditions between onCreated/onRemoved events could produce phantom tabs.\n\nChanges:\nAdd stress test. Open 5 tabs to testServer.url. Close tabs at index 0, 2, 4 (the 1st, 3rd, 5th). Poll plugin_list_tabs until exactly 2 tabs with ready=true. Verify distinct tabIds. Make a tool call.\n\nConstraints:\n- Close tabs immediately after opening (no await for ready state between operations)\n- The exact count (2) is the key assertion — not >= 2"
+    },
+    {
+      "id": "US-002",
+      "title": "Targeted dispatch to closed tab returns error, other tab unaffected",
+      "description": "With 2 tabs open, close tab A, then dispatch with tabId=A. MUST return isError=true within 10s with error identifying the tab as closed. Tab B MUST NOT be used as fallback.",
+      "acceptanceCriteria": [
+        "2 matching tabs opened, tabIds recorded",
+        "Tab A closed",
+        "e2e-test_echo with tabId=tabA returns isError=true within 10s",
+        "Error matches /not found|no usable|closed/i",
+        "e2e-test_echo with tabId=tabB succeeds with correct message (proving B was not used as fallback for A's call)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-tab-targeting.e2e.ts (add stress test)\n\nContext:\nExplicit tabId targeting must NOT silently fall back to another tab. The user chose a specific tab for a reason. If the tab is gone, they need an error, not a silent redirect.\n\nChanges:\nAdd stress test. Open 2 tabs, get tabIds from plugin_list_tabs. Close tab A. Call echo with tabId=A. Call echo with tabId=B. Verify A fails and B succeeds.\n\nConstraints:\n- The key assertion: tab B's echo call returns its own message (not A's failed message routed to B)\n- Use multi-tab-targeting.e2e.ts existing patterns for tab ID discovery"
+    },
+    {
+      "id": "US-003",
+      "title": "Concurrent dispatch to alpha and beta instances — no cross-routing",
+      "description": "Fire tool calls to two different plugin instances concurrently. Each MUST route to its correct backend server. Zero cross-contamination.",
+      "acceptanceCriteria": [
+        "Two instances configured (alpha, beta) with separate test servers",
+        "Concurrent echo calls: one to alpha, one to beta via Promise.all",
+        "Both return isError=false",
+        "alphaServer received exactly 1 echo, betaServer received exactly 1 echo",
+        "alphaServer's echo message is 'from-alpha', betaServer's is 'from-beta' (no swap)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance.e2e.ts (add stress test)\n\nContext:\nWith multi-instance plugins, the instance parameter maps to a specific tab/URL. Concurrent dispatch could cause a race in the tab-selection logic, routing both calls to the same instance.\n\nChanges:\nAdd stress test following the existing multi-instance pattern. Set up alpha and beta test servers. Open tabs for each. Fire concurrent echo calls with instance parameter. Verify each server received its own call.\n\nConstraints:\n- Use the test server's invocation recording to verify which server received which call\n- The Promise.all fires truly concurrent — not sequential"
+    },
+    {
+      "id": "US-004",
+      "title": "Adapter hash matches disk file after 3 consecutive reconnects",
+      "description": "After 3 hot reloads where the IIFE hasn't changed, extension_check_adapter MUST report hashMatch=true and the hash MUST equal the SHA-256 of the file on disk.",
+      "acceptanceCriteria": [
+        "3 consecutive hot reloads triggered, each followed by waitForExtensionConnected",
+        "extension_check_adapter reports hashMatch=true for the tab",
+        "The reported hash equals the SHA-256 of the adapter file read from disk",
+        "Tool dispatch still works after the reconnects"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/adapter-hash.e2e.ts (add stress test)\n\nContext:\nThe existing tests check hashMatch=true but don't verify against the disk file. The extension could have a stale cached hash that coincidentally matches the server's equally stale value. Computing the disk hash is ground truth.\n\nChanges:\nAdd stress test. Use the existing adapter-hash test pattern. After 3 reloads, read the adapter file from configDir/extension/adapters/, compute SHA-256 via crypto.createHash('sha256').update(content).digest('hex'). Compare against extension_check_adapter's reported hash.\n\nConstraints:\n- The adapter file name includes a hash suffix — use fs.readdirSync + filter to find it\n- Use node:crypto for the SHA-256 computation\n- The hash from extension_check_adapter may be truncated — check the actual format"
+    },
+    {
+      "id": "US-005",
+      "title": "Adapter file cleanup on plugin removal — no orphaned files",
+      "description": "Start with a plugin configured (adapter file exists). Remove the plugin from config + hot reload. The adapter file MUST be deleted. Re-add the plugin — a new adapter file MUST be created.",
+      "acceptanceCriteria": [
+        "With plugin configured, exactly 1 adapter file (e2e-test-*.js) exists in adapters dir",
+        "After removing plugin from config + hot reload, 0 adapter files for e2e-test exist",
+        "After re-adding plugin + hot reload, exactly 1 adapter file exists",
+        "The re-created file is non-empty and contains valid IIFE structure"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/adapter-files-eager.e2e.ts (add stress test)\n\nContext:\nThe eager adapter write logic must also CLEAN UP files for removed plugins. If it only adds files but never removes them, the extension would inject stale adapters for uninstalled plugins.\n\nChanges:\nAdd stress test. Start with plugin configured, verify 1 adapter file exists. Remove plugin from config, trigger hot reload, verify 0 adapter files. Re-add plugin, trigger hot reload, verify 1 adapter file with valid content.\n\nConstraints:\n- Use fs.readdirSync on the adapters directory, filter for e2e-test-*.js\n- Verify the file content starts with '(' or 'void' (valid IIFE prefix)\n- Follow the existing adapter-files-eager.e2e.ts pattern"
+    },
+    {
+      "id": "US-006",
+      "title": "Navigate away and back — exactly 1 tab entry, no duplicates",
+      "description": "Navigate a matching tab to a non-matching URL, then back. plugin_list_tabs MUST show exactly 1 tab (not 2 from duplicate registration). Tool dispatch MUST succeed.",
+      "acceptanceCriteria": [
+        "Matching tab opened, wait for ready state",
+        "Navigate to non-matching URL (about:blank), wait for tab removed from plugin state",
+        "Navigate back to matching URL, wait for ready state",
+        "plugin_list_tabs reports exactly 1 tab (not 2 duplicate entries)",
+        "The 1 tab has ready=true",
+        "e2e-test_echo succeeds"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/tab-state-sync.e2e.ts (add stress test)\n\nContext:\nNavigating back could re-register the tab without clearing the stale 'closed' entry, creating a duplicate. The extension's onUpdated handler must update the existing entry for the same tabId, not create a new one.\n\nChanges:\nAdd stress test. Open matching tab, wait for ready. Navigate to about:blank, wait for tab gone from health. Navigate back, wait for ready. Check plugin_list_tabs — MUST be exactly 1 tab. Call echo.\n\nConstraints:\n- Use page.goto('about:blank') for away navigation\n- Use page.goto(testServer.url) for back navigation\n- The exact count of 1 is the key assertion"
+    }
+  ]
+}

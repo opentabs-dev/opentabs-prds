@@ -1,0 +1,106 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add correctness-focused stress tests to security, mcp-session-persistence, permissions, secret-rotation, and multi-connection E2E files. Tests cover concurrency limits, session persistence, permission isolation, auth boundaries, and multi-connection dispatch routing.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Concurrency limit boundary — 5th succeeds, 6th rejected with specific error",
+      "description": "Fire 6 concurrent slow tool calls. Exactly 5 MUST dispatch. The 6th MUST be rejected with 'Too many concurrent dispatches' containing the plugin name and limit.",
+      "acceptanceCriteria": [
+        "5 slow_with_progress calls (10s each) dispatch successfully",
+        "6th concurrent call returns isError=true with text containing 'Too many concurrent dispatches'",
+        "Error text contains 'e2e-test' (plugin name) and 'limit' or '5'",
+        "After the first batch completes, 5 new calls all succeed (slot leak check)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/security.e2e.ts (add stress test)\n\nContext:\nMAX_CONCURRENT_DISPATCHES_PER_PLUGIN = 5 in mcp-tool-dispatch.ts. The existing concurrency test fires exactly at the limit but doesn't test the boundary (5 succeeds, 6 fails). This also tests that slots are freed after completion (no slot leak).\n\nChanges:\nAdd stress test. Fire 5 slow_with_progress (durationMs=10000). While those are in-flight, fire a 6th — assert it's rejected immediately. Wait for the 5 to complete. Then fire 5 new calls — all must succeed (proves slots were freed).\n\nConstraints:\n- The 6th call must be rejected IMMEDIATELY (not after 10s) — it fails at dispatch entry\n- The second batch of 5 proves no slot leak from the first batch"
+    },
+    {
+      "id": "US-002",
+      "title": "Config mutex serializes 10 concurrent permission writes without data loss",
+      "description": "Fire 10 concurrent setToolPermission calls on different tools. ALL 10 MUST be persisted in config.json. No write may be silently dropped by a read-modify-write race.",
+      "acceptanceCriteria": [
+        "10 concurrent config.setToolPermission calls fire via Promise.all (different tool names)",
+        "All 10 return ok:true",
+        "config.json on disk contains all 10 tool permission overrides",
+        "No JSON parse errors in server logs"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/security.e2e.ts (add stress test)\n\nContext:\nThe configWriteMutex must serialize concurrent writes. Without it, concurrent read-modify-write cycles would overwrite each other (lost update problem). The security.e2e.ts file already tests the mutex for single writes.\n\nChanges:\nAdd stress test. Use the MCP client via raw WebSocket (sendServerRequest) or via the existing mcpClient pattern to call config.setToolPermission 10 times concurrently. Read config.json after all complete, verify all 10 tool overrides exist.\n\nConstraints:\n- Use 10 different tool names from the e2e-test plugin (it has 29 tools)\n- The test proves the mutex works under contention — if any write is lost, it's a serialization bug"
+    },
+    {
+      "id": "US-003",
+      "title": "Session ID survives 5 rapid hot reloads without re-initialization",
+      "description": "Trigger 5 hot reloads rapidly. The MCP client's session ID MUST remain identical throughout. listTools MUST work without re-initialization after the final reload.",
+      "acceptanceCriteria": [
+        "Record client.sessionId after initialization",
+        "5 hot reloads triggered in succession (500ms between each)",
+        "After final 'Hot reload complete', client.sessionId is identical to original",
+        "client.listTools() returns expected tools without calling client.initialize() again"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/mcp-session-persistence.e2e.ts (add stress test)\n\nContext:\nThe dev proxy assigns a stable session ID and maps it to each new worker's internal session. Rapid reloads could cause the proxy to lose session state if the mapping is cleared during worker restart.\n\nChanges:\nAdd stress test. Initialize client, record sessionId. Fire 5 triggerHotReload with 500ms spacing. Wait for final 'Hot reload complete'. Verify sessionId unchanged. Call listTools without re-init.\n\nConstraints:\n- The client must NOT re-initialize between reloads\n- Access sessionId via the client object (check MCP client interface for the property)"
+    },
+    {
+      "id": "US-004",
+      "title": "Permission auto→off during in-flight call — in-flight completes, next call disabled",
+      "description": "Change permission from 'auto' to 'off' while a tool call is in-flight. The in-flight call MUST complete (permission checked once at entry). The next call MUST return 'currently disabled'.",
+      "acceptanceCriteria": [
+        "slow_with_progress (5s) starts with permission 'auto'",
+        "Permission changed to 'off' via config write + POST /reload after 500ms",
+        "In-flight call completes successfully (isError=false) — it already passed the permission check",
+        "After reload, e2e-test_echo returns isError=true with 'currently disabled' or 'not been reviewed'"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/permissions.e2e.ts (add stress test)\n\nContext:\nPermission is checked once at dispatch entry (mcp-tool-dispatch.ts). An in-flight call that already passed MUST complete. This is the same principle as stress-mcp-dispatch.e2e.ts but tested through the permissions.e2e.ts patterns.\n\nChanges:\nAdd stress test following the permissions.e2e.ts setup pattern. Start slow call, change permission mid-flight via config + reload, verify in-flight succeeds, verify next call fails.\n\nConstraints:\n- The in-flight call MUST succeed (hard assertion) — this is a correctness spec, not a 'success or error' hedge"
+    },
+    {
+      "id": "US-005",
+      "title": "Double secret rotation — only final secret valid, previous two rejected with 401",
+      "description": "Rotate secret twice (A→B→C). After both rotations, only secret C MUST authenticate. Secrets A and B MUST both return 401.",
+      "acceptanceCriteria": [
+        "Start with secret A, verify /audit returns 200",
+        "Rotate to B: write B to auth.json, POST /reload with A, wait for reload",
+        "/audit with A returns 401, /audit with B returns 200",
+        "Rotate to C: write C to auth.json, POST /reload with B, wait for reload",
+        "/audit with A returns 401, /audit with B returns 401, /audit with C returns 200",
+        "New MCP client with secret C initializes successfully"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/secret-rotation.e2e.ts (add stress test)\n\nContext:\nThis tests that the server does NOT accumulate old secrets. Each rotation must invalidate the previous secret immediately. If old secrets persist, it's a credential leak vulnerability.\n\nChanges:\nAdd stress test. Start server, record secret A. Rotate to B, verify A rejected. Rotate to C, verify both A and B rejected, C works.\n\nConstraints:\n- POST /reload authenticates with the CURRENT in-memory secret (not the new one on disk)\n- Use /audit endpoint for auth testing (lightweight, returns 401 on bad auth)"
+    },
+    {
+      "id": "US-006",
+      "title": "Multi-connection: disconnecting one connection returns dispatch error within 5s, other stays functional",
+      "description": "With two connections, dispatch a tool via connection Alpha, disconnect Alpha mid-dispatch. The call MUST return error within 5s (not 30s timeout). Connection Beta MUST remain functional.",
+      "acceptanceCriteria": [
+        "Two WebSocket connections (Alpha, Beta) established",
+        "Tool dispatch sent via Alpha's connection for a slow operation",
+        "Alpha disconnected 500ms after dispatch",
+        "The dispatch resolves with isError=true within 5s of disconnect",
+        "Error message indicates connection/extension lost (not generic timeout)",
+        "A browser tool call routed through Beta succeeds after Alpha's disconnect"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-connection.e2e.ts (add stress test)\n\nContext:\nWhen a connection disconnects, all pending dispatches for that connection must be rejected immediately. The dispatch pending-response map must be cleaned up on disconnect. If not, dispatches hang for the full 30s timeout.\n\nChanges:\nAdd stress test using createRawWsConnection pattern from the existing multi-connection tests. Connect Alpha and Beta. Send a tool dispatch via Alpha (don't await response). Close Alpha's WebSocket. Verify the dispatch error arrives within 5s. Then send a request via Beta and verify it works.\n\nConstraints:\n- Must use the raw WebSocket pattern (not MCP client) to control connection lifecycle\n- The 5s bound is the key correctness check — 30s means the cleanup didn't fire"
+    }
+  ]
+}
