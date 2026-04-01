@@ -1,0 +1,217 @@
+# Ralph Progress Log
+PRD: prd-2026-03-31-171850-multi-instance-robustness-4eb0e0~running.json
+Started: Wed Apr  1 00:19:25 UTC 2026
+---
+
+## Codebase Patterns
+- `deriveMatchPattern` in `platform/mcp-server/src/settings-resolver.ts` uses `url.host` (includes port for non-standard ports) rather than `url.hostname` (strips port)
+- Chrome match patterns support ports: `*://hostname:port/*` is valid syntax
+- `new URL().host` strips default ports (80 for HTTP, 443 for HTTPS) automatically — no manual port filtering needed
+- Three locations compare tab URLs to match patterns: `findTabForInstance` (mcp-tool-dispatch.ts), `annotateTabsWithInstance` (plugin-list-tabs.ts), `resolvePerTabSettings` (iife-injection.ts) — all need `.host` instead of `.hostname` for port-aware matching
+- **E2E multi-instance tests must use localhost with different ports, NOT 127.0.0.1** — `chrome.tabs.query` in Playwright Chromium doesn't reliably match IP-address-based match patterns. The `SameHostTestContext` (different ports) approach is the proven pattern.
+
+---
+
+## 2026-04-01 00:21 UTC - US-001
+- Changed `deriveMatchPattern` to use `url.host` instead of `url.hostname` so non-standard ports produce distinct Chrome match patterns
+- Updated JSDoc comment to reflect port-aware behavior
+- Added 8 new unit tests: non-standard port, IP with port, explicit port 80 (stripped), explicit port 443 (stripped), HTTPS with non-standard port, two localhost instances on different ports, standard HTTPS (no port), standard HTTP (no port)
+- All existing tests pass unchanged (they use standard-port HTTPS URLs where host === hostname)
+- Files changed: `platform/mcp-server/src/settings-resolver.ts`, `platform/mcp-server/src/settings-resolver.test.ts`
+- **Learnings for future iterations:**
+  - The URL constructor's `.host` property is the ideal tool for port-aware hostname extraction — it handles default port stripping automatically
+  - Existing tests didn't need updating because all used standard-port URLs (https://...)
+  - The `hostnameFromPattern` regex in mcp-tool-dispatch.ts and plugin-list-tabs.ts already captures host:port (regex is `([^/]+)`) — it's the comparison sites that need `.host`
+---
+
+## 2026-04-01 00:26 UTC - US-002
+- Changed `.hostname` to `.host` in three locations: `findTabForInstance` (mcp-tool-dispatch.ts), `annotateTabsWithInstance` (plugin-list-tabs.ts), `resolvePerTabSettings` (iife-injection.ts)
+- Updated JSDoc comments to reflect host:port matching
+- Added 2 new tests to mcp-tool-dispatch.test.ts: port-aware instance match, wrong-port no-match
+- Added 2 new tests to plugin-list-tabs.test.ts: port-aware instance annotation, wrong-port no-label
+- Existing tests pass unchanged (all use standard-port URLs where `.host` === `.hostname`)
+- Files changed: `platform/mcp-server/src/mcp-tool-dispatch.ts`, `platform/mcp-server/src/mcp-tool-dispatch.test.ts`, `platform/mcp-server/src/browser-tools/plugin-list-tabs.ts`, `platform/mcp-server/src/browser-tools/plugin-list-tabs.test.ts`, `platform/browser-extension/src/iife-injection.ts`
+- **Learnings for future iterations:**
+  - The `hostnameFromPattern` regex already captures ports (`[^/]+` matches `hostname:port`) — no regex change needed
+  - `resolvePerTabSettings` in iife-injection.ts uses a different approach (string replace instead of regex) to extract pattern host, but the `.hostname` → `.host` fix is the same
+  - The `pattern.replace('*://', '').replace('/*', '')` approach in iife-injection.ts correctly preserves the port
+---
+
+## 2026-04-01 00:28 UTC - US-003
+- Replaced fragile `Object.values(urlMap)[0]` fallback in `resolvePerTabSettings` with empty string `''`
+- Added `console.warn` logging the unmatched tab URL and field name for debuggability
+- Files changed: `platform/browser-extension/src/iife-injection.ts`
+- **Learnings for future iterations:**
+  - The `resolvePerTabSettings` function runs in Chrome extension context (bundled into the extension), so `console.warn` is correct (not the server-side logger)
+  - The change is minimal — only the else branch at lines 285-289 was modified
+---
+
+## 2026-04-01 00:31 UTC - US-004
+- Added duplicate pattern detection in `resolvePluginSettings` inner loop: checks both `validEntries` (same field) and `instanceMap` (previous fields) for existing patterns before adding a new one
+- Logs `log.warn` with plugin name, instance names, and the duplicate pattern string
+- No behavioral change — duplicate patterns are still stored (last-write-wins), only a warning is logged
+- Added 3 unit tests: same-field duplicate warning, cross-field duplicate warning, and no-warn for distinct patterns
+- Files changed: `platform/mcp-server/src/settings-resolver.ts`, `platform/mcp-server/src/settings-resolver.test.ts`
+- **Learnings for future iterations:**
+  - `vi.spyOn(log, 'warn').mockImplementation(() => {})` is the standard pattern for asserting log.warn calls in mcp-server tests
+  - The `log` import from `./logger.js` was already present in `settings-resolver.ts` so no new import was needed
+  - `Object.entries(validEntries).find(([, p]) => p === pattern)` is a clean way to find duplicate values in a record
+---
+
+## 2026-04-01 00:35 UTC - US-005
+- Swapped tabId vs instance precedence in `handlePluginToolCall`: when both are provided, tabId now takes precedence (more specific) and a `log.warn` is emitted
+- Changed `if (instance !== undefined)` to `if (instance !== undefined && tabId !== undefined) { warn } else if (instance !== undefined) { resolve instance }` — no changes to instance resolution logic itself
+- Updated existing test "instance takes precedence over tabId" → "tabId takes precedence over instance": reversed expected tabId in dispatch assertion, added `vi.spyOn(log, 'warn')` assertion for warning message
+- Added `log` import to test file
+- Files changed: `platform/mcp-server/src/mcp-tool-dispatch.ts`, `platform/mcp-server/src/mcp-tool-dispatch.test.ts`
+- **Learnings for future iterations:**
+  - The `log` import from `./logger.js` was already in the production file but NOT in the test file — always check test file imports separately
+  - The if/else if pattern is clean for precedence swaps: first branch handles the conflict case (both present), second branch handles the single-parameter case
+  - Biome auto-formatted the `expect(warnSpy).toHaveBeenCalledWith(...)` line during pre-commit to be single-line
+---
+
+## 2026-04-01 00:39 UTC - US-006
+- Created `e2e/multi-instance-robust.e2e.ts` with shared infrastructure (`setupSameHostTest`, `cleanupSameHostTest`, `waitForReadyTabs`, `openTabAndWaitForAdapter`) and the US-006 test
+- Test starts two test servers on ephemeral ports (both localhost), configures them as alpha and beta instances, verifies:
+  - `plugin_list_tabs` shows both tabs with correct instance labels and port-specific URLs
+  - Dispatch with `instance='alpha'` hits only server A (alphaServer)
+  - Dispatch with `instance='beta'` hits only server B (betaServer)
+  - `getConfig('instanceUrl')` returns the correct port-specific URL in each tab
+- Files changed: `e2e/multi-instance-robust.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - The `openTestAppTab` helper in `helpers.ts` handles adapter injection waiting with rich diagnostics — no need for manual `waitForFunction` calls like in `multi-instance.e2e.ts`
+  - Both test servers are on `localhost` (same hostname), so the port-aware pattern derivation from US-001 (`*://localhost:PORT/*`) is essential for this test to pass
+  - The `SameHostTestContext` includes `alphaUrl` and `betaUrl` fields for easy assertion against config values
+  - Biome's `useConsistentArrowReturn` rule requires implicit return for single-expression arrow functions
+---
+
+## 2026-04-01 00:43 UTC - US-007
+- Added `SingleInstanceTestContext` interface and `setupSingleInstanceTest`/`cleanupSingleInstanceTest` helpers for single-instance test scenarios
+- Added E2E test verifying single-instance seamless behavior:
+  - Tool schema does NOT include `instance` property (confirmed via `listTools` schema inspection)
+  - Tool schema does NOT include `instance` in `required` array
+  - `tabId` is still present in schema
+  - Dispatch without `instance` parameter succeeds and hits the test server
+  - `getConfig('instanceUrl')` returns the URL as a string (not a map)
+- Files changed: `e2e/multi-instance-robust.e2e.ts`
+- **Learnings for future iterations:**
+  - The `instance` parameter is only added to tool schemas when `instanceNames.length >= 2` (in mcp-setup.ts line 364)
+  - With a single url-type instance, `resolvePerTabSettings` still resolves the URL map to a single string value per tab — the single entry in the instance map matches correctly
+  - The `setupSingleInstanceTest` helper can be reused for US-014 (URL path variations) which also uses a single instance
+---
+
+## 2026-04-01 00:48 UTC - US-008
+- Added two E2E tests for hot-reload instance addition and removal in `e2e/multi-instance-robust.e2e.ts`
+- Addition test: starts with alpha+beta, starts a third server (gamma), rewrites config to add gamma, triggers POST /reload, waits for tool schema to include gamma in instance enum, opens gamma tab, dispatches to gamma successfully
+- Removal test: starts with alpha+beta, rewrites config removing beta, triggers POST /reload, waits for instance parameter to disappear from schema (single instance), dispatches to beta returns "Unknown instance" error, dispatches to alpha still works without instance param
+- Added `triggerReload` helper function and imported `readTestConfig` and `waitForToolList`
+- Files changed: `e2e/multi-instance-robust.e2e.ts`
+- **Learnings for future iterations:**
+  - `server.secret` is typed as `string | undefined` in the `McpServer` fixture — the `triggerReload` helper must accept `string | undefined` and conditionally set the Authorization header
+  - `readTestConfig` from fixtures.ts returns the parsed `OpentabsConfig` object, which can be mutated and written back via `writeTestConfig` to modify config in place
+  - `waitForToolList` from helpers.ts is the correct way to poll until the tool schema changes after POST /reload — avoids timing issues with `listChanged` notifications
+  - When removing instances down to 1, the `instance` parameter disappears from the tool schema entirely (`instanceNames.length >= 2` check in mcp-setup.ts)
+---
+
+## 2026-04-01 00:51 UTC - US-009
+- Added `CrossHostTestContext` interface and `setupCrossHostTest`/`cleanupCrossHostTest` helpers for tests needing alpha on localhost and beta on 127.0.0.1 (different hostnames)
+- Added E2E test verifying tabId takes precedence over instance when both are provided and disagree:
+  - Sets up alpha (localhost) and beta (127.0.0.1) instances
+  - Gets beta tab's tabId from `plugin_list_tabs`
+  - Dispatches with `instance='alpha'` AND `tabId=<beta_tab_id>`
+  - Verifies beta server received the call (tabId won) and alpha server did not
+- Files changed: `e2e/multi-instance-robust.e2e.ts`
+- **Learnings for future iterations:**
+  - The `CrossHostTestContext` setup can be reused for US-010, US-011, US-012, US-013, and US-015 which all need localhost vs 127.0.0.1 distinction
+  - Biome prefers optional chaining (`betaTab?.tabId`) over non-null assertion (`betaTab!.tabId`) — add an explicit `expect(betaTabId).toBeDefined()` after to satisfy both the linter and the type checker
+  - The test server's `.url` property returns `http://localhost:<port>`, and `.replace('localhost', '127.0.0.1')` creates the alternate hostname URL pointing to the same server
+---
+
+## 2026-04-01 00:53 UTC - US-010
+- Added E2E stress test: 20 sequential echo calls alternating between alpha and beta instances
+- Reuses `CrossHostTestContext` (localhost vs 127.0.0.1) for clear instance distinction
+- Verifies each call returns correct response, alpha receives exactly 10 calls, beta receives exactly 10 calls
+- Files changed: `e2e/multi-instance-robust.e2e.ts`
+- **Learnings for future iterations:**
+  - The `CrossHostTestContext` setup works well for stress tests — no additional infrastructure needed beyond what US-009 established
+  - Sequential dispatch tests are straightforward: loop with `await` ensures ordering, then check invocation counts at the end
+  - `String(i)` is needed in template literals per Biome's style rules
+---
+
+## 2026-04-01 00:57 UTC - US-011
+- Added concurrent burst dispatch E2E stress test in `e2e/multi-instance-robust.e2e.ts`
+- 10 concurrent calls via `Promise.all` — 5 to alpha, 5 to beta — verifying correct routing under parallel load
+- Reuses `CrossHostTestContext` (localhost vs 127.0.0.1) for clear instance distinction
+- Verifies all 10 calls succeed, each returns correct response, alpha gets exactly 5 calls, beta gets exactly 5
+- Files changed: `e2e/multi-instance-robust.e2e.ts`
+- **Learnings for future iterations:**
+  - Biome prefers optional chaining over non-null assertion — destructure `const { client } = ctx` before a closure to avoid needing `ctx!.client` or `ctx?.client` inside `Array.from` callbacks
+  - `Promise.all` with `.then()` chaining is clean for mapping concurrent calls to structured results
+  - The `CrossHostTestContext` setup works well for concurrent tests — no additional infrastructure needed
+---
+
+## 2026-04-01 01:01 UTC - US-012
+- Added `waitForTabCount` helper: polls `plugin_list_tabs` until the e2e-test plugin reports exactly `count` tabs (regardless of readiness), complementing the existing `waitForReadyTabs` which waits for a minimum count of ready tabs
+- Added E2E test for full tab lifecycle: open → close → error → reopen → recover
+  - Sets up alpha (localhost) and beta (127.0.0.1) instances using `CrossHostTestContext`
+  - Verifies dispatch to both instances works before closing
+  - Closes beta tab, waits for tab mapping to update to 1 tab
+  - Verifies dispatch to beta returns error while alpha still works
+  - Reopens beta tab, waits for 2 ready tabs
+  - Verifies dispatch to beta works again after reopen
+- Files changed: `e2e/multi-instance-robust.e2e.ts`
+- **Learnings for future iterations:**
+  - `waitForTabCount` uses exact count matching (not `>=` like `waitForReadyTabs`) to detect tab removal
+  - After `page.close()`, the extension's `chrome.tabs.onRemoved` listener fires and updates the tab mapping — polling `plugin_list_tabs` with `waitForTabCount` catches this reliably
+  - `let betaPage = ...` (not `const`) is needed since the page reference is reassigned when reopening the tab
+  - The `CrossHostTestContext` (localhost vs 127.0.0.1) works well for tab lifecycle tests — different hostnames make assertions clearer
+---
+
+## 2026-04-01 01:08 UTC - US-014
+- Added E2E test verifying URL path variations in pattern derivation in `e2e/multi-instance-robust.e2e.ts`
+- Reuses `SingleInstanceTestContext` with config rewrite: changes instance URL to include a path (`/grafana/`)
+- Uses POST /reload to pick up config change, then opens a tab to the server root
+- Verifies: dispatch succeeds (pattern `*://localhost:PORT/*` matches any path), getConfig returns original URL with path
+- Files changed: `e2e/multi-instance-robust.e2e.ts`
+- **Learnings for future iterations:**
+  - The `setupSingleInstanceTest` helper sets up config with a default instance — to test path variations, rewrite the config with `readTestConfig`/`writeTestConfig` and trigger POST /reload
+  - The `triggerReload` helper (defined earlier in the file for US-008) is reusable for any test that modifies config mid-test
+  - Pattern derivation strips paths: `http://localhost:PORT/grafana/` → `*://localhost:PORT/*` — this is intentional, the pattern matches all paths on the host:port
+  - `getConfig` returns the original config URL (with path), not the derived pattern — this is the correct behavior for plugin tools that need the instance's base URL
+---
+
+## 2026-04-01 01:10 UTC - US-015
+- Added E2E stress test for per-tab getConfig isolation under concurrent load in `e2e/multi-instance-robust.e2e.ts`
+- 10 concurrent `e2e-test_sdk_get_config` calls via `Promise.all` — 5 to alpha instance, 5 to beta instance
+- Reuses `CrossHostTestContext` (localhost vs 127.0.0.1) for clear instance distinction
+- Verifies all alpha calls return the alpha URL, all beta calls return the beta URL, with no cross-contamination
+- Files changed: `e2e/multi-instance-robust.e2e.ts`
+- **Learnings for future iterations:**
+  - The `CrossHostTestContext` setup pattern works well for all concurrent tests — destructure `{ client, alphaUrl, betaUrl }` before the `Array.from` closure to avoid optional chaining issues
+  - `resolvePerTabSettings` creates a new object each invocation, so there's no shared mutable state — concurrent getConfig calls are inherently safe
+  - The test pattern mirrors US-011 (concurrent burst dispatch) but uses `e2e-test_sdk_get_config` instead of `e2e-test_echo`
+---
+
+## 2026-04-01 01:04 UTC - US-013
+- Added E2E test verifying all instance tabs closed returns appropriate errors and plugin reports `closed` state
+- Reuses `CrossHostTestContext` (localhost vs 127.0.0.1) for clear instance distinction
+- Test flow: open both tabs → verify dispatch works → close both tabs → wait for 0 tabs → verify dispatch to both alpha and beta returns error → verify `plugin_list_tabs` reports `state: 'closed'` and empty tabs array
+- Files changed: `e2e/multi-instance-robust.e2e.ts`
+- **Learnings for future iterations:**
+  - `waitForTabCount(client, 0)` works correctly — when no entry exists, the helper returns true for count===0; when entry exists with empty tabs, `entry.tabs.length === 0` matches
+  - `plugin_list_tabs` reports `state: 'closed'` (from `mapping?.state ?? 'closed'` fallback) and `tabs: []` when all tabs are closed
+  - The test is placed before the US-012 tab close/reopen test since US-013 has higher priority number (13 > 12) but was implemented later
+---
+
+## 2026-04-01 01:39 UTC - US-016
+- Added E2E test verifying duplicate hostname warning is logged when two instances derive the same match pattern
+- Test configures `prod` and `staging` instances both pointing to same host:port (different paths) → verifies server logs contain "instance routing will be ambiguous" warning naming both instances
+- Also verifies dispatch still works despite duplicate patterns (last-write-wins behavior)
+- **Fixed 10 pre-existing E2E failures** across `multi-instance.e2e.ts` and `multi-instance-robust.e2e.ts`: all cross-host tests used `127.0.0.1` which `chrome.tabs.query` in Playwright Chromium doesn't match reliably. Changed `CrossHostTestContext` to alias `SameHostTestContext` (both on localhost, different ports) and updated all `multi-instance.e2e.ts` tests to use `openTestAppTab` with `ctx.betaServer.url` directly instead of manual `127.0.0.1` replacement
+- Files changed: `e2e/multi-instance-robust.e2e.ts`, `e2e/multi-instance.e2e.ts`
+- **Learnings for future iterations:**
+  - `chrome.tabs.query` in Playwright Chromium does NOT reliably match IP-address-based match patterns like `*://127.0.0.1:PORT/*` — use hostname-based patterns (localhost) instead
+  - `server.logs` in the E2E fixtures captures both stdout and stderr, so `log.warn` output from the MCP server is available via `waitForLog` or direct `server.logs.find()`
+  - The `waitForLog` helper is the right way to wait for server-side warning messages — it polls until the substring appears in the accumulated logs
+  - The duplicate pattern warning is logged during settings resolution at server startup, so `waitForLog` catches it before the extension is even connected
+---
