@@ -1,0 +1,79 @@
+# Ralph Progress Log
+PRD: prd-2026-04-01-101830-fix-stale-update-notification-e13cd3~running.json
+Started: Wed Apr  1 17:19:09 UTC 2026
+---
+
+## Codebase Patterns
+- `pruneStaleState` in `platform/mcp-server/src/reload.ts` runs after every reload (both `performReload` and `performConfigReload`) via `reloadCore`
+- `npmPackageName` is set from `pkg.name` for ALL plugins (local and npm), not just npm plugins — the loader sets it unconditionally
+- `OutdatedPlugin.name` matches `RegisteredPlugin.npmPackageName` (both are npm package names like `opentabs-plugin-slack`)
+- The `createPluginDir` test helper creates plugins with version `1.0.0` and `npmPackageName` of `opentabs-plugin-${name}`
+- TypeScript strict mode requires optional chaining on array index access (e.g., `arr[0]?.field`)
+
+## 2026-04-01 17:22 UTC - US-001
+- Changed `pruneStaleState` to build a `Map<npmPackageName, version>` instead of a `Set<npmPackageName>`, then filter outdatedPlugins by both existence AND version mismatch
+- Added two unit tests: one for version-match pruning (entry removed when installed version == latestVersion) and one for retention (entry kept when installed version < latestVersion)
+- Files changed:
+  - `platform/mcp-server/src/reload.ts` (pruneStaleState function, lines 128-137)
+  - `platform/mcp-server/src/reload.test.ts` (two new tests after line 347)
+- **Learnings for future iterations:**
+  - The existing test at line 324 tests local plugins with no matching npm entry — both entries are pruned. This still passes because the new filter checks `npmPkgVersions.has(o.name)` first.
+  - `npmPackageName` is always set from `pkg.name` in loader.ts:440, even for local plugins. The field name is misleading.
+---
+
+## 2026-04-01 17:26 UTC - US-002
+- Added E2E test `update notification clears after POST /reload when installed version matches latestVersion` in a new `test.describe('Side panel — pruneStaleState clears update after reload')` block
+- Test injects outdated data where `latestVersion` equals the plugin's actual installed version, triggers `POST /reload`, and verifies the update dot and menu item disappear
+- Files changed:
+  - `e2e/side-panel-plugin-update.e2e.ts` (new test describe block added before the stress tests)
+- **Learnings for future iterations:**
+  - The `setOutdatedPlugins` helper blindly stores whatever data you inject — the server doesn't validate versions against the registry, so you can set `latestVersion` to the current installed version to test pruning
+  - The `POST /reload` endpoint triggers `pruneStaleState` which is the actual code path that prunes stale outdated entries
+  - Pattern for testing pruneStaleState: inject stale data → trigger reload → verify UI updates
+---
+
+## 2026-04-01 17:30 UTC - US-003
+- Extended the existing 'POST /reload preserves update dot when plugin has a pending update' test (line 180) to also verify the 'Update to v99.0.0' menu item remains visible after reload
+- Did NOT add a new test — the existing test already covered the dot persistence scenario; only the menu item assertion was missing
+- Updated the comment to reflect the version-aware pruning behavior
+- Files changed:
+  - `e2e/side-panel-plugin-update.e2e.ts` (added menu item assertions to existing test at line 231)
+- **Learnings for future iterations:**
+  - When the PRD says "if existing test covers this, add a comment rather than duplicating" — check the existing test's assertions against the acceptance criteria first. Add only the missing assertions.
+  - The existing reload-preserves-update test was missing menu item verification — the update dot check alone is not sufficient since the dot and menu item are separate UI elements driven by the same data
+---
+
+## 2026-04-01 17:32 UTC - US-004
+- Added E2E stress test `rapid POST /reload spam does not corrupt update notification state` in a new `test.describe('stress — rapid reload spam with update notification')` block
+- Test injects outdated data (latestVersion: '99.0.0'), fires 5 sequential POST /reload requests with 200ms gaps, then verifies: update dot still visible, exactly one plugin card, zero page errors
+- Follows the same stress test pattern from `side-panel-reload.e2e.ts` (rapid reload spam test)
+- Files changed:
+  - `e2e/side-panel-plugin-update.e2e.ts` (new stress test describe block added between existing stress block and plugin update flow block)
+- **Learnings for future iterations:**
+  - The `button[data-radix-collection-item]` selector with `hasText: 'E2E Test'` is the established pattern for counting plugin cards (no duplicates check)
+  - `test.slow()` is needed for stress tests that involve multiple reloads and settle waits
+  - The reload coalescing logic means not all 5 POSTs necessarily trigger separate reloads — some may be batched, which is expected behavior
+---
+
+## 2026-04-01 17:33 UTC - US-005
+- Added E2E test `simulate-update updates version text in menu and clears update indicator` in the existing `Side panel — plugin update flow` describe block
+- Test verifies: (1) menu shows current version before update, (2) after injecting outdated data, both version and Update menu item are visible, (3) after simulateUpdate, update dot disappears, (4) menu shows new version `v99.0.0`, (5) no Update menu item exists
+- Files changed:
+  - `e2e/side-panel-plugin-update.e2e.ts` (new test added after the existing "successful update" test)
+- **Learnings for future iterations:**
+  - The VersionItem component renders `v{plugin.version}` as a `[role="menuitem"]` — use `sidePanelPage.locator('[role="menuitem"]', { hasText: 'v0.0.84' })` to target it
+  - After `simulateUpdate`, the version menuitem text changes because `plugins.changed` carries the updated version to the rendered PluginMenu component
+  - The existing "successful update" test verified server-side version change via `/health` but didn't check the UI version text — this test fills that gap
+---
+
+## 2026-04-01 17:40 UTC - US-006
+- Added E2E stress test `concurrent simulate-update and POST /reload settle to correct state` in a new `test.describe('stress — concurrent update + reload race condition')` block
+- Test injects outdated data (latestVersion: '99.0.0'), fires simulateUpdate and POST /reload concurrently via Promise.all, then verifies: update dot is gone, exactly one plugin card, zero page errors
+- All Phase 1 (build, type-check, lint, knip, test) and Phase 2 (E2E: 227 passed) checks green
+- Files changed:
+  - `e2e/side-panel-plugin-update.e2e.ts` (new stress test describe block)
+- **Learnings for future iterations:**
+  - `Promise.all` with simulateUpdate and POST /reload works because both operations are idempotent in their effect on the outdated entry — simulateUpdate clears it directly, and reload's pruneStaleState also clears it (since the version now matches)
+  - The 3-second settle wait after concurrent operations is sufficient for the side panel to process both `plugins.changed` notifications
+  - `test.slow()` is needed for stress tests that involve concurrent server operations and settle waits
+---
