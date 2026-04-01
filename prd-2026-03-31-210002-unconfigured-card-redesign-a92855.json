@@ -1,0 +1,57 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Redesign unconfigured plugin cards so they are forced open (expanded, non-collapsible) with the Configure button always visible. Remove the subtle 'Needs Setup' badge and gear icon from the header — the expanded state itself is the indicator.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Remove Needs Setup badge and make unconfigured cards non-collapsible in PluginCard",
+      "description": "Remove the 'Needs Setup' badge + Settings icon from the PluginCard header. Disable the accordion trigger and hide the chevron when the plugin is unconfigured. The Configure button in the accordion content (already exists) becomes the primary CTA, always visible because the card is forced open.",
+      "acceptanceCriteria": [
+        "The 13-line block rendering the Needs Setup badge + Settings icon + Tooltip (lines 259-271) is removed from PluginCard.tsx",
+        "AccordionPrimitive.Trigger has disabled={isUnconfigured} and cursor-default class when unconfigured",
+        "ChevronDown is conditionally rendered: hidden when isUnconfigured is true",
+        "The Configure button block (lines 310-317) is unchanged — still renders when isUnconfigured",
+        "The Settings import from lucide-react remains (used by the Configure button at line 314)",
+        "Badge import remains (used by the DEV badge at line 247)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/PluginCard.tsx\n\nContext:\nThe current PluginCard header renders three optional indicators after the plugin name: DEV badge (line 246-250), unreviewed shield icon (line 251-258), and the Needs Setup badge (line 259-271). We are removing only the Needs Setup block.\n\nChanges:\n\n1. **Remove the Needs Setup block** (lines 259-271). Delete the entire `{isUnconfigured && (` block through its closing `)}`. The code to remove is:\n```tsx\n{isUnconfigured && (\n  <Tooltip>\n    <Tooltip.Trigger asChild>\n      <span className=\"inline-flex items-center gap-0.5 align-middle\">\n        <Settings className=\"inline-block h-3.5 w-3.5 text-muted-foreground\" />\n        <Badge variant=\"outline\" size=\"sm\" className=\"text-muted-foreground\">\n          Needs Setup\n        </Badge>\n      </span>\n    </Tooltip.Trigger>\n    <Tooltip.Content>This plugin has required settings that are not configured</Tooltip.Content>\n  </Tooltip>\n)}\n```\n\n2. **Disable the accordion trigger** when unconfigured. Change line 242 from:\n```tsx\n<AccordionPrimitive.Trigger className=\"focus-ring flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-2 pr-0 pl-2 [&[data-state=open]>svg]:rotate-180\">\n```\nto:\n```tsx\n<AccordionPrimitive.Trigger\n  disabled={isUnconfigured}\n  className={`focus-ring flex min-w-0 flex-1 items-center gap-2 py-2 pr-0 pl-2 [&[data-state=open]>svg]:rotate-180 ${isUnconfigured ? 'cursor-default' : 'cursor-pointer'}`}>\n```\n\n3. **Hide the chevron** when unconfigured. Change lines 273-275 from:\n```tsx\n<ChevronDown\n  className={`h-4 w-4 shrink-0 transition-transform duration-200 ${inactive ? 'text-muted-foreground' : ''}`}\n/>\n```\nto:\n```tsx\n{!isUnconfigured && (\n  <ChevronDown\n    className={`h-4 w-4 shrink-0 transition-transform duration-200 ${inactive ? 'text-muted-foreground' : ''}`}\n  />\n)}\n```\n\nConstraints:\n- Do NOT remove the `isUnconfigured` variable (line 154) — it's still used by the accordion content (line 310) and the trigger disabled prop\n- Do NOT remove the `needsSetup` import from ConfigDialog — still used at line 154\n- Do NOT remove `Settings` from the lucide-react import — still used by the Configure button at line 314\n- Do NOT remove `Badge` import — still used by the DEV badge at line 247\n- Do NOT change the accordion content area (lines 309-339) — the Configure button stays as-is\n- Do NOT change the PluginMenu Settings item — it's the fallback for post-configuration edits"
+    },
+    {
+      "id": "US-002",
+      "title": "Force unconfigured plugins open in PluginList accordion state",
+      "description": "In PluginList, compute which plugins need setup per group and force them into the controlled accordion value arrays. Wrap onValueChange to prevent users from collapsing unconfigured cards.",
+      "acceptanceCriteria": [
+        "needsSetup is imported from ConfigDialog in PluginList.tsx",
+        "Unconfigured plugin names are computed per group (unconfiguredReady, unconfiguredNotReady)",
+        "effectiveOpenReady and effectiveOpenNotReady merge forced-open names into the user-controlled arrays",
+        "Accordion value props use the effective arrays instead of raw openReady/openNotReady",
+        "onValueChange handlers re-add forced-open names so unconfigured plugins cannot be collapsed",
+        "Configured plugins can still be expanded and collapsed normally"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/PluginList.tsx\n\nContext:\nPluginList manages accordion open/close state via two controlled arrays: `openReady` (line 122) and `openNotReady` (line 123). These are hydrated from `chrome.storage.session` and persisted on every change. Plugins are grouped into `readyPlugins` and `notReadyPlugins` at line 157-159. The two Accordion components use `value={openReady}` (line 253) and `value={openNotReady}` (line 264) with `onValueChange={setOpenReady}` and `onValueChange={setOpenNotReady}`.\n\nChanges:\n\n1. **Add import** after the existing imports (after line 12, before the FailedPluginCard import at line 13):\n```tsx\nimport { needsSetup } from './ConfigDialog.js';\n```\n\n2. **Compute forced-open sets** after the group computation (after line 160, before `const hasNotReady`):\n```tsx\n// Plugins that need setup are forced open and cannot be collapsed.\nconst unconfiguredReady = new Set(\n  readyPlugins.filter(p => needsSetup(p.configSchema, p.resolvedSettings)).map(p => p.name),\n);\nconst unconfiguredNotReady = new Set(\n  notReadyPlugins.filter(p => needsSetup(p.configSchema, p.resolvedSettings)).map(p => p.name),\n);\n\n// Merge forced-open names into the controlled value arrays.\nconst effectiveOpenReady = [...new Set([...openReady, ...unconfiguredReady])];\nconst effectiveOpenNotReady = [...new Set([...openNotReady, ...unconfiguredNotReady])];\n\n// Wrap onValueChange to re-add forced-open names (Radix removes them when toggle fires).\nconst handleOpenReadyChange = (next: string[]) => setOpenReady([...new Set([...next, ...unconfiguredReady])]);\nconst handleOpenNotReadyChange = (next: string[]) => setOpenNotReady([...new Set([...next, ...unconfiguredNotReady])]);\n```\n\n3. **Wire into JSX**. Change the ready Accordion (line 253) from:\n```tsx\n<Accordion type=\"multiple\" value={openReady} onValueChange={setOpenReady} className=\"space-y-2\">\n```\nto:\n```tsx\n<Accordion type=\"multiple\" value={effectiveOpenReady} onValueChange={handleOpenReadyChange} className=\"space-y-2\">\n```\n\nChange the not-ready Accordion (line 264) from:\n```tsx\n<Accordion type=\"multiple\" value={openNotReady} onValueChange={setOpenNotReady} className=\"space-y-2\">\n```\nto:\n```tsx\n<Accordion type=\"multiple\" value={effectiveOpenNotReady} onValueChange={handleOpenNotReadyChange} className=\"space-y-2\">\n```\n\nConstraints:\n- Do NOT change the storage persistence logic — it still reads/writes openReady and openNotReady (the raw user state, without forced names). This is correct: when a plugin becomes configured, the forced-open logic stops applying, and the card collapses naturally.\n- Do NOT change the uncontrolled filter-mode Accordion (line 247) — when filtering tools, the accordion is uncontrolled and forced-open doesn't apply.\n- Do NOT change the collapseTransitioningItems effect (lines 150-154) — it operates on the raw state, which is correct.\n- The `needsSetup` function signature is: `needsSetup(configSchema: ConfigSchema | undefined, resolvedSettings: Record<string, unknown> | undefined): boolean`. The PluginState type has both `configSchema` and `resolvedSettings` properties."
+    },
+    {
+      "id": "US-003",
+      "title": "Update E2E test assertion and CLAUDE.md documentation",
+      "description": "Update the plugin-settings E2E test that asserts 'Needs Setup' text visibility, and update the browser-extension CLAUDE.md to document the new forced-open behavior instead of the removed badge.",
+      "acceptanceCriteria": [
+        "The E2E assertion at plugin-settings.e2e.ts:247 no longer checks for 'Needs Setup' text (badge was removed)",
+        "The assertion is replaced with a check that the Configure button is visible (since unconfigured cards are forced open)",
+        "The 'NeedsSetup badge' paragraph in platform/browser-extension/CLAUDE.md is replaced with documentation of the forced-open behavior"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/plugin-settings.e2e.ts (line 247)\n- platform/browser-extension/CLAUDE.md (line 168)\n\nContext:\n\n**E2E test change:**\nThe test at line 247 currently asserts:\n```ts\n// Verify NeedsSetup badge is NOT shown (all configSchema fields are optional)\nawait expect(sidePanelPage.getByText('Needs Setup')).not.toBeVisible();\n```\n\nSince the 'Needs Setup' text no longer exists anywhere in the UI, this assertion will trivially pass (element not found = not visible). But it's now testing a removed feature. Replace with a meaningful assertion. Since the e2e-test plugin has only optional configSchema fields, it should NOT be forced open — so verify the Configure button is NOT visible (the card should be collapsed with its normal tool list):\n```ts\n// Verify unconfigured state is NOT shown (all configSchema fields are optional)\nawait expect(sidePanelPage.getByRole('button', { name: 'Configure' })).not.toBeVisible();\n```\n\nNote: Read the surrounding test context (lines 210-267) to understand the full test — it opens the side panel, waits for the e2e-test plugin card to appear, and checks various settings behaviors. The assertion at line 247 is in the 'side panel shows Settings menu item' test.\n\n**CLAUDE.md change:**\nReplace the paragraph at line 168:\n```\n**NeedsSetup badge**: `PluginCard` shows a Settings icon + \"Needs Setup\" badge in the plugin card header when `needsSetup(plugin)` is true. When the badge is present, the card content area shows a \"Configure\" button instead of the tool list, prompting the user to open `ConfigDialog`.\n```\n\nWith:\n```\n**Unconfigured state**: When `needsSetup(plugin)` is true, the plugin card is forced open (expanded by default, cannot be collapsed). The accordion trigger and chevron are disabled, and the content area shows a \"Configure\" button instead of the tool list. This makes the setup CTA immediately visible without requiring user interaction.\n```\n\nConstraints:\n- Do NOT change any other assertions in plugin-settings.e2e.ts\n- Do NOT change any other paragraphs in CLAUDE.md\n- The e2eCheckpoint is true on this story because it's the final story and touches browser-observable behavior"
+    }
+  ]
+}
