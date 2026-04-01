@@ -1,0 +1,32 @@
+# Ralph Progress Log
+PRD: prd-2026-03-31-165324-fix-ci-platform-failures-5033ce~running.json
+Started: Tue Mar 31 23:53:55 UTC 2026
+---
+
+## Codebase Patterns
+- The MCP server logger (`platform/mcp-server/src/logger.ts`) reads `OPENTABS_LOG_LEVEL` at module evaluation time. Default level is `info`, so `log.info`, `log.warn`, `log.error` all output to console.
+- The `wsOpen` handler fires `sendSyncFull(state)` as a fire-and-forget `void` promise. This means async console output can occur after the synchronous test body returns.
+- When mocking console in tests, use `vi.spyOn` + `mockImplementation` in `beforeAll`/`afterAll` rather than `vi.mock` of the logger module, since the logger is imported transitively by the module under test.
+- On Windows, `npm` is a `.cmd` script — `spawnSync('npm', ...)` requires `shell: true`. The codebase already uses `shell: isWindows()` in `platform/cli/src/scaffold.ts` for `execFile('npm', ...)`. Tests that spawn npm must also use `shell: true`.
+
+## 2026-04-01 - US-001
+- **Implemented**: Suppressed console output in http-routes.test.ts to prevent Vitest worker teardown race condition
+- **Root cause**: The `wsOpen` handler (http-routes.ts:1065) fires `sendSyncFull(state)` as a fire-and-forget promise. When `sendToExtension` fails (mock WS), `console.warn` is called asynchronously. On macOS, this races with Vitest worker teardown, causing `EnvironmentTeardownError: Closing rpc while "onUserConsoleLog" was pending`.
+- **Fix**: Added `beforeAll` to mock all console methods (`log`, `warn`, `error`, `debug`) and `afterAll` to restore them.
+- **Files changed**: `platform/mcp-server/src/http-routes.test.ts`
+- **Learnings for future iterations:**
+  - Vitest intercepts console output via RPC to the main thread. Fire-and-forget async operations that log can cause teardown races, especially on macOS where event loop timing differs.
+  - Look for `void someAsyncFn()` patterns in handler code — these are fire-and-forget promises that run after the test body returns.
+  - The `sendSyncFull` call in `wsOpen` is the primary source of async console output in tests that call `handlers.wsOpen()`.
+---
+
+## 2026-04-01 - US-002
+- **Implemented**: Fixed create-plugin scaffold test TypeError on Windows
+- **Root cause**: `spawnSync('npm', ['install'], ...)` without `shell: true` fails on Windows because `npm` is a `.cmd` script, not a binary. When spawn fails with ENOENT, `stdout`/`stderr` are `null`, and `.toString()` on null throws TypeError.
+- **Fix**: Extracted shared `spawnOpts` with `shell: true` for all `spawnSync('npm', ...)` calls. Made error-path `.toString()` calls null-safe with `String(x ?? '')`.
+- **Files changed**: `platform/create-plugin/src/index.test.ts`
+- **Learnings for future iterations:**
+  - On Windows, `.cmd` scripts (npm, npx, etc.) require `shell: true` in `spawnSync`/`spawn`/`execFile`. The codebase already handles this in production code (`scaffold.ts:74` uses `shell: isWindows()`), but test code had the same pattern without the fix.
+  - When `spawnSync` fails to find a command (ENOENT), `stdout`/`stderr` can be `null` — use `String(x ?? '')` instead of `.toString()` for safe error logging.
+  - Always check the existing codebase for cross-platform patterns before writing new `child_process` calls.
+---
