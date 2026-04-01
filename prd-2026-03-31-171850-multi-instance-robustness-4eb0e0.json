@@ -1,0 +1,261 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix all multi-instance feature gaps (port-aware match patterns, fragile per-tab fallback, duplicate hostname detection, tabId+instance precedence) and add extensive E2E stress tests to make multi-instance plugin support ruthlessly robust for self-hosted services like Grafana, Retool, and SQLPad running on different ports of the same host.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Port-aware match pattern derivation in settings resolver",
+      "description": "Change deriveMatchPattern to include the port in Chrome match patterns when the URL has a non-standard port (not 80/443/empty). Currently it produces *://hostname/* which makes two instances on localhost:3000 and localhost:3001 indistinguishable.",
+      "acceptanceCriteria": [
+        "deriveMatchPattern('http://localhost:3000/app') returns '*://localhost:3000/*'",
+        "deriveMatchPattern('https://grafana.example.com/dashboard') returns '*://grafana.example.com/*' (standard HTTPS port omitted)",
+        "deriveMatchPattern('http://grafana.example.com') returns '*://grafana.example.com/*' (standard HTTP port omitted)",
+        "deriveMatchPattern('http://localhost:8080/foo?bar=1') returns '*://localhost:8080/*'",
+        "Existing unit tests in settings-resolver.test.ts updated to reflect port-aware patterns",
+        "New unit tests cover port variations (explicit 80, explicit 443, non-standard ports, no port)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/settings-resolver.ts (deriveMatchPattern function)\n- platform/mcp-server/src/settings-resolver.test.ts (unit tests)\n\nContext:\nThe `deriveMatchPattern` function at line 29-36 currently does:\n```ts\nconst deriveMatchPattern = (urlString: string): string | null => {\n  try {\n    const url = new URL(urlString);\n    return `*://${url.hostname}/*`;\n  } catch {\n    return null;\n  }\n};\n```\n\nThis drops the port entirely. Chrome match patterns support ports: `*://hostname:port/*` is valid.\n\nChanges:\nChange to include the port when it's non-standard. `new URL()` exposes `.host` (hostname:port) and `.hostname` (hostname only). Use `.host` which includes the port when present, but omit the port for standard 80/443.\n\n```ts\nconst deriveMatchPattern = (urlString: string): string | null => {\n  try {\n    const url = new URL(urlString);\n    // url.host includes port when non-default; url.hostname does not.\n    // For standard ports (80/443), url.host === url.hostname (port is stripped).\n    return `*://${url.host}/*`;\n  } catch {\n    return null;\n  }\n};\n```\n\nNote: `new URL('http://localhost:3000').host` returns `'localhost:3000'`. `new URL('https://example.com').host` returns `'example.com'` (443 is the default for https, so it's stripped). `new URL('http://example.com').host` returns `'example.com'` (80 is the default for http, so it's stripped). This is exactly the behavior we want — Chrome match patterns work the same way.\n\nUpdate existing unit tests — many currently expect `*://hostname/*` for URLs with ports. The test at line 30 for `'https://my-app.example.com/dashboard'` should still produce `*://my-app.example.com/*` (no port). But if we had a test with `http://localhost:3000`, it should now produce `*://localhost:3000/*`.\n\nExisting tests that need updating (check each test's input URL and expected pattern):\n- 'derives match pattern from single-instance url map' (line 25) — input `'https://my-app.example.com/dashboard'` → no change (standard port)\n- 'derives match patterns from multi-instance url map' (line 38) — inputs are `https://prod.example.com` and `https://staging.example.com` → no change\n- 'appends derived patterns to static urlPatterns' (line 64) — `https://custom.example.com` → no change\n- All other tests use standard-port URLs, so most won't change.\n\nAdd new tests for:\n- `http://localhost:3000/app` → `*://localhost:3000/*`\n- `http://127.0.0.1:8080` → `*://127.0.0.1:8080/*`\n- `http://localhost:80` → `*://localhost/*` (explicit standard port is stripped by URL constructor)\n- `https://example.com:443` → `*://example.com/*` (explicit standard port is stripped)\n- `http://example.com:8443/path` → `*://example.com:8443/*`\n\nConstraints:\n- Do NOT change the function signature or return type\n- Do NOT change how invalid URLs are handled (return null)\n- The instanceMap values will now include ports where applicable — this is intentional and needed for downstream matching"
+    },
+    {
+      "id": "US-002",
+      "title": "Port-aware hostname matching in findTabForInstance and plugin_list_tabs",
+      "description": "Update hostnameFromPattern in mcp-tool-dispatch.ts and plugin-list-tabs.ts to extract host:port (not just hostname) from match patterns, and update findTabForInstance to compare host:port against tab URLs. Same for annotateTabsWithInstance in plugin-list-tabs.ts.",
+      "acceptanceCriteria": [
+        "hostnameFromPattern('*://localhost:3000/*') returns 'localhost:3000'",
+        "hostnameFromPattern('*://example.com/*') returns 'example.com'",
+        "findTabForInstance correctly matches tab at localhost:3000 to pattern *://localhost:3000/* and does NOT match tab at localhost:3001",
+        "annotateTabsWithInstance in plugin-list-tabs.ts correctly labels tabs with port-specific instances",
+        "Existing unit tests in mcp-tool-dispatch.test.ts and plugin-list-tabs.test.ts updated"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/mcp-tool-dispatch.ts (hostnameFromPattern, findTabForInstance)\n- platform/mcp-server/src/browser-tools/plugin-list-tabs.ts (hostnameFromPattern, annotateTabsWithInstance)\n- platform/mcp-server/src/mcp-tool-dispatch.test.ts (unit tests)\n- platform/mcp-server/src/browser-tools/plugin-list-tabs.test.ts (unit tests)\n\nContext:\nThere are TWO separate `hostnameFromPattern` functions — one in mcp-tool-dispatch.ts (line 41-44) and one in plugin-list-tabs.ts (line 22-25). Both have the same regex-based implementation:\n```ts\nconst hostnameFromPattern = (pattern: string): string | undefined => {\n  const match = pattern.match(/^\\*:\\/\\/([^/]+)\\/\\*$/);\n  return match?.[1];\n};\n```\n\nThe regex `([^/]+)` already captures everything between `://` and `/*`, which includes the port if present. So `*://localhost:3000/*` would already extract `localhost:3000`. The regex itself does NOT need changing — it already works with ports.\n\nThe real issue is in `findTabForInstance` (mcp-tool-dispatch.ts lines 52-73):\n```ts\nconst findTabForInstance = (state: ServerState, pluginName: string, pattern: string): number | undefined => {\n  const patternHost = hostnameFromPattern(pattern);\n  ...\n  for (const tab of mapping.tabs) {\n    try {\n      const tabHost = new URL(tab.url).hostname;  // <-- BUG: uses .hostname (no port)\n      if (tabHost === patternHost) {\n```\n\nIt uses `new URL(tab.url).hostname` which strips the port. After US-001, `patternHost` will be `localhost:3000` but `tabHost` will be `localhost`. The comparison fails.\n\nFix: Change `.hostname` to `.host` in findTabForInstance:\n```ts\nconst tabHost = new URL(tab.url).host;\n```\n\n`new URL('http://localhost:3000/app').host` returns `'localhost:3000'` which matches `patternHost` = `'localhost:3000'`.\n`new URL('https://example.com/app').host` returns `'example.com'` which matches `patternHost` = `'example.com'`.\n\nSame fix in `annotateTabsWithInstance` in plugin-list-tabs.ts (line 36-38):\n```ts\nconst tabHost = new URL(tab.url).hostname;  // <-- BUG: same issue\nfor (const [name, pattern] of Object.entries(instanceMap)) {\n  if (hostnameFromPattern(pattern) === tabHost) {\n```\nChange `.hostname` to `.host`.\n\nAlso fix `resolvePerTabSettings` in platform/browser-extension/src/iife-injection.ts (line 266-269):\n```ts\nconst tabHost = new URL(tabUrl).hostname;\nfor (const [name, pattern] of Object.entries(instanceMap)) {\n  const patternHost = pattern.replace('*://', '').replace('/*', '');\n  if (tabHost === patternHost) {\n```\nChange `.hostname` to `.host`. The `pattern.replace` approach already extracts the full host:port.\n\nConstraints:\n- Do NOT change hostnameFromPattern's regex — it already handles ports\n- Do NOT rename the function (even though it now returns host:port) — the name is descriptive enough and renaming would be churn\n- The three locations to fix are: findTabForInstance, annotateTabsWithInstance, resolvePerTabSettings"
+    },
+    {
+      "id": "US-003",
+      "title": "Eliminate fragile fallback in resolvePerTabSettings",
+      "description": "When no instance matches a tab's URL in resolvePerTabSettings, the current code falls back to Object.values(urlMap)[0] which silently returns the wrong instance's URL. Change to return an empty string instead of a random instance's URL, and log a warning.",
+      "acceptanceCriteria": [
+        "When a tab's URL does not match any instance in the instanceMap, url-type fields resolve to empty string ''",
+        "A console.warn is logged identifying the unmatched tab URL and plugin name",
+        "The fallback to Object.values(urlMap)[0] is removed"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/iife-injection.ts (resolvePerTabSettings function, around line 257-295)\n\nContext:\nThe current code at lines 278-292:\n```ts\nconst resolved: Record<string, unknown> = {};\nfor (const [key, value] of Object.entries(settings)) {\n  if (typeof value === 'object' && value !== null && !Array.isArray(value)) {\n    // url-type field stored as Record<string, string> — resolve to this instance's URL\n    const urlMap = value as Record<string, string>;\n    if (matchedInstance && urlMap[matchedInstance] !== undefined) {\n      resolved[key] = urlMap[matchedInstance];\n    } else {\n      // Fallback: use the first URL in the map\n      const firstValue = Object.values(urlMap)[0];\n      resolved[key] = firstValue ?? '';\n    }\n  } else {\n    resolved[key] = value;\n  }\n}\n```\n\nChanges:\nReplace the else branch (lines 285-289) with:\n```ts\n} else {\n  console.warn(\n    `[opentabs] resolvePerTabSettings: tab URL \"${tabUrl}\" does not match any instance — url-type field \"${key}\" resolved to empty string`,\n  );\n  resolved[key] = '';\n}\n```\n\nConstraints:\n- Do NOT change the happy path (matchedInstance found)\n- Do NOT throw an error — just warn and return empty string\n- The console.warn is important for debuggability — users will see it in the browser console when something is misconfigured\n- This code runs in the Chrome extension context (iife-injection.ts is bundled into the extension), so `console.warn` is correct (not the server logger)"
+    },
+    {
+      "id": "US-004",
+      "title": "Detect and warn on duplicate derived patterns in settings resolver",
+      "description": "When two instances produce the same Chrome match pattern (e.g., same hostname and port), log a warning during settings resolution. This helps users catch misconfiguration early.",
+      "acceptanceCriteria": [
+        "When two instance entries derive the same match pattern, a warning is logged naming both instances and the duplicate pattern",
+        "The second instance still lands in the instanceMap (last-write-wins, as before) — no behavioral change, just a warning",
+        "Unit test verifies warning is logged for duplicate patterns"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/settings-resolver.ts (resolvePluginSettings function)\n- platform/mcp-server/src/settings-resolver.test.ts (unit tests)\n\nContext:\nIn the inner loop at lines 74-91:\n```ts\nfor (const [instanceName, url] of Object.entries(urlMap)) {\n  ...\n  const pattern = deriveMatchPattern(url);\n  ...\n  derivedPatterns.push(pattern);\n  validEntries[instanceName] = pattern;\n  if (!derivedHomepage) derivedHomepage = url;\n}\nif (Object.keys(validEntries).length > 0) {\n  instanceMap = { ...instanceMap, ...validEntries };\n  resolvedValues[key] = rawValue;\n}\n```\n\nChanges:\nAfter deriving the pattern and before pushing to derivedPatterns, check if this pattern is already in the instanceMap (from a previous url-type field) or already in validEntries (same field, different instance):\n\n```ts\n// Check for duplicate pattern within this field\nconst existingInstance = Object.entries(validEntries).find(([, p]) => p === pattern);\nif (existingInstance) {\n  log.warn(\n    `Plugin \"${pluginName}\" setting \"${key}\": instances \"${existingInstance[0]}\" and \"${instanceName}\" both derive pattern \"${pattern}\" — instance routing will be ambiguous`,\n  );\n}\n// Also check against instanceMap from previous url-type fields\nconst prevInstance = Object.entries(instanceMap).find(([, p]) => p === pattern);\nif (prevInstance) {\n  log.warn(\n    `Plugin \"${pluginName}\": instances \"${prevInstance[0]}\" and \"${instanceName}\" both derive pattern \"${pattern}\" — instance routing will be ambiguous`,\n  );\n}\n```\n\nAdd unit test: two instances with the same URL should trigger the warning. Can use vi.spyOn to capture log.warn calls.\n\nConstraints:\n- Do NOT prevent duplicate patterns from being stored — just warn\n- Do NOT change the last-write-wins behavior of instanceMap spread\n- The `log` import from `./logger.js` is already present in the file"
+    },
+    {
+      "id": "US-005",
+      "title": "Clear tabId vs instance precedence with warning",
+      "description": "When both tabId and instance are provided in a tool call, tabId should take precedence (it's more specific). Currently instance takes precedence (the if-block runs first). Swap the precedence: if tabId is provided, use it and log a warning that instance is being ignored.",
+      "acceptanceCriteria": [
+        "When both tabId and instance are provided, tabId is used for dispatch",
+        "A warning is logged: 'Both tabId and instance provided for tool X — using tabId, ignoring instance'",
+        "When only instance is provided, behavior is unchanged",
+        "When only tabId is provided, behavior is unchanged"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/mcp-tool-dispatch.ts (handlePluginToolCall function)\n\nContext:\nThe current code at lines 443-477:\n```ts\n// Resolve instance name to a specific tab ID. When instance is provided,\n// it takes precedence over tabId — match the tab whose URL corresponds\n// to the instance's derived match pattern.\nlet resolvedTabId = tabId;\nif (instance !== undefined) {\n  const plugin = state.registry.plugins.get(pluginName);\n  const pattern = plugin?.instanceMap?.[instance];\n  ...\n  resolvedTabId = matchingTabId;\n}\n```\n\nChanges:\nSwap the precedence — add a guard before the instance block:\n```ts\nlet resolvedTabId = tabId;\nif (instance !== undefined && tabId !== undefined) {\n  log.warn(`Both tabId (${tabId}) and instance (\"${instance}\") provided for tool \"${toolName}\" — using tabId, ignoring instance`);\n} else if (instance !== undefined) {\n  // existing instance resolution logic (unchanged)\n  const plugin = state.registry.plugins.get(pluginName);\n  ...\n}\n```\n\nUpdate the comment from 'When instance is provided, it takes precedence over tabId' to 'When both are provided, tabId takes precedence (more specific).\n\nConstraints:\n- Do NOT change the instance resolution logic itself\n- Do NOT add a new parameter or change the function signature\n- The log import is already present in the file"
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: same-host-different-port dispatch",
+      "description": "Add E2E test verifying that two instances on the same hostname but different ports (e.g., localhost:PORT_A and localhost:PORT_B) are correctly distinguished — dispatch to instance alpha hits server A, dispatch to instance beta hits server B.",
+      "acceptanceCriteria": [
+        "Test starts two test servers on ephemeral ports, both on localhost",
+        "Config uses both as instances of the same plugin (alpha: localhost:PORT_A, beta: localhost:PORT_B)",
+        "Dispatching with instance 'alpha' hits only server A",
+        "Dispatching with instance 'beta' hits only server B",
+        "plugin_list_tabs shows both tabs with correct instance labels",
+        "getConfig('instanceUrl') returns the correct port-specific URL in each tab"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (NEW file — all new E2E tests from US-006 through US-016 go in this file)\n\nContext:\nThis is THE critical real-world test — self-hosted services on localhost with different ports is the most common multi-instance scenario. The existing multi-instance.e2e.ts tests use localhost vs 127.0.0.1 (different hostnames), which dodged the port issue.\n\nUse the same test infrastructure pattern as e2e/multi-instance.e2e.ts:\n- `startTestServer()` to get two servers on ephemeral ports (both will be localhost)\n- `writeTestConfig` with settings that map alpha and beta to the two localhost URLs WITH different ports\n- `openTestAppTab` to open tabs for each\n- `waitForReadyTabs` to wait for adapter injection\n- `client.callTool` to dispatch\n\nKey difference from existing tests: both servers are on localhost, distinguished only by port. The config should look like:\n```ts\nsettings: {\n  'e2e-test': {\n    instanceUrl: {\n      alpha: `http://localhost:${alphaPort}`,\n      beta: `http://localhost:${betaPort}`,\n    },\n  },\n},\n```\n\nAfter US-001 and US-002, this should work because patterns will be `*://localhost:PORT_A/*` and `*://localhost:PORT_B/*`.\n\nIMPORTANT: Create a shared setup/teardown helper at the top of the new file (similar to `setupMultiInstanceTest` in multi-instance.e2e.ts) that can be parameterized for different test scenarios. Many tests in this file will need the same infrastructure.\n\nConstraints:\n- Do NOT modify existing multi-instance.e2e.ts — these are additional tests in a NEW file\n- Follow the same test patterns as existing E2E tests (test.slow(), try/finally cleanup)\n- Use test.describe blocks for grouping"
+    },
+    {
+      "id": "US-007",
+      "title": "E2E test: single-instance seamless (no instance parameter needed)",
+      "description": "Add E2E test verifying that a single-instance configuration works without requiring the instance parameter in tool calls — the tool schema should not include an instance enum, and dispatch should work without passing instance.",
+      "acceptanceCriteria": [
+        "Config has a single instance (e.g., instanceUrl: { default: URL })",
+        "Tool schema does NOT include an 'instance' property",
+        "Tool schema does NOT require 'instance'",
+        "Dispatch without passing instance succeeds and hits the correct server",
+        "getConfig('instanceUrl') returns the single URL as a string"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file from US-006)\n\nContext:\nThe schema injection logic in mcp-setup.ts (lines 363-373) only adds the `instance` parameter when `instanceNames.length >= 2`. With a single instance, there should be no `instance` parameter at all, and dispatch should auto-select the only matching tab.\n\nTest steps:\n1. Start one test server\n2. Write config with single instance: `{ instanceUrl: { default: serverUrl } }`\n3. Start MCP server + extension\n4. Open one tab to the test server\n5. List tools — verify e2e-test_echo does NOT have `instance` in its schema\n6. Call e2e-test_echo without `instance` parameter — verify it succeeds\n7. Call e2e-test_sdk_get_config for 'instanceUrl' — verify it returns the URL string\n\nConstraints:\n- The e2e-test plugin has static urlPatterns: ['http://localhost/*'] — for single-instance with a specific port, the derived pattern will be `*://localhost:PORT/*` which should ALSO match. But the static pattern `http://localhost/*` might also match. This is fine — both patterns matching the same tab is harmless.\n- Do NOT modify the e2e-test plugin's package.json"
+    },
+    {
+      "id": "US-008",
+      "title": "E2E test: hot-reload instance addition and removal",
+      "description": "Add E2E tests verifying that adding or removing instances via config.json + POST /reload correctly updates the plugin's instance routing without server restart.",
+      "acceptanceCriteria": [
+        "Test 1 (addition): starts with 2 instances (alpha, beta), modifies config to add gamma, triggers POST /reload, opens gamma tab, verifies dispatch to gamma works",
+        "Test 2 (removal): starts with 2 instances (alpha, beta), modifies config to remove beta, triggers POST /reload, verifies dispatch to beta returns 'Unknown instance' error",
+        "Tool schema updates after reload (instance enum reflects the new set of instances)"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file)\n\nContext:\nPOST /reload triggers `performConfigReload` → `reloadCore` which re-runs settings resolution and rebuilds the registry. The existing E2E patterns for POST /reload can be found in e2e/side-panel-reload.e2e.ts and e2e/side-panel-live-update.e2e.ts.\n\nThe reload helper pattern:\n```ts\nconst triggerReload = async (port: number, secret: string) => {\n  const headers = { Authorization: `Bearer ${secret}` };\n  return fetch(`http://localhost:${port}/reload`, { method: 'POST', headers });\n};\n```\n\nFor the addition test:\n1. Setup with alpha + beta (two servers, two instances)\n2. Start a third test server (gamma)\n3. Rewrite config.json adding gamma instance\n4. POST /reload\n5. Wait for tools/list_changed (re-list tools to verify instance enum now has 3 values)\n6. Open gamma tab\n7. Wait for ready\n8. Dispatch to gamma — verify it hits the gamma server\n\nFor the removal test:\n1. Setup with alpha + beta\n2. Rewrite config.json removing beta\n3. POST /reload\n4. Re-list tools — verify instance enum now only has alpha\n5. Dispatch to beta — verify 'Unknown instance' error\n\nUse `writeTestConfig` to rewrite the config file, then POST /reload. After reload, use `client.listTools()` to verify the schema changed, and `client.callTool` to verify dispatch.\n\nConstraints:\n- Use the same configDir from initial setup (overwrite config.json in place)\n- Wait for the reload to complete before making assertions (check tools/list_changed or poll listTools)"
+    },
+    {
+      "id": "US-009",
+      "title": "E2E test: tabId + instance conflict precedence",
+      "description": "Add E2E test verifying that when both tabId and instance are provided and they disagree, tabId takes precedence.",
+      "acceptanceCriteria": [
+        "Dispatch with instance='alpha' and tabId pointing to the beta tab executes in the beta tab (tabId wins)",
+        "The tool call succeeds (no error)",
+        "The beta server receives the call, not the alpha server"
+      ],
+      "priority": 9,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file)\n\nContext:\nAfter US-005, tabId takes precedence over instance. This test verifies that.\n\nTest steps:\n1. Setup with alpha (localhost:PORT_A) and beta (use 127.0.0.1:PORT_B to make it easily distinguishable)\n2. Open both tabs, wait for ready\n3. Get the beta tab's tabId from plugin_list_tabs\n4. Call e2e-test_echo with instance='alpha' AND tabId=<beta_tab_id>\n5. Reset both servers' invocation counters before the call\n6. Verify beta server received the call (tabId won), alpha server did not\n\nNote: The dispatch with a mismatched tabId+instance should still succeed because tabId is a valid tab for the plugin — the security check validates the tab URL matches the plugin's URL patterns (which include both instances).\n\nConstraints:\n- Use different hostnames (localhost vs 127.0.0.1) to make the distinction clear in assertions\n- The tabId must be a valid tab for the plugin (just pointing to a different instance)"
+    },
+    {
+      "id": "US-010",
+      "title": "E2E stress test: rapid sequential dispatch across instances",
+      "description": "Add E2E stress test firing 20 rapid tool calls alternating between instances, verifying zero cross-routing under load.",
+      "acceptanceCriteria": [
+        "20 sequential calls alternate between alpha and beta instances",
+        "Each call returns the correct instance's response",
+        "Alpha server receives exactly 10 calls, beta server receives exactly 10 calls",
+        "No call routes to the wrong instance"
+      ],
+      "priority": 10,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file)\n\nContext:\nThe existing multi-instance.e2e.ts has a concurrent dispatch test (Test 6) using Promise.all with 2 calls. This stress test goes further with 20 sequential calls to exercise the dispatch path under sustained load.\n\nTest steps:\n1. Setup with alpha + beta (use localhost vs 127.0.0.1 for easy distinction)\n2. Open both tabs, wait for ready\n3. Reset invocation counters\n4. Fire 20 sequential echo calls: even indices go to alpha, odd to beta\n5. Each call includes a unique message (e.g., `call-${i}-alpha` or `call-${i}-beta`)\n6. Verify each call's response matches the expected message\n7. Check invocation counts: alpha=10, beta=10\n8. Optionally verify the message content of each invocation on each server\n\nConstraints:\n- Sequential (not concurrent) — this tests sustained throughput, not parallel handling\n- Use test.slow() as this will take time\n- Include a timeout appropriate for 20 round-trips"
+    },
+    {
+      "id": "US-011",
+      "title": "E2E stress test: concurrent burst dispatch across instances",
+      "description": "Add E2E stress test firing 10 concurrent tool calls (5 to each instance) via Promise.all, verifying correct routing under parallel load.",
+      "acceptanceCriteria": [
+        "10 concurrent calls dispatched via Promise.all — 5 to alpha, 5 to beta",
+        "All 10 calls succeed without error",
+        "Alpha server receives exactly 5 calls, beta server receives exactly 5 calls",
+        "Each call's response matches its expected instance"
+      ],
+      "priority": 11,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file)\n\nContext:\nThe existing multi-instance.e2e.ts has a concurrent test with only 2 calls. This stress test uses 10 concurrent calls to exercise the dispatch pipeline's concurrency handling.\n\nTest steps:\n1. Setup with alpha + beta\n2. Open both tabs, wait for ready\n3. Reset invocation counters\n4. Build array of 10 promises: indices 0-4 → alpha, indices 5-9 → beta\n5. Each call has a unique message: `burst-${i}`\n6. Promise.all the 10 calls\n7. Verify all 10 results are non-error\n8. Verify alpha got 5 calls, beta got 5 calls\n\nConstraints:\n- The MAX_CONCURRENT_DISPATCHES_PER_PLUGIN is 25 in mcp-tool-dispatch.ts, so 10 per plugin (5 per instance) is well within limits\n- Use test.slow()"
+    },
+    {
+      "id": "US-012",
+      "title": "E2E test: instance tab close and reopen recovery",
+      "description": "Add E2E test verifying that closing an instance's tab causes dispatch to fail with a clear error, and reopening the tab restores dispatch capability.",
+      "acceptanceCriteria": [
+        "With both tabs open, dispatch to both instances works",
+        "After closing beta's tab, dispatch to beta returns 'No open tab' error",
+        "Dispatch to alpha still works while beta is closed",
+        "After reopening beta's tab, dispatch to beta works again"
+      ],
+      "priority": 12,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file)\n\nContext:\nThis tests the full lifecycle: open → close → error → reopen → recover. The existing multi-instance.e2e.ts Test 7 only tests the missing-tab case (never opened). This tests the close+reopen cycle.\n\nTest steps:\n1. Setup with alpha + beta (localhost vs 127.0.0.1)\n2. Open both tabs, wait for 2 ready tabs\n3. Verify dispatch to both works\n4. Close beta tab (page.close())\n5. Wait for tab mapping to update (poll plugin_list_tabs until beta tab disappears or becomes unavailable)\n6. Dispatch to beta → expect 'No open tab' error\n7. Dispatch to alpha → expect success (isolated, not affected)\n8. Reopen beta tab (new page, navigate to beta URL)\n9. Wait for beta tab to become ready\n10. Dispatch to beta → expect success\n\nConstraints:\n- After closing a tab, the extension's tab state needs time to update. Poll plugin_list_tabs or use a waitFor helper.\n- The tab removal is detected by the extension's chrome.tabs.onRemoved listener"
+    },
+    {
+      "id": "US-013",
+      "title": "E2E test: all instance tabs closed returns appropriate error",
+      "description": "Add E2E test verifying that when all instance tabs are closed, dispatch returns a clear error and plugin_list_tabs shows the plugin in 'closed' state.",
+      "acceptanceCriteria": [
+        "With both tabs closed, dispatch to alpha returns 'No open tab' error",
+        "With both tabs closed, dispatch to beta returns 'No open tab' error",
+        "plugin_list_tabs shows the plugin with state 'closed' and empty tabs array"
+      ],
+      "priority": 13,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file)\n\nContext:\nTest steps:\n1. Setup with alpha + beta\n2. Open both tabs, wait for ready\n3. Close both tabs\n4. Wait for tab mapping to reflect closed state (poll plugin_list_tabs until tabs array is empty or state is 'closed')\n5. Dispatch to alpha → expect 'No open tab' error\n6. Dispatch to beta → expect 'No open tab' error\n7. Call plugin_list_tabs → verify state is 'closed' and tabs is empty or absent\n\nConstraints:\n- After closing tabs, the extension needs time to process onRemoved events. Use a waitFor with polling."
+    },
+    {
+      "id": "US-014",
+      "title": "E2E test: URL path and trailing slash variations in pattern derivation",
+      "description": "Add E2E test verifying that URLs with paths, trailing slashes, and query parameters all derive correct match patterns and route correctly.",
+      "acceptanceCriteria": [
+        "Instance URL 'http://localhost:PORT/grafana/' and tab opened to 'http://localhost:PORT/grafana/dashboards' match correctly",
+        "Dispatch to the instance works",
+        "getConfig returns the original URL with path"
+      ],
+      "priority": 14,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file)\n\nContext:\nThe pattern derivation strips paths: `http://localhost:3000/grafana/` → `*://localhost:3000/*`. This means the pattern matches ALL paths on that host:port, not just /grafana/. This is intentional — Chrome match patterns don't support path prefixes in a useful way for adapter injection (the adapter needs to run on all pages of the instance).\n\nThis test verifies that the pattern still matches correctly when:\n- The config URL has a path (e.g., http://localhost:PORT/app/)\n- The tab URL has a different path (e.g., http://localhost:PORT/app/dashboard)\n- The match still works because the pattern is host:port-based\n\nTest steps:\n1. Start one test server\n2. Config: `instanceUrl: { main: 'http://localhost:PORT/grafana/' }`\n3. Open tab to `http://localhost:PORT/grafana/dashboards` (or just the root, since test server serves all paths)\n4. Wait for ready\n5. Dispatch echo → verify success\n6. getConfig('instanceUrl') → verify returns `'http://localhost:PORT/grafana/'` (the original config URL, not the pattern)\n\nConstraints:\n- The test server serves all paths, so the specific path doesn't matter for the response\n- This test uses a single instance, so no instance parameter needed"
+    },
+    {
+      "id": "US-015",
+      "title": "E2E stress test: per-tab getConfig isolation under concurrent load",
+      "description": "Add E2E stress test firing concurrent getConfig calls to both instances simultaneously, verifying no cross-contamination of per-tab settings.",
+      "acceptanceCriteria": [
+        "10 concurrent getConfig calls — 5 to alpha instance, 5 to beta instance",
+        "All alpha calls return the alpha URL",
+        "All beta calls return the beta URL",
+        "No cross-contamination between instances"
+      ],
+      "priority": 15,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file)\n\nContext:\nThis verifies that resolvePerTabSettings correctly isolates settings per tab even under concurrent dispatch. The concern: if the resolution has any shared mutable state, concurrent calls might cross-contaminate.\n\nTest steps:\n1. Setup with alpha + beta (use localhost vs 127.0.0.1)\n2. Open both tabs, wait for ready\n3. Build 10 concurrent getConfig calls via Promise.all:\n   - Indices 0-4: `e2e-test_sdk_get_config({ key: 'instanceUrl', instance: 'alpha' })`\n   - Indices 5-9: `e2e-test_sdk_get_config({ key: 'instanceUrl', instance: 'beta' })`\n4. Verify all alpha results return the alpha URL\n5. Verify all beta results return the beta URL\n\nConstraints:\n- resolvePerTabSettings creates a new object each time (no shared state), so this should pass — but it's the kind of thing that must be tested under load to be sure"
+    },
+    {
+      "id": "US-016",
+      "title": "E2E test: duplicate hostname warning is logged",
+      "description": "Add E2E test verifying that when two instances resolve to the same match pattern, the MCP server logs a warning about ambiguous routing.",
+      "acceptanceCriteria": [
+        "Config has two instances with URLs that derive the same pattern (e.g., same host:port with different paths)",
+        "Server logs contain a warning about ambiguous instance routing",
+        "Dispatch still works (last-write-wins behavior, no crash)"
+      ],
+      "priority": 16,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-instance-robust.e2e.ts (append to the new file)\n\nContext:\nAfter US-004, the settings resolver logs a warning when two instances produce the same pattern. This test verifies the warning appears in the MCP server's output.\n\nTest steps:\n1. Start one test server on PORT_A\n2. Config with two instances that resolve to the same host:port:\n   ```\n   instanceUrl: {\n     prod: `http://localhost:${PORT_A}/prod`,\n     staging: `http://localhost:${PORT_A}/staging`,\n   }\n   ```\n   Both derive `*://localhost:PORT_A/*` — same pattern.\n3. Start MCP server\n4. Check server stdout/stderr for the warning string: 'instance routing will be ambiguous'\n5. Open one tab to the test server\n6. Dispatch should still work (the last-write-wins instance gets the tab)\n\nTo check server logs, the MCP server fixture captures stdout. Use `server.stdout` or grep the server output for the warning.\n\nConstraints:\n- This is the FINAL test in the file and has e2eCheckpoint: true — ralph will run the full E2E suite after this story\n- The warning is logged by the MCP server (platform/mcp-server), not the extension\n- Check the MCP server fixture's output capturing mechanism — look at how other tests check server logs (e.g., `waitForLog` helper in e2e/helpers.ts)"
+    }
+  ]
+}
