@@ -1,0 +1,59 @@
+# Ralph Progress Log
+PRD: prd-2026-04-03-110753-marketplace-search-icons-d53217~running.json
+Started: Fri Apr  3 18:08:29 UTC 2026
+---
+
+## Codebase Patterns
+- PluginSearchResult type is defined independently in two places: `platform/mcp-server/src/plugin-management.ts` and `platform/browser-extension/src/side-panel/bridge.ts`. Both must be updated in lockstep.
+- The npm search API (`/-/v1/search`) does NOT return custom package.json fields like `opentabs`. To get custom fields, fetch `/<package>/latest` for each result.
+- `probeDirectPackage` fetches the full packument (all versions), so custom fields are in `data.versions[latest]`.
+- Story mock factories for `PluginSearchResult` use `Partial<PluginSearchResult>` spread overrides, so new required fields need defaults in the factory.
+- Three story files construct `PluginSearchResult` objects: `NpmPluginCard.stories.tsx`, `SearchResults.stories.tsx`, `SidePanel.stories.tsx`.
+- PluginIcon selects SVG variant based on readiness: `tabState === 'ready'` uses active SVGs, otherwise inactive SVGs. Components with `tabState="closed"` must pass BOTH active and inactive SVG props for icons to render.
+- E2E tests that depend on npm registry state (icons, artifacts) should use pre-check functions and `test.skip()` guards.
+
+## 2026-04-03 - US-001
+- Added `iconSvg: string` and `iconDarkSvg: string` to `PluginSearchResult` in both MCP server and browser extension bridge
+- Added `iconSvg?: string` and `iconDarkSvg?: string` to `NpmRegistrySearchPackage` interface
+- Updated `probeDirectPackage` to extract `opentabs.iconSvg` and `opentabs.iconDarkSvg` from the latest version in the full packument
+- Added batch icon fetch in `searchNpmPlugins` using `Promise.all` with per-package `try/catch` to fetch `/<package>/latest` for keyword search results
+- Updated story mock factories in 3 files to include default empty string values for new fields
+- Files changed:
+  - `platform/mcp-server/src/plugin-management.ts`
+  - `platform/browser-extension/src/side-panel/bridge.ts`
+  - `platform/browser-extension/src/side-panel/components/NpmPluginCard.stories.tsx`
+  - `platform/browser-extension/src/side-panel/components/SearchResults.stories.tsx`
+  - `platform/browser-extension/src/side-panel/components/SidePanel.stories.tsx`
+- **Learnings for future iterations:**
+  - The AbortController signal from `searchNpmPlugins` is reused for the icon fetch requests, so they respect the same timeout
+  - Probe result icons flow directly from `probeDirectPackage` → merge phase → output (no extra fetch needed)
+  - Keyword search results need an extra fetch per package since the search API doesn't return custom fields
+---
+
+## 2026-04-03 - US-002
+- Updated NpmPluginCard.tsx to pass `iconSvg` and `iconDarkSvg` props to PluginIcon
+- Changed the PluginIcon invocation on line 22 to pass `plugin.iconSvg || undefined` and `plugin.iconDarkSvg || undefined`
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/NpmPluginCard.tsx`
+- **Learnings for future iterations:**
+  - Pass `|| undefined` (not empty string) when passing icon props to PluginIcon — the component uses truthy checks (`!!iconSvg`) to decide SVG vs letter-avatar rendering
+  - PluginIcon already handles all rendering logic; no changes needed to PluginIcon itself
+  - The change is minimal: search result cards now show SVG icons when available, falling back to letter avatars when iconSvg is empty string
+---
+
+## 2026-04-03 - US-003
+- Added three E2E tests for marketplace search icon rendering in `e2e/side-panel-npm-search.e2e.ts`
+- Fixed bug in NpmPluginCard: PluginIcon uses inactive SVG variant for `tabState="closed"` (search results), but NpmPluginCard only passed `iconSvg`/`iconDarkSvg` (active variants). Added `iconInactiveSvg` and `iconDarkInactiveSvg` props so icons actually render.
+- Added `npmPluginHasIcons()` pre-check that queries npm registry for icon availability
+- Test 1: "search results display SVG icons" — skipped when icons not published, verifies `<svg>` in card when available
+- Test 2: "search result icons change between light and dark mode" — skipped when icons not published, verifies different SVG innerHTML in light vs dark
+- Test 3: "search results without icons render letter-avatar fallback" — always runs, verifies `<span>` with single uppercase letter
+- Files changed:
+  - `e2e/side-panel-npm-search.e2e.ts`
+  - `platform/browser-extension/src/side-panel/components/NpmPluginCard.tsx`
+- **Learnings for future iterations:**
+  - PluginIcon selects SVG based on `isReady = tabState === 'ready'`: ready → active SVG, not ready → inactive SVG. For components with `tabState="closed"` that want to show icons, BOTH active and inactive SVG props must be provided.
+  - Published npm plugins do NOT yet have icons embedded (the build command was just implemented). Icon E2E tests are gated by `npmPluginHasIcons()` which checks the slack plugin's `opentabs.iconSvg` field.
+  - Use `xpath=ancestor::div[contains(@class,"border-2")][1]` to navigate from a nested element up to the NpmPluginCard container div in Playwright.
+  - The Playwright Docker image version may drift from the project's `@playwright/test` version. If Chromium binary is missing, run `npx playwright install chromium`.
+---
