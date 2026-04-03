@@ -1,0 +1,38 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix two bugs in the publish-plugins.yml GitHub Actions workflow: (1) git diff crashes when github.event.before is an unreachable SHA after force-push, and (2) plugins are built with stale @opentabs-dev/plugin-tools from npm instead of the local monorepo version, so platform fixes (like icon generation bug fixes) don't take effect until a manual platform publish.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Handle unreachable before SHA in publish-plugins detection",
+      "description": "Add a reachability check for the github.event.before SHA before using it in git diff. If the SHA is unreachable (force-push, history rewrite), fall back to HEAD~1.",
+      "acceptanceCriteria": [
+        "The detect step validates the BEFORE SHA with `git cat-file -e` before passing it to `git diff`",
+        "If the SHA is unreachable (exit code non-zero), BEFORE falls back to HEAD~1",
+        "The existing zero-SHA check (all zeros) is preserved",
+        "Comments explain all three cases: normal push, zero SHA, unreachable SHA"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- .github/workflows/publish-plugins.yml (detect step, lines 34-57)\n\nContext:\nThe detect step uses `github.event.before` to find all changed plugins across multi-commit pushes. Currently it checks for zero SHA (first push / force push to new branch) but does NOT check if the SHA is reachable in the repo. A force-push that rewrites history can leave `github.event.before` pointing to a commit that no longer exists, causing `git diff` to fatal with \"bad object\".\n\nCurrent code:\n```\nBEFORE=\"${{ github.event.before }}\"\nif [ -z \"$BEFORE\" ] || echo \"$BEFORE\" | grep -qE '^0+$'; then\n  BEFORE=\"HEAD~1\"\nfi\nCHANGED_PLUGINS=$(git diff --name-only \"$BEFORE\" HEAD -- 'plugins/' \\\n```\n\nChanges:\nAdd a `git cat-file -e \"$BEFORE\" 2>/dev/null` check after the zero-SHA check. If it fails (non-zero exit), set BEFORE to HEAD~1. The full guard should be:\n\n```bash\nBEFORE=\"${{ github.event.before }}\"\nif [ -z \"$BEFORE\" ] || echo \"$BEFORE\" | grep -qE '^0+$'; then\n  # First push or force push to new branch — no previous SHA\n  BEFORE=\"HEAD~1\"\nelif ! git cat-file -e \"$BEFORE\" 2>/dev/null; then\n  # SHA exists but is unreachable (force-push rewrote history)\n  BEFORE=\"HEAD~1\"\nfi\n```\n\nConstraints:\n- Do NOT change the git diff command itself or the plugin detection logic below it\n- Do NOT change the path filters in the `on:` trigger\n- Keep the `fetch-depth: 0` in the checkout step (needed for the SHA to be fetchable)"
+    },
+    {
+      "id": "US-002",
+      "title": "Build plugins with local plugin-tools instead of npm version",
+      "description": "In the publish-plugins workflow, after npm install, override @opentabs-dev/plugin-tools with the local monorepo version so that platform fixes to the build tool take effect immediately without waiting for a manual platform publish.",
+      "acceptanceCriteria": [
+        "After `npm install` in each plugin directory, the workflow builds the local plugin-tools and links it into the plugin's node_modules",
+        "The `opentabs-plugin build` command inside the plugin uses the monorepo's version of validate-icon.ts, not the npm-published version",
+        "The approach does not modify the plugin's package.json or package-lock.json permanently (no dirty git state from the override)",
+        "If the local build of plugin-tools fails, the workflow falls back to the npm version with a warning"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- .github/workflows/publish-plugins.yml (build step, lines 99-104)\n\nContext:\nPlugins are standalone projects that depend on `@opentabs-dev/plugin-tools` from npm. When the workflow runs `npm install` in a plugin directory, it installs the published npm version. If the monorepo has unpublished fixes to plugin-tools (like the decimal-percentage RGB icon fix in validate-icon.ts), the plugin gets built with the old buggy tool.\n\nThe monorepo's plugin-tools source is at `platform/plugin-tools/`. It needs to be built (`tsc`) before it can be used. The binary is `dist/cli.js`.\n\nCurrent code in the publish step:\n```bash\necho \"Installing dependencies...\"\n(cd \"$DIR\" && npm install)\n\necho \"Building...\"\n(cd \"$DIR\" && npm run build)\n```\n\nChanges:\nAfter `npm install`, build the local plugin-tools and copy it into the plugin's node_modules. The approach:\n\n1. Before the plugin loop, build plugin-tools once:\n```bash\necho \"Building local plugin-tools...\"\n(cd platform/plugin-tools && npm run build 2>/dev/null) || echo \"::warning::Failed to build local plugin-tools, using npm version\"\n```\n\n2. Inside the plugin loop, after `npm install`, override with local version:\n```bash\necho \"Installing dependencies...\"\n(cd \"$DIR\" && npm install)\n\n# Override with local plugin-tools to pick up unpublished fixes\nif [ -d \"platform/plugin-tools/dist\" ]; then\n  echo \"Linking local plugin-tools...\"\n  rm -rf \"$DIR/node_modules/@opentabs-dev/plugin-tools/dist\"\n  cp -r platform/plugin-tools/dist \"$DIR/node_modules/@opentabs-dev/plugin-tools/dist\"\nfi\n```\n\nThis copies the built dist/ over the npm-installed version without modifying package.json. The plugin's `opentabs-plugin build` command will use the local version's CLI and validate-icon.ts.\n\nConstraints:\n- Do NOT modify the plugin's package.json or package-lock.json\n- Do NOT use `npm link` (it creates symlinks that can cause issues with the IIFE bundler)\n- The local override must happen AFTER npm install (so the directory structure exists) and BEFORE npm run build\n- If platform/plugin-tools/dist doesn't exist (build failed), skip the override silently — the npm version is a safe fallback\n- Also need to build the shared package first since plugin-tools depends on it: `(cd platform/shared && npm run build 2>/dev/null)`"
+    }
+  ]
+}
