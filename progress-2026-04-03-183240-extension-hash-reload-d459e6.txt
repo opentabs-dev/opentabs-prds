@@ -1,0 +1,83 @@
+# Ralph Progress Log
+PRD: prd-2026-04-03-183240-extension-hash-reload-d459e6~running.json
+Started: Sat Apr  4 01:33:18 UTC 2026
+---
+
+## Codebase Patterns
+- Root scripts are in `scripts/` and type-checked via `tsconfig.scripts.json` (includes `scripts/**/*.ts`)
+- Build pipeline order in root `package.json`: tsc → catalog → bundle → side-panel → icons → hash → install → rebuild → make-executable
+- Extension bundle files live in `platform/browser-extension/dist/`
+- `.extension-hash` is a build artifact (gitignored) written to `platform/browser-extension/.extension-hash` and copied to `~/.opentabs/extension/` by `install-extension.ts`
+- `EXTENSION_COPY_EXCLUDE_PATTERN` in `platform/shared/src/index.ts` controls which files are excluded from the install copy
+- `sendSyncFull` in `extension-protocol.ts` must explicitly include every field from `buildConfigStatePayload` in the `params` object — fields are NOT automatically forwarded
+- In E2E tests, the server reads `.extension-hash` from `configDir/extension/` (via `getExtensionDir()` + `OPENTABS_CONFIG_DIR` env var), while the side panel's `window.__EXTENSION_HASH__` comes from the built bundle in the extension copy
+- `startMcpServer` pre-writes `.opentabs-version` to prevent `ensureExtensionInstalled` from copying files — write `.extension-hash` to `configDir/extension/` to control the server's hash value
+- Brand-color icons (e.g., Slack) use fixed colors that don't change between light/dark themes — don't assert SVG content differs
+
+## 2026-04-04 - US-001
+- Implemented extension content hash computation as a post-build step
+- Files changed:
+  - `scripts/compute-extension-hash.ts` (new) — SHA-256 hashes background.js, side-panel.js (pre-hash), styles.css, offscreen/index.js; writes .extension-hash file and prepends window.__EXTENSION_HASH__ to side-panel.js
+  - `package.json` — inserted `tsx scripts/compute-extension-hash.ts` into both `build` and `build:force` scripts, between generate-icons and install-extension
+  - `.gitignore` — added `.extension-hash` pattern
+- **Learnings for future iterations:**
+  - The hash must be computed from side-panel.js content BEFORE the hash prefix is prepended (otherwise it's circular — the hash changes the file, which changes the hash). The script strips any existing `window.__EXTENSION_HASH__="...";\n` prefix before hashing.
+  - `tsconfig.configs.json` covers root config files (knip.ts, playwright.config.ts, vitest.config.ts), NOT scripts. Scripts are covered by `tsconfig.scripts.json`.
+  - The `.extension-hash` file is NOT excluded by `EXTENSION_COPY_EXCLUDE_PATTERN`, so it gets copied to the install dir automatically — no changes needed to the exclude pattern.
+- The `extensionHash` field follows the exact same pipeline as `serverVersion` through all 7 files
+---
+
+## 2026-04-04 - US-002
+- Threaded extensionHash through the full server → extension → side panel pipeline
+- Files changed:
+  - `platform/shared/src/index.ts` — added `extensionHash?: string` to `ConfigStateResult`
+  - `platform/mcp-server/src/extension-handlers.ts` — reads `.extension-hash` from installed extension dir in `buildConfigStatePayload`, includes in return payload
+  - `platform/browser-extension/src/server-state-cache.ts` — added `extensionHash` to `ServerStateCache` interface, `EMPTY_CACHE`, and `loadServerStateCacheFromSession`
+  - `platform/browser-extension/src/message-router.ts` — extracts `extensionHash` in `handleSyncFull` and `plugins.changed`
+  - `platform/browser-extension/src/background-message-handlers.ts` — returns `extensionHash` from cache in `handleBgGetFullState`
+  - `platform/browser-extension/src/side-panel/bridge.ts` — added `extensionHash` to `FullStateResult`
+- **Learnings for future iterations:**
+  - The `extensionHash` flows through the same 7-file pipeline as `serverVersion`: shared type → server payload → cache → sync.full extraction → plugins.changed extraction → bg handler → bridge type
+  - `buildConfigStatePayload` reads `.extension-hash` synchronously (readFileSync) from `getExtensionDir()` — no async needed
+  - App.tsx state for extensionHash should be added when the consuming component (ExtensionUpdateDialog) is implemented, not before, to avoid lint warnings about unused variables
+---
+
+## 2026-04-04 - US-003
+- Added ExtensionUpdateDialog component with retro-themed reload prompt
+- Files changed:
+  - `platform/browser-extension/src/side-panel/components/ExtensionUpdateDialog.tsx` (new) — non-dismissable Radix dialog with custom header (no X button), uses retro Dialog.Content/Body/Footer primitives, RefreshCw icon, calls chrome.runtime.reload()
+  - `platform/browser-extension/src/side-panel/App.tsx` — added extensionHash state, set in applyFullState, cleared on disconnect, computes mismatch (connected + both hashes defined + hashes differ), renders ExtensionUpdateDialog at top of JSX
+- **Learnings for future iterations:**
+  - Dialog.Header includes a built-in X close button — for non-dismissable dialogs, use a custom div with the same styling classes instead
+  - `onOpenChange={() => {}}` prevents Radix from closing the dialog; combine with `onInteractOutside` and `onEscapeKeyDown` preventing default for full non-dismissability
+  - `window.__EXTENSION_HASH__` access requires double-cast: `(window as unknown as Record<string, unknown>).__EXTENSION_HASH__`
+  - Biome auto-sorts imports alphabetically, so import insertion order doesn't matter in source — the pre-commit hook fixes it
+---
+
+## 2026-04-04 - US-004
+- Removed proactive version-change extension reload paths, replaced by hash-based detection
+- Files changed:
+  - `platform/mcp-server/src/state.ts` — removed `pendingExtensionReload` from ServerState interface and createState()
+  - `platform/mcp-server/src/reload.ts` — replaced version-change block (sendExtensionReload + pendingExtensionReload) with simple log message
+  - `platform/mcp-server/src/http-routes.ts` — removed deferred reload check in WebSocket connect handler, simplified to direct .catch()
+- **Learnings for future iterations:**
+  - `sendExtensionReload` is used by both the auth secret rotation (reload.ts) AND the /extension/reload HTTP endpoint (http-routes.ts) — both imports must stay
+  - `isExtensionConnected` is used at 3 other callsites in reload.ts — import stays
+  - The change was surgical: 3 files, 37 lines removed, 4 lines added
+---
+
+## 2026-04-04 - US-005
+- Added 6 comprehensive E2E tests for extension hash mismatch detection and reload dialog
+- Found and fixed a bug: `sendSyncFull` in `extension-protocol.ts` was not including `extensionHash` in the sync.full params, even though `buildConfigStatePayload` computed it correctly. Added the missing field.
+- Fixed a pre-existing E2E test failure: `side-panel-npm-search` icon light/dark mode comparison failed because brand-color icons (e.g., Slack) use fixed colors that don't change between themes.
+- Files changed:
+  - `e2e/side-panel-extension-update.e2e.ts` (new) — 6 E2E tests: hash mismatch dialog appearance, hash match no-dialog, dialog non-dismissability (click outside + Escape), dev mode rebuild simulation, rapid reconnection stress test, proactive reload removal verification
+  - `platform/mcp-server/src/extension-protocol.ts` — added `extensionHash: configState.extensionHash` to sync.full params in `sendSyncFull`
+  - `e2e/side-panel-npm-search.e2e.ts` — fixed icon theme test to verify SVG presence instead of asserting content differs
+- **Learnings for future iterations:**
+  - `sendSyncFull` builds its own params object manually from `buildConfigStatePayload` results — new fields in `buildConfigStatePayload` must be explicitly added to the params object at line ~130 of `extension-protocol.ts`
+  - To simulate hash mismatch in E2E: write a fake hash to `configDir/extension/.extension-hash` before starting the server. The server reads it via `getExtensionDir()` which uses `OPENTABS_CONFIG_DIR`. The side panel has the real hash from `window.__EXTENSION_HASH__` in the built bundle.
+  - To simulate dev mode rebuild: write matching hash initially, then change it and trigger `server.triggerHotReload()`. The new worker sends sync.full with the changed hash.
+  - For proactive reload verification: write a stale `.opentabs-version` after server starts, then trigger hot reload. The new worker's `ensureExtensionInstalled` sees a version mismatch and logs the hash-based message.
+  - Playwright 1.59.1 requires chromium-1217; the Docker image (v1.58.2-noble) only has chromium-1208. Run `npx playwright install chromium` if needed.
+---
