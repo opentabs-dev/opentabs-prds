@@ -1,0 +1,51 @@
+# Ralph Progress Log
+PRD: prd-2026-04-04-212006-fix-e2e-sleep-server-575200~running.json
+Started: Sun Apr  5 04:20:41 UTC 2026
+---
+
+## Codebase Patterns
+- E2E test fixtures provide `mcpServer.waitForHealth(predicate, timeout)` for polling the /health endpoint
+- Playwright's `expect.poll()` is the preferred way to replace sleeps when waiting for a condition
+- The pre-commit hook runs Biome which auto-fixes non-null assertions to optional chaining
+- When `server` is typed as `McpServer | null`, use optional chaining (`server?.health()`) inside callbacks where TypeScript can't narrow
+- The /health endpoint does NOT expose `activeDispatches`; use server log polling (`tool.call: input validated`) to detect dispatch state
+- Clear `mcpServer.logs.length = 0` before triggering actions when you need to count fresh log occurrences
+
+## 2026-04-05 04:23 - US-001
+- Replaced 3 hard-coded sleeps with polling in E2E tests:
+  - notify-readiness-changed.e2e.ts: 2s sleep → `expect.poll` checking tabState via health endpoint
+  - multi-connection.e2e.ts: 3s sleep → two `waitForHealth` calls separated by 1s gap (verifies persistence)
+  - auth-bootstrap.e2e.ts: 3s sleep + manual health assertions → `expect.poll` checking `extensionConnected === false`
+- Files changed: e2e/notify-readiness-changed.e2e.ts, e2e/multi-connection.e2e.ts, e2e/auth-bootstrap.e2e.ts
+- **Learnings for future iterations:**
+  - `expect.poll` works well for replacing sleeps that wait for a condition; use `{ timeout: 10_000 }` for generous CI margins
+  - For persistence checks (multi-connection), a short 1s sleep between two polls is acceptable since the intent is verifying stability over time, not waiting for a condition
+  - Variables typed as `T | null` need optional chaining inside async callbacks for Biome compliance
+---
+
+## 2026-04-05 04:32 - US-002
+- Replaced 3 hard-coded sleeps with polling in E2E tests:
+  - iife-injection.e2e.ts: 3s sleep → `expect.poll` checking health endpoint for e2e-test plugin registration
+  - security.e2e.ts: 2s sleep → `expect.poll` counting `tool.call: input validated` log entries (≥25)
+  - permissions.e2e.ts: 1s sleep → `waitForLog` for `tool.call: input validated` dispatch log
+- Also fixed pre-existing lint warning in auth-bootstrap.e2e.ts (`server!` → `server?`)
+- Files changed: e2e/iife-injection.e2e.ts, e2e/security.e2e.ts, e2e/permissions.e2e.ts, e2e/auth-bootstrap.e2e.ts
+- **Learnings for future iterations:**
+  - The health endpoint does NOT expose `activeDispatches` — use server logs to detect dispatch state instead
+  - The log line `tool.call: input validated for <toolname>` is emitted before the concurrency check and before `activeDispatches` increment, making it a reliable proxy for "dispatch has been received and is being processed"
+  - When polling for multiple occurrences of a log line, clear `mcpServer.logs.length = 0` before the triggering action to avoid counting stale entries from test setup
+---
+
+## 2026-04-05 04:37 - US-003
+- Fixed reload-coalescing timing and replaced sleeps in stress-config-reload:
+  - reload-coalescing.e2e.ts:174 — 1500ms sleep → `expect.poll` on `countDiscovery()` for coalesced discovery completion
+  - reload-coalescing.e2e.ts:189 — 1500ms sleep → `expect.poll` on `countDiscovery()` for 4th reload discovery completion
+  - reload-coalescing.e2e.ts:105 and :180 — 700ms coalescing window exits → 1200ms for CI headroom
+  - stress-config-reload.e2e.ts:89 — removed redundant 2s sleep before `waitForToolList` which already polls
+- Files changed: e2e/reload-coalescing.e2e.ts, e2e/stress-config-reload.e2e.ts
+- **Learnings for future iterations:**
+  - When a sleep before a polling call is redundant (the poll already waits for the condition), remove the sleep entirely
+  - For coalescing window exits, 700ms margin over 500ms is too tight for CI; 1200ms provides adequate headroom
+  - `expect.poll` with `countDiscovery()` (counting log lines) is a clean replacement for sleeps that wait for discovery completion
+  - E2E checkpoint: all 227 E2E tests passed on first run
+---
