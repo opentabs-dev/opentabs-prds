@@ -1,0 +1,60 @@
+# Ralph Progress Log
+PRD: prd-2026-04-05-131335-harden-dispatch-validation-31abb6~running.json
+Started: Sun Apr  5 20:14:12 UTC 2026
+---
+
+## Codebase Patterns
+- executeInTab is a local helper in analyze-site/index.ts that wraps dispatchToExtension for browser.executeScript — it unwraps nested results and returns unknown
+- Chrome can truncate large JSON payloads (>50KB) to strings instead of parsed objects — guard with typeof + first-char check
+- PR #38 established the Array.isArray() validation pattern for executeInTab call sites expecting arrays
+- The pageTitle call at line 954 legitimately returns a string (document.title) — truncation guard only triggers for '{' or '[' prefixed strings
+- dispatchToAllConnections returns `{ connectionId: string; result: unknown }[]` — always validate result before spreading or accessing properties
+- Standard object-type dispatch result guard: `x !== null && typeof x === 'object' && !Array.isArray(x)` then cast to `Record<string, unknown>`
+- For numeric properties from dispatch results, validate with `typeof x === 'number'` before arithmetic to prevent NaN
+---
+
+## 2026-04-05 20:15 UTC - US-001
+- Added truncated-JSON guard in executeInTab (platform/mcp-server/src/browser-tools/analyze-site/index.ts:83-87)
+- When inner.value is a string starting with '{' or '[', returns null instead of the truncated string
+- All callers already use `?? default` patterns so they fall back correctly
+- Files changed: platform/mcp-server/src/browser-tools/analyze-site/index.ts
+- **Learnings for future iterations:**
+  - The guard is simple: typeof check + first char check — no logging needed since all callers have fallbacks
+  - pageTitle at line 954 returns a plain string (document.title) that never starts with '{' or '[', so it's unaffected
+---
+
+## 2026-04-05 20:18 UTC - US-002
+- Hardened 7 array-type executeInTab call sites in analyze-site/index.ts with Array.isArray() validation
+- Replaced `((await executeInTab(...)) ?? []) as Type[]` pattern with `const raw = await executeInTab(...); result = Array.isArray(raw) ? raw as Type[] : []`
+- frameworkProbes wraps Array.isArray check inside the deduplicateFrameworkProbes call
+- storageKeys, storageEntries (already hardened by PR #38) and pageTitle (string) were left untouched per constraints
+- Files changed: platform/mcp-server/src/browser-tools/analyze-site/index.ts
+- **Learnings for future iterations:**
+  - The ?? [] pattern doesn't protect against truthy non-arrays (like truncated JSON strings) — Array.isArray() is the correct guard
+  - interactiveElements already used a slightly different pattern (separate const) but was still an unsafe as-cast — normalize to the Array.isArray pattern
+---
+
+## 2026-04-05 20:20 UTC - US-003
+- Hardened spaSsrProbe object-type executeInTab call site in analyze-site/index.ts
+- Replaced unsafe `((await executeInTab(...)) as typeof defaultSpaSsrProbe | null) ?? defaultSpaSsrProbe` cast with explicit object shape validation
+- Uses `rawProbe !== null && typeof rawProbe === 'object' && !Array.isArray(rawProbe)` guard, then validates each boolean property with `=== true`
+- Falls back to `defaultSpaSsrProbe` (initial value) if result is not the expected shape
+- Files changed: platform/mcp-server/src/browser-tools/analyze-site/index.ts
+- **Learnings for future iterations:**
+  - For object-type results, use null/typeof/!Array.isArray guards then cast to Record<string, unknown> for property access
+  - `=== true` ensures only actual boolean true values pass (not truthy strings/numbers)
+  - The let variable initial value IS the default — no need for explicit fallback assignment at the end
+---
+
+## 2026-04-05 20:25 UTC - US-004
+- Hardened extension-get-logs: replaced unsafe `as LogsResult` cast with explicit object shape validation; validate r.result is non-null non-array object, validate entries is an array, validate stats is a non-null non-array object with number-typed properties before arithmetic
+- Removed unused `LogsResult` interface (biome lint flagged it as unused after removing the cast)
+- Hardened extension-get-state and extension-check-adapter: replaced unsafe `(r.result as object) ?? {}` spread with non-null/non-array object validation inside the map callback
+- Files changed: platform/mcp-server/src/browser-tools/extension-get-logs.ts, extension-get-state.ts, extension-check-adapter.ts
+- All Phase 1 (build, type-check, lint, knip, test) and Phase 2 (E2E: 725 passed) checks green
+- **Learnings for future iterations:**
+  - `dispatchToAllConnections` returns `{ connectionId: string; result: unknown }[]` — always validate `result` before spreading or accessing properties
+  - The `(x as object) ?? {}` pattern is doubly unsafe: the cast lies about the type, and `?? {}` doesn't guard against arrays (arrays are truthy objects that spread into numeric keys)
+  - The standard validation guard for object-type dispatch results: `x !== null && typeof x === 'object' && !Array.isArray(x)`
+  - When removing an unsafe cast, check if the cast's target interface becomes unused — biome's noUnusedVariables will flag it
+---
