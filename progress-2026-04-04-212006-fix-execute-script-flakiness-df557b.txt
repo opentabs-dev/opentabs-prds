@@ -1,0 +1,38 @@
+# Ralph Progress Log
+PRD: prd-2026-04-04-212006-fix-execute-script-flakiness-df557b~running.json
+Started: Sun Apr  5 04:20:51 UTC 2026
+---
+
+## Codebase Patterns
+- Chromium returns 'Frame with ID 0 was removed.' when a tab is closed mid-script-execution (not 'tab closed' or 'cannot access')
+- E2E test files live in e2e/*.e2e.ts; regex patterns in assertions must cover all Chromium error message variants
+- The exec file wrapper in adapter-files.ts wraps ALL user code in `async function`, so `__r` is always a Promise and the sync result path is dead code
+- Use `.then(onFulfilled, onRejected)` instead of `.then().catch()` for Promise rejection handling — one microtask hop instead of two
+- Set `__asyncKey` before calling the async function, not after — ensures the poller sees the flag even if chrome.scripting.executeScript resolves before microtasks drain
+- The polling logic in extension-commands.ts uses EXEC_POLL_INTERVAL_MS=50ms and EXEC_MAX_ASYNC_WAIT_MS=10000ms
+
+---
+
+## 2026-04-05 - US-001
+- Fixed tab-closed error regex in e2e/browser-tools.e2e.ts line 3339
+- Changed `/tab|cannot access/i` to `/tab|cannot access|frame.*removed/i` to also match 'Frame with ID 0 was removed.'
+- Files changed: e2e/browser-tools.e2e.ts
+- **Learnings for future iterations:**
+  - Chromium's error for a closed tab mid-execution is 'Frame with ID 0 was removed.' — neither 'tab' nor 'cannot access' appear in this message
+  - The test at line 3310 is a stress test that closes a tab 500ms into a 3s async script; the error text must match at least one of the alternatives in the regex
+  - Negative assertion (`not.toMatch(/timed out/i)`) must be preserved to distinguish from timeout errors
+---
+
+## 2026-04-05 - US-002
+- Fixed async Promise rejection race condition in browser_execute_script exec file wrapper
+- Changed `.then(fn).catch(fn)` to `.then(onFulfilled, onRejected)` for direct rejection handling (one microtask hop instead of two)
+- Set `__asyncKey = true` before calling the async function (was set after)
+- Removed dead code: thenable check and sync result path (always dead since async function always returns a Promise)
+- Files changed: platform/mcp-server/src/adapter-files.ts, platform/mcp-server/src/adapter-files.test.ts
+- **Learnings for future iterations:**
+  - The `async function` wrapper makes ALL user code async — `(async function() { return 42 })()` always returns a Promise, so the thenable check is always true
+  - `.then(fn).catch(fn)` requires TWO microtask hops for rejections (rejected Promise → .then() creates intermediate rejected Promise → .catch() catches it), while `.then(fn, fn2)` handles rejections directly in ONE microtask hop
+  - The `try/catch` in the wrapper only catches wrapper-level errors (not user code errors, which become Promise rejections from the async function)
+  - E2E tests for browser_execute_script live in both e2e/browser-tools.e2e.ts and e2e/strict-csp.e2e.ts
+  - Unit tests in adapter-files.test.ts check the wrapper structure via string containment assertions — update these when changing the wrapper template
+---
