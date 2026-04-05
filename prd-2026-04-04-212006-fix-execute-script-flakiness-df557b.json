@@ -1,0 +1,36 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix flaky browser_execute_script E2E tests: (1) tab-closed error regex doesn't match 'Frame with ID 0 was removed', (2) async Promise rejection race condition causes intermittent 10s timeout instead of catching the rejection, (3) async Promise returns undefined on strict-CSP pages. After this lands, all browser_execute_script tests pass reliably on all platforms.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix tab-closed error regex in browser-tools.e2e.ts stress test",
+      "description": "The test 'browser_execute_script on tab closed mid-execution returns error within 10s' fails because the error message 'Frame with ID 0 was removed' does not match the test's regex `/tab|cannot access/i`. The regex needs to also accept frame-removal messages from Chromium.",
+      "acceptanceCriteria": [
+        "The regex at the assertion matches 'Frame with ID 0 was removed' in addition to existing patterns",
+        "The negative assertion (not matching 'timed out') is preserved"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- e2e/browser-tools.e2e.ts (fix regex around line 3339)\n\nContext:\nThe test at line 3310 closes a tab during a slow script execution and asserts the error message:\n```ts\n// Error must reference tab being gone, not a generic timeout\nconst errorText = JSON.stringify(result.content);\nexpect(errorText).toMatch(/tab|cannot access/i);\nexpect(errorText).not.toMatch(/timed out/i);\n```\n\nChromium returns 'Frame with ID 0 was removed.' when a tab is closed mid-execution. This message contains neither 'tab' nor 'cannot access'.\n\nChanges:\nUpdate line 3339 from:\n```ts\nexpect(errorText).toMatch(/tab|cannot access/i);\n```\nTo:\n```ts\nexpect(errorText).toMatch(/tab|cannot access|frame.*removed/i);\n```\n\nConstraints:\n- Do NOT modify the negative assertion on line 3340 (`not.toMatch(/timed out/i)`)\n- Do NOT change any other test in the file"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix async Promise rejection race condition in browser_execute_script",
+      "description": "The test 'handles async code that rejects' in browser-tools.e2e.ts is flaky — the Promise rejection is sometimes not caught before the 10s polling timeout fires, returning 'Async code did not resolve within 10000ms' instead of the rejection error 'async-fail'. The same root cause affects 'handles async code (Promises)' on macOS and 'async code (Promise) resolves correctly on strict-CSP page' in strict-csp.e2e.ts.",
+      "acceptanceCriteria": [
+        "browser_execute_script correctly returns Promise rejection errors instead of timing out",
+        "browser_execute_script correctly returns async resolved values on strict-CSP pages",
+        "The exec file wrapper correctly sets __openTabs[resultKey] for both resolved and rejected Promises",
+        "All three affected tests pass reliably: browser-tools.e2e.ts:604, browser-tools.e2e.ts:582, strict-csp.e2e.ts:558"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/browser-commands/extension-commands.ts (investigate polling logic)\n- platform/mcp-server/src/browser-tools/ (investigate exec file generation)\n- e2e/browser-tools.e2e.ts (the flaky tests at lines 582, 604)\n- e2e/strict-csp.e2e.ts (the failing test at line 558)\n\nContext:\nThe `browser_execute_script` command works in two phases:\n1. Generates an exec JS file (wrapper around user code) and writes it to the adapters/ directory\n2. Injects the file into the tab's MAIN world via `chrome.scripting.executeScript({ files: [...] })`\n3. Polls for the result via repeated `chrome.scripting.executeScript({ func: ... })` calls\n\nThe wrapper sets `__openTabs[resultKey]` when the user code completes:\n- For sync code: sets immediately\n- For async code (Promises): sets `__openTabs[asyncKey] = true` and resolves/rejects later\n\nThe polling logic (extension-commands.ts around line 414-483) checks:\n```ts\nconst result = ot[rKey] as { value?: unknown; error?: string } | undefined;\nconst isAsync = ot[aKey] === true;\n\n// Result available (sync or async resolved)\nif (result && ('value' in result || 'error' in result)) { ... }\n\n// Async code hasn't resolved yet\nif (isAsync) return { pending: true };\n```\n\nThe race condition: the `isAsync` flag may be set AFTER the polling check reads it as undefined, causing the poller to return `{ pending: false, result: { error: 'No result captured' } }` or miss the first few polls. On CSP pages, file injection may be slightly slower, widening the race window.\n\nInvestigation steps:\n1. Read the exec file generation code in platform/mcp-server/src/browser-tools/ to understand the wrapper that sets resultKey/asyncKey/startedKey\n2. Check if the wrapper correctly handles Promise.reject() — the rejection might not set the error on resultKey\n3. Check timing: the `startedKey` is checked (line 452) but the `asyncKey` might not be set atomically with `startedKey`\n4. The EXEC_POLL_INTERVAL_MS constant controls polling frequency — check if it's too slow\n\nPotential fixes:\n- Ensure the exec wrapper sets asyncKey BEFORE starting the async operation\n- Ensure Promise.catch() correctly writes to resultKey with error\n- Consider reducing EXEC_POLL_INTERVAL_MS for faster detection\n\nConstraints:\n- Do NOT change the EXEC_MAX_ASYNC_WAIT_MS (10s) — that's the intended maximum wait\n- Do NOT change the SCRIPT_TIMEOUT_MS outer timeout\n- The fix must work for both regular pages and strict-CSP pages\n- The exec file approach (bypassing CSP via file injection) is the correct architecture — do NOT switch to inline func injection"
+    }
+  ]
+}
