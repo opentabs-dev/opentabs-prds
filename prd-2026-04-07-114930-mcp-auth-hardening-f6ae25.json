@@ -1,0 +1,54 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Harden MCP server HTTP responses for compatibility with Claude Code's MCP SDK auth flow. The first PRD (oauth-discovery-compat) fixed JSON 404 for catch-all and well-known routes. This follow-up addresses two remaining issues: (1) GET /mcp without a session returns 400 plain text, which the SDK throws as a StreamableHTTPError — should return 405 so the SDK silently proceeds; (2) the 401 response from checkBearerAuth lacks a WWW-Authenticate header, which is required by HTTP spec and helps the SDK distinguish Bearer auth from OAuth.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Return 405 for GET /mcp without a session ID",
+      "description": "Change the GET /mcp handler to return 405 Method Not Allowed (instead of 400) when no mcp-session-id header is present. The MCP SDK treats 405 as 'server does not offer SSE stream' and silently proceeds, while 400 throws a StreamableHTTPError that surfaces as an error to the client.",
+      "acceptanceCriteria": [
+        "GET /mcp with valid Bearer auth but no mcp-session-id returns 405",
+        "GET /mcp with a valid mcp-session-id still returns the SSE stream (existing behavior unchanged)",
+        "GET /mcp with an invalid mcp-session-id returns 400 (existing behavior for bad sessions unchanged)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.ts (modify handleMcp GET block)\n\nContext:\nThe MCP SDK's `_startOrAuthSse()` in streamableHttp.js handles the GET response:\n- 401 → triggers OAuth flow (bad)\n- 405 → `return;` silently (good — means 'server doesn't support standalone SSE')\n- 400 → `throw new StreamableHTTPError(400, ...)` (bad — surfaces as error)\n\nThe GET /mcp is called AFTER successful POST /mcp initialize, so it always has a session in normal flow. But Claude Code's SDK may also attempt a GET before POST in some code paths. Returning 405 for no-session GET is the safest response.\n\nCurrent code at line 780-786 in handleMcp:\n```typescript\nif (req.method === 'GET') {\n    const getTransport = sessionId ? transports.get(sessionId) : undefined;\n    if (getTransport) {\n      return getTransport.handleRequest(req);\n    }\n    return new Response('Missing or invalid session', { status: 400 });\n  }\n```\n\nChange to:\n```typescript\nif (req.method === 'GET') {\n    if (!sessionId) {\n      return new Response('Method Not Allowed', { status: 405 });\n    }\n    const getTransport = transports.get(sessionId);\n    if (getTransport) {\n      return getTransport.handleRequest(req);\n    }\n    return new Response('Missing or invalid session', { status: 400 });\n  }\n```\n\nThis returns 405 when there's no session ID at all (SDK's first probe), and 400 when there IS a session ID but it's invalid/expired (actual error condition).\n\nAlso apply the same logic to the DELETE block at lines 788-794 — a DELETE without a session ID should also return 405.\n\nConstraints:\n- Do NOT change POST handling — POST without session is how new sessions are created\n- Do NOT change the behavior when a valid session ID is provided\n- The 405 response does NOT need a JSON body — the SDK checks status code only for this case"
+    },
+    {
+      "id": "US-002",
+      "title": "Add WWW-Authenticate header to 401 responses",
+      "description": "Add a `WWW-Authenticate: Bearer` header to the 401 response returned by checkBearerAuth. This is required by RFC 7235 and helps MCP SDK clients distinguish Bearer token auth from OAuth.",
+      "acceptanceCriteria": [
+        "401 responses from /mcp include WWW-Authenticate: Bearer header",
+        "401 responses from other authenticated endpoints (/reload, /health, etc.) include WWW-Authenticate: Bearer header",
+        "The header value is 'Bearer' with no additional parameters"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.ts (modify checkBearerAuth)\n\nContext:\nThe `checkBearerAuth` function at line 131-139 returns a plain `401 Unauthorized` with no headers:\n```typescript\nconst checkBearerAuth = (req: Request, wsSecret: string | null): Response | null => {\n  if (!wsSecret) return null;\n  const authHeader = req.headers.get('Authorization');\n  const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;\n  if (!token || !constantTimeEqual(token, wsSecret)) {\n    return new Response('Unauthorized', { status: 401 });\n  }\n  return null;\n};\n```\n\nChange the Response to include a WWW-Authenticate header:\n```typescript\nreturn new Response('Unauthorized', {\n  status: 401,\n  headers: { 'WWW-Authenticate': 'Bearer' },\n});\n```\n\nPer RFC 7235, servers MUST include WWW-Authenticate with 401 responses. The `Bearer` value without additional parameters signals simple Bearer token auth. The MCP SDK's `extractWWWAuthenticateParams()` in auth.js parses this header to decide whether to use OAuth or simple Bearer auth.\n\nConstraints:\n- Do NOT add realm, scope, or other parameters — just 'Bearer'\n- Do NOT change the response body or status code"
+    },
+    {
+      "id": "US-003",
+      "title": "E2E tests for MCP auth hardening",
+      "description": "Add E2E tests verifying the 405 response for GET /mcp without session, the WWW-Authenticate header on 401 responses, and the full connection flow simulation.",
+      "acceptanceCriteria": [
+        "Test verifies GET /mcp with Bearer auth but no session returns 405 (not 400)",
+        "Test verifies GET /mcp with valid session ID still returns 200 SSE stream",
+        "Test verifies DELETE /mcp without session returns 405",
+        "Test verifies 401 response includes WWW-Authenticate: Bearer header",
+        "Test simulates full MCP SDK connection: POST initialize → POST notification → GET SSE with session → all succeed",
+        "Test verifies GET /mcp without session does NOT trigger error in a realistic client flow"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/oauth-discovery-compat.e2e.ts (extend existing file from previous PRD)\n\nContext:\nThe previous PRD created `e2e/oauth-discovery-compat.e2e.ts` with tests for JSON 404 responses on well-known endpoints. Extend this file with new test.describe blocks for the additional hardening.\n\nNew test groups to add:\n\n1. **GET /mcp without session returns 405**:\n```typescript\ntest('GET /mcp without session ID returns 405', async () => {\n  const server = await startMcpServer(configDir, true);\n  try {\n    await server.waitForHealth(h => h.status === 'ok');\n    const headers: Record<string, string> = {};\n    if (server.secret) headers.Authorization = `Bearer ${server.secret}`;\n    const res = await fetch(`http://127.0.0.1:${server.port}/mcp`, {\n      method: 'GET',\n      headers: { ...headers, Accept: 'text/event-stream' },\n    });\n    expect(res.status).toBe(405);\n  } finally {\n    await server.kill();\n  }\n});\n```\n\n2. **DELETE /mcp without session returns 405**: Same pattern but with DELETE method.\n\n3. **GET /mcp WITH valid session still works**: Do a full POST initialize first to get a session ID, then GET with that session ID → should return 200.\n\n4. **401 includes WWW-Authenticate header**:\n```typescript\ntest('401 response includes WWW-Authenticate: Bearer', async () => {\n  const server = await startMcpServer(configDir, true);\n  try {\n    await server.waitForHealth(h => h.status === 'ok');\n    const res = await fetch(`http://127.0.0.1:${server.port}/mcp`, {\n      method: 'POST',\n      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer wrong-token' },\n      body: '{}',\n    });\n    expect(res.status).toBe(401);\n    expect(res.headers.get('WWW-Authenticate')).toBe('Bearer');\n  } finally {\n    await server.kill();\n  }\n});\n```\n\n5. **Full MCP connection flow**: POST initialize → POST notification → GET SSE with session. Verify all three succeed and the session is established. Use the pattern from the existing test in the file.\n\nFollow the patterns from the existing `e2e/oauth-discovery-compat.e2e.ts` — use `createTestConfigDir`, `cleanupTestConfigDir`, `startMcpServer`, `server.waitForHealth`, and the test/expect from fixtures.\n\nConstraints:\n- Do NOT duplicate tests already in the existing file — add new test.describe blocks\n- These are pure HTTP tests — no Chrome extension or browser context needed\n- Each test must use its own server instance (test isolation)"
+    }
+  ]
+}
