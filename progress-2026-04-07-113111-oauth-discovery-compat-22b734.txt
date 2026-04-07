@@ -1,0 +1,36 @@
+# Ralph Progress Log
+PRD: prd-2026-04-07-113111-oauth-discovery-compat-22b734~running.json
+Started: Tue Apr  7 18:31:49 UTC 2026
+---
+
+## Codebase Patterns
+- The main HTTP router is `createHandleFetch` in `platform/mcp-server/src/http-routes.ts`, dispatching by `url.pathname` matching with a catch-all at the end
+- Security checks (Host header validation, CORS/Origin check) run before any route matching — new routes inherit these protections automatically
+- `Response.json()` is the preferred way to return JSON responses (used throughout the codebase)
+- E2E tests for HTTP endpoints follow the pattern in `e2e/security.e2e.ts`: `createTestConfigDir()` + `startMcpServer()` + `server.waitForHealth()` + `fetch()` assertions
+- MCP Streamable HTTP responses use SSE format (text/event-stream) when client sends `Accept: text/event-stream` — parse `data:` lines to extract JSON-RPC messages instead of using `res.json()`
+---
+
+## 2026-04-07 18:33 UTC - US-001
+- Changed catch-all 404 from plain text `new Response('Not Found', { status: 404 })` to `Response.json({ error: 'not_found', error_description: 'Not Found' }, { status: 404 })`
+- Added `/.well-known/*` route block before catch-all returning JSON 404 with OAuth-specific error_description
+- Files changed: `platform/mcp-server/src/http-routes.ts`
+- **Learnings for future iterations:**
+  - The MCP SDK's `parseErrorResponse()` calls `JSON.parse()` on all non-OK response bodies — any non-JSON response from the server will crash the SDK client
+  - The `OAuthErrorResponseSchema` expects `{ error: string, error_description?: string }` — matching this schema ensures graceful handling by the SDK
+  - Well-known routes don't need Bearer auth (they're public per RFC 8414) but still pass through Host/Origin security checks since those run before route matching
+---
+
+## 2026-04-07 18:42 UTC - US-002
+- Created `e2e/oauth-discovery-compat.e2e.ts` with 5 test groups (13 tests total):
+  1. Well-known endpoint responses (6 path variants, Content-Type + error field checks)
+  2. Fallback OAuth endpoints (/authorize, /token, /register)
+  3. Full Claude Code connection simulation (probe → 404 → initialize → tools/list)
+  4. Catch-all 404 returns valid JSON for arbitrary paths
+  5. Existing routes unaffected (/health, POST /mcp, GET /mcp)
+- Files changed: `e2e/oauth-discovery-compat.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - The MCP Streamable HTTP transport returns SSE (text/event-stream) responses when `Accept: text/event-stream` is in the request headers — cannot use `res.json()` directly, must parse `data:` lines from the SSE stream to extract JSON-RPC messages
+  - E2E tests for pure HTTP endpoints follow the `security.e2e.ts` pattern: `createTestConfigDir()` + `startMcpServer(configDir, true)` + `server.waitForHealth()` + `fetch()` — no browser context needed
+  - The `notifications/initialized` notification must be sent between `initialize` and `tools/list` for the MCP session to work, and returns 202 (not 200)
+---
