@@ -1,0 +1,50 @@
+# Ralph Progress Log
+PRD: prd-2026-04-07-114930-mcp-auth-hardening-f6ae25~running.json
+Started: Tue Apr  7 18:49:57 UTC 2026
+---
+
+## Codebase Patterns
+- Both `handleMcp` and `handleGatewayMcp` in `http-routes.ts` share identical GET/DELETE/POST handling patterns — changes to one usually need to be mirrored in the other
+- The existing test in `http-routes.test.ts` at line ~1180 tests rate-limiting behavior for GET /mcp without session — must be updated when changing the status code for that case
+- The MCP SDK checks status codes semantically: 405 = silently proceed, 400 = throw error, 401 = trigger auth
+- Node.js `writeHead()` buffers HTTP headers until the first body `write()` — SSE streams that start empty need `res.flushHeaders()` to send headers immediately, or `fetch()` hangs indefinitely
+- The dev proxy (`dev-proxy.ts`) and the server (`server-node.ts`) both need `flushHeaders()` for SSE streams — the proxy intercepts MCP GET requests and writes its own headers
+- The `/health` endpoint does NOT return 401 for wrong auth — it returns a limited 200 response. Use `/audit` or other authenticated endpoints for 401 testing
+- E2E tests run through the dev proxy (hot=true) by default — HTTP behavior changes must account for both the server and the proxy layers
+
+## 2026-04-07 18:52 UTC - US-001
+- Changed GET and DELETE /mcp handlers to return 405 instead of 400 when no mcp-session-id header is present
+- Applied to both `handleMcp` and `handleGatewayMcp` functions
+- Updated unit test that expected 400 for GET without session to expect 405
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`
+- **Learnings for future iterations:**
+  - `handleMcp` and `handleGatewayMcp` are nearly identical — always check both when making HTTP response changes
+  - The rate-limiting test section exercises GET /mcp without a session as a side effect of testing that GET isn't rate-limited
+---
+
+## 2026-04-07 18:55 UTC - US-002
+- Added `WWW-Authenticate: Bearer` header to the 401 response in `checkBearerAuth`
+- Added unit test verifying the header is present on 401 responses
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`
+- **Learnings for future iterations:**
+  - `checkBearerAuth` is used for ALL authenticated endpoints (not just /mcp) — a single change to it covers /mcp, /reload, /ws-info, /tools, /tools:call, /plugin-settings, /audit
+  - The header value must be exactly `'Bearer'` with no realm/scope parameters per RFC 7235
+  - The MCP SDK's `extractWWWAuthenticateParams()` parses this header to distinguish Bearer token auth from OAuth
+---
+
+## 2026-04-07 19:35 UTC - US-003
+- Added 22 E2E tests across 3 new test.describe blocks in `e2e/oauth-discovery-compat.e2e.ts`:
+  - Section 6: MCP auth hardening — 405 for sessionless GET/DELETE (4 tests)
+  - Section 7: MCP auth hardening — WWW-Authenticate header on 401 (4 tests)
+  - Section 8: MCP auth hardening — full MCP connection flow (2 tests)
+- Updated existing test name/assertion from 400 to 405 in section 5
+- Fixed SSE header flushing bug: added `res.flushHeaders()` in `server-node.ts` and `dev-proxy.ts`
+- Changed /health 401 test to use /audit endpoint (health doesn't require auth)
+- Files changed: `e2e/oauth-discovery-compat.e2e.ts`, `platform/mcp-server/src/server-node.ts`, `platform/mcp-server/src/dev-proxy.ts`
+- **Learnings for future iterations:**
+  - Node.js `fetch()` does NOT resolve until body data arrives, even after `writeHead()` — must call `res.flushHeaders()` explicitly for SSE streams that start empty
+  - The dev proxy intercepts MCP GET requests and writes its own SSE headers — both server-node.ts AND dev-proxy.ts need the flushHeaders fix
+  - `/health` returns 200 for unauthenticated requests (limited response) — it never returns 401. Use `/audit` or `/reload` for testing 401 behavior
+  - The MCP SDK's `WebStandardStreamableHTTPServerTransport.handleGetRequest` creates a ReadableStream and returns a Response immediately, but Node.js's HTTP server doesn't flush the response headers until the first chunk is piped
+  - SSE E2E tests that open GET /mcp with a session should use AbortController to close the stream after verifying headers, preventing cleanup issues
+---
