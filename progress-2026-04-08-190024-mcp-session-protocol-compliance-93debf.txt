@@ -1,0 +1,51 @@
+# Ralph Progress Log
+PRD: prd-2026-04-08-190024-mcp-session-protocol-compliance-93debf~running.json
+Started: Thu Apr  9 02:00:52 UTC 2026
+---
+
+## Codebase Patterns
+- `handleMcp` and `handleGatewayMcp` in `platform/mcp-server/src/http-routes.ts` have nearly identical code structures — changes to one typically need mirroring in the other
+- POST flow: existing session lookup → rate limit → parse body → initialize check → stale session 404 / missing session 400
+- GET/DELETE flow: missing sessionId → 405, valid session → handleRequest, stale session → 404
+- The rate limit check runs before the stale session check for POST, so 429 takes priority over 404
+- Existing tests in `http-routes.test.ts` cover rate limiting with unknown session IDs (expects 429 since rate limit fires first)
+- For E2E protocol compliance tests, use `startMcpServer(configDir, false)` to bypass the dev proxy and test handlers directly
+- `createMcpClient` targets `/mcp` — for `/mcp/gateway` tests, use raw `fetch()` calls
+- Fabricate `randomUUID()` as stale session IDs rather than restarting servers
+
+## 2026-04-09 - US-001
+- Changed stale session responses in `handleMcp` from HTTP 400 to HTTP 404 per MCP spec (2025-03-26) §3
+- POST: added `if (sessionId)` check before the existing 400 fallthrough, returning 404 for stale sessions while keeping 400 for missing session + non-initialize body
+- GET: changed `'Missing or invalid session'` 400 → `'Session not found'` 404
+- DELETE: changed `'Missing or invalid session'` 400 → `'Session not found'` 404
+- Files changed: `platform/mcp-server/src/http-routes.ts`
+- **Learnings for future iterations:**
+  - The `handleMcp` and `handleGatewayMcp` functions are structurally identical — edits need unique context (e.g., `createMcpServer` vs `createGatewayMcpServer`) to disambiguate when using text-based edit tools
+  - All existing unit tests passed without modification — the rate limit tests work because the rate limit fires before the stale session check
+---
+
+## 2026-04-09 - US-002
+- Applied the same 400→404 stale session fix to `handleGatewayMcp` in `platform/mcp-server/src/http-routes.ts`
+- POST: added `if (sessionId)` block before the 400 fallthrough, returning 404 JSON for stale sessions (matching US-001 pattern exactly)
+- GET: changed `'Missing or invalid session'` 400 → `'Session not found'` 404
+- DELETE: changed `'Missing or invalid session'` 400 → `'Session not found'` 404
+- Files changed: `platform/mcp-server/src/http-routes.ts`
+- **Learnings for future iterations:**
+  - Edit tool requires unique context strings — the POST fallthrough was unique enough between handleMcp and handleGatewayMcp because handleGatewayMcp's fallthrough was immediately followed by `createGatewayMcpServer` context
+  - All Phase 1 checks passed without any additional fixes needed
+---
+
+## 2026-04-09 - US-003
+- Created `e2e/mcp-session-protocol.e2e.ts` with 14 E2E tests covering both `/mcp` and `/mcp/gateway` endpoints
+- Tests cover: POST/GET/DELETE with stale session IDs (→404), POST without session ID (→400), GET/DELETE without session ID (→405), and valid session isolation
+- Used `randomUUID()` to fabricate stale session IDs — simpler and more reliable than server restart
+- Used `rawRequest()` helper wrapping `fetch()` to inspect exact HTTP status codes
+- Gateway valid-session test uses raw `fetch()` calls to initialize on `/mcp/gateway` (since `createMcpClient` targets `/mcp`)
+- All Phase 1 and Phase 2 checks passed (261 E2E tests, 3555 unit tests)
+- Files changed: `e2e/mcp-session-protocol.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - Use `startMcpServer(configDir, false)` (non-hot mode) to test `handleMcp`/`handleGatewayMcp` directly without the dev proxy layer
+  - `rawRequest()` pattern is useful for protocol compliance tests — bypasses `createMcpClient`'s error handling and auto-reinit logic
+  - `createMcpClient` hardcodes `/mcp` — for gateway endpoint tests, use raw `fetch()` calls
+  - Fabricating a random UUID as a session ID is the simplest way to test stale session behavior (no need to restart server or close sessions)
+---
