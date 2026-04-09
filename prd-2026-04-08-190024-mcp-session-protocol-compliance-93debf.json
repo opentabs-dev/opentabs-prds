@@ -1,0 +1,60 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix MCP Streamable HTTP session management to comply with the spec. The server returns HTTP 400 for stale/unknown session IDs, but the MCP spec (2025-03-26) requires HTTP 404 Not Found — which is the signal that triggers MCP clients (like Claude Code) to auto-reconnect by sending a fresh InitializeRequest. This affects both /mcp and /mcp/gateway endpoints. Also add E2E tests for session lifecycle scenarios (stale session, expired session, missing session).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Return 404 for stale/unknown session IDs in /mcp endpoint",
+      "description": "Change all stale-session responses in handleMcp from HTTP 400 to HTTP 404, per MCP spec section 3: 'The server MAY terminate the session at any time, after which it MUST respond to requests containing that session ID with HTTP 404 Not Found.' This applies to POST (stale session + non-initialize body), GET (stale session), and DELETE (stale session).",
+      "acceptanceCriteria": [
+        "POST /mcp with a stale Mcp-Session-Id and a non-initialize body returns HTTP 404 (not 400)",
+        "GET /mcp with a stale Mcp-Session-Id returns HTTP 404 (not 400)",
+        "DELETE /mcp with a stale Mcp-Session-Id returns HTTP 404 (not 400)",
+        "POST /mcp with no session ID and a non-initialize body still returns HTTP 400 (this is genuinely a bad request, not a stale session)",
+        "POST /mcp with a valid session ID continues to work normally (200/SSE)",
+        "New session creation via initialize request is unaffected"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.ts (handleMcp function, lines 687-803)\n\nContext:\nThe MCP spec (2025-03-26) session management section states:\n- Point 3: 'The server MAY terminate the session at any time, after which it MUST respond to requests containing that session ID with HTTP 404 Not Found.'\n- Point 4: 'When a client receives HTTP 404 in response to a request containing an Mcp-Session-Id, it MUST start a new session by sending a new InitializeRequest without a session ID attached.'\n\nCurrently, the server returns 400 for stale sessions, which clients treat as a permanent error (bad request) rather than a recoverable one (session expired, please reconnect).\n\nChanges:\nIn `handleMcp`, there are three locations that need to change:\n\n1. POST with stale session (lines 767-777): The fallthrough after checking `isInitializeRequest(body)` returns 400. This needs to be split into two cases:\n   - If `sessionId` is present but not in `transports`, return 404 (stale session)\n   - If `sessionId` is absent and body is not initialize, return 400 (genuinely bad request)\n   Current code:\n   ```\n   return Response.json(\n     {\n       jsonrpc: '2.0',\n       error: {\n         code: -32600,\n         message: 'Bad Request: missing session or not an initialize request',\n       },\n       id: null,\n     },\n     { status: 400 },\n   );\n   ```\n   Change to: check if `sessionId` is truthy. If yes → 404 with message like 'Session not found' (the session was lost/expired). If no → 400 with current message (genuinely missing session on a non-initialize request).\n\n2. GET with stale session (line 788):\n   Current: `return new Response('Missing or invalid session', { status: 400 });`\n   Change to: `return new Response('Session not found', { status: 404 });`\n   Note: the `!sessionId` check on line 781 already returns 405 for missing session ID — so if we reach line 788, `sessionId` is present but not in `transports`, meaning it's a stale session → 404.\n\n3. DELETE with stale session (line 799):\n   Current: `return new Response('Missing or invalid session', { status: 400 });`\n   Change to: `return new Response('Session not found', { status: 404 });`\n   Same logic as GET — the `!sessionId` check on line 792 returns 405 for absent IDs.\n\nConstraints:\n- Do NOT change the 405 responses for missing session IDs on GET/DELETE — those are correct per HTTP semantics\n- Do NOT change the rate-limit 429 response\n- Do NOT change any behavior for valid sessions\n- Do NOT change the initialize request flow\n- The 400 response for POST without a session ID and without an initialize body should remain 400 — that IS a genuinely bad request"
+    },
+    {
+      "id": "US-002",
+      "title": "Return 404 for stale/unknown session IDs in /mcp/gateway endpoint",
+      "description": "Apply the same 400→404 fix to handleGatewayMcp. The gateway endpoint has identical session management code and the same protocol violations.",
+      "acceptanceCriteria": [
+        "POST /mcp/gateway with a stale Mcp-Session-Id and non-initialize body returns HTTP 404",
+        "GET /mcp/gateway with a stale Mcp-Session-Id returns HTTP 404",
+        "DELETE /mcp/gateway with a stale Mcp-Session-Id returns HTTP 404",
+        "POST /mcp/gateway with no session ID and non-initialize body still returns HTTP 400"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.ts (handleGatewayMcp function, lines 806-913)\n\nContext:\nThis is the exact same fix as US-001 but for the gateway endpoint. The code structure is identical.\n\nChanges:\n1. POST fallthrough (lines 877-887): Split into sessionId-present → 404 vs sessionId-absent → 400, same as US-001.\n\n2. GET stale session (line 898):\n   Current: `return new Response('Missing or invalid session', { status: 400 });`\n   Change to: `return new Response('Session not found', { status: 404 });`\n\n3. DELETE stale session (line 909):\n   Current: `return new Response('Missing or invalid session', { status: 400 });`\n   Change to: `return new Response('Session not found', { status: 404 });`\n\nConstraints:\n- Same constraints as US-001 — do NOT change 405 responses, rate limits, or valid session behavior"
+    },
+    {
+      "id": "US-003",
+      "title": "Add E2E tests for MCP session protocol compliance",
+      "description": "Add E2E tests verifying the correct HTTP status codes for stale, missing, and valid session scenarios on both /mcp and /mcp/gateway endpoints. These tests exercise the production server (not dev proxy) to verify the actual session management behavior that clients experience.",
+      "acceptanceCriteria": [
+        "Test: POST with stale session ID returns 404 (not 400)",
+        "Test: GET with stale session ID returns 404 (not 400)",
+        "Test: DELETE with stale session ID returns 404 (not 400)",
+        "Test: POST without session ID and non-initialize body returns 400",
+        "Test: GET without session ID returns 405",
+        "Test: DELETE without session ID returns 405",
+        "Test: valid session continues to work after another session is invalidated",
+        "Tests cover both /mcp and /mcp/gateway endpoints"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/mcp-session-protocol.e2e.ts (new file)\n\nContext:\nExisting session tests in `e2e/mcp-session-persistence.e2e.ts` focus on dev proxy hot reload persistence. The new tests should focus on the HTTP status codes returned for various session states — this is about protocol compliance, not persistence.\n\nThe test fixtures provide:\n- `createTestConfigDir()` — creates a temp config dir\n- `startMcpServer(configDir, devMode?)` — starts the server, returns `{ port, secret, kill(), logs, triggerHotReload() }`. Use `devMode=false` (or omit) for production mode to test the actual `handleMcp` code path without the dev proxy layer.\n- `createMcpClient(port, secret?)` — creates an MCP client that can `initialize()`, `listTools()`, `callTool()`, `close()`, and exposes `sessionId`\n\nImport pattern (from `e2e/fixtures.ts`):\n```typescript\nimport {\n  cleanupTestConfigDir,\n  createMcpClient,\n  createTestConfigDir,\n  expect,\n  startMcpServer,\n  test,\n} from './fixtures.js';\n```\n\nTo test stale session behavior, the test needs to:\n1. Initialize a client session (gets a valid session ID)\n2. Close the client (or restart the server) to invalidate the session\n3. Make raw HTTP requests with the old session ID and verify the response status code\n\nFor raw HTTP requests (to check status codes precisely), use `fetch()` directly rather than the MCP client wrapper. Example pattern:\n```typescript\nconst res = await fetch(`http://localhost:${server.port}/mcp`, {\n  method: 'POST',\n  headers: {\n    'Content-Type': 'application/json',\n    Accept: 'application/json, text/event-stream',\n    'mcp-session-id': staleSessionId,\n    Authorization: `Bearer ${server.secret}`,\n  },\n  body: JSON.stringify({ jsonrpc: '2.0', method: 'tools/list', id: 1 }),\n});\nexpect(res.status).toBe(404);\n```\n\nFor the 'no session ID' tests, omit the `mcp-session-id` header entirely.\n\nTo invalidate a session, the simplest approach is:\n- Start server in production mode (not dev proxy)\n- Initialize a client, capture the session ID\n- Stop and restart the server (new process = all sessions lost)\n- Send requests with the old session ID\n\nAlternatively, use `client.close()` which sends a DELETE to close the session, then try to use the old session ID. But note: after close, the session ID may still be in the transports map for a brief period. The server restart approach is more reliable.\n\nActually, a simpler approach: just fabricate a random UUID as a session ID and send requests with it — the server has never seen it, so it's effectively a stale session.\n\nTest structure:\n```typescript\ntest.describe('MCP session protocol compliance', () => {\n  // /mcp endpoint tests\n  test('POST /mcp with stale session ID returns 404', ...);\n  test('POST /mcp without session ID and non-initialize body returns 400', ...);\n  test('GET /mcp with stale session ID returns 404', ...);\n  test('GET /mcp without session ID returns 405', ...);\n  test('DELETE /mcp with stale session ID returns 404', ...);\n  test('DELETE /mcp without session ID returns 405', ...);\n  // /mcp/gateway endpoint tests (same pattern)\n  test('POST /mcp/gateway with stale session ID returns 404', ...);\n  // ... etc\n  // Cross-session isolation\n  test('valid session unaffected when stale session gets 404', ...);\n});\n```\n\nConstraints:\n- Use production mode server (not dev proxy) to test the actual handleMcp/handleGatewayMcp code\n- Do NOT modify existing session persistence tests\n- Follow the existing E2E test patterns from fixtures.ts"
+    }
+  ]
+}
