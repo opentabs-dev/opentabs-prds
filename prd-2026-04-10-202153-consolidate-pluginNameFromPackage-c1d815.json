@@ -1,0 +1,54 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Consolidate all copies of pluginNameFromPackage to import from @opentabs-dev/shared. PR #43 moved the function to shared/constants.ts but left the CLI's duplicate copy and a redundant re-export chain through loader.ts. After this work, pluginNameFromPackage has exactly one definition (in shared) and all consumers import it directly from @opentabs-dev/shared.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Replace CLI's local pluginNameFromPackage with shared import",
+      "description": "Delete the duplicated pluginNameFromPackage function from the CLI and import it from @opentabs-dev/shared instead. Update the module export to re-export from shared. Update the test file to import from @opentabs-dev/shared for the pluginNameFromPackage tests.",
+      "acceptanceCriteria": [
+        "No local definition of pluginNameFromPackage exists in platform/cli/src/commands/plugin.ts",
+        "pluginNameFromPackage is imported from @opentabs-dev/shared in platform/cli/src/commands/plugin.ts",
+        "pluginNameFromPackage is re-exported from the module's export block (so downstream consumers like plugin.test.ts still work via ./plugin.js)",
+        "PLUGIN_PREFIX is removed from the @opentabs-dev/shared import if no other code in plugin.ts uses it",
+        "platform/cli/src/commands/plugin.test.ts imports pluginNameFromPackage from @opentabs-dev/shared (not from ./plugin.js)",
+        "All 4 pluginNameFromPackage tests in plugin.test.ts still pass"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/plugin.ts (delete local function, update imports and exports)\n- platform/cli/src/commands/plugin.test.ts (update import source for pluginNameFromPackage)\n\nContext:\nPR #43 moved pluginNameFromPackage to @opentabs-dev/shared (platform/shared/src/constants.ts) and updated the MCP server and plugin-tools to import from there. But the CLI has its own identical copy that was not updated.\n\nChanges:\n\n1. In platform/cli/src/commands/plugin.ts:\n   - Add `pluginNameFromPackage` to the existing @opentabs-dev/shared import block (lines 9-20):\n     ```\n     import {\n       type ConfigSchema,\n       type ConfigSettingDefinition,\n       DEFAULT_HOST,\n       isWindows,\n       normalizePluginName,\n       PLATFORM_PACKAGES,\n       PLUGIN_PREFIX,\n       pluginNameFromPackage,\n       resolvePluginPackageCandidates,\n       TOOLS_FILENAME,\n       toErrorMessage,\n     } from '@opentabs-dev/shared';\n     ```\n   - Delete the local function definition (lines 693-709 — the JSDoc comment starting with `/** Derive the short plugin name...` through the closing `};`)\n   - Check if PLUGIN_PREFIX is still used elsewhere in the file after deleting the function. If not, remove it from the import. (Grep for PLUGIN_PREFIX in the file — it may be used in other functions like resolvePackageName.)\n   - Keep pluginNameFromPackage in the export block at line 1157 — it's now a re-export of the shared import, which is fine. The test file and potentially other consumers import it from ./plugin.js.\n\n2. In platform/cli/src/commands/plugin.test.ts:\n   - Change the import of pluginNameFromPackage from `./plugin.js` to `@opentabs-dev/shared`. Current code (line 13):\n     ```\n     import {\n       buildDirectLookupCandidates,\n       findPluginDir,\n       pluginNameFromPackage,\n       readLocalPluginInfo,\n       ...\n     } from './plugin.js';\n     ```\n   - Move `pluginNameFromPackage` out of the ./plugin.js import and into a new or existing @opentabs-dev/shared import. The file already has an @opentabs-dev/shared import at line 7:\n     ```\n     import { normalizePluginName, resolvePluginPackageCandidates } from '@opentabs-dev/shared';\n     ```\n   - Add pluginNameFromPackage to that import.\n\nConstraints:\n- Do NOT remove pluginNameFromPackage from the export block in plugin.ts — other modules may import it from there.\n- Do NOT modify the test assertions — only the import source changes.\n- The comment `/** Derive the short plugin name from a package name. Mirrors pluginNameFromPackage in mcp-server/src/loader.ts. */` must be deleted along with the function body."
+    },
+    {
+      "id": "US-002",
+      "title": "Remove pluginNameFromPackage re-export from loader.ts and update consumers",
+      "description": "Remove the redundant re-export of pluginNameFromPackage from loader.ts. Update plugin-management.ts and loader.test.ts to import directly from @opentabs-dev/shared instead of going through the loader re-export.",
+      "acceptanceCriteria": [
+        "pluginNameFromPackage is not in the export block of platform/mcp-server/src/loader.ts",
+        "platform/mcp-server/src/plugin-management.ts imports pluginNameFromPackage from @opentabs-dev/shared (not ./loader.js)",
+        "platform/mcp-server/src/loader.test.ts imports pluginNameFromPackage from @opentabs-dev/shared (not ./loader.js)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/loader.ts (remove from export block)\n- platform/mcp-server/src/plugin-management.ts (change import source)\n- platform/mcp-server/src/loader.test.ts (change import source)\n\nContext:\nAfter PR #43, loader.ts imports pluginNameFromPackage from @opentabs-dev/shared and re-exports it. This re-export exists only for backward compatibility with plugin-management.ts and loader.test.ts. Since those files should import from shared directly (like discovery.test.ts already does), the re-export is unnecessary indirection.\n\nChanges:\n\n1. In platform/mcp-server/src/loader.ts, remove `pluginNameFromPackage` from the export block. Current code (lines 425-434):\n   ```\n   export {\n     checkBrowserToolReferences,\n     checkSdkCompatibility,\n     extractToolsArray,\n     loadPlugin,\n     parseMajorMinor,\n     pluginNameFromPackage,\n     validateTools,\n   };\n   ```\n   Remove the `pluginNameFromPackage,` line. Also remove `pluginNameFromPackage` from the import block at the top (lines 15-26) since loader.ts still uses it internally at line 270 (`const pluginName = pluginNameFromPackage(pkg.name);`). Wait — actually check: does loader.ts USE pluginNameFromPackage internally? If yes, keep the import but remove the re-export. Read the file to find all usages.\n\n   Actually, loader.ts calls pluginNameFromPackage at line ~270:\n   ```\n   const pluginName = pluginNameFromPackage(pkg.name);\n   ```\n   So KEEP the import from @opentabs-dev/shared, just remove it from the export block.\n\n2. In platform/mcp-server/src/plugin-management.ts, change the import source. Current code (line 23):\n   ```\n   import { pluginNameFromPackage } from './loader.js';\n   ```\n   Replace with importing from @opentabs-dev/shared. The file already imports from @opentabs-dev/shared (lines 13-22):\n   ```\n   import {\n     atomicWrite,\n     getConfigDir,\n     getConfigPath,\n     isValidPluginPackageName,\n     isWindows,\n     normalizePluginName,\n     PLATFORM_PACKAGES,\n     resolvePluginPackageCandidates,\n   } from '@opentabs-dev/shared';\n   ```\n   Add `pluginNameFromPackage` to this import block. Delete the `import { pluginNameFromPackage } from './loader.js';` line entirely.\n\n3. In platform/mcp-server/src/loader.test.ts, change the import source. Current code (line 5):\n   ```\n   import { checkSdkCompatibility, loadPlugin, parseMajorMinor, pluginNameFromPackage, validateTools } from './loader.js';\n   ```\n   Move `pluginNameFromPackage` out of the ./loader.js import and into a new @opentabs-dev/shared import:\n   ```\n   import { pluginNameFromPackage } from '@opentabs-dev/shared';\n   import { checkSdkCompatibility, loadPlugin, parseMajorMinor, validateTools } from './loader.js';\n   ```\n\nConstraints:\n- Do NOT remove the pluginNameFromPackage import in loader.ts — it's still used internally (line ~270). Only remove the re-export.\n- Do NOT modify any test assertions or function logic — only import sources change."
+    },
+    {
+      "id": "US-003",
+      "title": "Remove duplicate pluginNameFromPackage tests from loader.test.ts",
+      "description": "Remove the pluginNameFromPackage describe block from loader.test.ts since discovery.test.ts already has a comprehensive superset of the same tests (9 tests vs 4, all importing from @opentabs-dev/shared).",
+      "acceptanceCriteria": [
+        "No describe('pluginNameFromPackage') block exists in platform/mcp-server/src/loader.test.ts",
+        "The pluginNameFromPackage describe block in platform/mcp-server/src/discovery.test.ts is unchanged (9 tests)",
+        "All remaining tests in loader.test.ts still pass"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/loader.test.ts (remove duplicate test block)\n\nContext:\nAfter US-002, loader.test.ts no longer imports pluginNameFromPackage (it was moved to an @opentabs-dev/shared import for the tests). But the tests themselves are redundant — discovery.test.ts already tests pluginNameFromPackage with 9 comprehensive test cases that are a superset of the 4 in loader.test.ts.\n\nChanges:\n\nIn platform/mcp-server/src/loader.test.ts, delete the entire describe('pluginNameFromPackage') block (lines 42-58):\n```\ndescribe('pluginNameFromPackage', () => {\n  test('strips opentabs-plugin- prefix', () => {\n    expect(pluginNameFromPackage('opentabs-plugin-slack')).toBe('slack');\n  });\n\n  test('handles third-party scoped packages', () => {\n    expect(pluginNameFromPackage('@myorg/opentabs-plugin-jira')).toBe('myorg-jira');\n  });\n\n  test('strips official @opentabs-dev scope — treated like unscoped', () => {\n    expect(pluginNameFromPackage('@opentabs-dev/opentabs-plugin-slack')).toBe('slack');\n  });\n\n  test('handles packages without the prefix', () => {\n    expect(pluginNameFromPackage('some-other-package')).toBe('some-other-package');\n  });\n});\n```\n\nAlso remove the `pluginNameFromPackage` import from @opentabs-dev/shared that was added in US-002 (since no code in the file uses it anymore after the test block is removed).\n\nConstraints:\n- Do NOT modify any other test blocks in loader.test.ts (validateTools, loadPlugin, checkSdkCompatibility, parseMajorMinor, etc.)\n- Do NOT touch discovery.test.ts — it already has the comprehensive tests."
+    }
+  ]
+}
