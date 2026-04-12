@@ -1,0 +1,52 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add version-mismatch detection between CLI, MCP server, and extension to prevent stale nested dependency issues. After all stories pass, `opentabs start` displays the MCP server version in its startup banner and warns when CLI/server versions diverge, `opentabs doctor` checks CLI-vs-server version alignment, and the health endpoint exposes enough data for CLI-side version comparison.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add CLI helper to read the nested MCP server package version",
+      "description": "Create a helper function in the CLI that reads the version from the nested @opentabs-dev/mcp-server package.json, so other CLI commands can compare it against the CLI's own version.",
+      "acceptanceCriteria": [
+        "New function resolves the mcp-server package.json path (via import.meta.resolve or monorepo fallback) and returns its version string",
+        "Returns null if the package.json cannot be read (graceful degradation)",
+        "Function is exported from a shared CLI module (not inlined in a command)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/version-info.ts (new file — shared version helpers)\n\nContext:\nThe CLI already reads its own version in two places:\n  1. `platform/cli/src/commands/setup.ts` line 23-27: `getCliVersion()` reads `join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'package.json')`\n  2. `platform/cli/src/commands/doctor.ts` line 158: reads `join(cliDir, '..', '..', 'package.json')`\n\nThe MCP server entry is resolved via `import.meta.resolve('@opentabs-dev/mcp-server')` in `platform/cli/src/commands/start.ts` line 95. From the resolved entry path, the package.json is at `join(dirname(resolved), '..', 'package.json')` since the entry resolves to `dist/index.js`.\n\nChanges:\nCreate `platform/cli/src/version-info.ts` with:\n  - `getCliVersion(): Promise<string>` — reads CLI's own package.json version (extracted from setup.ts)\n  - `getMcpServerVersion(): Promise<string | null>` — resolves `@opentabs-dev/mcp-server/package.json` via `import.meta.resolve('@opentabs-dev/mcp-server/package.json')`, reads and parses it, returns the version string. Falls back to the monorepo relative path (`join(cliDir, '..', '..', '..', 'mcp-server', 'package.json')`). Returns null on any failure.\n\nConstraints:\n- Do NOT move or change existing `getCliVersion` in setup.ts yet — that will be updated in US-003 to import from this module\n- The monorepo fallback path matches the pattern in `resolveServerEntry()` at start.ts:97-98\n- Use `fileURLToPath(import.meta.resolve(...))` pattern, NOT `require.resolve` (ESM project)"
+    },
+    {
+      "id": "US-002",
+      "title": "Print MCP server version in the startup banner and warn on version mismatch",
+      "description": "Modify `opentabs start` to display the MCP server version in its startup header and emit a warning if the CLI and MCP server versions diverge.",
+      "acceptanceCriteria": [
+        "Startup banner includes a line showing the MCP server version (e.g., 'Server version: v0.0.91')",
+        "When CLI version differs from MCP server version, a yellow warning is printed suggesting reinstall",
+        "When versions match or MCP server version is unreadable, no warning is shown"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/start.ts (modify printStartupHeader and handleStart)\n- platform/cli/src/version-info.ts (import from US-001)\n\nContext:\nThe startup header is at `platform/cli/src/commands/start.ts` lines 401-409:\n```typescript\nconst printStartupHeader = (): void => {\n    console.log(`Starting OpenTabs MCP server on port ${pc.bold(String(port))}...`);\n    console.log('');\n    const label = (s: string) => `  ${pc.cyan(s.padEnd(15))}`;\n    console.log(`${label('MCP endpoint:')}http://127.0.0.1:${port}/mcp`);\n    console.log(`${label('MCP gateway:')}http://127.0.0.1:${port}/mcp/gateway`);\n    console.log(`${label('Health check:')}http://127.0.0.1:${port}/health`);\n    console.log(`${label('Log file:')}${logFilePath}`);\n    console.log('');\n};\n```\n\nChanges:\n1. Import `getCliVersion` and `getMcpServerVersion` from `../version-info.js`\n2. Call both in `handleStart` before `printStartupHeader`, store results\n3. Add a `Server:` line to `printStartupHeader` showing `v${serverVersion}` (or 'unknown' if null). Place it after the 'Starting...' line and before the endpoint lines.\n4. After `printStartupHeader()`, if both versions are available and they differ, print a yellow warning: `pc.yellow(`Warning: CLI version (v${cliVersion}) does not match MCP server (v${serverVersion}).`)` followed by `pc.dim('  Run: npm install -g @opentabs-dev/cli@latest')`\n\nThe version check runs once at startup — it's a local file read, not a network call.\n\nConstraints:\n- Do NOT change `printStartupHeader` signature to require version params — read versions in `handleStart` and pass them via closure or local scope\n- The warning must not block server startup — it's informational only\n- Keep the existing startup banner layout intact; the version line is an addition, not a replacement"
+    },
+    {
+      "id": "US-003",
+      "title": "Add CLI-vs-MCP-server version check to opentabs doctor",
+      "description": "Add a new diagnostic check in `opentabs doctor` that compares the CLI version against the nested MCP server package version and warns when they diverge.",
+      "acceptanceCriteria": [
+        "New check labeled 'MCP server version' appears in doctor output",
+        "When versions match: pass with 'v0.0.91 (matches CLI)'",
+        "When versions differ: warn with both versions and hint to reinstall",
+        "When MCP server version is unreadable: warn with hint"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/doctor.ts (add new check function and wire it in)\n- platform/cli/src/version-info.ts (import from US-001)\n- platform/cli/src/commands/setup.ts (refactor getCliVersion import)\n\nContext:\nThe existing `checkExtensionVersion` at doctor.ts lines 154-183 follows the exact pattern we need. It reads the CLI version, compares it to an installed version, and returns pass/warn.\n\nThe doctor check sequence is at lines 449-510. The new check should go after check 5 (MCP server health) and before check 6 (Extension connected), since it's about the server package version (not the running server).\n\nThe existing extension version check reads the CLI version inline:\n```typescript\nconst pkgJson = JSON.parse(await readFile(join(cliDir, '..', '..', 'package.json'), 'utf-8')) as {\n    version: string;\n};\ncliVersion = pkgJson.version;\n```\n\nChanges:\n1. Import `getCliVersion` and `getMcpServerVersion` from `../version-info.js`\n2. Add `checkMcpServerVersion` function:\n   ```\n   const checkMcpServerVersion = async (): Promise<CheckResult> => {\n     const cliVersion = await getCliVersion();\n     const serverVersion = await getMcpServerVersion();\n     if (!serverVersion) return warn('MCP server version', 'could not read version', 'Ensure @opentabs-dev/mcp-server is installed');\n     if (serverVersion === cliVersion) return pass('MCP server version', `v${serverVersion} (matches CLI)`);\n     return warn('MCP server version', `v${serverVersion} (CLI is v${cliVersion})`, 'Run: npm install -g @opentabs-dev/cli@latest');\n   };\n   ```\n3. Wire it in `handleDoctor` after the server health check (after line 490, before check 6)\n4. Refactor `checkExtensionVersion` to use `getCliVersion()` from version-info.ts instead of inline file reading\n5. Refactor `getCliVersion` in setup.ts to import from version-info.ts (remove the duplicate)\n\nConstraints:\n- The new check is about the PACKAGE version of the nested dependency, NOT the running server version (that's already shown by `checkServerHealth` which reads `/health`)\n- Do NOT change the `checkServerHealth` function — it already shows the running server version\n- Export `checkMcpServerVersion` for testability, matching the pattern of other check functions"
+    }
+  ]
+}
