@@ -1,0 +1,130 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Improve MCP server telemetry with a disableGeoip fix, posthog-node v5 upgrade, session tracking, and four new anonymous platform-level events (server_stopped, extension_connected, dispatch_timed_out) — all without collecting tool names, plugin names, arguments, or any user-identifiable data, in accordance with documented privacy promises.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Upgrade posthog-node to v5 and enforce disableGeoip",
+      "description": "Bump posthog-node from ^4.18.0 to ^5.29.2 in platform/mcp-server/package.json and add disableGeoip: true to the PostHog client constructor options in telemetry.ts. The top-of-file comment claims 'no IP logging' but the code never enforces it; this fix makes the code match the promise.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/package.json has 'posthog-node': '^5.29.2' in dependencies",
+        "The PostHog constructor call in telemetry.ts includes disableGeoip: true in its options object alongside host, flushAt, and flushInterval",
+        "No other telemetry logic changes"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/package.json (bump posthog-node version)\n- platform/mcp-server/src/telemetry.ts (add disableGeoip: true)\n\nContext:\nCurrent posthog-node version is ^4.18.0, latest is 5.29.2. The dynamic import in telemetry.ts is:\n  const { PostHog } = await import('posthog-node');\n  client = new PostHog(POSTHOG_API_KEY, {\n    host: POSTHOG_HOST,\n    flushAt: 1,\n    flushInterval: 0,\n  });\nPostHog Node.js v5 has the same PostHog class constructor API — new PostHog(key, opts), .capture(), .shutdown() are unchanged. posthog-node v5 still accepts disableGeoip: boolean in PostHogOptions.\n\nChanges:\n1. In package.json: change '\"posthog-node\": \"^4.18.0\"' to '\"posthog-node\": \"^5.29.2\"'\n2. In telemetry.ts: add disableGeoip: true to the PostHog constructor options:\n  client = new PostHog(POSTHOG_API_KEY, {\n    host: POSTHOG_HOST,\n    flushAt: 1,\n    flushInterval: 0,\n    disableGeoip: true,\n  });\n3. Run npm install in platform/mcp-server/ to update the lockfile\n\nConstraints:\n- Do NOT change any logic, event names, or other options\n- Do NOT modify the test file in this story\n- The existing test mock in telemetry.test.ts (vi.mock('posthog-node')) will still work because v5 has the same class shape\n- After npm install, commit the updated package-lock.json"
+    },
+    {
+      "id": "US-002",
+      "title": "Add session_id to telemetry module and enhance server_started event",
+      "description": "Generate a per-process session UUID in initTelemetry() and expose it via getSessionId(). Use it in server_started, and update that event to break out plugin counts: rename pluginCount to plugins_loaded and add plugins_failed, plugins_local, plugins_npm.",
+      "acceptanceCriteria": [
+        "telemetry.ts exports getSessionId(): string that returns the session UUID generated during initTelemetry()",
+        "getSessionId() returns undefined-safe value (empty string or UUID) when called before initTelemetry()",
+        "session_id generated in initTelemetry() is a UUIDv4 and is different from the persistent telemetry-id file value",
+        "server_started event in index.ts no longer includes pluginCount field; it includes plugins_loaded, plugins_failed, plugins_local, plugins_npm, and session_id instead",
+        "plugins_local counts plugins with source === 'local', plugins_npm counts plugins with source === 'npm'",
+        "plugins_failed is state.registry.failures.length"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/telemetry.ts (add sessionId module variable, initTelemetry sets it, export getSessionId)\n- platform/mcp-server/src/index.ts (update server_started trackEvent call)\n\nContext:\ntelemetry.ts has these module-level variables:\n  let client: ... | undefined;\n  let anonymousId: string | undefined;\n  let enabled = false;\n  let debugMode = false;\nAdd: let sessionId: string | undefined;\n\nIn initTelemetry() (line 84), after setting anonymousId, set:\n  sessionId = crypto.randomUUID();\n\nExport:\n  const getSessionId = (): string => sessionId ?? '';\n\nIn index.ts, the server_started call is at lines 259-266:\n  trackEvent('server_started', {\n    version,\n    os: process.platform,\n    arch: process.arch,\n    nodeVersion: process.version,\n    pluginCount: state.registry.plugins.size,  // ← rename this\n    mode: isDev() ? 'dev' : 'production',\n  });\nReplace with:\n  const plugins = Array.from(state.registry.plugins.values());\n  trackEvent('server_started', {\n    version,\n    os: process.platform,\n    arch: process.arch,\n    nodeVersion: process.version,\n    plugins_loaded: state.registry.plugins.size,\n    plugins_failed: state.registry.failures.length,\n    plugins_local: plugins.filter(p => p.source === 'local').length,\n    plugins_npm: plugins.filter(p => p.source === 'npm').length,\n    session_id: getSessionId(),\n    mode: isDev() ? 'dev' : 'production',\n  });\n\nAlso add getSessionId to the exports list at the bottom of telemetry.ts:\n  export { getOrCreateAnonymousId, getSessionId, initTelemetry, isTelemetryEnabled, shutdownTelemetry, trackEvent };\n\nConstraints:\n- Do NOT change how anonymousId works — it's the persistent installation ID\n- sessionId is NEW per process, NOT read from telemetry-id file\n- The server_started event fires only when !isHotReload (existing guard in index.ts — do not change it)\n- state.registry.failures is of type readonly FailedPlugin[] (defined in state.ts)\n- RegisteredPlugin.source is 'npm' | 'local' (PluginSource type in state.ts)"
+    },
+    {
+      "id": "US-003",
+      "title": "Add peakConcurrentDispatches and hadExtensionConnection to ServerState",
+      "description": "Add two tracking fields to ServerState: peakConcurrentDispatches (the high-water mark of simultaneous pending dispatches) and hadExtensionConnection (whether the extension ever connected this session). Update the peak in dispatchToExtension after each new dispatch is registered.",
+      "acceptanceCriteria": [
+        "ServerState interface in state.ts has peakConcurrentDispatches: number field",
+        "ServerState interface in state.ts has hadExtensionConnection: boolean field",
+        "createState() initializes peakConcurrentDispatches to 0 and hadExtensionConnection to false",
+        "STATE_SCHEMA_VERSION is bumped from 7 to 8",
+        "In dispatchToExtension in extension-protocol.ts, after state.pendingDispatches.set(id, pending), the peak is updated: if (state.pendingDispatches.size > state.peakConcurrentDispatches) state.peakConcurrentDispatches = state.pendingDispatches.size"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/state.ts (add fields to ServerState, update createState, bump STATE_SCHEMA_VERSION)\n- platform/mcp-server/src/extension-protocol.ts (update peak after pendingDispatches.set)\n\nContext:\nServerState interface is at line 277 in state.ts. STATE_SCHEMA_VERSION = 7 is at line 355.\ncreateState() returns the default object at line 369.\n\nThe bump from 7 to 8 triggers a warning on hot reload ('State schema version changed') which prompts developers to restart the dev server — this is expected and correct.\n\nThe pending dispatch peak update goes in dispatchToExtension() in extension-protocol.ts.\nThe relevant code in dispatchToExtension (lines 325-347):\n  const pending: PendingDispatch = {\n    resolve,\n    reject,\n    label: dispatchLabel,\n    startTs: Date.now(),\n    timerId,\n    progressToken: opts.progressToken,\n    onProgress: opts.onProgress,\n    connectionId: conn.connectionId,\n  };\n  state.pendingDispatches.set(id, pending);  // ← add peak update AFTER this line\n\nAdd immediately after state.pendingDispatches.set(id, pending):\n  const currentSize = state.pendingDispatches.size;\n  if (currentSize > state.peakConcurrentDispatches) {\n    state.peakConcurrentDispatches = currentSize;\n  }\n\nConstraints:\n- Do NOT modify dispatchToAllConnections — it has its own pending dispatch management\n- hadExtensionConnection is NOT set in this story — it will be set in US-005 when the extension connects\n- Do NOT remove or rename any existing ServerState fields\n- The schema version bump is intentional; do not skip it"
+    },
+    {
+      "id": "US-004",
+      "title": "Emit server_stopped telemetry event at graceful shutdown",
+      "description": "Add two pure helper functions to telemetry.ts (computeErrorRateBucket and classifyLoadFailures) and emit a server_stopped event in shutdown.ts before shutdownTelemetry() is called, capturing session duration, tool call counts, error rate, extension connectivity, peak concurrency, and plugin load failure breakdown.",
+      "acceptanceCriteria": [
+        "telemetry.ts exports computeErrorRateBucket(total: number, errors: number): string that returns '0%' when errors=0, '<5%' when rate < 0.05, '<25%' when rate < 0.25, '>=25%' otherwise",
+        "computeErrorRateBucket(0, 0) returns '0%' (no division by zero)",
+        "telemetry.ts exports classifyLoadFailures that takes a readonly array of { path: string; error: string } and returns { missing_adapter: number, invalid_manifest: number, schema_error: number, unknown: number }",
+        "shutdown.ts emits trackEvent('server_stopped', ...) immediately before void shutdownTelemetry()",
+        "server_stopped event includes session_id, uptime_seconds, tool_calls_total, tool_errors_total, tool_error_rate_bucket, extension_was_connected, peak_concurrent_dispatches, plugin_load_failures"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/telemetry.ts (add computeErrorRateBucket and classifyLoadFailures, export them)\n- platform/mcp-server/src/shutdown.ts (import trackEvent, getSessionId from telemetry; emit server_stopped before shutdownTelemetry)\n\nContext for shutdown.ts — current shutdown sequence (lines 39-90):\n  // 1. Reject pending dispatches\n  // 2. Reject pending confirmations\n  // 3. Stop sweep timer\n  // 3b. Stop version check timer\n  // 4. Stop file watchers\n  // 5. Close extension WebSocket connections\n  // 6. Flush pending telemetry events (void shutdownTelemetry())  ← insert server_stopped BEFORE this\n\nInsert before `void shutdownTelemetry()` at line 82:\n  const auditLog = state.auditLog;\n  const total = auditLog.length;\n  const errors = auditLog.filter(e => !e.success).length;\n  trackEvent('server_stopped', {\n    session_id: getSessionId(),\n    uptime_seconds: Math.round((Date.now() - state.startedAt) / 1000),\n    tool_calls_total: total,\n    tool_errors_total: errors,\n    tool_error_rate_bucket: computeErrorRateBucket(total, errors),\n    extension_was_connected: state.hadExtensionConnection,\n    peak_concurrent_dispatches: state.peakConcurrentDispatches,\n    plugin_load_failures: classifyLoadFailures(state.registry.failures),\n  });\n\nFor classifyLoadFailures: read platform/mcp-server/src/loader.ts to understand the actual error messages produced when plugins fail to load (look for what strings appear in thrown/returned errors for missing adapter files, bad tools.json, schema validation failures). Use those patterns for classification heuristics. Common categories:\n- missing_adapter: error string mentions 'adapter.iife.js', 'ENOENT', 'adapter file'\n- invalid_manifest: error string mentions 'tools.json', 'package.json', 'manifest', 'opentabs field'\n- schema_error: error string mentions 'schema', 'Schema', 'Ajv', 'compile'\n- unknown: everything else\n\ncomputeErrorRateBucket signature:\n  const computeErrorRateBucket = (total: number, errors: number): '0%' | '<5%' | '<25%' | '>=25%' => {\n    if (total === 0 || errors === 0) return '0%';\n    const rate = errors / total;\n    if (rate < 0.05) return '<5%';\n    if (rate < 0.25) return '<25%';\n    return '>=25%';\n  };\n\nConstraints:\n- trackEvent is fire-and-forget — server_stopped must be called synchronously, not awaited (same pattern as existing trackEvent calls)\n- state.startedAt already exists on ServerState (line 316 in state.ts): startedAt: number initialized in createState() with Date.now()\n- state.hadExtensionConnection will be set to true by US-005; in this story just reference it\n- state.registry.failures is readonly FailedPlugin[] where FailedPlugin = { path: string; error: string } (state.ts line 192)\n- Do NOT change the shutdown sequence order beyond inserting server_stopped before shutdownTelemetry"
+    },
+    {
+      "id": "US-005",
+      "title": "Emit extension_connected telemetry event on first extension connection",
+      "description": "In createHandleWsOpen in http-routes.ts, emit an extension_connected event the first time any extension WebSocket connects this session (i.e., when state.hadExtensionConnection is false). Set hadExtensionConnection to true immediately after to prevent re-emission on reconnects.",
+      "acceptanceCriteria": [
+        "extension_connected event is emitted exactly once per session — on the first extension WebSocket connection",
+        "Reconnects (same connectionId or new connectionId after first) do NOT emit extension_connected",
+        "extension_connected includes session_id, time_to_connect_bucket, and profile_count",
+        "time_to_connect_bucket is '<10s' for elapsed < 10s, '10-60s' for elapsed < 60s, '1-5min' for elapsed < 300s, '>5min' otherwise",
+        "profile_count is state.extensionConnections.size after adding the new connection, capped at 3"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.ts (emit event in createHandleWsOpen, import trackEvent/getSessionId)\n\nContext:\ncreateHandleWsOpen is defined starting at line 1061 in http-routes.ts.\nThe connection is registered at line 1109: state.extensionConnections.set(connectionId, conn);\nThen at line 1112: void sendSyncFull(state)\n\nInsert AFTER state.extensionConnections.set(connectionId, conn) at line 1109 and BEFORE sendSyncFull:\n  if (!state.hadExtensionConnection) {\n    state.hadExtensionConnection = true;\n    const elapsed = Date.now() - state.startedAt;\n    const bucket =\n      elapsed < 10_000 ? '<10s' :\n      elapsed < 60_000 ? '10-60s' :\n      elapsed < 300_000 ? '1-5min' :\n      '>5min';\n    trackEvent('extension_connected', {\n      session_id: getSessionId(),\n      time_to_connect_bucket: bucket,\n      profile_count: Math.min(state.extensionConnections.size, 3),\n    });\n  }\n\nAdd import at the top of http-routes.ts (with the other telemetry imports, or as a new import line):\n  import { getSessionId, trackEvent } from './telemetry.js';\n\nConstraints:\n- Do NOT emit extension_connected on reconnects. The !state.hadExtensionConnection guard handles this correctly because hadExtensionConnection is set to true on first connection and never reset.\n- state.extensionConnections.size is checked AFTER the new connection is added (line 1109), so size=1 for the first connection, 2 for second simultaneous profile, etc. Math.min(..., 3) caps the reported value.\n- state.startedAt is the process start timestamp (set in createState() with Date.now())\n- Do NOT change any other logic in createHandleWsOpen"
+    },
+    {
+      "id": "US-006",
+      "title": "Emit dispatch_timed_out telemetry event on tool dispatch timeout",
+      "description": "In the setTimeout callback inside dispatchToExtension in extension-protocol.ts, emit a dispatch_timed_out event before rejecting the pending promise. The event includes whether the dispatch received any progress updates before timing out and a bucket of how long it ran.",
+      "acceptanceCriteria": [
+        "dispatch_timed_out event is emitted when a pending dispatch times out",
+        "had_progress_updates is true if the pending dispatch received at least one progress notification (lastProgressTs is set), false otherwise",
+        "duration_bucket is based on actual elapsed time (Date.now() - pending.startTs) not on timeoutMs: '<32s' maps to '30s', '<65s' to '1min', '<130s' to '2min', otherwise '5min'",
+        "Event includes session_id",
+        "dispatch_timed_out is NOT emitted when dispatch is rejected for other reasons (WebSocket send failure, extension disconnect)"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/extension-protocol.ts (modify setTimeout callback in dispatchToExtension)\n\nContext:\nIn dispatchToExtension (lines 317-323), the current timeout callback is:\n  const timerId = setTimeout(() => {\n    if (state.pendingDispatches.has(id)) {\n      state.pendingDispatches.delete(id);\n      reject(new Error(`Dispatch ${dispatchLabel} timed out after ${timeoutMs}ms`));\n    }\n  }, timeoutMs);\n\nReplace with:\n  const timerId = setTimeout(() => {\n    const p = state.pendingDispatches.get(id);\n    if (p) {\n      state.pendingDispatches.delete(id);\n      const elapsed = Date.now() - p.startTs;\n      const durationBucket =\n        elapsed < 32_000 ? '30s' :\n        elapsed < 65_000 ? '1min' :\n        elapsed < 130_000 ? '2min' :\n        '5min';\n      trackEvent('dispatch_timed_out', {\n        session_id: getSessionId(),\n        had_progress_updates: p.lastProgressTs !== undefined,\n        duration_bucket: durationBucket,\n      });\n      reject(new Error(`Dispatch ${dispatchLabel} timed out after ${timeoutMs}ms`));\n    }\n  }, timeoutMs);\n\nAdd import at top of extension-protocol.ts:\n  import { getSessionId, trackEvent } from './telemetry.js';\n\nConstraints:\n- Use state.pendingDispatches.get(id) to retrieve the pending object (do NOT use the 'pending' variable from the outer scope — it may not be in scope when the setTimeout callback runs, as it is declared after timerId). The pending object IS in the Map by the time the timer fires because pendingDispatches.set(id, pending) happens right after the setTimeout call.\n- Only emit in THIS timeout path. WebSocket send failures (lines 340-344) and extension-disconnect rejections are NOT timeouts — do not add telemetry there.\n- PendingDispatch.lastProgressTs is set by handleToolProgress in extension-handlers.ts when tool.progress arrives. It is undefined if no progress was ever received.\n- trackEvent is fire-and-forget and never throws — no try/catch needed"
+    },
+    {
+      "id": "US-007",
+      "title": "Add unit tests for new telemetry features",
+      "description": "Extend platform/mcp-server/src/telemetry.test.ts with tests covering: disableGeoip in PostHog init, getSessionId behavior, computeErrorRateBucket bucketing logic, and classifyLoadFailures categorization.",
+      "acceptanceCriteria": [
+        "Test verifies disableGeoip: true is passed to PostHog constructor during initTelemetry",
+        "Test verifies getSessionId() returns a UUIDv4 after initTelemetry()",
+        "Test verifies getSessionId() returns '' (empty string) before initTelemetry()",
+        "Test verifies two calls to getSessionId() within the same module instance return the same value",
+        "Test verifies session_id from getSessionId() differs from the persistent telemetry-id file value",
+        "Test verifies computeErrorRateBucket(0, 0) returns '0%'",
+        "Test verifies computeErrorRateBucket(100, 0) returns '0%'",
+        "Test verifies computeErrorRateBucket(100, 1) returns '<5%'",
+        "Test verifies computeErrorRateBucket(100, 10) returns '<25%'",
+        "Test verifies computeErrorRateBucket(100, 50) returns '>=25%'",
+        "Test verifies classifyLoadFailures correctly counts missing_adapter, invalid_manifest, schema_error, and unknown categories"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/telemetry.test.ts (add new describe blocks)\n\nContext:\nThe existing test file uses a pattern of vi.hoisted() mocks, vi.resetModules(), and re-importing telemetry fresh per test via importTelemetry(). Follow this same pattern.\n\nFor the disableGeoip test, the mock needs to capture constructor arguments:\n  Update vi.hoisted() to also capture constructor options:\n    const mockConstructorOptions = { captured: undefined as Record<string, unknown> | undefined };\n  Update the MockPostHog class:\n    class MockPostHog {\n      constructor(_key: string, options?: Record<string, unknown>) {\n        mockConstructorOptions.captured = options;\n      }\n      capture = mockCapture;\n      shutdown = mockShutdown;\n    }\n  Test:\n    test('passes disableGeoip: true to PostHog constructor', async () => {\n      const dir = makeTestDir();\n      await writeFile(join(dir, 'config.json'), JSON.stringify({}));\n      const { initTelemetry } = await importTelemetry();\n      await initTelemetry();\n      expect(mockConstructorOptions.captured).toMatchObject({ disableGeoip: true });\n    });\n\nFor getSessionId tests:\n  test('returns empty string before initTelemetry', async () => {\n    makeTestDir();\n    const { getSessionId } = await importTelemetry();\n    expect(getSessionId()).toBe('');\n  });\n  test('returns a UUIDv4 after initTelemetry', async () => {\n    const dir = makeTestDir();\n    await writeFile(join(dir, 'config.json'), JSON.stringify({}));\n    const { initTelemetry, getSessionId } = await importTelemetry();\n    await initTelemetry();\n    const id = getSessionId();\n    expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);\n  });\n  test('returns consistent value within same module instance', async () => {\n    const dir = makeTestDir();\n    await writeFile(join(dir, 'config.json'), JSON.stringify({}));\n    const { initTelemetry, getSessionId } = await importTelemetry();\n    await initTelemetry();\n    expect(getSessionId()).toBe(getSessionId());\n  });\n  test('session_id differs from persistent telemetry-id file', async () => {\n    const dir = makeTestDir();\n    await writeFile(join(dir, 'config.json'), JSON.stringify({}));\n    const { initTelemetry, getSessionId, getOrCreateAnonymousId } = await importTelemetry();\n    await initTelemetry();\n    const anonId = await getOrCreateAnonymousId();\n    expect(getSessionId()).not.toBe(anonId);\n  });\n\nFor computeErrorRateBucket — import it directly:\n  const { computeErrorRateBucket } = await importTelemetry();\n  (It must be exported from telemetry.ts for this to work.)\n\nFor classifyLoadFailures — construct realistic FailedPlugin arrays:\n  const failures = [\n    { path: '/some/path', error: 'ENOENT: no such file or directory, open dist/adapter.iife.js' },\n    { path: '/other', error: 'Invalid tools.json: missing name field' },\n    { path: '/third', error: 'Schema compilation failed: invalid pattern keyword' },\n    { path: '/fourth', error: 'Unexpected token in package.json' },\n    { path: '/fifth', error: 'Completely unknown error' },\n  ];\n  Verify the returned object has the expected counts.\n\nConstraints:\n- All new tests go in new describe() blocks, not mixed into existing ones\n- Follow the importTelemetry() + makeTestDir() pattern from existing tests\n- Do NOT modify existing test cases\n- computeErrorRateBucket and classifyLoadFailures must be exported from telemetry.ts for direct testing"
+    }
+  ]
+}
