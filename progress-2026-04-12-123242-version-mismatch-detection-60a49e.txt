@@ -1,0 +1,47 @@
+## Codebase Patterns
+- CLI commands are in platform/cli/src/commands/; shared helpers go in platform/cli/src/ (not in commands/)
+- CLI entry point is src/cli.ts → src/commands/index.js; new shared modules must be imported transitively from there to avoid knip "unused file" errors, OR added as knip entry points
+- import.meta.resolve('@pkg/package.json') pattern is used for resolving nested package.json paths (ESM project, not require.resolve)
+- Monorepo fallback path for mcp-server from cli/src/: join(cliDir, '..', '..', '..', 'mcp-server', 'package.json')
+- setup.ts has a local getCliVersion() that will be refactored to import from version-info.ts in US-003
+
+# Ralph Progress Log
+PRD: prd-2026-04-12-123242-version-mismatch-detection-60a49e~running.json
+Started: Sun Apr 12 19:33:22 UTC 2026
+---
+
+## 2026-04-12 - US-001
+- Created platform/cli/src/version-info.ts with getCliVersion() and getMcpServerVersion()
+- Added src/version-info.ts as a knip entry in knip.ts (file is unused until wired in by US-002/003)
+- Files changed: platform/cli/src/version-info.ts (new), knip.ts
+- **Learnings for future iterations:**
+  - Since version-info.ts is not yet imported by any command, knip flags it as an "unused file". Adding it as an explicit knip entry for platform/cli resolves this cleanly without touching behavioral code.
+  - The getMcpServerVersion uses import.meta.resolve('@opentabs-dev/mcp-server/package.json') as primary, with join(cliDir, '../../../mcp-server/package.json') as monorepo fallback — both wrapped in a null-returning try/catch.
+  - US-002 should add imports to start.ts (and remove the knip entry since the file will be reachable via the import chain).
+---
+
+## 2026-04-12 - US-002
+- Added MCP server version display in startup banner via `printStartupHeader`
+- Added yellow warning when CLI and MCP server versions diverge via `printVersionWarning`
+- Imported `getCliVersion` and `getMcpServerVersion` from `../version-info.js` in start.ts
+- Removed `src/version-info.ts` from knip entry since it's now reachable via import chain
+- Files changed: platform/cli/src/commands/start.ts, knip.ts
+- **Learnings for future iterations:**
+  - The startup header function is a closure inside `handleStart`, so version reads are done before it and captured via closure scope
+  - Both background and foreground code paths call `printStartupHeader()` — both need `printVersionWarning()` added after
+  - `getCliVersion` always returns a string (not nullable), while `getMcpServerVersion` returns `string | null`
+---
+
+## 2026-04-12 - US-003
+- Added checkMcpServerVersion function to doctor.ts that compares CLI vs nested MCP server package version
+- Refactored checkExtensionVersion in doctor.ts to use getCliVersion() from version-info.ts (removes inline file read)
+- Refactored setup.ts to import getCliVersion from version-info.ts (removes duplicate local function)
+- Wired checkMcpServerVersion into handleDoctor after check 5 (server health), renumbered subsequent checks 6→7 through 11→12
+- Exported checkMcpServerVersion for testability
+- Added tests in doctor.test.ts using vi.mock('../version-info.js') to mock getCliVersion and getMcpServerVersion
+- Files changed: platform/cli/src/commands/doctor.ts, platform/cli/src/commands/setup.ts, platform/cli/src/commands/doctor.test.ts
+- **Learnings for future iterations:**
+  - To mock a sibling module in Vitest (ESM), call vi.mock('../module.js') and place the import after — Vitest hoists vi.mock before imports automatically
+  - The biome pre-commit hook reformats staged files; the reformatted version is what gets committed
+  - checkExtensionVersion in doctor.ts was not exported (and still isn't), so no test updates needed for that refactor
+---
