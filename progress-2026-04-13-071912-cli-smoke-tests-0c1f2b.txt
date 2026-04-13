@@ -1,0 +1,53 @@
+# Ralph Progress Log
+PRD: prd-2026-04-13-071912-cli-smoke-tests-0c1f2b~running.json
+Started: Mon Apr 13 14:19:57 UTC 2026
+---
+
+## Codebase Patterns
+- CLI binary is at `platform/cli/dist/cli.js`, source entry at `platform/cli/src/cli.ts`
+- The `--show-config` flag on `start` prints a human-readable display with ANSI color codes (not JSON), so assertions should only check exit code
+- The PRD suggested `../../dist/cli.js` for the URL path from src, but the correct relative path from `platform/cli/src/` to `platform/cli/dist/cli.js` is `../dist/cli.js`
+- `OPENTABS_CONFIG_DIR` env var isolates tests from real user config at `~/.opentabs/`
+- `OPENTABS_TELEMETRY_DISABLED=1` prevents telemetry during tests
+- Test files in `platform/cli/src/` are included via `platform/cli/tsconfig.test.json` which has `"include": ["src/**/*.test.ts"]`
+
+---
+
+## 2026-04-13 - US-001
+- Implemented CLI binary smoke test suite in `platform/cli/src/cli-smoke.test.ts`
+- 35 tests total: 2 root commands (--version, --help), 28 --help tests for every command/subcommand, 5 safe command tests
+- Files changed: `platform/cli/src/cli-smoke.test.ts` (new file, 128 lines)
+- **Learnings for future iterations:**
+  - The relative URL from `src/` files is `../dist/` (one level up), not `../../dist/` (two levels up)
+  - `start --show-config` outputs formatted text with ANSI codes, not valid JSON — the acceptance criteria was slightly inaccurate
+  - All 28 registered commands/subcommands accept `--help` and exit 0 cleanly
+  - The `execFile` error object from `node:child_process` has `code`, `stdout`, and `stderr` properties for capturing non-zero exit results
+---
+
+## 2026-04-13 - US-002
+- Added `start command lifecycle` describe block to `platform/cli/src/cli-smoke.test.ts`
+- Test spawns `node dist/cli.js start` with PORT=0, parses the listening port from stdout/stderr, fetches /health, and kills the server
+- Files changed: `platform/cli/src/cli-smoke.test.ts` (added ~50 lines)
+- **Learnings for future iterations:**
+  - Use `spawn` (not `execFile`) for long-running processes where you need the process handle to kill it later
+  - PORT=0 must be set via env var, not --port CLI flag (the CLI flag parser rejects 0)
+  - OPENTABS_SKIP_NPM_DISCOVERY=1 speeds up test startup by skipping npm plugin scans
+  - OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS=1 is needed since the temp config dir has no reviewed plugins
+  - The port regex `/[Ll]istening on http:\/\/(?:127\.0\.0\.1|localhost):(\d+)/` matches the server's startup log format
+  - Always kill child processes in a `finally` block to avoid orphans on test failure
+---
+
+## 2026-04-13 - US-003
+- Added "CLI smoke test (packed tarball)" step to `.github/workflows/publish-platform.yml`
+- Step placed between "Run quality checks" and "Publish packages to npm (dependency order)"
+- Tests the compiled dist binary directly (not npm pack + isolated install) because cross-package dependencies aren't published yet at that point in the workflow
+- Runs: --version (asserts match with target version), --help, start --show-config, config path (asserts absolute), doctor, plugin list, telemetry status
+- Uses OPENTABS_CONFIG_DIR=<tmpdir> and OPENTABS_TELEMETRY_DISABLED=1 for isolation
+- No `if` condition so the step runs on both dry-run and real publish
+- Files changed: `.github/workflows/publish-platform.yml`
+- **Learnings for future iterations:**
+  - The publish workflow publishes packages in dependency order (shared → ... → cli), so the CLI's cross-package deps aren't on npm yet when the smoke test runs — must test compiled dist, not an npm-packed tarball in isolation
+  - `set -euo pipefail` at the top of a workflow step ensures any command failure is caught immediately
+  - Commands that may exit non-zero by design (doctor, plugin list, telemetry status) need `|| true` to prevent the step from failing
+  - GitHub Actions `::error::` annotations surface failures clearly in the workflow UI
+---
