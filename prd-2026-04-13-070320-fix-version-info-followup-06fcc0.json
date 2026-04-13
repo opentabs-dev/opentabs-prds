@@ -1,0 +1,40 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Clean up version-info.ts: simplify getCliVersion() to use the same one-level-up pattern as cli.ts, fix the broken fallback path, fix getMcpServerVersion() for global installs by adding ./package.json export to mcp-server, and add unit tests so this path resolution logic is never untested again.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Simplify getCliVersion() and fix getMcpServerVersion() fallback path",
+      "description": "Simplify getCliVersion() to use join(cliDir, '..', 'package.json') matching the proven pattern in cli.ts. Remove the unnecessary import.meta.resolve + try/catch. Fix getMcpServerVersion() by adding ./package.json export to mcp-server/package.json so import.meta.resolve works, and fix the fallback path. Remove the now-unnecessary ./package.json export from cli/package.json.",
+      "acceptanceCriteria": [
+        "getCliVersion() uses `join(cliDir, '..', 'package.json')` with no try/catch or import.meta.resolve",
+        "getMcpServerVersion() primary path uses import.meta.resolve('@opentabs-dev/mcp-server/package.json') which succeeds because the export exists",
+        "getMcpServerVersion() fallback path resolves to a valid location in monorepo dev (platform/mcp-server/package.json)",
+        "platform/mcp-server/package.json exports field includes './package.json': './package.json'",
+        "platform/cli/package.json exports field does NOT include './package.json' (no longer needed)",
+        "No import.meta.resolve in getCliVersion()"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/version-info.ts (simplify both functions)\n- platform/cli/package.json (remove ./package.json export)\n- platform/mcp-server/package.json (add ./package.json export)\n\nContext:\ncli.ts:24 already reads its own package.json correctly with one level up:\n```\nconst cliDir = dirname(fileURLToPath(import.meta.url));\nconst pkgJson = JSON.parse(await readFile(join(cliDir, '..', 'package.json'), 'utf-8')) as { version: string };\n```\n\nThis works because compiled output is in `platform/cli/dist/`, so `..` goes to `platform/cli/` where `package.json` lives. This works identically for global npm installs (`node_modules/@opentabs-dev/cli/dist/` -> `node_modules/@opentabs-dev/cli/package.json`).\n\nChanges:\n\n1. In `platform/cli/src/version-info.ts`, replace the current getCliVersion():\n```ts\nexport const getCliVersion = async (): Promise<string> => {\n  let pkgPath: string;\n  try {\n    pkgPath = fileURLToPath(import.meta.resolve('@opentabs-dev/cli/package.json'));\n  } catch {\n    pkgPath = join(cliDir, '..', '..', 'package.json');\n  }\n  const pkgJson = JSON.parse(await readFile(pkgPath, 'utf-8')) as { version: string };\n  return pkgJson.version;\n};\n```\nWith the simple version:\n```ts\nexport const getCliVersion = async (): Promise<string> => {\n  const pkgPath = join(cliDir, '..', 'package.json');\n  const pkgJson = JSON.parse(await readFile(pkgPath, 'utf-8')) as { version: string };\n  return pkgJson.version;\n};\n```\n\n2. In `platform/cli/src/version-info.ts`, fix getMcpServerVersion() fallback. The current fallback is `join(cliDir, '..', '..', '..', 'mcp-server', 'package.json')` which only works in monorepo. From `platform/cli/dist/`, three levels up is the repo root, then into `mcp-server/` — but there's no `mcp-server/` at the repo root. The correct monorepo fallback path from `platform/cli/dist/` is `join(cliDir, '..', '..', 'mcp-server', 'package.json')` which resolves to `platform/mcp-server/package.json`. Keep the import.meta.resolve primary path and outer try/catch for getMcpServerVersion since it reads a DIFFERENT package's version (unlike getCliVersion which reads its own).\n\n3. In `platform/mcp-server/package.json`, add `\"./package.json\": \"./package.json\"` to the exports field so import.meta.resolve succeeds. Current exports:\n```json\n\"exports\": {\n  \".\": \"./dist/index.js\"\n}\n```\nChange to:\n```json\n\"exports\": {\n  \".\": \"./dist/index.js\",\n  \"./package.json\": \"./package.json\"\n}\n```\n\n4. In `platform/cli/package.json`, remove the `\"./package.json\": \"./package.json\"` export since getCliVersion no longer uses import.meta.resolve. Current exports:\n```json\n\"exports\": {\n  \"./package.json\": \"./package.json\",\n  \"./scaffold\": {\n    \"types\": \"./dist/scaffold.d.ts\",\n    \"import\": \"./dist/scaffold.js\"\n  }\n}\n```\nChange to:\n```json\n\"exports\": {\n  \"./scaffold\": {\n    \"types\": \"./dist/scaffold.d.ts\",\n    \"import\": \"./dist/scaffold.js\"\n  }\n}\n```\n\nConstraints:\n- Do NOT change cli.ts — it already works correctly\n- Do NOT change the outer try/catch in getMcpServerVersion — returning null on failure is intentional for global installs where the mcp-server package may not be resolvable\n- Do NOT change how doctor.test.ts mocks version-info.js"
+    },
+    {
+      "id": "US-002",
+      "title": "Add unit tests for version-info.ts",
+      "description": "Create platform/cli/src/version-info.test.ts that tests the real getCliVersion() and getMcpServerVersion() implementations (no mocking). This ensures the path resolution logic is validated and regressions are caught.",
+      "acceptanceCriteria": [
+        "platform/cli/src/version-info.test.ts exists and is covered by tsconfig.test.json",
+        "getCliVersion() test calls the real function and asserts it returns a valid semver string matching the version in platform/cli/package.json",
+        "getMcpServerVersion() test calls the real function and asserts it returns a valid semver string matching the version in platform/mcp-server/package.json",
+        "All tests pass with npm run test"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/version-info.test.ts (new file)\n\nContext:\nversion-info.ts had zero test coverage — the only test file that references it (doctor.test.ts) mocks the entire module with `vi.mock('../version-info.js')` at line 24. The path resolution bug shipped because no test ever called the real implementation.\n\nThe test file will be automatically included by `platform/cli/tsconfig.test.json` which has `\"include\": [\"src/**/*.test.ts\"]`.\n\nChanges:\nCreate `platform/cli/src/version-info.test.ts` with:\n\n1. A test for getCliVersion() that:\n   - Calls the real `getCliVersion()` (no mocking)\n   - Asserts the result matches `/^\\d+\\.\\d+\\.\\d+/` (semver)\n   - Reads `platform/cli/package.json` independently and asserts the version matches\n\n2. A test for getMcpServerVersion() that:\n   - Calls the real `getMcpServerVersion()` (no mocking)\n   - Asserts the result is not null (since mcp-server is installed in the monorepo)\n   - Asserts the result matches `/^\\d+\\.\\d+\\.\\d+/` (semver)\n   - Reads `platform/mcp-server/package.json` independently and asserts the version matches\n\nUse `import { readFile } from 'node:fs/promises'` and `import { dirname, join } from 'node:path'` and `import { fileURLToPath } from 'node:url'` to read the package.json files independently for comparison. Use `dirname(fileURLToPath(import.meta.url))` to get the test file's directory, then resolve `../../package.json` for the CLI package.json (test file is at `src/version-info.test.ts`, package.json is at `platform/cli/package.json` — but since test runs from source, the dir is `platform/cli/src/`, so `../package.json` is correct).\n\nConstraints:\n- Do NOT mock anything — the whole point is to test the real path resolution\n- Do NOT import from doctor.test.ts or reuse its patterns — that file mocks version-info\n- Use `describe`/`it` from vitest, and `expect` for assertions"
+    }
+  ]
+}
