@@ -1,0 +1,88 @@
+# Ralph Progress Log
+PRD: prd-2026-04-12-194904-server-self-update-49f524~running.json
+Started: Mon Apr 13 02:49:33 UTC 2026
+---
+
+## Codebase Patterns
+- ServerState is defined in platform/mcp-server/src/state.ts; optional fields don't need explicit initialization in createState()
+- ConfigStateResult is defined in platform/shared/src/index.ts around line 382
+- STATE_SCHEMA_VERSION only bumps when changing the type of existing fields, not when adding optional ones
+- All Phase 1 checks (build, type-check, lint, knip, test) pass cleanly on the main branch
+- Browser tools card E2E tests don't need startTestServer or openTestAppTab — the card is always visible
+- startMcpServer(configDir, hot, explicitPort) accepts an optional port for kill-restart reconnect tests
+- The update dot locator for BrowserToolsCard is on the accordion trigger (button[data-radix-collection-item] hasText Browser), not the menu button
+
+## 2026-04-13 - US-001
+- What was implemented: Added optional `serverUpdate?: { latestVersion: string; updateCommand: string }` field to ServerState interface in state.ts (after outdatedPlugins) and to ConfigStateResult in shared/src/index.ts (after extensionHash)
+- Files changed: platform/mcp-server/src/state.ts, platform/shared/src/index.ts
+- **Learnings for future iterations:**
+  - Both files had clear insertion points matching the PRD notes exactly
+  - No initialization needed in createState() since the field is optional
+  - All Phase 1 checks pass cleanly with these minimal type-only changes
+---
+
+## 2026-04-13 - US-002
+- What was implemented: Added checkServerUpdate() function to version-check.ts that queries npm registry for @opentabs-dev/cli and populates state.serverUpdate. Added isProductionInstall() helper using node_modules path detection. Included serverUpdate in buildConfigStatePayload() with conditional spread. Added serverUpdate prune in pruneStaleState() using isNewer(). Updated runVersionCheck() to call checkServerUpdate alongside checkForUpdates, with change detection to only notify extension when state actually changed.
+- Files changed: platform/mcp-server/src/version-check.ts, platform/mcp-server/src/extension-handlers.ts, platform/mcp-server/src/reload.ts
+- **Learnings for future iterations:**
+  - version-check.ts already exports fetchLatestVersion() and isNewer() which are reusable for the server update check
+  - The version import (from './version.js') reads the mcp-server package.json version, which matches the CLI version since CLI bundles mcp-server
+  - runVersionCheck() notifies extension via plugins.changed — the same notification used for plugin updates
+  - pruneStaleState() runs during reloadCore() — prune logic for serverUpdate follows the same isNewer pattern as outdatedPlugins
+  - Biome auto-sorts imports during pre-commit hook (version.js import moved before version-check.js)
+---
+
+## 2026-04-13 - US-003
+- What was implemented: Added handleServerSelfUpdate handler in extension-handlers.ts that performs a phoenix restart: validates state.serverUpdate exists and server is a production install, runs `npm install -g @opentabs-dev/cli@<version>` synchronously, acknowledges the request, prints TTY message if applicable, spawns `opentabs start --background` as a detached child, then exits after 200ms. Registered `server.selfUpdate` dispatch in extension-protocol.ts.
+- Files changed: platform/mcp-server/src/extension-handlers.ts, platform/mcp-server/src/extension-protocol.ts
+- **Learnings for future iterations:**
+  - serverSourcePath is a module-level const in extension-handlers.ts (line 47) — reuse it, don't re-declare
+  - isDev() was NOT already imported in extension-handlers.ts — needed to add the import from ./dev-mode.js
+  - Biome pre-commit hook auto-sorts imports (moved isDev import after config.js alphabetically)
+  - isWindows() and DEFAULT_PORT are exported from @opentabs-dev/shared
+  - The dispatch pattern in extension-protocol.ts uses if-chains with `void` for async handlers
+---
+
+## 2026-04-13 - US-004
+- What was implemented: Added two dev-only test HTTP endpoints to http-routes.ts: `POST /__test/set-server-update` (sets state.serverUpdate from body and broadcasts plugins.changed) and `POST /__test/simulate-server-update` (clears state.serverUpdate and broadcasts plugins.changed). Both return 404 when not in dev mode, require bearer auth, and follow the exact same pattern as the existing `/__test/set-outdated` handler.
+- Files changed: platform/mcp-server/src/http-routes.ts
+- **Learnings for future iterations:**
+  - New __test handlers go BEFORE the main router comment `// --- Main router ---` (they are defined before the router function)
+  - Router entries go right after the existing `/__test/simulate-update` route in `createHandleFetch`
+  - The `body.serverUpdate ?? undefined` pattern correctly handles both `null` (explicit clear) and missing key (also clear) from the request body
+  - All Phase 1 checks pass cleanly — biome schema version mismatch is an `info` message only, not an error
+---
+
+## 2026-04-13 - US-005
+- What was implemented: Propagated serverUpdate through the Chrome extension pipeline. Added serverUpdate field to ServerStateCache interface, EMPTY_CACHE, and loadServerStateCacheFromSession (with runtime type validation). Extracted serverUpdate from both sync.full and plugins.changed payloads in message-router.ts, always setting it (including undefined to clear). Added BgSelfUpdateServerMessage type to extension-messages.ts and included in InternalMessage union. Added handleBgSelfUpdateServer handler in background-message-handlers.ts (registered in dispatch map and EXTENSION_ONLY_TYPES set). Added serverUpdate to bg:getFullState response. Added serverUpdate to FullStateResult in bridge.ts and exported selfUpdateServer() function.
+- Files changed: platform/browser-extension/src/server-state-cache.ts, platform/browser-extension/src/message-router.ts, platform/browser-extension/src/extension-messages.ts, platform/browser-extension/src/background-message-handlers.ts, platform/browser-extension/src/side-panel/bridge.ts
+- **Learnings for future iterations:**
+  - serverUpdate must always be set in updateServerStateCache (not conditionally spread) because it needs to CLEAR when the server omits it from the payload — unlike other fields like serverVersion that are never explicitly cleared
+  - The runtime type validation pattern for serverUpdate in loadServerStateCacheFromSession and message-router.ts checks typeof on both latestVersion and updateCommand fields via Record<string, unknown> cast
+  - bg:selfUpdateServer follows the same fire-and-forget pattern as bg:updatePlugin (sendServerRequest then resolve/reject through sendResponse)
+  - handleBgGetFullState already includes serverVersion and extensionHash from serverCache — serverUpdate follows the same pattern
+  - New bg:* message types need to be added to three places in background-message-handlers.ts: backgroundHandlers map, EXTENSION_ONLY_TYPES set, and the export block
+---
+
+## 2026-04-13 - US-006
+- What was implemented: Added serverUpdate prop to BrowserToolsCard with yellow dot indicator on the PluginIcon (wrapped in relative div, same className as PluginMenu.tsx). Added Update menu item to BrowserToolsMenu as the first item before ServerVersionItem, with loading spinner (Loader retro component), ArrowUpCircle icon, and disabled state for double-click protection. Added onUpdateError callback from BrowserToolsMenu to BrowserToolsCard's existing showToggleError. Wired serverUpdate state in App.tsx: new useState, populated from applyFullState (getFullState + plugins.changed), cleared on disconnect, passed to BrowserToolsCard.
+- Files changed: platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx, platform/browser-extension/src/side-panel/components/BrowserToolsMenu.tsx, platform/browser-extension/src/side-panel/App.tsx
+- **Learnings for future iterations:**
+  - BrowserToolsCard already has toggleError state and showToggleError helper — reuse for error reporting from child components via onUpdateError callback
+  - BrowserToolsMenu was a stateless arrow function component — converted to function body to add useState for updating state
+  - The plugins.changed handler in App.tsx calls getFullState() → applyFullState, so serverUpdate is already propagated through the full state snapshot — no separate handling needed
+  - Biome auto-formats destructured props in function signatures (breaks long lines)
+  - The retro Loader component exists at components/retro/Loader.tsx and accepts size="sm"
+  - Yellow dot pattern: same className across PluginMenu and BrowserToolsCard — 'absolute -top-0.5 -right-0.5 h-2 w-2 rounded-full border border-border bg-primary'
+---
+
+## 2026-04-13 - US-007
+- What was implemented: Comprehensive E2E test file e2e/side-panel-server-update.e2e.ts with 5 tests covering the full server self-update flow: (1) update dot and menu item appear/disappear when serverUpdate is injected/cleared, (2) no dot when no serverUpdate is set, (3) clicking Update shows error alert when server.selfUpdate fails in dev mode, (4) server kill and restart clears update indicator on reconnect, (5) double-click protection only executes one update.
+- Files changed: e2e/side-panel-server-update.e2e.ts (new file)
+- **Learnings for future iterations:**
+  - Browser tools card is always visible without needing a plugin tab or test server — simplifies test setup (no startTestServer or openTestAppTab needed)
+  - The update dot for browser tools is inside the accordion trigger (button[data-radix-collection-item] with hasText 'Browser'), not the menu button — different from plugin update tests which locate it on the menu button
+  - The server.selfUpdate handler returns an error in dev mode because serverSourcePath doesn't contain 'node_modules' — reliable failure path for testing error UI
+  - startMcpServer accepts an optional third parameter (explicitPort) for kill-restart tests that need the extension to reconnect on the same port
+  - All 263 E2E tests pass including the 5 new server update tests
+---
