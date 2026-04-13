@@ -1,0 +1,104 @@
+# Ralph Progress Log
+PRD: prd-2026-04-12-164910-telemetry-improvements-634288~running.json
+Started: Sun Apr 12 23:49:42 UTC 2026
+---
+
+## Codebase Patterns
+- posthog-node v5 has the same PostHog constructor API (new PostHog(key, opts)) as v4 — no callsite changes needed
+- telemetry.ts uses a module-level `client` variable (type-narrowed to duck-type shape), initialized lazily in initTelemetry()
+- npm install at the workspace level (platform/mcp-server) updates both that package's node_modules and the root package-lock.json
+
+---
+
+## 2026-04-12 - US-001
+- Upgraded posthog-node from ^4.18.0 to ^5.29.2 in platform/mcp-server/package.json
+- Added disableGeoip: true to the PostHog constructor options in platform/mcp-server/src/telemetry.ts
+- Ran npm install in platform/mcp-server/ to update the lockfile (root package-lock.json updated)
+- **Learnings for future iterations:**
+  - posthog-node v5 constructor accepts disableGeoip: boolean in its options object alongside host/flushAt/flushInterval
+  - The client type in telemetry.ts is a duck type (has capture and shutdown), so version upgrade required no TypeScript changes
+  - npm install in platform/mcp-server updates the root package-lock.json (workspace hoisting)
+  - Phase 1 checks: build, type-check, lint, knip, test — all pass; biome schema version mismatch (1 info) is pre-existing noise
+- ServerState fields survive hot reloads via globalThis — bump STATE_SCHEMA_VERSION when adding new fields
+---
+
+## 2026-04-12 - US-002
+- Added per-process sessionId (UUIDv4) module variable in telemetry.ts, set in initTelemetry()
+- Exported getSessionId() returning sessionId ?? '' for undefined-safe pre-init access
+- Updated server_started event in index.ts: replaced pluginCount with plugins_loaded, plugins_failed, plugins_local, plugins_npm, and session_id
+- plugins_local/plugins_npm filter state.registry.plugins.values() by source field
+- plugins_failed uses state.registry.failures.length
+- Files changed: platform/mcp-server/src/telemetry.ts, platform/mcp-server/src/index.ts
+- **Learnings for future iterations:**
+  - getSessionId export must be added to the named export list at the bottom of telemetry.ts
+  - index.ts imports from ./telemetry.js (with .js extension for ESM) — add getSessionId to existing import
+  - RegisteredPlugin.source is typed as PluginSource = 'npm' | 'local' (state.ts line 93)
+  - state.registry.failures is readonly FailedPlugin[] with { path: string; error: string }
+---
+
+## 2026-04-12 - US-003
+- Added peakConcurrentDispatches (number) and hadExtensionConnection (boolean) fields to ServerState interface
+- Initialized both in createState() (0 and false respectively)
+- Bumped STATE_SCHEMA_VERSION from 7 to 8
+- Added peak concurrent dispatch tracking in dispatchToExtension after pendingDispatches.set
+- Files changed: platform/mcp-server/src/state.ts, platform/mcp-server/src/extension-protocol.ts
+- **Learnings for future iterations:**
+  - Peak tracking goes only in dispatchToExtension, not in dispatchToAllConnections (which has its own dispatch management)
+  - hadExtensionConnection is only declared here — it gets set to true in US-005 when the extension connects
+  - STATE_SCHEMA_VERSION bump triggers a hot-reload warning prompting devs to restart
+---
+
+## 2026-04-13 - US-004
+- Added computeErrorRateBucket(total, errors) to telemetry.ts — returns '0%', '<5%', '<25%', or '>=25%' with (0,0) returning '0%'
+- Added classifyLoadFailures(failures) to telemetry.ts — categorizes FailedPlugin[] into missing_adapter, invalid_manifest, schema_error, unknown based on error message patterns from loader.ts
+- Exported both functions from telemetry.ts
+- Updated shutdown.ts to emit server_stopped trackEvent before shutdownTelemetry() with session_id, uptime_seconds, tool_calls_total, tool_errors_total, tool_error_rate_bucket, extension_was_connected, peak_concurrent_dispatches, plugin_load_failures
+- Files changed: platform/mcp-server/src/telemetry.ts, platform/mcp-server/src/shutdown.ts
+- **Learnings for future iterations:**
+  - shutdown.ts's shutdown() function accesses state via getState() closure — state.auditLog, state.startedAt, state.hadExtensionConnection, state.peakConcurrentDispatches, state.registry.failures all accessible
+  - AuditEntry has a `success: boolean` field for counting errors
+  - loader.ts error messages use patterns like "Adapter IIFE not found", "Failed to read package.json", "Invalid tools.json", "SDK" for classifiable failures
+  - Biome pre-commit hook auto-formatted the multi-import in shutdown.ts into separate lines
+---
+
+## 2026-04-13 - US-005
+- Added import of getSessionId and trackEvent from ./telemetry.js in http-routes.ts
+- Emitted extension_connected telemetry event in createHandleWsOpen after extensionConnections.set, guarded by !state.hadExtensionConnection
+- Sets hadExtensionConnection = true immediately to prevent re-emission on reconnects
+- Event includes session_id, time_to_connect_bucket (bucketed elapsed since state.startedAt), and profile_count (capped at 3)
+- Files changed: platform/mcp-server/src/http-routes.ts
+- **Learnings for future iterations:**
+  - Biome pre-commit hook reformats multi-line ternaries into single-line when they fit
+  - The telemetry import was added between sdkVersion and state.js imports (biome sorted it alphabetically)
+  - createHandleWsOpen registers connections at state.extensionConnections.set(connectionId, conn) — size reflects the new connection when checked afterward
+  - state.startedAt is set in createState() with Date.now() and is available for elapsed time calculations
+---
+
+## 2026-04-13 - US-006
+- Modified setTimeout callback in dispatchToExtension to emit dispatch_timed_out telemetry event
+- Changed state.pendingDispatches.has(id) to state.pendingDispatches.get(id) to retrieve pending dispatch object
+- Computes elapsed time from p.startTs and maps to duration buckets: '30s' (<32s), '1min' (<65s), '2min' (<130s), '5min' (>=130s)
+- Emits dispatch_timed_out with session_id, had_progress_updates (p.lastProgressTs !== undefined), and duration_bucket
+- Added import of getSessionId and trackEvent from ./telemetry.js
+- Files changed: platform/mcp-server/src/extension-protocol.ts
+- **Learnings for future iterations:**
+  - PendingDispatch.lastProgressTs is set by handleToolProgress in extension-handlers.ts — undefined means no progress received
+  - The timeout callback must use state.pendingDispatches.get(id) not the outer `pending` variable, since `pending` is declared after `timerId` in the Promise constructor
+  - dispatchToAllConnections has its own timeout logic (lines 247-250) that does NOT need telemetry — only dispatchToExtension timeouts matter
+  - Biome pre-commit hook auto-formatted the ternary chain into a single line
+---
+
+## 2026-04-13 - US-007
+- Extended telemetry.test.ts with 4 new describe blocks: disableGeoip, getSessionId, computeErrorRateBucket, classifyLoadFailures
+- Updated vi.hoisted() mock to capture PostHog constructor options via mockConstructorOptions
+- Added constructor to MockPostHog class to capture options parameter
+- Reset mockConstructorOptions.captured in beforeEach
+- All 15 new tests pass alongside 3600+ existing tests
+- Phase 2 (E2E) ran successfully: 263 E2E tests passed
+- Files changed: platform/mcp-server/src/telemetry.test.ts
+- **Learnings for future iterations:**
+  - vi.hoisted() mocks can share mutable state objects (like mockConstructorOptions) across the mock and test code
+  - MockPostHog class needs an explicit constructor to capture options — class field assignments (capture, shutdown) still work alongside a constructor
+  - classifyLoadFailures categorizes "package.json" errors as invalid_manifest, so a test with both "tools.json" and "package.json" errors expects invalid_manifest: 2
+  - computeErrorRateBucket and classifyLoadFailures are pure functions — they can be tested directly without initTelemetry()
+---
