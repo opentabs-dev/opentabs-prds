@@ -1,0 +1,110 @@
+# Ralph Progress Log
+PRD: prd-2026-04-13-151833-telemetry-events-7d3269~running.json
+Started: Mon Apr 13 22:19:14 UTC 2026
+---
+
+## Codebase Patterns
+- Telemetry system lives in `platform/mcp-server/src/telemetry.ts` — exports `trackEvent(event, properties?)` and `getSessionId()`
+- Events are fire-and-forget, no PII. Import as `import { getSessionId, trackEvent } from './telemetry.js';`
+- `handlePluginInstall` is at line ~917 in extension-handlers.ts. The catch block error is typed as `unknown` — use `err instanceof Error` for message access.
+- Error categorization pattern: lowercase the error message, check for keywords like 'timed out', 'not a valid opentabs plugin', default to generic category
+- To test telemetry events: use `vi.hoisted(() => ({ mockTrackEvent: vi.fn() }))` + `vi.mock('./telemetry.js', ...)` pattern
+- serverSourcePath/isProductionInstall are module-level constants from import.meta.url — mock `node:url` fileURLToPath to inject 'node_modules' into path for testing production-only code paths
+- ConfigSchema `url` type expects `Record<string, string>` (instance name → URL map), not a plain string
+
+## 2026-04-13 22:22 - US-001
+- Implemented plugin_installed and plugin_install_failed telemetry events
+- Files changed: platform/mcp-server/src/extension-handlers.ts
+- Added import for getSessionId and trackEvent from telemetry.js
+- Added trackEvent('plugin_installed') after successful installPlugin call
+- Added trackEvent('plugin_install_failed') in catch block with error_category classification
+- **Learnings for future iterations:**
+  - The telemetry import was not yet in extension-handlers.ts — future stories (US-002 through US-007) that modify this file can reuse the existing import
+  - Error category classification uses ternary chain on lowercased error message
+  - All Phase 1 checks passed on first run — the change is purely additive
+---
+
+## 2026-04-13 22:24 - US-002
+- Implemented plugin_removed telemetry event in both handlePluginRemove and handlePluginRemoveBySpecifier
+- Files changed: platform/mcp-server/src/extension-handlers.ts
+- In handlePluginRemove: looks up plugin source BEFORE removePlugin call (plugin is gone from registry after removal), then emits trackEvent with was_failed: false and the normalized plugin_source
+- In handlePluginRemoveBySpecifier: emits trackEvent with was_failed: true and plugin_source: 'unknown' (failed plugins don't have a registered source)
+- **Learnings for future iterations:**
+  - Plugin source lookup must happen before removePlugin() — the registry no longer has the plugin after removal
+  - The source field normalization pattern (explicit === checks for 'npm' and 'local', fallback to 'unknown') is used to guard against future source type changes
+  - Biome auto-formatted the ternary chain for pluginSource across multiple lines during pre-commit
+---
+
+## 2026-04-13 22:27 - US-003
+- Implemented plugin_updated and plugin_reviewed telemetry events
+- Files changed: platform/mcp-server/src/extension-handlers.ts, platform/mcp-server/src/mcp-tool-dispatch.ts
+- Added trackEvent('plugin_updated') after successful updatePlugin in handlePluginUpdateFromRegistry
+- Added trackEvent('plugin_reviewed') after savePluginPermissions in handlePluginMarkReviewed with permission_set and review_source: 'agent'
+- Added telemetry import to mcp-tool-dispatch.ts (getSessionId, trackEvent)
+- **Learnings for future iterations:**
+  - Biome reorders imports alphabetically during pre-commit — the telemetry import was moved after state.js import
+  - mcp-tool-dispatch.ts now has the telemetry import, so future stories (US-008 tests) can rely on it
+  - The `permission` variable in handlePluginMarkReviewed is typed loosely — needs `as string` cast for the trackEvent property
+---
+
+## 2026-04-13 22:30 - US-004
+- Implemented permission_changed and skip_permissions_changed telemetry events
+- Files changed: platform/mcp-server/src/extension-handlers.ts
+- Added trackEvent('permission_changed') after onPluginPermissionsPersist() with target discriminator ('browser' vs 'plugin') and new_permission
+- Added trackEvent('skip_permissions_changed') after state.skipPermissions assignment with enabled boolean
+- **Learnings for future iterations:**
+  - The handleConfigSetPluginPermission pattern appears twice in the file (once for plugin permission, once for tool permission) — needed unique context for the edit
+  - All Phase 1 checks passed on first run — purely additive change
+---
+
+## 2026-04-13 22:32 - US-005
+- Implemented plugin_search telemetry event in handlePluginSearch
+- Files changed: platform/mcp-server/src/extension-handlers.ts
+- Added result count bucketing: '0' for empty, '1-5' for 1-5 results, '6+' for 6 or more
+- trackEvent fires only on successful search (not in catch block)
+- **Learnings for future iterations:**
+  - Very small, surgical change — only 7 lines added inside the existing try block
+  - All Phase 1 checks passed on first run — purely additive change
+---
+
+## 2026-04-13 22:36 - US-006
+- Implemented plugin_configured telemetry event in both side panel and HTTP handlers
+- Files changed: platform/mcp-server/src/extension-handlers.ts, platform/mcp-server/src/http-routes.ts
+- In handleConfigSetPluginSettings: added trackEvent('plugin_configured') after reload with source: 'side_panel' and had_required_fields boolean
+- In handlePluginSettings (http-routes.ts): added trackEvent('plugin_configured') after reload with source: 'http' and had_required_fields boolean
+- had_required_fields is derived from Object.values(configSchema).some(f => f.required) since ConfigSchema is a Record, not an array
+- **Learnings for future iterations:**
+  - ConfigSchema is `Record<string, ConfigSettingDefinition>` — use Object.values() not .some() directly (PRD example used array-style `.some(f => f.required)`)
+  - http-routes.ts already had the telemetry import from a previous event (extension_connected at line ~1141)
+  - All Phase 1 checks passed on first run — purely additive change
+---
+
+## 2026-04-13 22:38 - US-007
+- Implemented server_update_available and server_update_applied telemetry events
+- Files changed: platform/mcp-server/src/version-check.ts, platform/mcp-server/src/extension-handlers.ts
+- In checkServerUpdate (version-check.ts): added telemetry import and trackEvent('server_update_available') after state.serverUpdate is set when isNewer detects a new version
+- In handleServerSelfUpdate (extension-handlers.ts): added trackEvent('server_update_applied') after successful spawnSync npm install, before sending success response
+- Both events emit only session_id — no version numbers, package names, or update commands
+- **Learnings for future iterations:**
+  - version-check.ts did not previously import telemetry — needed to add the import
+  - extension-handlers.ts already had the telemetry import from US-001
+  - All Phase 1 checks passed on first run — purely additive change
+---
+
+## 2026-04-13 22:50 - US-008
+- Added unit tests for all 11 telemetry events across 3 test files
+- Files changed:
+  - platform/mcp-server/src/extension-handlers.test.ts (9 events: plugin_installed, plugin_install_failed, plugin_removed×2, plugin_updated, permission_changed, skip_permissions_changed, plugin_search, plugin_configured, server_update_applied + privacy aggregation test)
+  - platform/mcp-server/src/mcp-tool-dispatch.test.ts (1 event: plugin_reviewed + privacy + negative test)
+  - platform/mcp-server/src/version-check.test.ts (1 event: server_update_available + privacy + negative test)
+- Added vi.mock('./telemetry.js') with mockTrackEvent to all 3 test files using vi.hoisted pattern
+- Added removeFailedPlugin to plugin-management mock in extension-handlers.test.ts
+- Added node:child_process and node:url mocks to extension-handlers.test.ts to enable handleServerSelfUpdate testing (bypasses production-only guard via fileURLToPath path injection)
+- Added node:url mock to version-check.test.ts for same isProductionInstall() bypass
+- Privacy assertion helper: assertNoPrivacyViolation checks plugin_name, plugin, query, error_message, version, package_name absence
+- **Learnings for future iterations:**
+  - serverSourcePath and _serverDir in extension-handlers.ts/version-check.ts are module-level constants computed from import.meta.url — they never include 'node_modules' in test environments, so handleServerSelfUpdate and checkServerUpdate short-circuit. Must mock node:url's fileURLToPath to inject 'node_modules' into the path.
+  - vi.hoisted() is required for mock variables that need to be available before vi.mock() factory runs
+  - ConfigSchema url type now expects Record<string, string> (instance name → URL map), not a plain string — test needed to use 'string' type for required field validation test
+  - All Phase 1 checks passed after fixing the url-type schema test
+---
