@@ -1,0 +1,112 @@
+# Ralph Progress Log
+PRD: prd-2026-04-13-213602-browser-notify-tool-27a0dc~running.json
+Started: Tue Apr 14 04:36:37 UTC 2026
+---
+
+## Codebase Patterns
+- Browser command handlers follow `(params: Record<string, unknown>, id: string | number) => Promise<void>` pattern with try/catch, `sendSuccessResult`, `sendErrorResult` from `helpers.ts`
+- When adding a new browser command, update 4 places: handler file, `browser-commands/index.ts` barrel, `message-router.ts` dispatch table + import, `known-methods.ts` DISPATCH_METHODS array
+- Test mocks must be added in 3 files: `known-methods.test.ts`, `message-router.test.ts` (both hoisted destructured mock var AND vi.mock map entry)
+- `chrome.notifications.onClicked` supports multiple listeners — filter by notification ID prefix to avoid conflicts between handlers
+- Biome auto-fixes import ordering during pre-commit; the barrel export in `index.ts` was reordered alphabetically by the linter
+- In worktrees, workspace packages are real copies (not symlinks) in each package's local `node_modules/`. When modifying shared or mcp-server dist, copy updates to all local copies before running generators or tests.
+- When adding a browser tool to mcp-server: create definition file, add to index.ts barrel array, update browser-tools-catalog.ts (generated file, can edit manually then verify with `npm run generate:browser-tools-catalog`)
+
+## 2026-04-14 04:42 UTC - US-001
+- Implemented `handleBrowserShowNotification` in `notification-commands.ts`
+- Implemented `initNotificationClickHandler` for click-to-open behavior
+- Exported `_notificationUrlsForTesting` for test access to internal Map
+- Created unit tests covering: successful creation, default icon, custom icon, optional fields, contextMessage omission, URL storage, error handling
+- Added export to `browser-commands/index.ts` barrel
+- Registered `browser.showNotification` in `message-router.ts` dispatch table
+- Added to `DISPATCH_METHODS` in `known-methods.ts`
+- Updated mocks in `known-methods.test.ts` and `message-router.test.ts`
+- Files changed:
+  - platform/browser-extension/src/browser-commands/notification-commands.ts (NEW)
+  - platform/browser-extension/src/browser-commands/notification-commands.test.ts (NEW)
+  - platform/browser-extension/src/browser-commands/index.ts
+  - platform/browser-extension/src/message-router.ts
+  - platform/browser-extension/src/message-router.test.ts
+  - platform/browser-extension/src/known-methods.ts
+  - platform/browser-extension/src/known-methods.test.ts
+- **Learnings for future iterations:**
+  - `message-router.test.ts` has its own vi.mock for `browser-commands/index.js` separate from `known-methods.test.ts` — both must be updated when adding handlers
+  - The `message-router.test.ts` mock has a hoisted destructured variable pattern (e.g., `mockHandleBrowserX`) that must be declared in the `vi.hoisted()` block AND referenced in the `vi.mock()` map
+---
+
+## 2026-04-14 04:55 UTC - US-003
+- Added `initNotificationClickHandler()` import and call in `background.ts` right after `initConfirmationBadge()`
+- Added 6 unit tests for the click handler in `notification-commands.test.ts`:
+  - Registers a chrome.notifications.onClicked listener
+  - Opens URL in new tab when notification has a stored URL
+  - Opens side panel when notification has no stored URL
+  - Clears the notification after click
+  - Removes URL from map after click
+  - Ignores notifications without the opentabs-notify- prefix
+- Files changed:
+  - platform/browser-extension/src/background.ts
+  - platform/browser-extension/src/browser-commands/notification-commands.test.ts
+- **Learnings for future iterations:**
+  - `initNotificationClickHandler()` can be called multiple times in tests without issue — each call adds a new listener, so use `beforeEach` with `vi.clearAllMocks()` to reset the mock
+  - The click handler's side panel open path uses a `.then()` chain (getCurrent → sidePanel.open), so tests need `vi.waitFor()` to wait for the promise chain to resolve
+---
+
+## 2026-04-14 04:51 UTC - US-002
+- Created `show-notification.ts` browser tool definition using `defineBrowserTool` with Zod schema
+- Tool name: `browser_notify`, dispatches to `browser.showNotification` on the extension
+- Input schema: title (string, required), message (string, required), iconUrl (url, optional), requireInteraction (boolean, optional), contextMessage (string, optional), url (url, optional)
+- Tool metadata: group 'Notifications', icon 'bell', summary 'Show a desktop notification'
+- Added import and array entry to `browser-tools/index.ts` (after `handleDialog`, before `extensionGetState`)
+- Updated `browser-tools-catalog.ts` to include the new tool (alphabetically between `browser_navigate_tab` and `browser_open_tab`)
+- Files changed:
+  - platform/mcp-server/src/browser-tools/show-notification.ts (NEW)
+  - platform/mcp-server/src/browser-tools/index.ts
+  - platform/shared/src/generated/browser-tools-catalog.ts
+- **Learnings for future iterations:**
+  - In worktrees, `npm ci` creates real copies (not symlinks) of workspace packages in each package's `node_modules/`. When modifying `@opentabs-dev/shared` or `@opentabs-dev/mcp-server` source+dist, the stale copies in other packages' `node_modules/` must also be updated. Copy the rebuilt dist to all local copies before running the catalog generator or tests.
+  - The `generate:browser-tools-catalog` script uses `tsx` which runs TypeScript source directly. It imports `@opentabs-dev/shared` from whatever `node_modules` copy resolves first (local package copy, not root). This means the catalog in the local copy must match the source before the generator can succeed.
+  - The cli-smoke test ("starts the server and responds to health check") can fail with stale `node_modules/@opentabs-dev/mcp-server` copies in `platform/cli/` — the spawned server crashes on catalog validation mismatch.
+---
+
+## 2026-04-14 04:58 UTC - US-004
+- Created `e2e/browser-notify.e2e.ts` with tool listing tests
+- Test 1: Verifies `browser_notify` appears in the `tools/list` response
+- Test 2: Verifies the input schema has all expected properties (title, message, iconUrl, requireInteraction, contextMessage, url) and that title/message are required
+- Test 3: Verifies the tool description mentions "desktop notification"
+- Used the standard `initAndListTools` helper pattern from browser-tools.e2e.ts
+- Files changed:
+  - e2e/browser-notify.e2e.ts (NEW)
+- **Learnings for future iterations:**
+  - Biome warns about non-null assertions (`!`) in test files — use optional chaining (`?.`) instead even after `expect(x).toBeDefined()` assertions
+  - The `listTools()` return type includes `inputSchema?: unknown` which can be cast to `{ type, properties, required }` for Zod-generated schemas
+  - E2E tests that only need tool listing don't require `testServer` fixture — only `mcpServer`, `extensionContext`, and `mcpClient`
+---
+
+## 2026-04-14 05:01 UTC - US-005
+- Added 4 E2E dispatch tests to `e2e/browser-notify.e2e.ts` in a new `browser_notify — dispatch` describe block
+- Test 1: Sends notification with title and message, verifies isError: false and notificationId starts with `opentabs-notify-`
+- Test 2: Sends notification with all optional fields (requireInteraction, contextMessage, url), verifies success
+- Test 3: Sends notification with requireInteraction: true, verifies success
+- Test 4: Sends two sequential notifications, verifies both return unique notificationIds starting with `opentabs-notify-`
+- Added `parseToolResult` import from helpers.ts
+- Files changed:
+  - e2e/browser-notify.e2e.ts
+- **Learnings for future iterations:**
+  - Dispatch tests for browser tools only need `waitForExtensionConnected` (not `waitForLog('plugin(s) mapped')`) since browser tools don't depend on plugin loading
+  - `parseToolResult` returns `Record<string, unknown>` — cast individual fields as needed (e.g., `as string`) for type-safe assertions
+---
+
+## 2026-04-14 05:10 UTC - US-006
+- Added 5 E2E edge case tests in a new `browser_notify — edge cases` describe block in `e2e/browser-notify.e2e.ts`
+- Test 1: Sends 5 notifications concurrently via Promise.all, verifies all return unique notificationIds
+- Test 2: Sends notification with 500-char title, verifies success
+- Test 3: Sends notification with empty message string, verifies success
+- Test 4: Verifies missing title returns isError: true (Zod validation)
+- Test 5: Verifies missing message returns isError: true (Zod validation)
+- All Phase 1 and Phase 2 checks passed (263 E2E tests passed)
+- Files changed:
+  - e2e/browser-notify.e2e.ts
+- **Learnings for future iterations:**
+  - Zod schema validation on the MCP server rejects missing required fields before dispatch, so validation error tests don't need the extension connected — but `waitForExtensionConnected` is still called for consistency with other tests in the file
+  - `Promise.all` with `mcpClient.callTool` works reliably for concurrent notification dispatch — the server/extension handle parallel WebSocket messages without issues
+---

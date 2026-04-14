@@ -1,0 +1,111 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Add a `browser_notify` browser tool that sends Chrome desktop notifications via the extension's chrome.notifications API. The tool accepts a title, message, optional icon URL, and optional requireInteraction flag. The extension receives the dispatch via WebSocket and calls chrome.notifications.create(). Clicking the notification opens the specified URL (if provided) or the side panel. Includes extensive E2E tests.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add browser.showNotification handler in the extension",
+      "description": "Add a new browser command handler in the extension that receives notification parameters via WebSocket and calls chrome.notifications.create(). Add the handler to the browser-commands barrel and register it in the message router.",
+      "acceptanceCriteria": [
+        "handleBrowserShowNotification exists in a new file browser-commands/notification-commands.ts",
+        "Handler calls chrome.notifications.create with type 'basic', title, message, iconUrl (defaulting to extension icon), priority, and requireInteraction",
+        "Handler supports optional contextMessage field",
+        "Handler generates a unique notification ID and returns it in the success result",
+        "Handler is exported from browser-commands/index.ts",
+        "Message router maps 'browser.showNotification' to the handler via wrapAsync",
+        "known-methods.test.ts mock includes handleBrowserShowNotification",
+        "Unit tests cover: successful creation, default icon fallback, optional fields"
+      ],
+      "priority": 1,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/browser-commands/notification-commands.ts (NEW \u2014 create this file)\n- platform/browser-extension/src/browser-commands/notification-commands.test.ts (NEW \u2014 unit tests)\n- platform/browser-extension/src/browser-commands/index.ts (add export)\n- platform/browser-extension/src/message-router.ts (register handler)\n- platform/browser-extension/src/known-methods.test.ts (add mock)\n\nContext:\nBrowser commands follow a consistent pattern. Each handler receives `(params: Record<string, unknown>, id: string | number)` and uses `sendSuccessResult(id, ...)` or `sendErrorResult(id, err)` from messaging.ts. Example handler \u2014 `handleBrowserFocusTab` in `platform/browser-extension/src/browser-commands/tab-commands.ts`:\n```typescript\nexport const handleBrowserFocusTab = async (params: Record<string, unknown>, id: string | number): Promise<void> => {\n  try {\n    const tabId = requireTabId(params, id);\n    if (tabId === null) return;\n    const tab = await chrome.tabs.update(tabId, { active: true });\n    ...\n    sendSuccessResult(id, { id: tab.id, title: tab.title ?? '', url: tab.url ?? '', active: true });\n  } catch (err) {\n    sendErrorResult(id, err);\n  }\n};\n```\n\nThe notification-commands.ts handler should:\n1. Extract `title` (required string), `message` (required string), `iconUrl` (optional string), `requireInteraction` (optional boolean, default false), `contextMessage` (optional string), `url` (optional string \u2014 stored for click handling) from params\n2. Generate a unique notification ID like `opentabs-notify-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`\n3. Call `chrome.notifications.create(notificationId, { type: 'basic', iconUrl: iconUrl ?? chrome.runtime.getURL('icons/icon-128.png'), title, message, contextMessage, priority: 1, requireInteraction })`\n4. Return `sendSuccessResult(id, { notificationId })` on success\n5. Return `sendErrorResult(id, err)` on failure\n6. Store `{ notificationId, url }` in a module-level Map so the click handler can open the URL\n7. Export an `initNotificationClickHandler()` function that registers `chrome.notifications.onClicked` \u2014 when clicked, if the notification has a URL, open it via `chrome.tabs.create({ url })`; otherwise open the side panel. Always clear the notification after click.\n\nMessage router registration \u2014 in `platform/browser-extension/src/message-router.ts`, the handler map is a `Map<string, MessageHandler>` built from entries array (lines ~678-730). Add:\n```typescript\n['browser.showNotification', wrapAsync('browser.showNotification', handleBrowserShowNotification)],\n```\nafter the existing browser handlers. Import from `./browser-commands/index.js`.\n\nThe existing confirmation-badge.ts already uses `chrome.notifications.onClicked` with a listener that checks `notificationId === 'opentabs-confirmation'`. The new click handler in notification-commands.ts should check that the notificationId starts with `opentabs-notify-` so the two listeners don't conflict.\n\nThe `initNotificationClickHandler()` must be called from background.ts at startup, similar to how `initConfirmationBadge()` is called.\n\nFor known-methods.test.ts \u2014 add `handleBrowserShowNotification: vi.fn(asyncNoop),` to the `browser-commands/index.js` mock (around line 66, after the existing mocks).\n\nConstraints:\n- Do NOT modify confirmation-badge.ts or its notification handling\n- Do NOT use the Web Notifications API \u2014 only chrome.notifications\n- The notification ID prefix must be 'opentabs-notify-' to avoid collision with the confirmation notification ID 'opentabs-confirmation'\n- Do NOT add initNotificationClickHandler to background.ts in this story \u2014 that's US-003's job"
+    },
+    {
+      "id": "US-002",
+      "title": "Add browser_notify tool definition on the MCP server",
+      "description": "Add a new browser tool definition that dispatches to the extension's browser.showNotification handler. Register it in the browser tools barrel and regenerate the browser tools catalog.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/browser-tools/show-notification.ts exists with defineBrowserTool",
+        "Tool name is 'browser_notify'",
+        "Zod input schema has: title (string, required), message (string, required), iconUrl (string, optional), requireInteraction (boolean, optional), contextMessage (string, optional), url (string, optional)",
+        "Handler dispatches to extension via dispatchToExtension(state, 'browser.showNotification', args)",
+        "Tool is added to the browserTools array in browser-tools/index.ts",
+        "Tool has group 'Notifications', icon 'bell', and a descriptive summary",
+        "npm run generate:browser-tools-catalog updates the generated catalog to include browser_notify"
+      ],
+      "priority": 2,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/browser-tools/show-notification.ts (NEW)\n- platform/mcp-server/src/browser-tools/index.ts (add import + array entry)\n- platform/shared/src/generated/browser-tools-catalog.ts (regenerated by script)\n\nContext:\nBrowser tool definition pattern \u2014 see `platform/mcp-server/src/browser-tools/focus-tab.ts`:\n```typescript\nimport { z } from 'zod';\nimport { dispatchToExtension } from '../extension-protocol.js';\nimport { defineBrowserTool } from './definition.js';\n\nconst focusTab = defineBrowserTool({\n  name: 'browser_focus_tab',\n  description: '...',\n  summary: 'Focus a browser tab',\n  icon: 'eye',\n  group: 'Tabs',\n  input: z.object({\n    tabId: z.number().int().positive().describe('Tab ID to focus'),\n  }),\n  handler: async (args, state) => dispatchToExtension(state, 'browser.focusTab', { tabId: args.tabId }),\n});\n\nexport { focusTab };\n```\n\nFor show-notification.ts:\n```typescript\nimport { z } from 'zod';\nimport { dispatchToExtension } from '../extension-protocol.js';\nimport { defineBrowserTool } from './definition.js';\n\nconst showNotification = defineBrowserTool({\n  name: 'browser_notify',\n  description: 'Show a Chrome desktop notification. Use this to alert the user about completed tasks, errors, or important events. ' +\n    'The notification appears even when Chrome is in the background. ' +\n    'If url is provided, clicking the notification opens that URL in a new tab; otherwise it opens the OpenTabs side panel.',\n  summary: 'Show a desktop notification',\n  icon: 'bell',\n  group: 'Notifications',\n  input: z.object({\n    title: z.string().describe('Notification title'),\n    message: z.string().describe('Notification body text'),\n    iconUrl: z.string().url().optional().describe('Optional icon URL (defaults to the OpenTabs extension icon)'),\n    requireInteraction: z.boolean().optional().describe('If true, the notification stays visible until the user clicks or dismisses it (default: false)'),\n    contextMessage: z.string().optional().describe('Optional secondary text shown below the main message'),\n    url: z.string().url().optional().describe('Optional URL to open when the notification is clicked'),\n  }),\n  handler: async (args, state) => dispatchToExtension(state, 'browser.showNotification', args),\n});\n\nexport { showNotification };\n```\n\nIn browser-tools/index.ts, add:\n1. Import: `import { showNotification } from './show-notification.js';`\n2. Array entry: add `showNotification` to the `browserTools` array \u2014 insert it after `handleDialog` and before `extensionGetState` (near the end of the tool group, keeping the existing grouping style)\n\nAfter adding the tool definition, run `npm run generate:browser-tools-catalog` to regenerate `platform/shared/src/generated/browser-tools-catalog.ts`. This script reads the compiled browser tools and writes a static catalog. The build will fail if the catalog is out of sync with the definitions.\n\nConstraints:\n- The tool name MUST be 'browser_notify' (not 'browser_show_notification') \u2014 this is the user-facing MCP tool name\n- The extension method MUST be 'browser.showNotification' (this matches the handler registered in message-router.ts)\n- Do NOT modify any other browser tool definitions"
+    },
+    {
+      "id": "US-003",
+      "title": "Wire up notification click handler in background.ts",
+      "description": "Call initNotificationClickHandler() from background.ts at startup so notification click events are handled. Add unit tests for the click handler.",
+      "acceptanceCriteria": [
+        "background.ts imports and calls initNotificationClickHandler() at startup",
+        "Clicking a notification with a stored URL opens that URL in a new tab",
+        "Clicking a notification without a URL opens the side panel",
+        "The notification is cleared after being clicked",
+        "Unit tests in notification-commands.test.ts cover click-to-open-url and click-to-open-side-panel scenarios",
+        "Unit tests verify notification cleanup on click"
+      ],
+      "priority": 3,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/background.ts (add init call)\n- platform/browser-extension/src/browser-commands/notification-commands.ts (verify initNotificationClickHandler export)\n- platform/browser-extension/src/browser-commands/notification-commands.test.ts (add click handler tests)\n\nContext:\nIn background.ts, `initConfirmationBadge()` is already called at startup. Search for it \u2014 add `initNotificationClickHandler()` right after it:\n```typescript\ninitConfirmationBadge();\ninitNotificationClickHandler();\n```\n\nThe click handler in notification-commands.ts should:\n1. Register a `chrome.notifications.onClicked` listener\n2. Check if the notificationId starts with 'opentabs-notify-'\n3. If it has a stored URL in the module-level Map, call `chrome.tabs.create({ url })` and remove the entry from the Map\n4. If no URL, open the side panel via `chrome.windows.getCurrent()` then `chrome.sidePanel.open({ windowId })`\n5. Always call `chrome.notifications.clear(notificationId)`\n\nThe existing `initConfirmationBadge()` in confirmation-badge.ts (line 111-125) already registers an `onClicked` listener that filters for `notificationId === 'opentabs-confirmation'`. Both listeners will fire for every click, but each filters by its own ID prefix, so they don't conflict.\n\nFor unit tests, mock `chrome.notifications.onClicked.addListener`, `chrome.tabs.create`, `chrome.sidePanel.open`, `chrome.windows.getCurrent`, and `chrome.notifications.clear`. Call `initNotificationClickHandler()`, capture the listener callback, and invoke it with test notification IDs.\n\nConstraints:\n- Do NOT modify initConfirmationBadge or confirmation-badge.ts\n- The onClicked listener MUST only handle notifications with the 'opentabs-notify-' prefix"
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: browser_notify tool appears in tool listing",
+      "description": "Add E2E tests verifying browser_notify appears in tools/list with correct metadata and the catalog is in sync.",
+      "acceptanceCriteria": [
+        "E2E test verifies browser_notify appears in tools/list response",
+        "E2E test verifies the tool has the expected input schema properties (title, message, iconUrl, requireInteraction, contextMessage, url)",
+        "E2E test verifies the tool description mentions desktop notification"
+      ],
+      "priority": 4,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/browser-notify.e2e.ts (NEW \u2014 create this file)\n\nContext:\nE2E tests use Playwright fixtures from `e2e/fixtures.ts` and helpers from `e2e/helpers.ts`. The standard pattern:\n\n```typescript\nimport type { McpClient, McpServer } from './fixtures.js';\nimport { expect, test } from './fixtures.js';\nimport { waitForExtensionConnected, waitForLog } from './helpers.js';\n\nconst initAndListTools = async (\n  mcpServer: McpServer,\n  mcpClient: McpClient,\n): Promise<Array<{ name: string; description: string }>> => {\n  await waitForExtensionConnected(mcpServer);\n  await waitForLog(mcpServer, 'plugin(s) mapped');\n  return mcpClient.listTools();\n};\n```\n\nSee `e2e/browser-tools.e2e.ts` for the reference pattern \u2014 it imports `BROWSER_TOOL_NAMES` from helpers and checks each tool appears. For this test file, create a dedicated `test.describe('browser_notify')` block.\n\nThe `mcpClient.listTools()` returns `Array<{ name: string; description: string }>` \u2014 use this to verify the tool name and description. To check the input schema, use `mcpClient.callTool` or check the raw tool definition if available.\n\nFixtures needed: `mcpServer`, `extensionContext` (required for WebSocket connection), `mcpClient`.\n\nThe `BROWSER_TOOL_NAMES` array in helpers.ts is derived from `BROWSER_TOOLS_CATALOG` \u2014 after US-002 regenerates the catalog, `browser_notify` will automatically be in this array.\n\nConstraints:\n- Do NOT modify existing browser-tools.e2e.ts \u2014 create a separate file\n- Use the standard fixture pattern (mcpServer, extensionContext, mcpClient)"
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: successful notification dispatch and response",
+      "description": "Add E2E tests that call browser_notify via the MCP client and verify the tool returns a success response with a notificationId.",
+      "acceptanceCriteria": [
+        "E2E test calls browser_notify with title and message, receives isError: false and a notificationId string in the response",
+        "E2E test calls browser_notify with all optional fields (iconUrl, requireInteraction, contextMessage, url), receives success",
+        "E2E test calls browser_notify with requireInteraction: true, receives success",
+        "E2E test verifies the notificationId starts with 'opentabs-notify-'"
+      ],
+      "priority": 5,
+      "passes": true,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/browser-notify.e2e.ts (append to the file created in US-004)\n\nContext:\nThe MCP client's `callTool` method dispatches a tool call and returns `{ content, isError }`. The `parseToolResult` helper from `e2e/helpers.ts` extracts the JSON from the content array.\n\nPattern from browser-tools.e2e.ts:\n```typescript\nconst result = await mcpClient.callTool('browser_open_tab', { url: testServer.url });\nexpect(result.isError).toBe(false);\nconst tabInfo = parseToolResult(result.content);\n```\n\nFor browser_notify tests:\n```typescript\ntest.describe('browser_notify \u2014 dispatch', () => {\n  test('sends notification with title and message', async ({ mcpServer, extensionContext: _ext, mcpClient }) => {\n    await waitForExtensionConnected(mcpServer);\n    const result = await mcpClient.callTool('browser_notify', {\n      title: 'Test Notification',\n      message: 'Hello from E2E test',\n    });\n    expect(result.isError).toBe(false);\n    const data = parseToolResult(result.content);\n    expect(data.notificationId).toMatch(/^opentabs-notify-/);\n  });\n\n  test('sends notification with all optional fields', async ({ mcpServer, extensionContext: _ext, mcpClient }) => {\n    await waitForExtensionConnected(mcpServer);\n    const result = await mcpClient.callTool('browser_notify', {\n      title: 'Full Notification',\n      message: 'With all fields',\n      requireInteraction: true,\n      contextMessage: 'Additional context',\n      url: 'https://example.com',\n    });\n    expect(result.isError).toBe(false);\n    const data = parseToolResult(result.content);\n    expect(data.notificationId).toMatch(/^opentabs-notify-/);\n  });\n});\n```\n\nNote: We cannot verify the notification actually appeared on the desktop in E2E tests (Chromium in Playwright doesn't render system notifications). The verification is that the dispatch round-trip succeeds (server \u2192 WebSocket \u2192 extension \u2192 chrome.notifications.create \u2192 response).\n\nConstraints:\n- Import parseToolResult and waitForExtensionConnected from helpers.ts\n- Each test needs mcpServer + extensionContext + mcpClient fixtures"
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: multiple notifications, error handling, and edge cases",
+      "description": "Add E2E tests for edge cases: multiple rapid notifications, empty/long strings, missing required fields, and notification without extension connected.",
+      "acceptanceCriteria": [
+        "E2E test sends 5 notifications rapidly and all return unique notificationIds",
+        "E2E test sends notification with very long title (500+ chars) and receives success",
+        "E2E test sends notification with empty message string and receives success",
+        "E2E test verifies calling browser_notify without required title field returns an error",
+        "E2E test verifies calling browser_notify without required message field returns an error"
+      ],
+      "priority": 6,
+      "passes": true,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/browser-notify.e2e.ts (append to the file created in US-004)\n\nContext:\nFor rapid-fire notifications, send 5 calls concurrently with Promise.all:\n```typescript\ntest('sends multiple notifications with unique IDs', async ({ mcpServer, extensionContext: _ext, mcpClient }) => {\n  await waitForExtensionConnected(mcpServer);\n  const results = await Promise.all(\n    Array.from({ length: 5 }, (_, i) =>\n      mcpClient.callTool('browser_notify', {\n        title: `Notification ${i}`,\n        message: `Message ${i}`,\n      }),\n    ),\n  );\n  const ids = results.map(r => {\n    expect(r.isError).toBe(false);\n    return parseToolResult(r.content).notificationId as string;\n  });\n  // All IDs are unique\n  expect(new Set(ids).size).toBe(5);\n});\n```\n\nFor validation errors \u2014 the MCP server validates Zod schemas before dispatch. Missing required fields should result in `isError: true` responses. Pattern:\n```typescript\ntest('returns error when title is missing', async ({ mcpServer, extensionContext: _ext, mcpClient }) => {\n  await waitForExtensionConnected(mcpServer);\n  const result = await mcpClient.callTool('browser_notify', { message: 'no title' });\n  expect(result.isError).toBe(true);\n});\n```\n\nFor long strings, generate a 500-char title:\n```typescript\nconst longTitle = 'A'.repeat(500);\nconst result = await mcpClient.callTool('browser_notify', { title: longTitle, message: 'test' });\nexpect(result.isError).toBe(false);\n```\n\nConstraints:\n- All tests in the same file (e2e/browser-notify.e2e.ts)\n- Each test.describe block should have a descriptive name\n- Use parseToolResult from helpers.ts for all response parsing"
+    }
+  ]
+}
