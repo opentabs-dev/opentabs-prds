@@ -1,0 +1,173 @@
+# Ralph Progress Log
+PRD: prd-2026-04-13-225005-cdp-inspection-tools-e5c785~running.json
+Started: Tue Apr 14 05:50:35 UTC 2026
+---
+
+## US-001: Add browser_get_accessibility_tree tool — PASSED
+Commit: 47acddcd feat: add browser_get_accessibility_tree tool
+
+### Files Changed (10 files: 3 new, 7 modified)
+- platform/mcp-server/src/browser-tools/get-accessibility-tree.ts (NEW) — server-side tool definition with Zod schema, dispatches to extension
+- platform/browser-extension/src/browser-commands/accessibility-commands.ts (NEW) — extension handler using withDebugger, CDP Accessibility.getFullAXTree, node transformation, filtering, truncation
+- platform/browser-extension/src/browser-commands/accessibility-commands.test.ts (NEW) — 8 unit tests covering nodes, filtering, truncation, states, errors
+- platform/browser-extension/src/browser-commands/index.ts — added export
+- platform/browser-extension/src/message-router.ts — added handler mapping
+- platform/browser-extension/src/known-methods.ts — added to DISPATCH_METHODS
+- platform/browser-extension/src/known-methods.test.ts — added mock
+- platform/browser-extension/src/message-router.test.ts — added mock in 3 locations
+- platform/mcp-server/src/browser-tools/index.ts — added import + array entry
+- platform/shared/src/generated/browser-tools-catalog.ts — added catalog entry (48 tools total)
+
+### Implementation Details
+- CDP Accessibility domain: enable → getFullAXTree → disable (in finally block)
+- IGNORED_ROLES: none, ignored, GenericContainer, InlineTextBox (filtered by default)
+- interestingOnly defaults to true: filters nodes without name, value, or description
+- MAX_NODES = 2000 with truncation warning in response
+- Depth filtering via BFS parent→child traversal
+- State extraction from boolean properties (focused, expanded, selected, etc.)
+
+### Learnings / Gotchas
+1. **Stale node_modules in worktrees**: `platform/mcp-server/node_modules/@opentabs-dev/shared/` contained a stale copy from `npm ci` during worktree setup. The stale catalog didn't have `browser_notify` (added by a prior PR). Fix: `rm -rf platform/mcp-server/node_modules/@opentabs-dev/shared` so it resolves via workspace symlink.
+2. **Catalog generation chicken-and-egg**: The `generate:browser-tools-catalog` script imports `mcp-server/dist/browser-tools/index.js` which validates tools against the catalog at import time. If catalog is stale, import throws before the script can update. Fix: manually insert catalog entry with `sed -i`, then the script confirms "up to date" on next build.
+3. **message-router.test.ts has its own mock block**: Separate from known-methods.test.ts — must add the mock in 3 places (vi.hoisted destructuring, return block, vi.mock mapping).
+
+## US-002: Add browser_get_performance_metrics tool — PASSED
+Commit: aedd6aad feat: add browser_get_performance_metrics tool
+
+### Files Changed (10 files: 3 new, 7 modified)
+- platform/mcp-server/src/browser-tools/get-performance-metrics.ts (NEW) — server-side tool definition with Zod schema, group 'Performance', icon 'gauge'
+- platform/browser-extension/src/browser-commands/performance-commands.ts (NEW) — extension handler using withDebugger + CDP Performance domain + chrome.scripting.executeScript for Web Vitals
+- platform/browser-extension/src/browser-commands/performance-commands.test.ts (NEW) — 7 unit tests covering metrics, LayoutDuration conversion, timing fallback, errors
+- platform/browser-extension/src/browser-commands/index.ts — added export
+- platform/browser-extension/src/message-router.ts — added import + handler mapping
+- platform/browser-extension/src/known-methods.ts — added to DISPATCH_METHODS
+- platform/browser-extension/src/known-methods.test.ts — added mock
+- platform/browser-extension/src/message-router.test.ts — added mock in 3 locations
+- platform/mcp-server/src/browser-tools/index.ts — added import + array entry
+- platform/shared/src/generated/browser-tools-catalog.ts — added catalog entry (49 tools total)
+
+### Implementation Details
+- Two-phase data collection: (1) CDP Performance.enable → getMetrics → disable, (2) chrome.scripting.executeScript for Web Vitals timing
+- CDP metric name mapping via CDP_METRIC_MAP record (e.g., Nodes → domNodes, JSHeapUsedSize → jsHeapUsedBytes)
+- LayoutDuration converted from seconds to milliseconds
+- Web Vitals collected via page's performance API: navigation timing (TTFB, domContentLoaded, loadComplete), paint timing (FCP, LCP)
+- LCP uses largest-contentful-paint entries (last entry), returns null if unavailable
+- Timing collection wrapped in try/catch — returns null defaults for restricted pages (chrome://)
+- Response structured as: { dom, memory, layout, timing }
+
+### Learnings / Gotchas
+1. **Catalog entry must be inserted manually before build**: Same chicken-and-egg as US-001 — the catalog validation at import time throws if the entry is missing. Insert alphabetically into browser-tools-catalog.ts, then `npm run build` confirms "up to date".
+2. **Two-phase approach for performance data**: CDP Performance domain gives DOM/memory/layout metrics, but Web Vitals (FCP, LCP, TTFB) are only available via the page's performance API. Using chrome.scripting.executeScript with world: 'MAIN' to access performance.getEntriesByType().
+3. **Biome auto-fixes import ordering**: The pre-commit hook may reorder imports in message-router.ts — this is expected and harmless.
+---
+
+## US-003: Add browser_audit_page tool — PASSED
+Commit: 1df782ee feat: add browser_audit_page tool
+
+### Files Changed (10 files: 3 new, 7 modified)
+- platform/mcp-server/src/browser-tools/audit-page.ts (NEW) — server-side tool definition with Zod schema, group 'Inspection', icon 'shield-alert'
+- platform/browser-extension/src/browser-commands/audit-commands.ts (NEW) — extension handler using withDebugger, CDP Audits domain, event-driven issue collection with configurable wait
+- platform/browser-extension/src/browser-commands/audit-commands.test.ts (NEW) — 10 unit tests covering grouped issues, empty categories, categorization, severity extraction, source location, truncation, errors, listener cleanup, tab filtering
+- platform/browser-extension/src/browser-commands/index.ts — added export
+- platform/browser-extension/src/message-router.ts — added import + handler mapping
+- platform/browser-extension/src/known-methods.ts — added to DISPATCH_METHODS
+- platform/browser-extension/src/known-methods.test.ts — added mock
+- platform/browser-extension/src/message-router.test.ts — added mock in 3 locations
+- platform/mcp-server/src/browser-tools/index.ts — added import + array entry
+- platform/shared/src/generated/browser-tools-catalog.ts — added catalog entry (50 tools total)
+
+### Implementation Details
+- CDP Audits domain: enable → collect events via chrome.debugger.onEvent listener → wait configurable seconds → disable
+- Event-driven: listener filters Audits.issueAdded events by tabId, collects {code, details} tuples
+- Issue categorization by code string matching: MixedContent, CorsIssue/CrossOrigin, ContentSecurityPolicy, Cookie/SameSite, Deprecation → generic fallback
+- Severity extracted by scanning detail sub-objects for 'severity' field
+- Source location extracted by scanning for sourceFile/url/lineNumber/line fields in details
+- MAX_ISSUES = 100 with truncation warning
+- Listener always cleaned up in finally block even on error
+- Response: { issues: grouped, summary: counts, totalIssues, truncated }
+
+### Learnings / Gotchas
+1. **chrome.debugger.onEvent listener type**: The listener signature must use `chrome.debugger.Debuggee` (where `tabId` is optional `number | undefined`), not `{ tabId: number }`. The `params` arg is typed as `object | undefined`, needs explicit cast to `Record<string, unknown>`.
+2. **Same catalog chicken-and-egg**: Must manually insert into browser-tools-catalog.ts before build, using sed for the generated file.
+3. **Edit tool read state**: The Edit tool's "file has been read" check resets between tool calls within the same message. If reading and editing in the same parallel batch, the edit may fail. Read in one step, then edit in the next.
+---
+
+## US-004: Add browser_get_security_info tool — PASSED
+Commit: bd6e9144 feat: add browser_get_security_info tool
+
+### Files Changed (10 files: 3 new, 7 modified)
+- platform/mcp-server/src/browser-tools/get-security-info.ts (NEW) — server-side tool definition with Zod schema, group 'Inspection', icon 'shield-check'
+- platform/browser-extension/src/browser-commands/security-commands.ts (NEW) — extension handler using withDebugger, CDP Security domain, event-driven security state collection with 3s timeout
+- platform/browser-extension/src/browser-commands/security-commands.test.ts (NEW) — 8 unit tests covering secure/insecure/neutral states, certificate parsing, ISO dates, tab filtering, errors, listener cleanup
+- platform/browser-extension/src/browser-commands/index.ts — added export
+- platform/browser-extension/src/message-router.ts — added import + handler mapping
+- platform/browser-extension/src/known-methods.ts — added to DISPATCH_METHODS
+- platform/browser-extension/src/known-methods.test.ts — added mock
+- platform/browser-extension/src/message-router.test.ts — added mock in 3 locations
+- platform/mcp-server/src/browser-tools/index.ts — added import + array entry
+- platform/shared/src/generated/browser-tools-catalog.ts — added catalog entry (51 tools total)
+
+### Implementation Details
+- CDP Security domain: enable → listen for Security.visibleSecurityStateChanged → disable
+- Event-driven with 3s timeout: fires immediately for current state, returns 'unknown' if timeout
+- Parses visibleSecurityState.certificateSecurityState: subjectName, issuer, validFrom/validTo (epoch → ISO string), protocol, keyExchange, cipher
+- Mixed content derived from securityState: insecure/insecure-broken/neutral → hasInsecureContent, insecure-broken → ranInsecureContent, neutral → displayedInsecureContent
+- Event listener cleanup in Promise.finally pattern (listener removed in resolve path and timeout path)
+- Response: { securityState, certificate: { issuer, subject, validFrom, validTo, protocol, keyExchange, cipher } | null, mixedContent: { hasInsecureContent, ranInsecureContent, displayedInsecureContent } }
+
+### Learnings / Gotchas
+1. **sed for catalog insertion is error-prone**: Using sed -i to insert multi-line content before a specific line duplicated the opening brace. Used python3 string replacement as a more reliable fix. For future stories, prefer python3 or manual Edit tool for catalog entry insertion.
+2. **Same stale node_modules fix needed**: Must rm -rf platform/mcp-server/node_modules/@opentabs-dev/shared so it resolves via workspace symlink.
+3. **Security.visibleSecurityStateChanged fires immediately**: The CDP Security domain fires the security state event immediately upon enable for the current page state, so no wait is needed — just a timeout as fallback for edge cases.
+---
+
+## US-005: Add browser_get_memory_usage tool — PASSED
+Commit: c7f36fe4 feat: add browser_get_memory_usage tool
+
+### Files Changed (10 files: 3 new, 7 modified)
+- platform/mcp-server/src/browser-tools/get-memory-usage.ts (NEW) — server-side tool definition with Zod schema, group 'Performance', icon 'memory-stick'
+- platform/browser-extension/src/browser-commands/memory-commands.ts (NEW) — extension handler using withDebugger, CDP Memory.getDOMCounters + Runtime.getHeapUsage
+- platform/browser-extension/src/browser-commands/memory-commands.test.ts (NEW) — 8 unit tests covering DOM counters, heap usage, percentage calculation, zero/null/missing fields, errors
+- platform/browser-extension/src/browser-commands/index.ts — added export
+- platform/browser-extension/src/message-router.ts — added import + handler mapping
+- platform/browser-extension/src/known-methods.ts — added to DISPATCH_METHODS
+- platform/browser-extension/src/known-methods.test.ts — added mock
+- platform/browser-extension/src/message-router.test.ts — added mock in 3 locations
+- platform/mcp-server/src/browser-tools/index.ts — added import + array entry
+- platform/shared/src/generated/browser-tools-catalog.ts — added catalog entry (52 tools total)
+
+### Implementation Details
+- Two CDP domains: Memory.getDOMCounters for DOM stats, Runtime.getHeapUsage for JS heap
+- No enable/disable cycle needed — both are simple request/response CDP methods
+- DOM counters: documents, nodes, jsEventListeners
+- Heap: usedSize → usedBytes, totalSize → totalBytes, computed usagePercent (rounded to 2 decimal places)
+- Defensive typing: all CDP response fields checked with typeof before use, defaults to 0
+- Division-by-zero protection: usagePercent returns 0 when totalBytes is 0
+
+### Learnings / Gotchas
+1. **Memory.getDOMCounters and Runtime.getHeapUsage are simple request/response**: Unlike Security or Audits domains, no enable/disable cycle or event listeners needed. Just sendCommand and read the response.
+2. **python3 for catalog insertion**: Following the learning from US-004, used python3 string replacement for inserting catalog entries instead of error-prone sed.
+3. **Read tool state resets**: The Edit tool requires the file to be read within the same "conversation turn". If you read a file in one tool call and try to edit it in a later tool call, it may fail. Re-read before editing.
+---
+
+## US-006: E2E tests for CDP inspection tools — PASSED
+Commit: 66106ed0 feat: add E2E tests for CDP inspection tools
+
+### Files Changed (1 file: 1 new)
+- e2e/browser-inspection.e2e.ts (NEW) — 13 E2E tests across 6 describe blocks covering all 5 CDP inspection tools
+
+### Implementation Details
+- Tool listing test: verifies all 5 tools (browser_get_accessibility_tree, browser_get_performance_metrics, browser_audit_page, browser_get_security_info, browser_get_memory_usage) appear in tools/list and BROWSER_TOOL_NAMES
+- Accessibility tree: tests node structure (nodeId, role, name), metadata (totalNodes, truncated), depth parameter (depth:2 returns fewer nodes), invalid tabId error
+- Performance metrics: tests dom (nodes, documents, eventListeners), memory (jsHeapUsedBytes, jsHeapTotalBytes), layout (count, durationMs), timing (ttfbMs, domContentLoadedMs, loadCompleteMs, fcpMs, lcpMs), invalid tabId error
+- Audit page: tests all 6 issue categories (mixedContent, cors, csp, cookies, deprecations, generic) are arrays, summary has numeric counts per category, metadata (totalIssues, truncated), invalid tabId error
+- Security info: tests securityState is a string, mixedContent structure (hasInsecureContent, ranInsecureContent, displayedInsecureContent are booleans), certificate key exists, invalid tabId error
+- Memory usage: tests dom counters (documents, nodes > 0, eventListeners), heap (usedBytes > 0, totalBytes > 0, usagePercent in 0-100), invalid tabId error
+- Each tool test opens its own tab via openTestServerTab to avoid debugger session conflicts
+- All 263 E2E tests passed (including the 13 new tests)
+
+### Learnings / Gotchas
+1. **Debugger is released after each withDebugger call**: Unlike what the PRD notes suggest, the debugger does NOT need a fresh tab for subsequent calls to the same tool. withDebugger attaches and detaches within each call. However, using separate tabs is still safer for parallel test execution.
+2. **Biome non-null assertion lint**: Cannot use `nodes[0]!` — must use `nodes[0]` with a separate `expect(firstNode).toBeDefined()` assertion.
+3. **Test server is HTTP**: Security info returns 'insecure' or similar non-secure state since the test server doesn't use HTTPS. Certificate is null for HTTP pages.
+---
