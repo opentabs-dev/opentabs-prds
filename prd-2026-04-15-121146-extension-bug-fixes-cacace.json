@@ -1,0 +1,78 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix five bugs in the Chrome extension: missing throttle cleanup on debugger detach, silent error swallowing in failed-plugin removal, incorrect optimistic-update rollback in BrowserToolsCard for concurrent failures, dangling message ports from handlePluginReadinessChanged, and alwaysAllow state leaking across ConfirmationDialog navigation.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Call cleanupThrottle in chrome.debugger.onDetach handler",
+      "description": "The chrome.debugger.onDetach listener in network-capture.ts omits cleanupThrottle(tabId), leaving a stale entry in the throttlingTabs Set. This causes subsequent browser_throttle_network calls on the same tab to fail because ensureDebuggerAttached in throttle-commands.ts sees isThrottling(tabId) === true and skips re-attaching, then the CDP command fails with a 'Debugger not attached' error.",
+      "acceptanceCriteria": [
+        "chrome.debugger.onDetach listener calls cleanupThrottle(tabId) alongside cleanupInterception and cleanupEmulation",
+        "cleanupThrottle is called before captures.delete(tabId) so the throttle state is always cleared when the debugger detaches, regardless of whether network capture was active"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/browser-extension/src/network-capture.ts (add one cleanupThrottle call in onDetach)\n\nContext:\nThe chrome.debugger.onDetach handler (lines 435-444) cleans up interception and emulation state but NOT throttle state. The chrome.tabs.onRemoved handler (lines 420-430) DOES call all three: cleanupInterception, cleanupEmulation, cleanupThrottle. This is an inconsistency that violates the documented contract of cleanupThrottle ('called when tab is closed or debugger detaches').\n\nThe cleanupThrottle import is already present in network-capture.ts at the top of the file:\n  import { cleanupThrottle } from './browser-commands/throttle-commands.js';\n\nCurrent onDetach handler:\n```\nchrome.debugger.onDetach.addListener((source: chrome.debugger.Debuggee, _reason: string) => {\n  const tabId = source.tabId;\n  if (tabId !== undefined) {\n    cleanupInterception(tabId);\n    cleanupEmulation(tabId);\n    const state = captures.get(tabId);\n    if (state) clearInterval(state.pruneIntervalId);\n    captures.delete(tabId);\n  }\n});\n```\n\nAfter fix:\n```\nchrome.debugger.onDetach.addListener((source: chrome.debugger.Debuggee, _reason: string) => {\n  const tabId = source.tabId;\n  if (tabId !== undefined) {\n    cleanupInterception(tabId);\n    cleanupEmulation(tabId);\n    cleanupThrottle(tabId);\n    const state = captures.get(tabId);\n    if (state) clearInterval(state.pruneIntervalId);\n    captures.delete(tabId);\n  }\n});\n```\n\nConstraints:\n- Do NOT add cleanupThrottle to any other place — only the onDetach handler is missing it\n- Do NOT change the onRemoved handler (it already has all three cleanup calls)\n- The import line is already present — do NOT add a duplicate import"
+    },
+    {
+      "id": "US-002",
+      "title": "Show error feedback when handleRemoveFailedPlugin fails",
+      "description": "handleRemoveFailedPlugin in App.tsx silently swallows server errors: the spinner disappears but no error message is shown. Every other action handler (handleRemove, handleUpdate, handleInstall) shows an error. Fix the .catch handler to give the user feedback when failed-plugin removal fails.",
+      "acceptanceCriteria": [
+        "When removeFailedPlugin() rejects, the user sees an error message — either in the FailedPluginCard itself or via a fallback notification mechanism",
+        "The catch handler still clears the loading spinner (removes specifier from removingFailedPlugins) even when showing an error"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/App.tsx (fix .catch handler)\n- platform/browser-extension/src/side-panel/components/FailedPluginCard.tsx (add error display if not already present; read this file first)\n- platform/browser-extension/src/side-panel/components/PluginList.tsx (may need to thread failedPluginErrors through; read this file first)\n\nContext:\nCurrent handleRemoveFailedPlugin (App.tsx ~lines 220-237):\n```\nconst handleRemoveFailedPlugin = (specifier: string) => {\n  setRemovingFailedPlugins(prev => new Set([...prev, specifier]));\n  removeFailedPlugin(specifier)\n    .then(() => {\n      setRemovingFailedPlugins(prev => {\n        const next = new Set(prev);\n        next.delete(specifier);\n        return next;\n      });\n    })\n    .catch(() => {\n      setRemovingFailedPlugins(prev => {\n        const next = new Set(prev);\n        next.delete(specifier);\n        return next;\n      });\n    });\n};\n```\n\nThe existing pattern for regular plugin errors uses showPluginError (pluginName, message) which adds to a pluginErrors Map and auto-clears after 5s. FailedPluginCard currently has no analogous prop.\n\nRecommended approach:\n1. Add a failedPluginErrors Map<string, string> state in App.tsx, mirroring pluginErrors\n2. Add a showFailedPluginError (specifier, message) helper function\n3. Call showFailedPluginError in the .catch handler\n4. Thread failedPluginErrors through PluginList to FailedPluginCard\n5. FailedPluginCard renders the error when present\n\nAlternative (simpler if FailedPluginCard already has an actionError or similar prop):\nRead FailedPluginCard.tsx first to check what props it accepts, then use the simplest available mechanism.\n\nConstraints:\n- The .catch handler MUST still clear the removing state — do NOT remove setRemovingFailedPlugins from catch\n- Follow the same auto-dismiss pattern (ERROR_DISPLAY_DURATION_MS from side-panel/constants.ts) used by showPluginError\n- Do NOT change how successful removal works"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix BrowserToolsCard tool permission rollback for concurrent failures",
+      "description": "BrowserToolsCard.handleToolPermissionChange uses a single preToggleRef to store the pre-change tools array. If two tool permissions are changed in rapid succession and both requests fail, only the last failure's rollback fires, leaving the first change's optimistic update stuck in the UI. PluginCard solves this correctly with a Map of per-version rollback states — apply the same pattern to BrowserToolsCard.",
+      "acceptanceCriteria": [
+        "Each pending tool permission change stores its own pre-change rollback data independently (keyed by version number, not overwriting a shared ref)",
+        "When a setToolPermission request fails, only that specific tool's change is reverted in the UI — other pending changes are not affected",
+        "The rollback entry is cleaned up (deleted from the Map) in .finally() regardless of success or failure"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx (replace preToggleRef with Map-based rollback)\n\nContext:\nCurrent handleToolPermissionChange in BrowserToolsCard.tsx (lines 95-106):\n```\nconst handleToolPermissionChange = (toolName: string, newPermission: ToolPermission) => {\n  const myVersion = ++toggleCounter.current;\n  onToolsChange(prev => {\n    preToggleRef.current = prev;  // BUG: shared ref overwritten by concurrent calls\n    return prev.map(t => (t.name === toolName ? { ...t, permission: newPermission } : t));\n  });\n  void setToolPermission('browser', toolName, newPermission).catch(() => {\n    if (toggleCounter.current === myVersion) {\n      onToolsChange(() => preToggleRef.current);  // BUG: may use wrong pre-state\n    }\n    showToggleError(`Failed to update ${toolName}`);\n  });\n};\n```\n\nThe existing preToggleRef is declared at line 71: `const preToggleRef = useRef<BrowserToolState[]>([]);`\n\nReference implementation: PluginCard.tsx uses this pattern correctly:\n```\nconst pendingToolRollbacks = useRef<Map<number, { toolName: string; prev: ToolPermission }>>(new Map());\n\nconst applyToolPermission = (toolName: string, newPermission: ToolPermission) => {\n  const myVersion = ++toggleCounter.current;\n  const currentPerm = pluginTools.find(t => t.name === toolName)?.permission ?? 'off';\n  pendingToolRollbacks.current.set(myVersion, { toolName, prev: currentPerm });\n  updatePluginTools(prev => prev.map(t => (t.name === toolName ? { ...t, permission: newPermission } : t)));\n  void setToolPermission(plugin.name, toolName, newPermission)\n    .catch(() => {\n      const rollback = pendingToolRollbacks.current.get(myVersion);\n      if (rollback) {\n        updatePluginTools(prev =>\n          prev.map(t => (t.name === rollback.toolName ? { ...t, permission: rollback.prev } : t)),\n        );\n      }\n      showToggleError(`Failed to update ${toolName}`);\n    })\n    .finally(() => {\n      pendingToolRollbacks.current.delete(myVersion);\n    });\n};\n```\n\nApply the same Map-based pattern to BrowserToolsCard.handleToolPermissionChange. Instead of storing the entire tools array in preToggleRef, store {toolName, prev: ToolPermission} per version.\n\nConstraints:\n- preToggleRef may become unused after this change — remove it if so\n- Keep showToggleError(...) call in the .catch — error display must not regress\n- Do NOT change handleBrowserPermissionChange (which uses preBrowserPermRef — it is correct since it stores a scalar permission value, not an array)\n- The toggleCounter ref is shared across both browser permission and tool permission changes — do NOT change this"
+    },
+    {
+      "id": "US-004",
+      "title": "Call sendResponse in handlePluginReadinessChanged to release message port",
+      "description": "handlePluginReadinessChanged never calls sendResponse, but the background message listener returns true (async) for all registered handlers. Chrome keeps the message port open for several minutes per event until GC collects the unreferenced sendResponse. Since readiness-changed events fire on auth state changes, dangling ports accumulate during active sessions. Fix: call sendResponse({ ok: true }) immediately (fire-and-forget) before the async work begins.",
+      "acceptanceCriteria": [
+        "handlePluginReadinessChanged calls sendResponse (renamed from _sendResponse) with { ok: true } immediately — not after the async IIFE completes",
+        "The async plugin readiness probe still runs in the background; the sendResponse call does not block or skip it"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/browser-extension/src/background-message-handlers.ts (fix handlePluginReadinessChanged)\n\nContext:\nAll registered handlers in the backgroundHandlers Map have the listener return true (line 826 in background-message-handlers.ts). This tells Chrome to keep the message port open awaiting sendResponse. handlePluginReadinessChanged is the only handler that never calls sendResponse — it uses `_sendResponse` (underscore = intentionally unused).\n\nCurrent code (approximately lines 338-348):\n```\nconst handlePluginReadinessChanged: MessageHandler = (message, _sendResponse) => {\n  const plugin = message.plugin;\n  if (typeof plugin !== 'string' || plugin === '') return;\n\n  (async () => {\n    const meta = await getPluginMeta(plugin);\n    if (!meta) return;\n    await notifyAffectedPlugins([meta]);\n  })().catch((err: unknown) => {\n    console.warn('[opentabs] handlePluginReadinessChanged failed:', err);\n  });\n};\n```\n\nFix: rename _sendResponse to sendResponse and call it immediately (fire-and-forget):\n```\nconst handlePluginReadinessChanged: MessageHandler = (message, sendResponse) => {\n  const plugin = message.plugin;\n  sendResponse({ ok: true });  // Release port immediately — async work runs in background\n  if (typeof plugin !== 'string' || plugin === '') return;\n\n  (async () => {\n    const meta = await getPluginMeta(plugin);\n    if (!meta) return;\n    await notifyAffectedPlugins([meta]);\n  })().catch((err: unknown) => {\n    console.warn('[opentabs] handlePluginReadinessChanged failed:', err);\n  });\n};\n```\n\nNote: sendResponse({ ok: true }) is called BEFORE the plugin string validation check on purpose — we always want to release the port regardless. Move sendResponse before the if-guard.\n\nConstraints:\n- Do NOT await the async IIFE before calling sendResponse — call it immediately\n- Do NOT change what the async IIFE does (getPluginMeta + notifyAffectedPlugins)\n- Do NOT add sendResponse calls to any other handler — only handlePluginReadinessChanged is missing it"
+    },
+    {
+      "id": "US-005",
+      "title": "Reset alwaysAllow when navigating between pending confirmations",
+      "description": "ConfirmationDialog.tsx does not reset the alwaysAllow switch when the user navigates between confirmations using the prev/next buttons. If a user checks 'Always allow' while viewing confirmation A, then navigates to confirmation B and clicks 'Allow', tool B receives auto-permission even though the user only intended one-time permission. Fix: reset alwaysAllow to false on every navigation.",
+      "acceptanceCriteria": [
+        "Clicking the 'prev' button resets alwaysAllow to false so the switch is unchecked on the newly visible confirmation",
+        "Clicking the 'next' button resets alwaysAllow to false so the switch is unchecked on the newly visible confirmation",
+        "alwaysAllow is still correctly reset to false in handleAllow and handleDeny (existing behavior preserved)"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/browser-extension/src/side-panel/components/ConfirmationDialog.tsx (add setAlwaysAllow(false) in prev/next onClick handlers)\n\nContext:\nCurrent prev/next button onClick handlers (approximately lines 93-106):\n```\n<button\n  type=\"button\"\n  ...\n  disabled={safeIndex === 0}\n  onClick={() => setCurrentIndex(i => i - 1)}>\n  prev\n</button>\n<button\n  type=\"button\"\n  ...\n  disabled={safeIndex >= count - 1}\n  onClick={() => setCurrentIndex(i => i + 1)}>\n  next\n</button>\n```\n\nFix — update both onClick handlers to also reset alwaysAllow:\n```\nonClick={() => { setCurrentIndex(i => i - 1); setAlwaysAllow(false); }}\n```\n```\nonClick={() => { setCurrentIndex(i => i + 1); setAlwaysAllow(false); }}\n```\n\nConstraints:\n- Do NOT change any other behavior in ConfirmationDialog\n- Do NOT change handleAllow or handleDeny — they already reset alwaysAllow correctly\n- This is a two-line change (one per button)"
+    }
+  ]
+}
