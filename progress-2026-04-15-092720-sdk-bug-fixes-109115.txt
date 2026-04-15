@@ -1,0 +1,44 @@
+# Ralph Progress Log
+PRD: prd-2026-04-15-092720-sdk-bug-fixes-109115~running.json
+Started: Wed Apr 15 16:27:52 UTC 2026
+---
+
+## Codebase Patterns
+- Plugin SDK tests use a real Node.js http.createServer test server (not fetch mocking) — add new endpoint handlers by checking `url.pathname` in the request handler chain
+- fetch.test.ts server endpoints follow the pattern: check pathname → writeHead(status) → end(body) → return
+- The `TRANSIENT_5XX` set in httpStatusToToolError is defined inline in the `if (status >= 500)` block per PRD constraint
+- waitUntil uses a closure-captured variable for lastPredicateError — JS closures capture by reference, so the timeout handler reads the final value when it fires
+- storage.ts: to fix iframe fallback write errors silently swallowed by withIframeFallback's outer catch, wrap the operation inside the fn lambda with try-catch — the error is caught before withIframeFallback sees it, so the outer catch is not involved
+
+## 2026-04-15 - US-001
+- Implemented: Fix httpStatusToToolError to only mark transient 5xx codes (500, 502, 503, 504) as retryable=true; all other 5xx codes get retryable=false
+- Files changed:
+  - platform/plugin-sdk/src/fetch.ts (added TRANSIENT_5XX set inside 5xx branch)
+  - platform/plugin-sdk/src/fetch.test.ts (added /error-501 and /error-505 server endpoints + test cases)
+- **Learnings for future iterations:**
+  - The test server is a large if-else chain on url.pathname — add new endpoints by inserting after the nearest related status block
+  - Biome reports a schema version info (not an error) about biome.json — exits 0, safe to ignore
+  - All 3758 existing tests passed after the change; 2 new tests added
+---
+
+## 2026-04-15 - US-002
+- Implemented: Fix waitUntil to include last predicate error in timeout message when predicate always throws
+- Files changed:
+  - platform/plugin-sdk/src/timing.ts (added `let lastPredicateError: unknown;`, catch `(err)` saves it, timeout handler appends `: predicate last threw — ${message}` when it's an Error)
+  - platform/plugin-sdk/src/timing.test.ts (added 2 new tests: predicate always throws → message includes error, predicate never throws → message unchanged)
+- **Learnings for future iterations:**
+  - Biome pre-commit hook auto-formats inline arrow functions that throw to multi-line style
+  - 3760 tests passed (2 new); all 110 test files passed
+  - The `lastPredicateError` variable is only appended to the timeout message when it's an `instanceof Error` — non-Error throws produce no context (consistent with the PRD spec)
+---
+
+## 2026-04-15 - US-003
+- Implemented: Fix setLocalStorage iframe fallback to log write failures (QuotaExceededError silently swallowed)
+- Files changed:
+  - platform/plugin-sdk/src/storage.ts (wrap s.setItem inside the withIframeFallback lambda with try-catch; log.warn on error)
+  - platform/plugin-sdk/src/storage.test.ts (added test: iframe fallback setItem throws QuotaExceededError → two log.warn entries, both containing the key name and 'iframe fallback failed')
+- **Learnings for future iterations:**
+  - withIframeFallback has an outer catch that swallows all errors from fn() — to add error logging for a specific caller, wrap the throwing call inside fn() before it can propagate out
+  - The fix must NOT modify withIframeFallback itself (used by read/remove paths where returning null on failure is correct)
+  - 3761 tests passed (1 new); all 110 test files passed
+---
