@@ -1,0 +1,40 @@
+# Ralph Progress Log
+PRD: prd-2026-04-15-092528-extension-bug-fixes-adda81~running.json
+Started: Wed Apr 15 16:26:04 UTC 2026
+---
+
+## Codebase Patterns
+- Background message handlers in `background-message-handlers.ts` must always call `sendResponse()` because `initBackgroundMessageHandlers` returns `true` for all registered handlers, keeping the Chrome message channel open
+- Fire-and-forget handlers (async work launched but not awaited) still call `sendResponse({ ok: true })` synchronously after launching the async IIFE
+---
+
+## 2026-04-15 16:27 UTC - US-001
+- Fixed handlePluginReadinessChanged to call sendResponse({ ok: true }) on both the early-return path and after the async IIFE
+- Renamed `_sendResponse` parameter to `sendResponse`
+- Files changed: platform/browser-extension/src/background-message-handlers.ts
+- **Learnings for future iterations:**
+  - The message listener in initBackgroundMessageHandlers returns `true` for ALL registered handlers, so every handler MUST call sendResponse to close the channel
+  - The fire-and-forget pattern (async IIFE + synchronous sendResponse) is used by multiple handlers (handleToolProgress, handlePluginReadinessChanged)
+---
+
+## 2026-04-15 16:31 UTC - US-002
+- Fixed `resolvePerTabSettings` host extraction to handle `https://` and `http://` patterns in addition to `*://`
+- Replaced two-step `String.replace` with a regex match: `/^(?:\*|https?):\/\/([^/]+)/` captures the host (including port) between the scheme and the first `/`
+- Files changed: platform/browser-extension/src/iife-injection.ts
+- **Learnings for future iterations:**
+  - Chrome match patterns can have `*://`, `https://`, or `http://` scheme prefixes — string replace targeting only `*://` misses the other two
+  - `new URL(url).host` includes the port for non-standard ports (e.g., `localhost:8080`) but omits it for 80/443 — pattern host extraction must preserve the port to match correctly
+  - The regex approach `pattern.match(/^(?:\*|https?):\/\/([^/]+)/)` is more robust than chained `.replace()` calls for extracting hosts from Chrome URL patterns
+---
+
+## 2026-04-15 16:35 UTC - US-003
+- Fixed BrowserToolsCard.handleToolPermissionChange rollback race condition
+- Replaced single `preToggleRef` (shared array overwritten on every call) with `pendingToolRollbacks` Map keyed by version number
+- Each concurrent invocation now captures and rolls back its own tool's permission independently
+- Map entries cleaned up in `.finally()` to prevent accumulation
+- Files changed: platform/browser-extension/src/side-panel/components/BrowserToolsCard.tsx
+- **Learnings for future iterations:**
+  - BrowserToolsCard and PluginCard both handle tool permission changes with optimistic updates + rollback on failure — they should use the same pattern (per-invocation Map keyed by version number)
+  - `handleBrowserPermissionChange` uses a separate `preBrowserPermRef` for the single browser-level permission — this is correct because there's only one browser permission value (not a list of tools), so the shared-ref problem doesn't apply
+  - When capturing pre-change state for rollback, read from the component's props/state at call time (e.g., `tools.find(...)`) rather than from inside a state updater callback
+---
