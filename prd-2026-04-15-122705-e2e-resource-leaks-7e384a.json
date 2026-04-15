@@ -1,0 +1,63 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix four resource leak and test isolation bugs in E2E tests where cleanup code is missing or unreachable on failure paths. After all stories pass: (1) the WebSocket in security.e2e.ts is always closed in a finally block; (2) the strict-CSP server's connect-src state is always reset after each test, preventing isolation failures; (3) the side-panel-open-tab.e2e.ts homepageServer is properly closed and its EADDRINUSE fallback is corrected; (4) the stress-mcp-dispatch.e2e.ts second page and progress.e2e.ts slow-mode state are always cleaned up on failure paths.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Move WebSocket close into finally block in security.e2e.ts",
+      "description": "In security.e2e.ts, the raw WebSocket `ws` created for the concurrent-writes test (around line 700) is closed at line ~773 with `ws.close()`, which is placed just before the `finally` block. Any assertion failure in lines 738-771 (Promise.all results check, waitFor poll, or explicit field assertions) skips `ws.close()` and the connection leaks for the lifetime of the test process. The fix is to move `ws.close()` into the existing `finally` block alongside `server.kill()`.",
+      "acceptanceCriteria": [
+        "`ws.close()` appears inside the `finally` block in the concurrent-writes test in e2e/security.e2e.ts",
+        "`ws.close()` is called even when any assertion between the WebSocket creation and the end of the try body throws"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- e2e/security.e2e.ts (move ws.close() into finally block)\n\nContext:\nThe test `concurrent setToolPermission calls with WebSocket` (around line 670 in security.e2e.ts) creates a raw WebSocket:\n```ts\nconst { wsUrl, wsSecret } = await fetchWsInfo(server.port, server.secret);\nconst ws = new WebSocket(wsUrl, [...]);\n```\nAt the end of the test body:\n```ts\n      ws.close();        // <-- line ~773, outside finally\n    } finally {\n      await server.kill();\n      cleanupTestConfigDir(configDir);\n    }\n```\nThe fix is:\n```ts\n    } finally {\n      ws.close();        // <-- moved here\n      await server.kill();\n      cleanupTestConfigDir(configDir);\n    }\n```\n\nConstraints:\n- Do NOT change anything else in the test logic\n- `ws.close()` should be the FIRST statement in the finally block so it runs before the server is killed (closing the WS client before the server is cleaner)"
+    },
+    {
+      "id": "US-002",
+      "title": "Reset connect-src server state in finally block in strict-csp.e2e.ts",
+      "description": "In strict-csp.e2e.ts, one test calls `strictCspServer.control('set-connect-src', { connectSrcNone: true })` to test adapter injection when the page's connect-src CSP is 'none'. This state change is never reset in a finally block. If the test fails after this call (e.g., `openTestAppTab` throws), subsequent tests that share the `strictCspServer` fixture run against a server that blocks all connections, causing cascading failures that are hard to diagnose.",
+      "acceptanceCriteria": [
+        "The `connect-src none` test in e2e/strict-csp.e2e.ts wraps its test body in a try/finally that calls `strictCspServer.control('set-connect-src', { connectSrcNone: false })` before the page is closed",
+        "The reset is in a finally block so it runs even if the test throws"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- e2e/strict-csp.e2e.ts (add try/finally with connect-src reset for the connect-src:'none' test)\n\nContext:\nLocate the test that calls `set-connect-src` with `connectSrcNone: true`. The pattern to fix:\n```ts\nawait strictCspServer.control('set-connect-src', { connectSrcNone: true });\n\nconst page = await openTestAppTab(extensionContext, strictCspServer.url, mcpServer);\n// ... assertions ...\nawait page.close();\n// no reset!\n```\nThe fix:\n```ts\nawait strictCspServer.control('set-connect-src', { connectSrcNone: true });\ntry {\n  const page = await openTestAppTab(extensionContext, strictCspServer.url, mcpServer);\n  try {\n    // ... assertions ...\n  } finally {\n    await page.close();\n  }\n} finally {\n  await strictCspServer.control('set-connect-src', { connectSrcNone: false }).catch(() => {});\n}\n```\nNote: `.catch(() => {})` is a best-effort since the test server might be in a bad state.\n\nConstraints:\n- Do NOT change the test's assertions\n- Only add the cleanup guarantee"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix homepageServer cleanup and EADDRINUSE fallback in side-panel-open-tab.e2e.ts",
+      "description": "In side-panel-open-tab.e2e.ts, the test that verifies the side panel 'Open Tab' button uses a hardcoded port 9876 for a local HTTP server. Two bugs: (1) The EADDRINUSE handler re-listens on port 0 (random port) but the test still asserts the page URL contains port 9876 — meaning when port 9876 is taken by a parallel test, the URL assertion checks a page served by that OTHER test, not the homepageServer. (2) `homepageServer.close()` in the finally block is fire-and-forget (no callback/promise), so the server stays half-open after the test.",
+      "acceptanceCriteria": [
+        "The homepageServer uses a dynamic port (not hardcoded 9876) so it never collides with parallel tests",
+        "`homepageServer.close()` is called with a callback or wrapped in a Promise so the test waits for the server to fully close before the finally block exits",
+        "The URL assertion checks the ACTUAL port the homepageServer bound to, not a hardcoded 9876"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-open-tab.e2e.ts (fix homepageServer port and close)\n\nContext:\nThe test creates an http.Server and listens on port 9876:\n```ts\nhomepageServer.listen(9876, resolve);  // hardcoded port\n```\nWith an EADDRINUSE fallback:\n```ts\nhomepageServer.once('error', (err) => {\n  if (err.code === 'EADDRINUSE') {\n    homepageServer.listen(0, resolve);  // fallback to random port\n  }\n});\n```\nBut then the URL assertion uses the hardcoded port:\n```ts\nexpect(newPage.url()).toContain('localhost:9876');\n```\nAnd cleanup:\n```ts\nhomepageServer.close();  // fire and forget\n```\n\nFix:\n1. Always use port 0 (dynamic) from the start:\n```ts\nhomepageServer.listen(0, () => {\n  const homepagePort = (homepageServer.address() as net.AddressInfo).port;\n  resolve();\n});\n```\n2. Store the actual port and use it in the URL assertion:\n```ts\nexpect(newPage.url()).toContain(`localhost:${String(homepagePort)}`);\n```\n3. Wrap close() in a Promise:\n```ts\nawait new Promise<void>(resolve => homepageServer.close(() => resolve()));\n```\n\nThe test needs to import `import net from 'node:net'` if not already imported, or read the port via `(homepageServer.address() as net.AddressInfo).port`.\n\nConstraints:\n- Do NOT change the test's assertion about the page URL behavior — just fix what port it checks\n- The server still needs to serve the same 'homepage-test' content at the root path"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix page and slow-mode leaks in stress-mcp-dispatch and progress tests",
+      "description": "Two test files have cleanup gaps. (1) stress-mcp-dispatch.e2e.ts: tests call `setupToolTest` (returns a page) and then open a second page via `openTestAppTab`, but neither page is wrapped in try/finally — any assertion failure leaves both pages open. (2) progress.e2e.ts: the timeout test calls `testServer.setSlow(35_000)` but `testServer.setSlow(0)` to reset slow mode is called after assertions that can throw — if an elapsed-time bound assertion fails, the test server is left in 35-second slow mode for subsequent cleanup.",
+      "acceptanceCriteria": [
+        "In e2e/stress-mcp-dispatch.e2e.ts, all four tests wrap their page handles in try/finally blocks so pages are closed on failure paths",
+        "In e2e/progress.e2e.ts, `testServer.setSlow(0)` is called in a finally block so slow mode is always reset regardless of assertion outcomes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "sonnet",
+      "notes": "Files:\n- e2e/stress-mcp-dispatch.e2e.ts (wrap all 4 test page handles in try/finally)\n- e2e/progress.e2e.ts (move setSlow(0) into finally block)\n\nContext for stress-mcp-dispatch.e2e.ts:\nAll four tests follow this pattern:\n```ts\nconst page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\n// ... assertions ...\nawait page.close();\n```\nFix pattern:\n```ts\nconst page = await setupToolTest(mcpServer, testServer, extensionContext, mcpClient);\ntry {\n  // ... assertions ...\n} finally {\n  await page.close();\n}\n```\nThe third test ('slow tool — tab closes during execution') also opens a second page:\n```ts\nconst newPage = await openTestAppTab(extensionContext, testServer.url, mcpServer, testServer);\n// ...\nawait newPage.close();\n```\nThis second page also needs a try/finally.\n\nContext for progress.e2e.ts:\nThe timeout test currently:\n```ts\nawait testServer.setSlow(35_000);\n// ... assertions that can throw ...\nawait testServer.setSlow(0);\nawait page.close();\n```\nFix:\n```ts\nawait testServer.setSlow(35_000);\ntry {\n  // ... assertions ...\n} finally {\n  await testServer.setSlow(0).catch(() => {});\n  await page.close().catch(() => {});\n}\n```\n\nConstraints:\n- Do NOT change any test assertions\n- Do NOT wrap the entire test body in try/finally if the page comes from a fixture — only wrap the user-created pages\n- In stress-mcp-dispatch.e2e.ts, the `page` from `setupToolTest` is the main tab page — wrap it; `newPage` from `openTestAppTab` is the recovery page — also wrap it"
+    }
+  ]
+}
