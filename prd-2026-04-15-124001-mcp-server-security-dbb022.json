@@ -1,0 +1,51 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three security and protocol correctness bugs in the MCP server's WebSocket handling and confirmation flow: (1) a race condition and forgeable-connectionId attack in http-routes.ts WebSocket upgrade, (2) missing connection-scope validation in handleConfirmationResponse allowing any connected profile to resolve another profile's confirmation, and (3) a resource leak from pending confirmations with no timeout when the MCP client drops but the extension stays connected.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix WebSocket upgrade connectionId race and forgeable-ID force-close attack",
+      "description": "In http-routes.ts, `state._pendingConnectionId` is a shared module-level field on ServerState. Two concurrent WebSocket upgrades can overwrite each other's connectionId (race), and an authenticated client can craft a connectionId matching an existing connection to force-close it (security). Fix both by storing the connectionId as ephemeral local state tied to the upgrade response rather than on the shared ServerState.",
+      "acceptanceCriteria": [
+        "`state._pendingConnectionId` field is removed from ServerState (or made per-upgrade private so concurrent upgrades cannot clobber each other)",
+        "A WebSocket upgrade request whose connectionId matches an existing connection is rejected with 400/409 (or the connectionId is ignored/regenerated), preventing a caller from force-closing another live connection",
+        "The `createHandleWsOpen` callback correctly receives the connectionId without reading it from shared state"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/http-routes.ts (primary fix)\n- platform/mcp-server/src/state.ts (remove `_pendingConnectionId` field if necessary)\n\nContext:\n`handleWsUpgrade` (lines 241–288) parses the connectionId from Sec-WebSocket-Protocol and stores it in `state._pendingConnectionId`. Immediately after, `server.upgrade(req, ...)` is called. The `createHandleWsOpen` handler later reads `state._pendingConnectionId` to recover the connectionId. If two upgrades arrive concurrently before either `wsOpen` fires, the second write clobbers the first — one connection gets the wrong connectionId.\n\nThe forgeable-ID attack: `createHandleWsOpen` at line 1104–1115 checks `existing = state.extensionConnections.get(connectionId)` — if found, it calls `existing.ws.close(1000, 'Replaced by same-profile reconnect')`. Any client with the secret can close any existing connection by sending the victim's connectionId in the subprotocol.\n\nChanges:\nFix the race: pass the connectionId as part of the `data` field of `server.upgrade(req, { data: { connectionId: parsedConnectionId } })`. The Bun/uWS WebSocket `open` handler receives `ws.data` directly, eliminating the shared-state intermediary. Update `createHandleWsOpen` to read from `ws.data` instead of `state._pendingConnectionId`.\n\nFix the force-close attack: in `createHandleWsOpen`, before closing an existing connection, verify that the new WebSocket came from the same IP/profile. The simplest safe fix: only close an existing connection with the same connectionId if the existing connection's WebSocket is already closed (`existing.ws.readyState >= 2`). For active connections, assign a new UUID instead of using the attacker-supplied connectionId.\n\nConstraints:\n- Do NOT remove the existing-connection-replacement logic for legitimate same-profile reconnects (where the extension restarts and sends the same connectionId it previously used)\n- Do NOT break the `hasExplicitId` path (line 1100) which gates backwards-compatible single-connection mode\n- After the fix, remove `_pendingConnectionId` from `ServerState` if it is no longer needed\n\nTraps:\n- `server.upgrade()` in Bun takes `{ data: T }` as the per-connection context. This is accessible in `ws.data` in the open/message/close handlers. This is the correct mechanism for per-upgrade state.\n- Do NOT use `state.pendingWsProtocol` or any other module-level shared variable as an alternative — that recreates the same race."
+    },
+    {
+      "id": "US-002",
+      "title": "Add connection-scope validation to handleConfirmationResponse",
+      "description": "In extension-handlers.ts, `handleConfirmationResponse` resolves a pending confirmation by ID with no check that the response came from the same connection that is waiting for it. In a multi-profile setup, any connected profile can resolve (or deny) another profile's pending confirmation dialog. Add a `connectionId` field to `PendingConfirmation` and validate it in the handler.",
+      "acceptanceCriteria": [
+        "`PendingConfirmation` in state.ts stores the `connectionId` of the connection that originated the request",
+        "`handleConfirmationResponse` verifies the sender's connectionId matches the stored connectionId before resolving",
+        "A response from a different profile is silently ignored (no error sent back, since the sender may be legitimate and just confused)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/state.ts (add `connectionId` to `PendingConfirmation` interface)\n- platform/mcp-server/src/extension-handlers.ts (`handleConfirmationResponse` + `sendConfirmationRequest` call site)\n- platform/mcp-server/src/extension-protocol.ts (`sendConfirmationRequest` signature)\n\nContext:\n`PendingConfirmation` (state.ts) currently has `{ resolve, reject, tool, plugin, params }`. `handleConfirmationResponse` (extension-handlers.ts line 861–877) validates only `id` and `decision` fields — no check of which connection sent the response.\n\n`sendConfirmationRequest` in extension-protocol.ts (lines 399–427) sends `confirmation.request` to ALL connections via `sendToExtension(state, ...)` — the first profile to respond wins. This is intentional (any profile can show the dialog). But the resolution should be pinned to the connection that actually initiated the dispatch — the one whose MCP client is waiting.\n\nChanges:\n1. In state.ts, add `connectionId: string` to `PendingConfirmation`\n2. In extension-protocol.ts, `sendConfirmationRequest` receives a `connectionId` parameter; store it in the pending entry\n3. In the dispatch paths that call `sendConfirmationRequest`, pass the connection's `connectionId` (look at how `runAskFlow` in mcp-tool-dispatch.ts calls it — it needs the connectionId from the tool dispatch context)\n4. In `handleConfirmationResponse`, check `pending.connectionId === senderConn?.connectionId` before resolving\n\nConstraints:\n- When there is only ONE connection (single-profile mode), the behavior must be unchanged\n- The `sendConfirmationRequest` API change will require updates to all callers — find them all with grep\n- Do NOT add a new timeout to sendConfirmationRequest in this story (separate concern)"
+    },
+    {
+      "id": "US-003",
+      "title": "Add idle timeout to pending confirmations to prevent indefinite accumulation",
+      "description": "In extension-protocol.ts, `sendConfirmationRequest` creates a Promise that waits for the user to respond in the extension UI with no timeout. If an MCP client (Claude) times out or drops its connection but the extension WebSocket stays alive, the PendingConfirmation entry remains in `state.pendingConfirmations` indefinitely. Add a configurable idle timeout (e.g., 5 minutes) that rejects unconsumed confirmations.",
+      "acceptanceCriteria": [
+        "A pending confirmation that has not been resolved within a configurable timeout (at least 5 minutes) is automatically rejected with a descriptive error",
+        "The timeout is cancelled when the confirmation is resolved or rejected normally",
+        "The `rejectAllPendingConfirmations` function in extension-handlers.ts still works correctly (rejects remaining pending entries on disconnect)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/extension-protocol.ts (`sendConfirmationRequest` function, lines 399–427)\n- platform/mcp-server/src/state.ts (`PendingConfirmation` interface — add `timerId` field)\n\nContext:\n`sendConfirmationRequest` (lines 399–427) creates a `PendingConfirmation` entry and returns a Promise. The entry is removed either by `handleConfirmationResponse` (when the user responds) or `rejectAllPendingConfirmations` (when the extension disconnects). There is intentionally no timeout.\n\nThe current code comment: 'There is no timeout — the request hangs until the user responds or the WebSocket disconnects (at which point rejectAllPendingConfirmations fires).'\n\nThe problem: if the MCP client times out before the user responds, the MCP SDK closes the request from its side, but the server-side PendingConfirmation entry persists. Over many abandoned 'ask' tool calls, these accumulate indefinitely.\n\nChanges:\n1. Add `timerId: ReturnType<typeof setTimeout>` to `PendingConfirmation` in state.ts\n2. In `sendConfirmationRequest`, set a 5-minute timeout `setTimeout(() => { state.pendingConfirmations.delete(id); reject(new Error('Confirmation timed out — user did not respond within 5 minutes')); }, 300_000)` \n3. Store the timerId in the PendingConfirmation entry\n4. In `handleConfirmationResponse`, call `clearTimeout(pending.timerId)` before resolving\n5. In `rejectAllPendingConfirmations`, call `clearTimeout(pending.timerId)` before rejecting\n\nConstraints:\n- 5 minutes (300_000ms) is the recommended timeout — long enough that users who step away and return can still approve\n- Do NOT use a shorter timeout — tool calls waiting for human approval should not be aggressively timed out\n- Make the timeout configurable via a constant `CONFIRMATION_TIMEOUT_MS` defined near `DISPATCH_TIMEOUT_MS`"
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix four bugs in the MCP server's reload, config migration, plugin loader, and self-update paths: (1) sendSyncFull is sent to the extension even when writeAllAdapterFiles fails, causing it to load stale adapters; (2) a failed config migration is retried on every subsequent startup with no backoff or skip; (3) validateTools in loader.ts permits duplicate tool names, causing registry lookup inconsistency; (4) handleServerSelfUpdate always calls process.exit(0) after spawn, even if the new server process failed to start.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Skip sendSyncFull when writeAllAdapterFiles fails during reload",
+      "description": "In reload.ts, after `writeAllAdapterFiles(state)` throws, reloadCore catches the error, logs a warning, and continues to `sendSyncFull(state)` unconditionally. The extension then receives a sync that references adapter files that may not have been written, leading to injection failures. Track whether the write succeeded and skip or delay sendSyncFull on failure.",
+      "acceptanceCriteria": [
+        "When `writeAllAdapterFiles` throws, `sendSyncFull` is NOT called immediately after; an appropriate error is logged",
+        "When `writeAllAdapterFiles` succeeds, `sendSyncFull` continues to be called as before",
+        "The auth-secret-change `sendExtensionReload` path (lines 412–420 in reload.ts) is unaffected"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/reload.ts (primary fix)\n\nContext:\nIn `reloadCore` (around lines 356–364):\n```typescript\ntry {\n  await writeAllAdapterFiles(state);\n} catch (err) {\n  log.warn('Failed to write adapter files:', err);\n}\n```\nThis inner try/catch swallows the error and execution falls through to line 406:\n```typescript\nif (isExtensionConnected(state)) {\n  await sendSyncFull(state);\n```\n`sendSyncFull` sends the extension a list of plugins to load adapters for, but if `writeAllAdapterFiles` failed the adapter .iife.js files for new/updated plugins may not exist on disk.\n\nChanges:\nIntroduce a boolean flag `adapterWriteSucceeded = true`. Set it to `false` in the catch block. After the try/catch, change the condition to:\n```typescript\nif (isExtensionConnected(state) && adapterWriteSucceeded) {\n  await sendSyncFull(state);\n} else if (isExtensionConnected(state)) {\n  log.warn('Skipping extension sync — adapter file write failed');\n}\n```\n\nConstraints:\n- The `secretChanged` and `sendExtensionReload` block (after `await sendSyncFull`) must still execute when the secret changes, regardless of whether adapter write succeeded — keep that block independent of the adapter write result\n- Do NOT rethrow the writeAllAdapterFiles error — callers expect reloadCore to be best-effort"
+    },
+    {
+      "id": "US-002",
+      "title": "Prevent config migration from retrying permanently when persist fails",
+      "description": "In config-migrations.ts, when `atomicWrite` fails (e.g., disk full, wrong permissions), the catch block restores the backup and returns the original (unmigrated) config. On the next startup, the same migration runs again and fails again — an infinite retry loop. Add a sentinel after a failed migration write to prevent repeated attempts in the same session, and log a clear actionable error.",
+      "acceptanceCriteria": [
+        "When `migrateConfig` fails to persist the migrated config, a clear error is logged that includes the config file path and a suggestion to fix the underlying issue (e.g., disk permissions)",
+        "The server still starts with the in-memory migrated config (best-effort) even when persist fails",
+        "On the next startup (after the issue is resolved), the migration succeeds and is written normally — no permanent state is introduced that would prevent future successful migrations"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config-migrations.ts\n\nContext:\nIn `migrateConfig` (lines 65–101):\n```typescript\ntry {\n  // ...run migrations...\n  await atomicWrite(configPath, JSON.stringify(migrated, null, 2) + '\\n', 0o600);\n  return migrated;\n} catch (err) {\n  log.error('Config migration failed — restoring backup:', err);\n  await atomicWrite(configPath, originalContent, 0o600);\n  return raw;\n}\n```\nIf `atomicWrite(configPath, ...)` at line 94 fails (e.g., disk full), the backup is restored (config stays at old version) and `raw` is returned. On next startup, `currentVersion < CURRENT_CONFIG_VERSION` is still true, the migration runs again, and fails again.\n\nChanges:\nThe fix: return `migrated` (not `raw`) from the catch block when the write fails. The in-memory migration succeeded; only persisting failed. The server can use the migrated config for this session. On the next startup, another write attempt is made — this time it may succeed if the disk issue was resolved.\n\n```typescript\n} catch (err) {\n  log.error(\n    `Config migration succeeded in memory but failed to persist to ${configPath}: ${toErrorMessage(err)}. ` +\n    'Check disk space and file permissions. The migrated config is active for this session only.',\n    err\n  );\n  // Return migrated (not raw) — the in-memory migration succeeded; only disk write failed.\n  // On next startup, another persist attempt will be made.\n  return migrated;\n}\n```\n\nConstraints:\n- The backup restore line (`await atomicWrite(configPath, originalContent, 0o600)`) should be REMOVED from the catch block — the backup is no longer needed when we return the migrated in-memory result. If we restore the backup, the file remains at old version and next startup shows the same migration log messages. Without restoring, the file remains at the original (already at old version since write failed), same result but simpler code.\n- Import `toErrorMessage` from `@opentabs-dev/shared` — it is already used in the file (check imports at top)"
+    },
+    {
+      "id": "US-003",
+      "title": "Detect and reject duplicate tool names in validateTools",
+      "description": "In loader.ts, `validateTools` iterates tool definitions and validates individual fields but never checks for duplicate `name` values within the same plugin. Duplicate-named tools cause `toolLookup.set(prefixed, ...)` in registry.ts to silently overwrite earlier entries, and `plugin.tools.find(t => t.name === lookup.toolName)` then returns the first definition while the lookup holds the validator compiled for the last. Detect duplicates in validateTools and return an error.",
+      "acceptanceCriteria": [
+        "`validateTools` returns an `err(...)` result when any two tools in the array share the same `name`",
+        "The error message identifies the duplicate name and the plugin source path",
+        "Plugins with duplicate tool names are treated as FailedPlugin entries (not loaded)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/loader.ts (`validateTools` function, lines 111–195)\n\nContext:\n`validateTools` builds a `validated: ManifestTool[]` array. It validates each tool's `name`, `displayName`, `description`, `icon`, `input_schema`, `output_schema` but has no Set to track seen names.\n\nAfter the per-tool loop (around line 190), add a duplicate check:\n```typescript\nconst seenNames = new Set<string>();\nfor (const tool of validated) {\n  if (seenNames.has(tool.name)) {\n    return err(`Invalid tools.json at ${sourcePath}: duplicate tool name \"${tool.name}\"`);\n  }\n  seenNames.add(tool.name);\n}\n```\n\nAlternatively, build the Set during the existing loop (more efficient, single pass):\nAt the start of the loop body (around line 124), after `const name = ...` is extracted and validated, add:\n```typescript\nif (seenNames.has(name)) {\n  return err(`Invalid tools.json at ${sourcePath}: duplicate tool name \"${name}\"`);\n}\nseenNames.add(name);\n```\nAnd declare `const seenNames = new Set<string>();` before the loop.\n\nConstraints:\n- The `seenNames` Set must be declared OUTSIDE the loop (per-tools.json, not per-tool)\n- This change affects production plugin validation — do NOT make it a warning-only, make it a hard error\n- In tests (loader.test.ts), verify the duplicate detection works; check if existing tests need updating"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix handleServerSelfUpdate to handle spawn failure before calling process.exit",
+      "description": "In extension-handlers.ts, `handleServerSelfUpdate` calls `spawn('opentabs', [...])` and then unconditionally schedules `setTimeout(() => process.exit(0), 200)`. If `spawn` fails (e.g., 'opentabs' is not in PATH because the newly installed version is at a different location), the process exits without a replacement server running. Add an error handler to the child process that cancels the exit and sends an error response to the extension.",
+      "acceptanceCriteria": [
+        "If `child.on('error')` fires before the 200ms exit timer, the timer is cleared and an error response is sent to the extension",
+        "If spawn succeeds (no error within 200ms), process.exit(0) fires as before",
+        "The error message sent to the extension is descriptive (includes the spawn error message)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/extension-handlers.ts (`handleServerSelfUpdate`, lines 1139–1191)\n\nContext:\nCurrent code (lines 1187–1190):\n```typescript\nconst child = spawn('opentabs', startArgs, { detached: true, stdio: 'ignore', shell: isWindows() });\nchild.unref();\n\nsetTimeout(() => process.exit(0), 200);\n```\nIf `spawn` throws ENOENT (opentabs not in PATH) or errors asynchronously, the process still exits after 200ms with no replacement running.\n\nChanges:\n```typescript\nconst child = spawn('opentabs', startArgs, { detached: true, stdio: 'ignore', shell: isWindows() });\nchild.unref();\n\nconst exitTimer = setTimeout(() => process.exit(0), 200);\n\nchild.on('error', (spawnErr: Error) => {\n  clearTimeout(exitTimer);\n  log.error('Failed to start new server after update:', spawnErr);\n  sendToExtension(state, {\n    jsonrpc: '2.0',\n    error: {\n      code: -32603,\n      message: `Server updated but failed to restart: ${spawnErr.message}. Restart manually with: opentabs start`,\n    },\n    id,\n  });\n});\n```\n\nConstraints:\n- `child.unref()` must remain — it detaches the child from the parent's event loop so the parent can exit cleanly when the child is healthy\n- The error handler must clear the timer — otherwise the process exits even on spawn error\n- Importing `toErrorMessage` is preferred over `err.message` if already imported in the file"
+    }
+  ]
+}

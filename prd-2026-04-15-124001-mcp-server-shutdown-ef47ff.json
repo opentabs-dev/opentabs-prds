@@ -1,0 +1,66 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix four infrastructure and shutdown bugs: (1) the HTTP server is never closed during graceful shutdown, allowing new connections during the 150ms exit window; (2) the telemetry flush timeout (2s) is always preempted by process.exit (150ms), reliably losing server_stopped events; (3) the stdio MCP entry point installs no shutdown handlers, so SIGTERM abandons in-flight dispatches silently; (4) version-check.ts accumulates npm stdout/stderr in unbounded buffers that could exhaust memory on an unexpectedly large registry response.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Close HTTP server during shutdown and fix telemetry flush timing",
+      "description": "In shutdown.ts, `installShutdownHandlers` closes WebSocket connections and rejects pending dispatches but never calls `httpServer.close()`, so new HTTP connections are accepted during the 150ms exit window. Additionally, `void shutdownTelemetry()` is fire-and-forget — its 2-second internal timeout is always preempted by the 150ms `process.exit(0)`. Pass the HTTP server into the shutdown handler and await the telemetry flush before exiting.",
+      "acceptanceCriteria": [
+        "`installShutdownHandlers` accepts an `httpServer` parameter (or a `getHttpServer` getter) and calls `httpServer.close()` during shutdown",
+        "The shutdown exit delay is extended to allow telemetry to flush — at minimum 2s, or `await shutdownTelemetry()` before `process.exit`",
+        "The existing signal handler install-once guard (`SHUTDOWN_INSTALLED_KEY`) is preserved"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/shutdown.ts (primary)\n- platform/mcp-server/src/index.ts (pass httpServer to installShutdownHandlers)\n\nContext:\n`installShutdownHandlers(getState: () => ServerState)` (shutdown.ts line 41). The shutdown function closes WebSocket connections (lines 78–85) and calls `shutdownTelemetry()` fire-and-forget (line 101), then `setTimeout(() => process.exit(0), 150)` (line 104). The HTTP server is never closed — new connections are accepted for 150ms after shutdown begins.\n\n`shutdownTelemetry` in telemetry.ts races `client.shutdown()` against a 2-second timeout. 150ms < 2000ms, so the telemetry flush never wins.\n\nChanges to shutdown.ts:\n1. Change signature: `installShutdownHandlers(getState: () => ServerState, getHttpServer?: () => import('node:http').Server | null): void`\n2. In the shutdown function, after closing WebSocket connections, add:\n   ```typescript\n   const httpServer = getHttpServer?.();\n   if (httpServer) {\n     httpServer.close();\n   }\n   ```\n3. Make the exit async: replace `setTimeout(() => process.exit(0), 150)` with:\n   ```typescript\n   void shutdownTelemetry().finally(() => process.exit(0));\n   ```\n   `shutdownTelemetry` already has its own 2-second timeout, so this will not hang indefinitely.\n\nChanges to index.ts:\nFind where `installShutdownHandlers` is called and pass a getter that returns the HTTP server. The HTTP server is created in `createHttpServer` or returned from `startServer`. Read index.ts to find the actual call site.\n\nConstraints:\n- `shutdownTelemetry` already races against a 2-second timeout internally — do NOT add another outer timeout\n- The `void shutdownTelemetry()` call earlier in the shutdown function (line 101) is the only place it should be called — do not call it twice\n- Server-node.ts creates the HTTP server; check how it's exposed and how to pass it back to installShutdownHandlers\n\nTraps:\n- Do NOT remove the fire-and-forget pattern from `shutdownTelemetry` inside the shutdown function — just change the exit to wait for it via `.finally(() => process.exit(0))`"
+    },
+    {
+      "id": "US-002",
+      "title": "Install shutdown handlers in the stdio MCP entry point",
+      "description": "In stdio.ts, `main()` performs plugin discovery and connects a StdioServerTransport but never calls `installShutdownHandlers`. When SIGTERM is received (e.g., from `mcp-proxy` or container orchestration), the process exits immediately, abandoning any in-flight dispatches without rejecting them. Install the shutdown handlers with appropriate no-op wrappers for the missing resources (no HTTP server, no file watchers in stdio mode).",
+      "acceptanceCriteria": [
+        "`installShutdownHandlers` is called in stdio.ts after state is created",
+        "On SIGTERM, pending dispatches in `state.pendingDispatches` are rejected (fast error) rather than silently abandoned",
+        "The stdio entry point does not attempt to close an HTTP server or stop file watchers (it has none)"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/stdio.ts (primary)\n\nContext:\n`stdio.ts` calls `createMcpServer(state)` and `server.connect(transport)` but has no SIGTERM/SIGINT handlers. The `installShutdownHandlers` function in shutdown.ts already handles: (1) rejecting pending dispatches, (2) rejecting pending confirmations, (3) stopping sweep/versionCheck timers, (4) stopping file watchers, (5) closing WebSocket connections. In stdio mode, steps 4 and 5 are no-ops (no file watchers, no WebSocket connections).\n\nChanges:\n1. Import `installShutdownHandlers` from `./shutdown.js`\n2. After `const state = createState();`, add:\n   ```typescript\n   installShutdownHandlers(() => state);\n   ```\n3. If `installShutdownHandlers` now requires a second `getHttpServer` parameter (after US-001 lands), pass `undefined` for it in stdio.ts\n\nConstraints:\n- Do NOT import `http` or create an HTTP server in stdio.ts\n- The call must happen BEFORE `server.connect(transport)` so handlers are registered before any tool calls can be dispatched\n- After US-001 is merged, the signature may have changed — adjust accordingly (pass `undefined` for the http server getter)"
+    },
+    {
+      "id": "US-003",
+      "title": "Cap stdout/stderr buffer sizes in fetchLatestVersion",
+      "description": "In version-check.ts, `fetchLatestVersion` accumulates all stdout and stderr from `npm view` in unbounded Buffer arrays (`stdoutChunks`, `stderrChunks`). Although a 10-second `NPM_VIEW_TIMEOUT_MS` kills the process if it runs too long, a registry that streams a large response within 10 seconds (e.g., a compromised or misconfigured registry) could exhaust server memory. Add a size cap that kills the process early if output exceeds a reasonable limit.",
+      "acceptanceCriteria": [
+        "If the combined stdout or stderr bytes exceed 1 MB, the `npm view` child process is killed and the Promise rejects with a descriptive error",
+        "Normal `npm view <package> version` responses (a few bytes) are unaffected",
+        "The 10-second timeout remains in place as a separate guard"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/version-check.ts (`fetchLatestVersion`, lines 33–100)\n\nContext:\nCurrent code (lines 40–43):\n```typescript\nconst stdoutChunks: Buffer[] = [];\nconst stderrChunks: Buffer[] = [];\nchild.stdout.on('data', (chunk: Buffer) => stdoutChunks.push(chunk));\nchild.stderr.on('data', (chunk: Buffer) => stderrChunks.push(chunk));\n```\nNo size limit. `npm view <package> version` returns a few bytes (e.g., '1.2.3\\n'), so the limit is only for protection against adversarial registry responses.\n\nChanges:\n```typescript\nconst MAX_OUTPUT_BYTES = 1024 * 1024; // 1 MB\nlet stdoutBytes = 0;\nlet stderrBytes = 0;\nconst stdoutChunks: Buffer[] = [];\nconst stderrChunks: Buffer[] = [];\n\nchild.stdout.on('data', (chunk: Buffer) => {\n  stdoutBytes += chunk.length;\n  if (stdoutBytes > MAX_OUTPUT_BYTES) {\n    child.kill();\n    reject(new Error(`npm view stdout exceeded 1 MB for ${packageName}`));\n    return;\n  }\n  stdoutChunks.push(chunk);\n});\nchild.stderr.on('data', (chunk: Buffer) => {\n  stderrBytes += chunk.length;\n  if (stderrBytes > MAX_OUTPUT_BYTES) {\n    child.kill();\n    // stderr overflow is non-fatal — just stop accumulating\n    return;\n  }\n  stderrChunks.push(chunk);\n});\n```\n\nConstraints:\n- The `reject` call inside the data handler will fire after the Promise was already constructed. Guard against double-rejection by checking if the timer is still active or using a `settled` flag\n- The `MAX_OUTPUT_BYTES` constant should be defined at the top of the function or module"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix pendingHeadersByReq memory leak in server-node.ts",
+      "description": "In server-node.ts, `handleWsUpgradeEvent` stores custom headers in `pendingHeadersByReq` keyed by IncomingMessage. These headers are removed in the `wss.on('headers')` callback. But if a WebSocket upgrade socket closes before the headers event fires (client drops mid-handshake), the entry is never removed, causing an unbounded Map growth over many failed upgrade attempts.",
+      "acceptanceCriteria": [
+        "When a socket closes before the WebSocket headers event fires, the corresponding entry is removed from `pendingHeadersByReq`",
+        "Normal WebSocket upgrades (socket stays open through handshake) are unaffected",
+        "Existing behavior of injecting custom headers into the WebSocket handshake is preserved"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/server-node.ts\n\nContext:\nIn `createNodeHttpServer` (or the equivalent function in server-node.ts), `handleWsUpgradeEvent` is called when a WebSocket upgrade request arrives. It stores `pendingHeadersByReq.set(req, ctx.headers)`. The `wss.on('headers')` callback at line ~319 does `pendingHeadersByReq.delete(req)`. If the socket closes between upgrade and headers event, the Map entry leaks.\n\nChanges:\nIn the `handleWsUpgradeEvent` handler (or the upgrade event listener), after storing the entry, also listen for the socket close event:\n```typescript\npendingHeadersByReq.set(req, ctx.headers);\nreq.socket.once('close', () => {\n  pendingHeadersByReq.delete(req);\n});\n```\n\nAlternatively, use a WeakMap instead of Map — WeakMap keys are garbage-collected when the object is no longer referenced:\n```typescript\nconst pendingHeadersByReq = new WeakMap<IncomingMessage, Record<string, string>>();\n```\nA WeakMap would eliminate the leak entirely without explicit cleanup code, and is the simpler fix. Check whether `pendingHeadersByReq` is iterated anywhere — if not, WeakMap is a drop-in replacement.\n\nConstraints:\n- If using WeakMap, verify there are no `pendingHeadersByReq.size` checks or iteration (WeakMap has neither)\n- If using the socket close listener approach, make sure `pendingHeadersByReq.delete(req)` is idempotent (it is — deleting a non-existent key is a no-op)\n- Read the full server-node.ts to understand the pendingHeadersByReq usage before choosing the approach"
+    }
+  ]
+}

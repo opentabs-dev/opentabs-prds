@@ -1,0 +1,50 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three classes of bugs in the MCP server's dev-mode infrastructure: (1) dev-proxy.ts has a session memory leak (sessions not evicted on client disconnect), a splice(-1,1) bug that drops a pending request, and a module-level race in pendingWsProtocol; (2) dev-proxy.ts also fails to restart the worker after an unexpected crash, hanging the proxy indefinitely; (3) file-watcher.ts drops hot-reload events on Linux because fs.watch can pass null as the filename argument, and the EMFILE escalation to polling fails when the mtime poll timer hasn't started yet.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix dev-proxy session memory leak — evict sessions on SSE stream close with a TTL",
+      "description": "In dev-proxy.ts, MCP sessions are created on `POST /mcp initialize` and deleted only on `DELETE /mcp`. If a client crashes or disconnects without sending DELETE, the session is never cleaned up. The comment at line 616–619 intentionally avoids cleanup on SSE close to support clients that can re-open the stream. Add a TTL-based eviction: if no SSE stream is active for a session for 10 minutes, evict it.",
+      "acceptanceCriteria": [
+        "Sessions without an active `upstreamSse` connection for more than 10 minutes are automatically evicted via `cleanupSession`",
+        "Active sessions (with a live SSE connection) are never evicted by the TTL",
+        "Sessions are still cleaned up immediately on explicit `DELETE /mcp` as before"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/dev-proxy.ts\n\nContext:\nThe `sessions` Map (line 78) maps proxySessionId → ProxySession. `cleanupSession` (lines 187–199) removes and tears down a session. Sessions are only cleaned up via `DELETE /mcp` (line 677) or failed `reinitializeSessions` (lines 124, 131, 181).\n\nThe comment at line 616–619: 'Sessions are cleaned up only via explicit DELETE /mcp or when the proxy restarts.'\n\nDesign for TTL eviction:\n1. Add an `idleSince: number | null` field to `ProxySession` — set to `Date.now()` when `disconnectUpstreamSse` is called, cleared when `connectUpstreamSse` succeeds\n2. Add a periodic sweep (e.g., `setInterval(() => sweepIdleSessions(), 60_000)`) that iterates `sessions` and calls `cleanupSession` for entries where `idleSince !== null && Date.now() - idleSince > SESSION_IDLE_TTL_MS` (10 minutes)\n3. Clear the sweep interval on proxy shutdown\n\nAlternative (simpler): set a per-session timeout when `disconnectUpstreamSse` fires; clear it on `connectUpstreamSse`:\n```typescript\nconst SESSION_IDLE_TTL_MS = 10 * 60 * 1000;\nif (session.idleTimer) clearTimeout(session.idleTimer);\nsession.idleTimer = setTimeout(() => cleanupSession(session.proxySessionId), SESSION_IDLE_TTL_MS);\n```\n\nConstraints:\n- Read the full ProxySession interface before adding fields\n- The idle timer must be cancelled in `cleanupSession` to prevent double-cleanup\n- Do NOT clean up sessions when sseStreams empty — that is intentional (clients can reconnect)\n- Only trigger idle tracking when the upstream SSE connection (not client streams) becomes idle"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix dev-proxy splice(-1,1) bug, worker-crash no-restart, and pendingWsProtocol race",
+      "description": "Three bugs in dev-proxy.ts: (a) `whenReady` timeout handler calls `pending.splice(pending.indexOf(entry), 1)` — if `entry` was already drained, `indexOf` returns -1 and `splice(-1, 1)` removes the last pending entry. (b) Worker crash after becoming ready sets `workerPort = null` but does not restart the worker, leaving the proxy hanging. (c) `pendingWsProtocol` is a module-level variable shared across concurrent WebSocket upgrades.",
+      "acceptanceCriteria": [
+        "In `whenReady`, the timeout handler guards `indexOf` result: `const idx = pending.indexOf(entry); if (idx >= 0) pending.splice(idx, 1);`",
+        "The `child.on('exit')` handler in `startWorker` calls `startWorker()` to restart the process when it exits unexpectedly (not from a planned kill)",
+        "`pendingWsProtocol` is no longer a shared module-level variable; the connectionId is passed through per-upgrade scope"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/dev-proxy.ts\n\nContext (three separate bugs):\n\n(a) splice(-1,1) bug — in `whenReady` (lines 265–292), the timeout handler:\n```typescript\npending.splice(pending.indexOf(entry), 1);\n```\nIf `entry` was already removed by `drainPending` (line 85: `for (const fn of pending.splice(0)) fn()`), `indexOf(entry)` returns -1. `splice(-1, 1)` removes the last element — dropping a legitimate pending request.\n\nFix: `const idx = pending.indexOf(entry); if (idx >= 0) pending.splice(idx, 1);`\n\n(b) Worker crash — the `child.on('exit')` handler around line 252–257:\n```typescript\nchild.on('exit', code => {\n  worker = null;\n  workerPort = null;\n  // ...\n});\n```\nThere is no restart logic. After a crash, all subsequent requests stay in `pending` indefinitely.\n\nFix: Track whether the exit was planned (from `startWorker()`'s `worker.kill('SIGTERM')`) vs unexpected. If unexpected (not killed by us), call `startWorker()` with a small delay:\n```typescript\nchild.on('exit', (code, signal) => {\n  if (worker === child) { // only restart if this is still the current worker\n    worker = null;\n    workerPort = null;\n    if (!plannedKill) {\n      setTimeout(() => startWorker(), 1000);\n    }\n  }\n});\n```\nUse a `let plannedKill = false` flag set to `true` before `worker.kill('SIGTERM')` in `startWorker()`, cleared on process message/exit.\n\n(c) pendingWsProtocol race — look for `pendingWsProtocol` in the file and understand its role. If it's a module-level variable set in one callback and read in another, the same pattern as `_pendingConnectionId` in http-routes.ts (see PRD mcp-server-security). Fix similarly by storing per-upgrade state in the WebSocket data or a Map keyed by the socket object.\n\nConstraints:\n- Read the full `startWorker()` function before implementing the restart logic\n- Do NOT restart the worker more than once every 1000ms to avoid restart storms\n- When the worker restarts, existing `reinitializeSessions` logic should handle re-connecting sessions"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix file-watcher null filename on Linux and EMFILE escalation failure",
+      "description": "In file-watcher.ts, two bugs prevent reliable hot reload in edge cases: (a) `fs.watch` callbacks receive `filename: string | null` on Linux — direct comparison `filename === TOOLS_FILENAME` without a null guard silently skips the event; (b) the EMFILE fast-poll escalation in `startConfigWatching` checks `fw.mtimePollTimerId !== null` but this condition is false if called before `startMtimePolling` has run, silently leaving config changes undetected.",
+      "acceptanceCriteria": [
+        "In `watchPlugin` and `watchPendingPlugin`, `fs.watch` callbacks guard `filename` with a null check before comparing to `TOOLS_FILENAME` or `ADAPTER_FILENAME`; when filename is null, the handler falls back to re-reading both files",
+        "In `startConfigWatching`, the EMFILE escalation path (`catch (err)` block) triggers mtime polling regardless of whether it was already running"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/file-watcher.ts\n\nContext:\n(a) null filename — `fs.watch` on Linux may pass `null` as the `filename` argument for some inotify events (e.g., attribute changes). The current code pattern in `watchPlugin` and `watchPendingPlugin` is:\n```typescript\n(eventType, filename) => {\n  if (filename === TOOLS_FILENAME) { ... }\n  else if (filename === ADAPTER_FILENAME) { ... }\n}\n```\nWhen `filename === null`, both conditions are false and the event is silently ignored. This means a file change that produced a null filename will not trigger hot reload.\n\nFix: when `filename === null`, re-read both `TOOLS_FILENAME` and `ADAPTER_FILENAME` to handle the event conservatively:\n```typescript\n(eventType, filename) => {\n  if (filename === null) {\n    // On Linux, filename can be null for some events. Re-check both files.\n    handleToolsJsonChange(pluginName, dir);\n    handleIifeChange(pluginName, dir);\n    return;\n  }\n  if (filename === TOOLS_FILENAME) { handleToolsJsonChange(pluginName, dir); }\n  else if (filename === ADAPTER_FILENAME) { handleIifeChange(pluginName, dir); }\n}\n```\nRead the actual handler names in the file before writing — they may be `onToolsChanged` or similar.\n\n(b) EMFILE escalation — in `startConfigWatching`, when `watch()` fails with EMFILE:\n```typescript\n} catch (err) {\n  if ((err as NodeJS.ErrnoException).code === 'EMFILE') {\n    if (fw.mtimePollTimerId !== null) {\n      // escalate polling\n    }\n  }\n}\n```\nIf `fw.mtimePollTimerId` is null (because `startMtimePolling` hasn't run yet), the escalation is skipped.\n\nFix: remove the `if (fw.mtimePollTimerId !== null)` guard and always call `startMtimePolling` (or equivalent). If polling is already running, `startMtimePolling` should be idempotent (check its implementation).\n\nConstraints:\n- The null-filename fallback (re-checking both files) may result in double invocation on some events — ensure `handleToolsJsonChange` and `handleIifeChange` are idempotent (they should already be, since they compare mtimes)\n- Do NOT change the mtime comparison logic — only add the null guard"
+    }
+  ]
+}

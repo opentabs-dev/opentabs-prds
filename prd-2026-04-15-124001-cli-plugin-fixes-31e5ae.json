@@ -1,0 +1,92 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix seven bugs across the CLI, plugin-tools, create-plugin, and shared packages: (1) stdio-bridge buffer overflow drops request without sending JSON-RPC error, leaving the client hung; (2) tool.ts crashes when server returns unexpected response shape; (3) doctor.ts shows 'Check server logs' for a 401 response instead of 'secret mismatch'; (4) config.ts handleConfigReset deletes config without notifying the running server; (5) logs.ts garbles output after stream error recovery; (6) plugin-tools build.ts leaves a temp wrapper .ts file on disk when esbuild fails; (7) validate-icon.ts fails to update CSS `#id` selectors inside `<style>` blocks during SVG namespacing.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Send JSON-RPC error response on stdio-bridge buffer overflow",
+      "description": "In stdio-bridge.ts, when the request buffer exceeds MAX_BUFFER (10 MB), the buffer is reset and the function returns without sending any JSON-RPC response. The MCP client waits indefinitely for a response that never arrives. Fix by extracting the request ID from the buffered data (if parseable) and sending a JSON-RPC error before resetting.",
+      "acceptanceCriteria": [
+        "When the buffer exceeds MAX_BUFFER, a JSON-RPC error response is written to stdout before the buffer is reset",
+        "The error response uses the request's `id` if it can be parsed from the buffer; otherwise uses `null` as the id (indicating parse failure)",
+        "After sending the error, the buffer is reset to empty string so the connection can continue"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/stdio-bridge.ts (lines around 306–315)\n\nContext:\nCurrent code:\n```typescript\nif (buffer.length > MAX_BUFFER) {\n  log('Buffer overflow, resetting');\n  buffer = '';\n  return;\n}\n```\nThe MCP client has sent a request (accumulated in buffer) but the response never comes.\n\nFix:\n```typescript\nif (buffer.length > MAX_BUFFER) {\n  log('Buffer overflow — sending error response');\n  // Try to extract the id from the buffered data\n  let requestId: string | number | null = null;\n  try {\n    const partial = JSON.parse(buffer) as Record<string, unknown>;\n    const rid = partial.id;\n    if (typeof rid === 'string' || typeof rid === 'number') requestId = rid;\n  } catch {\n    // Cannot parse — use null id\n  }\n  const errorResponse = JSON.stringify({\n    jsonrpc: '2.0',\n    id: requestId,\n    error: { code: -32700, message: 'Request too large — buffer overflow' },\n  });\n  writeStdout(`${errorResponse}\\n`);\n  buffer = '';\n  return;\n}\n```\n\nConstraints:\n- `writeStdout` is the existing function in stdio-bridge.ts that writes to process.stdout with newline — use it, do NOT write directly to process.stdout\n- Do NOT try to parse the entire 10 MB buffer with JSON.parse for the id — use `JSON.parse(buffer.slice(0, 1000))` to avoid OOM on the partial parse attempt\n- After the fix, the connection continues (buffer resets); the client may resend a smaller request"
+    },
+    {
+      "id": "US-002",
+      "title": "Guard result.content access in tool.ts and improve doctor.ts 401 error message",
+      "description": "Two CLI UX fixes: (1) In tool.ts, `handleToolCall` casts the JSON response to `ToolCallResult` and immediately accesses `result.content.filter(...)` without checking `content` is an array — crashes on unexpected server responses. (2) In doctor.ts, `checkServerHealth` returns 'Check server logs for errors' for all non-200 responses including 401, which means 'your auth secret doesn't match' — add a specific message for 401.",
+      "acceptanceCriteria": [
+        "In tool.ts, if `result.content` is missing or not an array, an informative error is printed (e.g., 'Unexpected server response: ...') instead of a TypeError crash",
+        "In doctor.ts, a 401 response from /health shows a message like 'Authentication failed — secret mismatch. Run: opentabs config rotate-secret' instead of 'Check server logs for errors'"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/tool.ts (lines around 172–180)\n- platform/cli/src/commands/doctor.ts (lines around 87–95)\n\nContext:\ntool.ts:\n```typescript\nconst result = (await res.json()) as ToolCallResult;\nconst texts = result.content.filter(c => c.type === 'text').map(c => c.text);\n```\nIf `result` is `{ error: 'something' }` or `result.content` is undefined, `.filter` throws TypeError.\n\nFix:\n```typescript\nconst result = (await res.json()) as ToolCallResult;\nif (!Array.isArray(result.content)) {\n  console.error(pc.red(`Unexpected response from server: ${JSON.stringify(result)}`);\n  process.exit(1);\n}\nconst texts = result.content.filter(c => c.type === 'text').map(c => c.text);\n```\n\ndoctor.ts — in `checkServerHealth`:\n```typescript\nif (!res.ok) {\n  return fail('MCP server', `HTTP ${res.status}`, 'Check server logs for errors');\n}\n```\nFix:\n```typescript\nif (res.status === 401) {\n  return fail('MCP server', 'HTTP 401 Unauthorized', 'Auth secret mismatch — run: opentabs config rotate-secret');\n}\nif (!res.ok) {\n  return fail('MCP server', `HTTP ${res.status}`, 'Check server logs for errors');\n}\n```\n\nConstraints:\n- `pc` (picocolors) is already imported in both files\n- In tool.ts, after the guard, the rest of the function should continue unchanged\n- Do NOT change the `fail` helper signature in doctor.ts"
+    },
+    {
+      "id": "US-003",
+      "title": "Notify running server after config reset and fix tool permission write-before-validate order",
+      "description": "Two bugs in config.ts: (1) `handleConfigReset` deletes config.json but never calls `notifyServer`, so the running server keeps its in-memory config unchanged until manually restarted. (2) `handleSetToolPermission` writes the permission to disk (atomicWriteConfig) before validating the tool exists in the running server — if the tool name is a typo, the invalid permission is permanently saved. Fix both.",
+      "acceptanceCriteria": [
+        "After `handleConfigReset` deletes the config file, `notifyServer` is called (or a message is printed telling the user to restart the server, which is acceptable given reset clears local plugins too)",
+        "In `handleSetToolPermission`, the tool existence check runs BEFORE `atomicWriteConfig`; if the server reports the tool does not exist, the function prints a warning and exits without writing"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/config.ts\n\nContext:\n(1) `handleConfigReset` (lines 671–696): after `await unlink(configPath).catch(() => {})`, the function just logs and returns. No call to `notifyServer`.\n\nNote: after a config reset, the server can't be reloaded in a meaningful way since all localPlugins and permissions would be cleared. The most useful UX is a message: 'Config deleted. Restart the server to apply: opentabs start'. Consider whether to call `notifyServer({ port, successMessage: 'Server restarted with default config.' })` and whether the server handles a reload with no config file gracefully.\n\n(2) `handleSetToolPermission` (around lines 250–330): current flow:\n1. `await atomicWriteConfig(configPath, ...)` — writes permission\n2. `const res = await fetch(.../health)` — validates tool exists\n3. If tool not found: `console.log(pc.yellow('Warning: tool \"..\" not found...'))`\n\nFix: swap order:\n1. `const res = await fetch(.../health)` — check tool exists first (if server running)\n2. If tool NOT found and server IS running: `console.error(pc.red('Tool not found — permission not saved')); process.exit(1);`\n3. `await atomicWriteConfig(configPath, ...)` — only write if tool exists or server not running\n\nConstraints:\n- When the server is NOT running (fetch fails or returns non-200), continue to write the permission anyway — the validation is best-effort (server might not be running)\n- Do NOT change the `pruneEmptyPluginEntries` call site\n- The fix for (1) should at minimum print an actionable message about restarting the server"
+    },
+    {
+      "id": "US-004",
+      "title": "Reset partialLine in logs.ts followFile after stream error recovery",
+      "description": "In logs.ts, the stream `error` handler in `followFile` resets `decoder = new StringDecoder('utf-8')` but does not reset `partialLine`. After stream recovery, the next successful chunk is prepended with the stale `partialLine` from before the error, producing garbled output at the boundary.",
+      "acceptanceCriteria": [
+        "In the stream `error` handler, `partialLine` is reset to `''` alongside the decoder reset",
+        "Normal log tailing (no stream errors) is unaffected"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/logs.ts (lines around 143–149)\n\nContext:\nCurrent code:\n```typescript\nstream.on('error', () => {\n  decoder = new StringDecoder('utf-8');\n});\n```\n`partialLine` is declared at line ~87: `let partialLine = '';`\n\nFix:\n```typescript\nstream.on('error', () => {\n  decoder = new StringDecoder('utf-8');\n  partialLine = '';\n});\n```\n\nConstraints:\n- This is a one-line fix; do NOT change the stream reconnection logic or polling"
+    },
+    {
+      "id": "US-005",
+      "title": "Fix plugin-tools build.ts temp file cleanup and OPENTABS_PORT validation",
+      "description": "Two bugs in platform/plugin-tools/src/commands/build.ts: (1) the temporary IIFE entry wrapper file (`_adapter_entry_<uuid>.ts`) is deleted after successful esbuild but left on disk if esbuild throws, causing type errors on subsequent builds; (2) when OPENTABS_PORT is set to an invalid value (NaN, 0, non-numeric), the server notification is silently skipped with no warning logged.",
+      "acceptanceCriteria": [
+        "The temp wrapper file is deleted in a `finally` block so it is cleaned up regardless of esbuild success or failure",
+        "When OPENTABS_PORT is set but invalid (NaN, 0, or out of range), a warning is logged: 'OPENTABS_PORT is invalid — skipping server notification'"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/plugin-tools/src/commands/build.ts\n\nContext:\n(1) Temp file: look for `_adapter_entry_` in build.ts — the temp wrapper file is written before esbuild and deleted after `await esbuild(...)`. The deletion is in the success path only. Wrap the esbuild call + delete in a try/finally.\n\n(2) OPENTABS_PORT: look for `OPENTABS_PORT` in build.ts. The code reads `const portEnv = process.env.OPENTABS_PORT`. If portEnv is set but `Number(portEnv)` yields NaN or 0, the guard returns early silently.\n\nFix (2): add a log before returning:\n```typescript\nconst port = Number(portEnv);\nif (!portEnv || !Number.isFinite(port) || port < 1 || port > 65535) {\n  if (portEnv) {\n    console.warn(`OPENTABS_PORT=${portEnv} is invalid — skipping server notification`);\n  }\n  return;\n}\n```\n\nConstraints:\n- Use `unlink` from `node:fs/promises` for the temp file delete (already imported or available)\n- Catch ENOENT in the finally unlink (file may not exist if write failed before esbuild)\n- Do NOT change the esbuild configuration"
+    },
+    {
+      "id": "US-006",
+      "title": "Update CSS #id selectors in <style> blocks during SVG namespacing in validate-icon.ts",
+      "description": "In platform/plugin-tools/src/validate-icon.ts, `namespaceSvgIds` updates `id=\"...\"` attributes, `url(#...)` references, `href=\"#...\"`, and `xlink:href=\"#...\"`. However, CSS rules inside `<style>` blocks that reference element IDs (e.g., `#gradient { ... }`) are not updated, so after namespacing the CSS selectors reference old unprefixed IDs while the element attributes have the new prefixed IDs, breaking SVG gradients, filters, and other ID-referenced effects.",
+      "acceptanceCriteria": [
+        "`namespaceSvgIds` updates CSS `#id` selectors inside `<style>` blocks to use the prefixed ID",
+        "SVGs with `<linearGradient id=\"g\">` referenced via `fill=\"url(#g)\"` AND `<style>#g { ... }</style>` have both the attribute and the CSS selector updated correctly",
+        "SVGs without `<style>` blocks are unaffected"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/plugin-tools/src/validate-icon.ts (`namespaceSvgIds` function)\n\nContext:\nThe function iterates over element `id` attributes and collects all IDs that need prefixing. It then does string replacements for `url(#ID)`, `href=\"#ID\"`, `xlink:href=\"#ID\"`. After all attributes, it needs to also replace `#ID` references inside `<style>` block text content.\n\nChanges:\nAfter updating attributes, find all `<style>` blocks and replace `#ID` selectors:\n```typescript\n// Update CSS selectors inside <style> blocks\nfor (const id of idsToNamespace) {\n  const oldRef = `#${id}`;\n  const newRef = `#${prefix}-${id}`;\n  // Replace #id in style element text content\n  svg = svg.replace(\n    /<style([^>]*)>(.*?)<\\/style>/gis,\n    (match, attrs: string, content: string) => {\n      // Replace whole-word #id occurrences in CSS\n      const updatedContent = content.replace(\n        new RegExp(`#${escapeRegExp(id)}(?=[{,\\\\s:>~+\\\\[)])`, 'g'),\n        newRef\n      );\n      return `<style${attrs}>${updatedContent}</style>`;\n    }\n  );\n}\n```\n\nAdd a helper: `const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');`\n\nConstraints:\n- Only replace `#ID` when followed by CSS-specific characters (`{`, `,`, `\\s`, `:`, `>`, `~`, `+`, `[`) to avoid replacing `#ID` in non-selector contexts like comments\n- Use the `/gis` flags for the outer style block regex (case-insensitive for `</style>`, `s` for dotall to match multiline style blocks)\n- Read the full `namespaceSvgIds` function first to understand the existing replacement pattern and add the style-block pass at the end\n- `idsToNamespace` is the Set of IDs that were actually renamed — iterate only over that set, not all IDs"
+    }
+  ]
+}
