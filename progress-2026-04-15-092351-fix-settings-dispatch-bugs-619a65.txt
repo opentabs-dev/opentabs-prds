@@ -1,0 +1,30 @@
+# Ralph Progress Log
+PRD: prd-2026-04-15-092351-fix-settings-dispatch-bugs-619a65~running.json
+Started: Wed Apr 15 16:24:40 UTC 2026
+---
+
+## Codebase Patterns
+- McpCallbacks interface in extension-handlers.ts defines the contract between extension protocol handlers and MCP server integration (created in http-routes.ts via createMcpCallbacks)
+- Test mocks for McpCallbacks live in noopCallbacks objects in extension-handlers.test.ts, extension-protocol.test.ts, and mcp-setup-dispatch.test.ts — all three must be updated when changing the interface
+- savePluginSettings and savePluginPermissions in config.ts do async disk I/O — callers that need the write to complete before proceeding must await the returned promise
+
+## 2026-04-15 16:28 - US-001
+- Fixed settings-reload race in handleConfigSetPluginSettings
+- Changed McpCallbacks.onPluginSettingsPersist type from `() => void` to `() => Promise<void>`
+- In http-routes.ts createMcpCallbacks, changed onPluginSettingsPersist to return the promise from savePluginSettings instead of discarding it
+- In extension-handlers.ts, added `await` before callbacks.onPluginSettingsPersist() so disk write completes before onReload reads from disk
+- Updated all test mocks (3 files) to return Promise.resolve()
+- Files changed: extension-handlers.ts, extension-handlers.test.ts, extension-protocol.test.ts, http-routes.ts, mcp-setup-dispatch.test.ts
+- **Learnings for future iterations:**
+  - The onPluginSettingsPersist/onPluginPermissionsPersist callbacks in createMcpCallbacks follow the same pattern — if onPluginPermissionsPersist has a similar race, the same fix applies
+  - When changing a callback signature in McpCallbacks, search for all mock instances across test files — there are at least 3 test files with noopCallbacks
+---
+
+## 2026-04-15 16:31 - US-002
+- Fixed settings-reload race in HTTP /plugin-settings endpoint (handlePluginSettings in http-routes.ts)
+- Changed `savePluginSettings(state, { ...state.pluginSettings }).catch(() => {})` to `await savePluginSettings(...)` so the disk write completes before `performConfigReload` reads settings from disk
+- Files changed: http-routes.ts (1 line change)
+- **Learnings for future iterations:**
+  - This is the exact same race pattern as US-001 but in the HTTP endpoint instead of the WebSocket handler — both call savePluginSettings fire-and-forget before a reload
+  - The `.catch(() => {})` is intentional — disk write failure is non-fatal, but the await ensures ordering
+---
