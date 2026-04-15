@@ -1,0 +1,38 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Two related config hygiene fixes: (1) config show leaks internal fields (telemetryNoticeShown, version) and raw-formats legacy fields (localPluginDirs, additionalAllowedDirectories) in user-visible output; (2) the MCP server warns 'Unknown config key' for telemetryNoticeShown and port even though the CLI writes them — add them to KNOWN_CONFIG_KEYS.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Hide internal fields and format legacy fields in config show",
+      "description": "opentabs config show displays telemetryNoticeShown true and version 3 — these are internal implementation details. It also shows localPluginDirs [] and additionalAllowedDirectories [] as raw key=value lines when those fields appear in the config (from migrations). Hide the internal fields and add proper formatted sections for localPluginDirs and additionalAllowedDirectories similar to how localPlugins is handled.",
+      "acceptanceCriteria": [
+        "opentabs config show output does not contain 'telemetryNoticeShown' or 'version 3'",
+        "When config has localPluginDirs: ['path1'], config show displays it as a formatted 'localPluginDirs' section with '- path1' entries, not as raw 'localPluginDirs [\"path1\"]'",
+        "When config has additionalAllowedDirectories: ['path1'], config show displays it as a formatted 'additionalAllowedDirectories' section, not raw",
+        "Empty localPluginDirs and additionalAllowedDirectories arrays are NOT shown at all (no '(none)' entry for these — they are optional fields)",
+        "opentabs config show --json output still includes all fields including telemetryNoticeShown and version (JSON is for programmatic use)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/config.ts\n\nContext:\nThe normalizeConfigForDisplay function (lines 61-74) passes ALL non-canonical keys through:\n```typescript\nconst CANONICAL_CONFIG_SECTIONS = ['localPlugins', 'permissions', 'settings'] as const;\n\nconst normalizeConfigForDisplay = (config: Record<string, unknown>): Record<string, unknown> => {\n  const normalized: Record<string, unknown> = {};\n  // Non-canonical keys (e.g., port) first, in their original config order\n  for (const key of Object.keys(config)) {\n    if (!(CANONICAL_CONFIG_SECTIONS as readonly string[]).includes(key)) {\n      normalized[key] = config[key];\n    }\n  }\n  // Canonical sections always appear in defined order with defaults for absent keys\n  normalized.localPlugins = config.localPlugins ?? [];\n  normalized.permissions = config.permissions ?? {};\n  normalized.settings = config.settings ?? {};\n  return normalized;\n};\n```\nThis means internal keys like 'telemetryNoticeShown' and 'version' get shown alongside user-meaningful keys.\n\nFix:\n1. Add a HIDDEN_CONFIG_KEYS set to normalizeConfigForDisplay:\n```typescript\nconst HIDDEN_CONFIG_KEYS = new Set(['telemetryNoticeShown', 'version']);\n```\nSkip these keys in the non-canonical loop.\n\n2. Add 'localPluginDirs' and 'additionalAllowedDirectories' to CANONICAL_CONFIG_SECTIONS (or handle them specially in normalizeConfigForDisplay) — but ONLY show them in the display loop if they are non-empty arrays. The display rendering code (lines 115-163) handles localPlugins specially; localPluginDirs and additionalAllowedDirectories should be handled similarly: show as array sections with '- path' entries, but SKIP the section entirely if empty (no '(none)' entry).\n\n3. In the display loop (lines 115-163), add cases:\n```typescript\n} else if (key === 'localPluginDirs' && Array.isArray(value) && value.length > 0) {\n  console.log(`  ${pc.cyan('localPluginDirs')}`);\n  for (const p of value) { console.log(`    - ${String(p)}`); }\n} else if (key === 'additionalAllowedDirectories' && Array.isArray(value) && value.length > 0) {\n  console.log(`  ${pc.cyan('additionalAllowedDirectories')}`);\n  for (const p of value) { console.log(`    - ${String(p)}`); }\n}\n```\n\nConstraints:\n- Do NOT change --json output — telemetryNoticeShown and version must still appear in JSON mode (used programmatically)\n- Do NOT change the 'port' key behavior — when set, it IS a user-meaningful setting and should be shown\n- Do NOT change how localPlugins is rendered (the existing canonical section with '(none)' placeholder)\n- The 'secret' display at lines 165-168 must be preserved unchanged"
+    },
+    {
+      "id": "US-002",
+      "title": "Add telemetryNoticeShown and port to server KNOWN_CONFIG_KEYS",
+      "description": "The MCP server logs 'Unknown config key \"telemetryNoticeShown\" in config.json' on every start. The CLI writes telemetryNoticeShown and port to config.json, but the server's KNOWN_CONFIG_KEYS set doesn't include them. Add both to the set so the server stops warning about CLI-written keys.",
+      "acceptanceCriteria": [
+        "Server startup no longer logs 'Unknown config key \"telemetryNoticeShown\"' when config.json has that key",
+        "Server startup no longer logs 'Unknown config key \"port\"' when config.json has that key",
+        "Server still logs a warning for genuinely unknown keys (e.g., a typo like 'permisisons')"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts\n\nContext:\nKNOWN_CONFIG_KEYS (lines 163-171) currently has 7 keys:\n```typescript\nconst KNOWN_CONFIG_KEYS = new Set([\n  'version',\n  'localPlugins',\n  'localPluginDirs',\n  'permissions',\n  'settings',\n  'additionalAllowedDirectories',\n  'updateCheckIntervalMinutes',\n]);\n```\nThe CLI writes 'telemetryNoticeShown' (boolean) and 'port' (number) to config.json, but these are not in the server's set. Add them:\n```typescript\nconst KNOWN_CONFIG_KEYS = new Set([\n  'version',\n  'localPlugins',\n  'localPluginDirs',\n  'permissions',\n  'settings',\n  'additionalAllowedDirectories',\n  'updateCheckIntervalMinutes',\n  'telemetryNoticeShown',\n  'port',\n]);\n```\n\nConstraints:\n- Do NOT change the parseConfigRecord function behavior for these keys — the server intentionally ignores them (they're for CLI use only)\n- The server does not need to read or use telemetryNoticeShown or port — just stop warning about them"
+    }
+  ]
+}

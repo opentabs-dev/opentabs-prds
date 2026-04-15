@@ -1,0 +1,53 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three CLI UX issues: status output floods the terminal with 76 disabled tool names; audit --since gives a 'broaden your search' hint when no audit data exists at all; plugin install leaks npm noise and gives no next-steps after a successful install.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Remove disabled tools list from status output",
+      "description": "The status command appends a 'Disabled Browser Tools' list of all 76 disabled tool names after the 14-line summary, making the total output 96 lines. Remove this block — the tool counts are already shown in the summary. Users who want the full list can run opentabs tool list.",
+      "acceptanceCriteria": [
+        "opentabs status output does not contain a 'Disabled Browser Tools' section",
+        "opentabs status output still shows 'Browser tools' and 'Plugin tools' numeric counts in the summary",
+        "opentabs status --json output still includes the browserToolNames array (this is used programmatically)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/status.ts\n\nContext:\nThe status command renders a text summary then appends a block listing all disabled tool names. This block is confusing — it floods the screen when the user just wants to see if the server is healthy.\n\nCode to remove (lines 196-205 approximately):\n```typescript\nconst disabledBrowserTools = Array.isArray(data.disabledBrowserTools)\n  ? (data.disabledBrowserTools as string[])\n  : [];\nif (disabledBrowserTools.length > 0) {\n  console.log('');\n  console.log(pc.bold('  Disabled Browser Tools'));\n  for (const name of disabledBrowserTools) {\n    console.log(`    ${pc.red(name)}`);\n  }\n}\n```\nDelete this block entirely. Do NOT change the JSON output path (which already has browserToolNames in it).\n\nConstraints:\n- Do NOT change status --json output\n- Do NOT remove the numeric 'Browser tools: 76' count from the text summary\n- Do NOT change the 'Disabled Browser Tools' concept elsewhere — only remove it from status text output"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix misleading audit empty-state messages",
+      "description": "When audit --since 1h (or any filter) is used on a fresh install with no audit data, the message says 'No entries match the current filters. Try broadening the search.' This implies data exists but was filtered out. Change both the file-path and server-path empty-state messages to not imply data exists when there is no audit history at all.",
+      "acceptanceCriteria": [
+        "opentabs audit --since 1h with no audit data returns 'No audit entries found. Invoke tools through an MCP client to generate audit entries.' (same as the no-filter message)",
+        "opentabs audit --plugin nonexistent with no audit data returns the same 'No audit entries found' message",
+        "opentabs audit (no filters) with no data still returns the original 'No audit entries found. Invoke tools through an MCP client to generate audit entries.' message",
+        "The --file path (handleAuditFromFile) also uses the same consistent message when file exists but entries are empty after filtering"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/audit.ts\n\nContext:\nThere are two handlers: handleAuditFromFile (reads from disk log) and handleAudit (calls server). Both have the same pattern:\n```typescript\nconst hasFilters = options.plugin || options.tool || options.since;\nif (hasFilters) {\n  console.log(pc.dim('No entries match the current filters. Try broadening the search.'));\n} else {\n  console.log(pc.dim('No audit entries found. Invoke tools through an MCP client to generate audit entries.'));\n}\n```\nThis appears at approximately line 191-197 (handleAuditFromFile) and lines 282-289 (handleAudit server path).\n\nFix: Remove the hasFilters branching and always use:\n```typescript\nconsole.log(pc.dim('No audit entries found. Invoke tools through an MCP client to generate audit entries.'));\n```\n\nRationale: The 'broaden the search' message implies data exists. When no audit file exists or no tools have been invoked, data does NOT exist. Using the same message in all empty-state cases is accurate and less confusing.\n\nConstraints:\n- Do NOT change the error message when the audit file is missing entirely ('No audit log file found at ...')\n- Do NOT change behavior for the --json path (which returns [])\n- Apply the fix to BOTH the file-path handler and the server-path handler"
+    },
+    {
+      "id": "US-003",
+      "title": "Suppress npm install noise and add next-steps after plugin install",
+      "description": "opentabs plugin install slack outputs raw npm messages ('added 4 packages in 736ms', '1 package is looking for funding...') because it uses spawnInherit with stdio: inherit. After a successful install, there are no next-steps hints. Fix: pass --loglevel=error --fund=false to suppress npm informational output. Add a next-steps hint after success that tells the user to restart the server if it's running.",
+      "acceptanceCriteria": [
+        "opentabs plugin install slack output does not contain npm funding notices ('package is looking for funding')",
+        "opentabs plugin install slack output does not contain 'added N packages in Xms'",
+        "If npm install fails, npm error output is still visible (loglevel=error means errors still print)",
+        "After 'Successfully installed @opentabs-dev/opentabs-plugin-slack.', the output includes a hint: if server is running (notifyServer succeeds), show 'Plugin loaded — run opentabs plugin list to see it.' If server is not running, show 'Start the server with: opentabs start'"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/plugin.ts\n\nContext:\nThe install handler at line 193 uses spawnInherit which directly inherits stdio, forwarding all npm output:\n```typescript\nconst exitCode = await spawnInherit('npm', ['install', '-g', pkg]);\n```\nspawnInherit is defined at lines 88-105 using stdio: 'inherit'. The npm output includes 'added N packages in Xms' (informational) and '1 package is looking for funding...' (npm funding notice).\n\nFix 1 — suppress npm noise:\nChange the npm install call to add --loglevel=error and --fund=false flags:\n```typescript\nconst exitCode = await spawnInherit('npm', ['install', '-g', pkg, '--loglevel=error', '--fund=false']);\n```\nThis suppresses informational messages while still showing errors. The same change should be applied to the npm uninstall call at line 275:\n```typescript\nconst exitCode = await spawnInherit('npm', ['uninstall', '-g', pkg]);\n```\nChange to:\n```typescript\nconst exitCode = await spawnInherit('npm', ['uninstall', '-g', pkg, '--loglevel=error']);\n```\n\nFix 2 — next-steps after install:\nThe current flow after install (lines 200-202):\n```typescript\nconsole.log(pc.green(`Successfully installed ${pkg}.`));\nawait warnIfNotPlugin(pkg);\nawait notifyServer(options);\n```\nnotifyServer already prints either 'Server notified.' (success) or 'Server not running — changes will apply on next start.' (not running). That's the existing behavior for notifyServer when warnIfNotRunning is passed.\n\nLook at how notifyServer is called for install — it's called as `await notifyServer(options)` without `warnIfNotRunning: true`. Check if the install path passes warnIfNotRunning. If not, the server-not-running path is silent.\n\nChange the notifyServer call to:\n```typescript\nawait notifyServer({ ...options, warnIfNotRunning: true, successMessage: pc.dim('Plugin loaded — run opentabs plugin list to see it.') });\n```\nThis uses the existing notifyServer infrastructure:\n- If server is running: prints the custom successMessage\n- If server not running: prints 'Server not running — changes will apply on next start.'\n\nConstraints:\n- Do NOT change the spawnInherit function itself — only the call sites in the install/remove handlers\n- Do NOT change the 'Resolving plugin...' and 'Installing ...' messages\n- Do NOT change plugin remove behavior beyond the --loglevel=error flag"
+    }
+  ]
+}
