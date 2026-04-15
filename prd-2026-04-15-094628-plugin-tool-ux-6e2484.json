@@ -1,0 +1,52 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three user-facing UX issues: (1) the internal e2e-test plugin appears in plugin search results, (2) tool list shows full multi-sentence descriptions making output overwhelming, and (3) disabled browser tool error says 'Ask the user' when the user IS the caller.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "plugin search: exclude internal e2e-test plugin from results",
+      "description": "Running `opentabs plugin search` returns `@opentabs-dev/opentabs-plugin-e2e-test` alongside real user-installable plugins. This is an internal testing plugin that confuses users browsing for plugins. Add it to the PLATFORM_PACKAGES exclusion set so it's filtered out of search results.",
+      "acceptanceCriteria": [
+        "platform/shared/src/constants.ts PLATFORM_PACKAGES set includes '@opentabs-dev/opentabs-plugin-e2e-test'",
+        "`opentabs plugin search` output does not include 'opentabs-plugin-e2e-test'",
+        "All other plugins still appear in search results"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/shared/src/constants.ts (PLATFORM_PACKAGES set at lines 66-74)\n\nContext:\nThe PLATFORM_PACKAGES set at lines 66-74:\n```typescript\nexport const PLATFORM_PACKAGES = new Set([\n  '@opentabs-dev/browser-extension',\n  '@opentabs-dev/cli',\n  '@opentabs-dev/create-plugin',\n  '@opentabs-dev/mcp-server',\n  '@opentabs-dev/plugin-sdk',\n  '@opentabs-dev/plugin-tools',\n  '@opentabs-dev/shared',\n]);\n```\nThe plugin search in plugin.ts filters by `!PLATFORM_PACKAGES.has(pkg.name)` (lines 396, 403). Adding the e2e-test package to this set is all that's needed.\n\nChanges:\nAdd one entry to PLATFORM_PACKAGES:\n```typescript\nexport const PLATFORM_PACKAGES = new Set([\n  '@opentabs-dev/browser-extension',\n  '@opentabs-dev/cli',\n  '@opentabs-dev/create-plugin',\n  '@opentabs-dev/mcp-server',\n  '@opentabs-dev/opentabs-plugin-e2e-test',  // internal test plugin\n  '@opentabs-dev/plugin-sdk',\n  '@opentabs-dev/plugin-tools',\n  '@opentabs-dev/shared',\n]);\n```\n\nConstraints:\n- Do NOT change the search logic in plugin.ts — only change the constant\n- Keep the set alphabetically ordered"
+    },
+    {
+      "id": "US-002",
+      "title": "tool list: truncate long descriptions to first sentence",
+      "description": "`opentabs tool list` shows full multi-sentence descriptions (including security advisories) for all 76 browser tools. Each description is 100-300 chars. The output is thousands of lines. Truncate descriptions to the first sentence (ending at the first period or 100 chars, whichever comes first) in the text output. The full description is available via `tool schema <name>`.",
+      "acceptanceCriteria": [
+        "`opentabs tool list` shows tool descriptions truncated to approximately one sentence or 100 characters",
+        "Lines ending with '...' appear when a description was truncated",
+        "`opentabs tool list --json` output is unchanged (full descriptions preserved)",
+        "`opentabs tool schema <name>` still shows full description"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/tool.ts (handleToolList function, lines 98-109)\n\nContext:\nThe current description display at line 104-105:\n```typescript\nconst desc = tool.description || '';\nconsole.log(`    ${pc.cyan(tool.name)}${padding}  ${pc.dim(desc)}`);\n```\nFor browser tools, descriptions are long multi-sentence strings starting with '[Disabled]' or '[Requires approval]' followed by long descriptions including security advisories.\n\nChanges:\nAdd a truncation helper and use it:\n```typescript\nconst truncateDesc = (desc: string, maxLen = 100): string => {\n  if (!desc) return '';\n  // Find first sentence end\n  const sentenceEnd = desc.search(/\\.(?:\\s|$)/);\n  const cutoff = sentenceEnd !== -1 && sentenceEnd + 1 < maxLen ? sentenceEnd + 1 : maxLen;\n  if (desc.length <= cutoff) return desc;\n  return `${desc.slice(0, cutoff).trimEnd()}...`;\n};\n// In the loop:\nconst desc = truncateDesc(tool.description || '');\nconsole.log(`    ${pc.cyan(tool.name)}${padding}  ${pc.dim(desc)}`);\n```\n\nConstraints:\n- Do NOT change the `--json` output path (line 70: `console.log(JSON.stringify(tools, null, 2))`)\n- Do NOT change handleToolSchema — it still shows the full description\n- The truncation should preserve the '[Disabled]' or '[Requires approval]' prefix that the server adds to descriptions"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix 'Ask the user to enable it' error message for disabled browser tools",
+      "description": "When an agent calls a disabled browser tool via `opentabs tool call`, the response says 'Tool X is currently disabled. Ask the user to enable it in the OpenTabs side panel.' When the caller is the CLI user themselves (not an AI agent), this message is confusing — 'ask the user' when they ARE the user. Improve the message to explain how to enable the tool programmatically as well as via the side panel.",
+      "acceptanceCriteria": [
+        "The disabled browser tool error message in mcp-tool-dispatch.ts includes both the side panel option AND the CLI config set command",
+        "The message no longer says 'Ask the user to enable it' — instead uses second-person 'You can enable it' or similar direct phrasing",
+        "The suggested CLI command example is `opentabs config set tool-permission.browser.<toolname> auto`"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/mcp-tool-dispatch.ts (around line 258)\n\nContext:\nCurrent message at line 258:\n```typescript\ntext: `Tool \"${toolName}\" is currently disabled. Ask the user to enable it in the OpenTabs side panel.`,\n```\nThis wording makes sense when an AI agent calls the tool (the agent should ask the human user to enable it). But it's confusing when the user calls `opentabs tool call browser_list_tabs` themselves — they are the user.\n\nChanges:\nUpdate the message to include both enabling methods:\n```typescript\ntext: `Tool \"${toolName}\" is currently disabled.\\n\\nTo enable it:\\n• Via the side panel: open the OpenTabs side panel and enable the tool\\n• Via CLI: opentabs config set tool-permission.browser.${toolName} auto`,\n```\n\nConstraints:\n- Do NOT change the plugin permission-off error message at line 348 (that one has a review flow for unreviewed plugins — different scenario)\n- Only change the browser tool disabled message (around line 258)\n- The tool name in the CLI example should be `toolName` (the actual tool name, not a placeholder)"
+    }
+  ]
+}

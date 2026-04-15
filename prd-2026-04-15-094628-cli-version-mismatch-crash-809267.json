@@ -1,0 +1,55 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix the version mismatch bug caused by stale `^0.0.100` internal package dependencies that should be `*` (replaced by the publish workflow), fix the EADDRINUSE crash that shows a raw Node.js stack trace, and suppress the spurious 'Unknown config key telemetryNoticeShown' log warning.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix stale ^0.0.100 internal package deps to use * placeholder",
+      "description": "All platform packages use `^0.0.100` for their @opentabs-dev/ internal dependencies instead of `*`. The publish workflow (`.github/workflows/publish-platform.yml`) only replaces `*` with `^$VERSION` at publish time. Because `^0.0.100` for `0.0.x` semver is pinned exactly to 0.0.100, users who install `@opentabs-dev/cli@0.0.102` get `@opentabs-dev/mcp-server@0.0.100`, causing version mismatch warnings on every start, extension downgrade noise, and circular doctor advice. Change all internal @opentabs-dev/ dependency values from `^0.0.100` to `*` in the affected package.json files.",
+      "acceptanceCriteria": [
+        "platform/cli/package.json: @opentabs-dev/browser-extension, @opentabs-dev/mcp-server, @opentabs-dev/plugin-sdk, @opentabs-dev/plugin-tools, @opentabs-dev/shared all have value `*` (not `^0.0.100`)",
+        "platform/mcp-server/package.json: @opentabs-dev/shared has value `*`",
+        "platform/browser-extension/package.json: @opentabs-dev/shared has value `*`",
+        "platform/plugin-sdk/package.json: @opentabs-dev/shared has value `*`",
+        "platform/plugin-tools/package.json: @opentabs-dev/plugin-sdk, @opentabs-dev/shared both have value `*`",
+        "platform/create-plugin/package.json: @opentabs-dev/cli has value `*`",
+        "No other versioned @opentabs-dev/ deps (like ^0.0.x) remain in any platform package.json"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/package.json (change 5 internal deps)\n- platform/mcp-server/package.json (change 1 internal dep)\n- platform/browser-extension/package.json (change 1 internal dep)\n- platform/plugin-sdk/package.json (change 1 internal dep)\n- platform/plugin-tools/package.json (change 2 internal deps)\n- platform/create-plugin/package.json (change 1 internal dep)\n\nContext:\nThe publish workflow at `.github/workflows/publish-platform.yml` lines 85-91 replaces `*` with `^$VERSION` at publish time:\n```javascript\nfor (const [name, ver] of Object.entries(depMap)) {\n  if (name.startsWith('@opentabs-dev/') && ver === '*') {\n    depMap[name] = '^$VERSION';\n  }\n}\n```\nIt ONLY replaces `*`, so stale `^0.0.100` values are never updated. In npm semver, `^0.0.100` means EXACTLY 0.0.100 (locked) for 0.0.x versions — so `@opentabs-dev/cli@0.0.102` installs `@opentabs-dev/mcp-server@0.0.100` even though 0.0.102 exists. This causes immediate version mismatch warnings and cascading extension version issues.\n\nChanges:\nIn each package.json file, change every occurrence of `\"^0.0.100\"` for `@opentabs-dev/` scoped packages to `\"*\"`. Only change INTERNAL @opentabs-dev/ packages — do NOT change external dependencies.\n\nConstraints:\n- Do NOT change any non-@opentabs-dev/ dependency versions\n- Do NOT change the `\"version\"` field of each package itself — only change dependency values\n- After the change, run `npm install` so the lockfile updates (npm will resolve `*` to the locally built packages in the monorepo workspace)"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix EADDRINUSE crash — exit cleanly instead of throwing",
+      "description": "When the MCP server tries to bind a port that's already in use, `handleListenError` correctly logs a helpful message but then calls `throw error`, causing an unhandled promise rejection with a raw Node.js stack trace printed to stderr (and captured in server.log). Change the EADDRINUSE case to call `process.exit(1)` instead of re-throwing, so the process exits cleanly after printing the helpful message.",
+      "acceptanceCriteria": [
+        "In handleListenError, when error.code === 'EADDRINUSE', the function calls process.exit(1) after logging the helpful message rather than throwing",
+        "The non-EADDRINUSE path in handleListenError still throws (for unexpected listen errors)",
+        "Running `opentabs start` when the port is already in use shows the helpful message and exits without a raw Node.js stack trace"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/index.ts (handleListenError function)\n\nContext:\nAt lines 213-226 in platform/mcp-server/src/index.ts:\n```typescript\nconst handleListenError = (error: unknown): never => {\n  const isAddrInUse = error instanceof Error && 'code' in error && error.code === 'EADDRINUSE';\n  if (isAddrInUse) {\n    log.error(`Port ${PORT} is already in use. ...`);\n    // platform-specific cleanup hints...\n    log.error(`  PORT=<number> opentabs start`);\n  }\n  throw error;  // ← THIS causes the raw stack trace\n};\n```\nThe `throw error` at line 225 is outside the `if (isAddrInUse)` block, so it runs for ALL errors including EADDRINUSE. When thrown from inside a top-level `await` (line 257: `const server = ... ?? (await createHttpServer())`), it becomes an unhandled rejection and Node.js prints the full stack trace.\n\nChanges:\n```typescript\nconst handleListenError = (error: unknown): never => {\n  const isAddrInUse = error instanceof Error && 'code' in error && error.code === 'EADDRINUSE';\n  if (isAddrInUse) {\n    log.error(`Port ${PORT} is already in use. Kill the existing process or use a different port:`);\n    // ... platform-specific hints ...\n    log.error(`  PORT=<number> opentabs start`);\n    process.exit(1);\n  }\n  throw error;  // Non-EADDRINUSE errors still propagate\n};\n```\n`process.exit(1)` satisfies the `never` return type since it terminates the process.\n\nConstraints:\n- Do NOT change the error message text or platform-specific hints\n- Keep `throw error` in the non-EADDRINUSE path for other unexpected errors\n- The function return type `never` is still satisfied by both `process.exit(1)` and `throw error`"
+    },
+    {
+      "id": "US-003",
+      "title": "Add missing config keys to KNOWN_CONFIG_KEYS to suppress log warnings",
+      "description": "The MCP server's `parseConfigRecord` warns 'Unknown config key X in config.json' for any key not in KNOWN_CONFIG_KEYS. The `telemetryNoticeShown` key (written by older CLI versions) and `telemetry` (written by `opentabs telemetry disable`) are both absent from this set, causing spurious warnings in server.log for every new user. Add both keys to KNOWN_CONFIG_KEYS.",
+      "acceptanceCriteria": [
+        "platform/mcp-server/src/config.ts KNOWN_CONFIG_KEYS set includes 'telemetryNoticeShown'",
+        "platform/mcp-server/src/config.ts KNOWN_CONFIG_KEYS set includes 'telemetry'",
+        "Starting the server with a config.json containing telemetryNoticeShown produces no 'Unknown config key' warning in the logs"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts (KNOWN_CONFIG_KEYS set)\n\nContext:\nAt lines 163-171 in platform/mcp-server/src/config.ts:\n```typescript\nconst KNOWN_CONFIG_KEYS = new Set([\n  'version',\n  'localPlugins',\n  'localPluginDirs',\n  'permissions',\n  'settings',\n  'additionalAllowedDirectories',\n  'updateCheckIntervalMinutes',\n]);\n```\nBoth `telemetryNoticeShown` (written by older CLI to track first-run notice) and `telemetry` (written by `opentabs telemetry disable` — sets it to `false`) are absent. When `parseConfigRecord` (lines 209-224) iterates config keys and finds these, it logs a warning.\n\nChanges:\nAdd both keys to KNOWN_CONFIG_KEYS:\n```typescript\nconst KNOWN_CONFIG_KEYS = new Set([\n  'version',\n  'localPlugins',\n  'localPluginDirs',\n  'permissions',\n  'settings',\n  'additionalAllowedDirectories',\n  'updateCheckIntervalMinutes',\n  'telemetryNoticeShown',  // legacy key from older CLI versions\n  'telemetry',             // opt-out flag written by `opentabs telemetry disable`\n]);\n```\n\nConstraints:\n- Do NOT change any other logic in parseConfigRecord\n- Do NOT add migration to remove telemetryNoticeShown — just suppress the warning"
+    }
+  ]
+}

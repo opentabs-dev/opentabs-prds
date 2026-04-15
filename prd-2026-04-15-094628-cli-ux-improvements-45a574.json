@@ -1,0 +1,67 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix several CLI output UX issues: status command enumerates 76 disabled tool names instead of summarizing, config show exposes internal config keys, audit command 401 error lacks actionable guidance, telemetry command has a dead link, and config set --help shows a wrong example tool name.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "status: show disabled tool count instead of enumerating 76 names",
+      "description": "When the Chrome extension is not connected, `opentabs status` prints a 'Disabled Browser Tools' section that lists all 76 disabled tool names one-per-line. This creates a wall of 76+ lines that buries the key message (extension not connected). Replace the enumeration with a summary line: the count and the reason they're disabled.",
+      "acceptanceCriteria": [
+        "`opentabs status` when extension is not connected shows a single summary line for disabled browser tools (e.g. '76 browser tools disabled — connect the Chrome extension to enable') rather than listing each name",
+        "The disabled tools section is only shown if disabledBrowserTools is non-empty (current behavior preserved)",
+        "`opentabs status --json` output is unchanged (still includes full disabledBrowserTools array for programmatic use)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/status.ts (lines 196-205)\n\nContext:\nThe current code at lines 196-205:\n```typescript\nconst disabledBrowserTools = Array.isArray(data.disabledBrowserTools)\n  ? (data.disabledBrowserTools as string[])\n  : [];\nif (disabledBrowserTools.length > 0) {\n  console.log('');\n  console.log(pc.bold('  Disabled Browser Tools'));\n  for (const name of disabledBrowserTools) {\n    console.log(`    ${pc.red(name)}`);\n  }\n}\n```\nThis loops through 76 tool names. The important context is: browser tools are disabled when the extension is not connected (`data.extensionConnected === false`). When the extension IS connected, the tools are active and this list should be short or empty.\n\nChanges:\nReplace the `for` loop that prints each name with a single summary line:\n```typescript\nif (disabledBrowserTools.length > 0) {\n  console.log('');\n  const extensionConnected = data.extensionConnected === true;\n  const reason = extensionConnected ? '' : ' — connect the Chrome extension to enable';\n  console.log(pc.dim(`  ${disabledBrowserTools.length} browser tool${disabledBrowserTools.length === 1 ? '' : 's'} disabled${reason}`));\n}\n```\n\nConstraints:\n- Do NOT change the `--json` output path (line 126-128) — it should still include the full array\n- The summary should only appear when `disabledBrowserTools.length > 0` (same condition as now)\n- Keep the section position (after plugin details, before failed plugins)"
+    },
+    {
+      "id": "US-002",
+      "title": "telemetry: fix dead learn-more URL",
+      "description": "The telemetry status command (and first-run telemetry notice in `opentabs start`) prints 'Learn more: https://docs.opentabs.dev/telemetry' which is a dead link (returns connection error). The correct URL is https://opentabs.dev/docs/reference/telemetry. Fix both occurrences.",
+      "acceptanceCriteria": [
+        "platform/cli/src/commands/telemetry.ts: the 'Learn more' line uses URL https://opentabs.dev/docs/reference/telemetry",
+        "platform/cli/src/commands/start.ts: the 'Learn more' line in the telemetry notice uses URL https://opentabs.dev/docs/reference/telemetry",
+        "No other occurrences of docs.opentabs.dev remain in the CLI codebase"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/telemetry.ts (line 55)\n- platform/cli/src/commands/start.ts (line containing 'docs.opentabs.dev/telemetry')\n\nContext:\nIn telemetry.ts at line 55:\n```typescript\nconsole.log(pc.dim('  Learn more: https://docs.opentabs.dev/telemetry'));\n```\nSame string appears in start.ts in the `showTelemetryNoticeIfNeeded` function. Both need to change to:\n```typescript\nconsole.log(pc.dim('  Learn more: https://opentabs.dev/docs/reference/telemetry'));\n```\n\nConstraints:\n- Only change the URL string, nothing else\n- Check for any other occurrences of 'docs.opentabs.dev' in the CLI (grep the platform/cli/src/ directory)"
+    },
+    {
+      "id": "US-003",
+      "title": "config show: hide internal fields; config set --help: fix wrong tool name example",
+      "description": "Two config display issues: (1) `opentabs config show` displays internal config fields like `telemetryNoticeShown`, `version`, `localPluginDirs`, and `updateCheckIntervalMinutes` that are meaningless to users. These should be hidden. (2) `opentabs config set --help` shows the example `tool-permission.browser.browser_screenshot ask` but the actual tool name is `browser_screenshot_tab` — users who copy this example set a permission for a non-existent tool.",
+      "acceptanceCriteria": [
+        "`opentabs config show` does not display `telemetryNoticeShown`, `version`, `localPluginDirs`, or `updateCheckIntervalMinutes` fields",
+        "`opentabs config show` does display `localPlugins`, `permissions`, `settings`, and `port` (if set) as before",
+        "`opentabs config set --help` example shows `tool-permission.browser.browser_screenshot_tab ask` (not `browser_screenshot`)",
+        "The inline help comment at the 'Invalid key format' error for tool-permission also shows `browser_screenshot_tab` (not `browser_screenshot`)"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/cli/src/commands/config.ts (normalizeConfigForDisplay function, addHelpText for config set, handleSetToolPermission inline comment)\n\nContext:\n(1) Internal fields hidden from display:\nIn normalizeConfigForDisplay (lines 61-74), the function passes through ALL non-canonical keys. The canonical sections are defined at line 54:\n```typescript\nconst CANONICAL_CONFIG_SECTIONS = ['localPlugins', 'permissions', 'settings'] as const;\n```\nAll other keys (including `telemetryNoticeShown`, `version`, `localPluginDirs`, `updateCheckIntervalMinutes`, `telemetry`) are shown verbatim via the loop at lines 64-67.\n\nThe fix: add a HIDDEN_DISPLAY_KEYS set and skip those in the loop:\n```typescript\nconst HIDDEN_DISPLAY_KEYS = new Set([\n  'version',             // internal migration counter\n  'telemetryNoticeShown', // legacy first-run flag\n  'telemetry',           // opt-out flag (surfaced via opentabs telemetry status)\n  'localPluginDirs',     // legacy alias for localPlugins (already shown)\n  'updateCheckIntervalMinutes', // internal scheduling config\n]);\n// In the loop at line 64:\nif (!(CANONICAL_CONFIG_SECTIONS as readonly string[]).includes(key) && !HIDDEN_DISPLAY_KEYS.has(key)) {\n  normalized[key] = config[key];\n}\n```\n\nNote: `additionalAllowedDirectories` should NOT be hidden — if the user has added allowed directories, they should see them. If empty, it's currently displayed as `additionalAllowedDirectories []` — this is acceptable for now.\n\n(2) Wrong tool name in help:\nAt line 800 in the addHelpText for `config set`:\n```typescript\n$ opentabs config set tool-permission.browser.browser_screenshot ask\n```\nChange `browser_screenshot` to `browser_screenshot_tab` (that's the actual tool name).\n\nAlso in handleSetToolPermission at line 256:\n```typescript\nconsole.error('For browser tools: tool-permission.browser.browser_screenshot');\n```\nChange `browser_screenshot` to `browser_screenshot_tab` here too.\n\nConstraints:\n- Do NOT hide `port` from display (even though it's non-canonical)\n- Do NOT hide `additionalAllowedDirectories` — it IS user-visible\n- Do NOT change the `--json` output path (which returns the raw normalized config including all fields)\n- The normalizeConfigForDisplay function adds canonical sections even if absent (localPlugins defaults to []); that behavior must be preserved"
+    },
+    {
+      "id": "US-004",
+      "title": "audit: improve 401 error message to match status command quality",
+      "description": "The `opentabs audit` command shows 'Authentication failed. Is the server secret correct? Check ~/.opentabs/extension/auth.json' for a 401 response. The `opentabs status` command has a better message for the same situation that also suggests actionable remedies. Align the audit 401 message with the status command's guidance.",
+      "acceptanceCriteria": [
+        "audit.ts 401 error includes the hint 'Try restarting the server or running: opentabs config rotate-secret --confirm' (matching status.ts guidance)",
+        "audit.ts 401 error still mentions auth.json for context",
+        "The status command's 401 message is not changed"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/audit.ts (lines 250-254)\n\nContext:\nCurrent audit.ts at lines 250-254:\n```typescript\nif (res.status === 401) {\n  console.error(pc.red('Authentication failed.'));\n  console.error(pc.dim('Is the server secret correct? Check ~/.opentabs/extension/auth.json'));\n  process.exit(1);\n}\n```\n\nThe status.ts 401 handler (lines 83-94) for reference:\n```typescript\nif (res.status === 401) {\n  // ...\n  console.error(pc.red('Authentication failed.'));\n  console.error(\n    pc.dim(\n      'The secret in ~/.opentabs/extension/auth.json may not match the running server.\\n' +\n      'Try restarting the server or running: opentabs config rotate-secret --confirm',\n    ),\n  );\n  process.exit(1);\n}\n```\n\nChanges:\nUpdate audit.ts to match the quality of status.ts:\n```typescript\nif (res.status === 401) {\n  console.error(pc.red('Authentication failed.'));\n  console.error(\n    pc.dim(\n      'The secret in ~/.opentabs/extension/auth.json may not match the running server.\\n' +\n      'Try restarting the server or running: opentabs config rotate-secret --confirm',\n    ),\n  );\n  process.exit(1);\n}\n```\n\nConstraints:\n- Do NOT change the status.ts 401 handler\n- Keep `process.exit(1)` after the error messages"
+    }
+  ]
+}
