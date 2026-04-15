@@ -14,7 +14,7 @@
         "isReady() returns true after ensureAuth() has successfully populated the auth cache"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- plugins/twilio/src/twilio-api.ts (fix isAuthenticated, lines 52-54)\n\nContext:\nCurrent isAuthenticated() (lines 52-54):\n  export const isAuthenticated = (): boolean => {\n    return getLocalStorage('accountSid') !== null;\n  };\n\nThe auth cache is populated by ensureAuth() -> fetchProjectInfo() -> setAuthCache('twilio', auth). The cache key is 'twilio'.\n\nFix:\n  export const isAuthenticated = (): boolean => {\n    return getAuthCache<TwilioAuth>('twilio') !== null;\n  };\n\nThis is consistent with how other plugins check auth (by cache presence, not raw storage). The auth cache is populated the first time ensureAuth() succeeds. isReady() polls isAuthenticated() until it returns true, so this change means isReady() won't return true until ensureAuth() has been called at least once (e.g., by a tool invocation). This is acceptable behavior — the plugin won't show as 'ready' until auth is confirmed.\n\nHowever, this may make the plugin show as unavailable until a tool is first called. If a warmup approach is needed (similar to other plugins that call waitForAuth() in isReady()), implement waitForAuth() instead of just checking the cache. Read the index.ts to see how isReady() is implemented.\n\nConstraints:\n- Do NOT change the TwilioAuth interface or ensureAuth() logic\n- Do NOT remove the localStorage-based check entirely if it serves another purpose (verify this by reading the full file)"
@@ -29,7 +29,7 @@
         "ensureAuth() propagates ToolError.auth from fetchProjectInfo() correctly to the caller"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- plugins/twilio/src/twilio-api.ts (fix fetchProjectInfo catch block, lines 19-32)\n\nContext:\nCurrent fetchProjectInfo() (lines 19-32):\n  const fetchProjectInfo = async (): Promise<TwilioAuth | null> => {\n    try {\n      const resp = await fetchFromPage('https://www.twilio.com/console/api/v2/projects/info', {\n        method: 'GET',\n      });\n      const data = (await resp.json()) as { projectSid?: string; authToken?: string };\n      if (data.projectSid && data.authToken) {\n        return { accountSid: data.projectSid, authToken: data.authToken };\n      }\n      return null;\n    } catch {\n      return null; // SWALLOWS everything including ToolError.auth\n    }\n  };\n\nFix:\n  } catch (e: unknown) {\n    if (e instanceof ToolError) throw e;  // let structured errors propagate\n    return null;  // only swallow network/parse errors\n  }\n\nConstraints:\n- ToolError is imported from '@opentabs-dev/plugin-sdk' (already imported)\n- Do NOT change the actual fetch logic or credential handling\n- ensureAuth() calls fetchProjectInfo() and throws its own ToolError.auth if null is returned — that flow is still correct for the case where the endpoint returns a 200 with no credentials"
