@@ -1,0 +1,42 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Make the version check interval configurable via config.json with a default of 30 minutes (currently hardcoded to 6 hours).",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add updateCheckIntervalMinutes to OpentabsConfig and wire it through the server",
+      "description": "Add a new optional config key 'updateCheckIntervalMinutes' to config.json that controls how often the server checks npm for plugin and server updates. Default to 30 minutes. Wire the value from config through state to the setInterval call in index.ts.",
+      "acceptanceCriteria": [
+        "OpentabsConfig has an optional 'updateCheckIntervalMinutes' field of type number",
+        "KNOWN_CONFIG_KEYS includes 'updateCheckIntervalMinutes'",
+        "parseConfigRecord reads and validates the field (must be a positive integer >= 1, defaults to 30)",
+        "ServerState has a 'updateCheckIntervalMinutes' field populated from config during reload",
+        "The setInterval in index.ts uses state.updateCheckIntervalMinutes * 60 * 1000 instead of the hardcoded 6 * 60 * 60 * 1000",
+        "When config.json omits the key, the interval defaults to 30 minutes",
+        "Setting updateCheckIntervalMinutes to 0 disables periodic checks (no setInterval, only the initial startup check runs)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config.ts (add config key, parse it)\n- platform/mcp-server/src/state.ts (add field to ServerState)\n- platform/mcp-server/src/reload.ts (thread config value to state during reload)\n- platform/mcp-server/src/index.ts (use state value for setInterval)\n\nContext:\nThe version check interval is currently hardcoded at line 164 of index.ts:\n```ts\nstate.versionCheckTimerId = setInterval(() => void runVersionCheck(state), 6 * 60 * 60 * 1000);\n```\n\nThe config system uses `OpentabsConfig` (config.ts:43-56) with `KNOWN_CONFIG_KEYS` (config.ts:161-168) for typo detection. New keys must be added to both.\n\nChanges:\n\n1. In config.ts, add 'updateCheckIntervalMinutes' to `KNOWN_CONFIG_KEYS` set (line 161-168).\n\n2. In config.ts, add `updateCheckIntervalMinutes` to `OpentabsConfig` interface (line 43-56):\n```ts\n/** Minutes between npm update checks (0 = disabled, default 30) */\nupdateCheckIntervalMinutes: number;\n```\n\n3. In config.ts, parse it in `parseConfigRecord` (around line 238-241). Add before the return:\n```ts\nconst updateCheckIntervalMinutes =\n  typeof record.updateCheckIntervalMinutes === 'number' &&\n  Number.isInteger(record.updateCheckIntervalMinutes) &&\n  record.updateCheckIntervalMinutes >= 0\n    ? record.updateCheckIntervalMinutes\n    : 30;\n```\nAdd it to the return object.\n\n4. In state.ts, add to `ServerState` interface (around line 316):\n```ts\n/** Minutes between npm update checks (from config, default 30, 0 = disabled) */\nupdateCheckIntervalMinutes: number;\n```\nAdd default `updateCheckIntervalMinutes: 30` in `createState` (around line 402).\n\n5. In reload.ts, thread the config value to state during `reloadCore`. Find where config values are applied to state (search for `state.localPlugins` assignment). Add:\n```ts\nstate.updateCheckIntervalMinutes = config.updateCheckIntervalMinutes;\n```\n\n6. In index.ts line 164, replace the hardcoded interval:\n```ts\n// Before:\nstate.versionCheckTimerId = setInterval(() => void runVersionCheck(state), 6 * 60 * 60 * 1000);\n// After:\nif (state.updateCheckIntervalMinutes > 0) {\n  state.versionCheckTimerId = setInterval(\n    () => void runVersionCheck(state),\n    state.updateCheckIntervalMinutes * 60 * 1000,\n  );\n}\n```\nThe initial `void runVersionCheck(state)` call on line 163 should remain — it always runs once at startup regardless of the interval setting.\n\nConstraints:\n- Do NOT change the version check logic itself (runVersionCheck, checkForUpdates, checkServerUpdate) — only the scheduling interval\n- Do NOT remove the initial startup check — only the periodic setInterval is affected by the config\n- The config key name must be 'updateCheckIntervalMinutes' (not 'updateCheckInterval' or 'versionCheckInterval')\n- The loadConfig defaults (config.ts around line 265) must include the new field with value 30\n- The saveConfig/savePluginPermissions/savePluginSettings functions write back the full config — make sure they don't accidentally drop the new field. They currently spread the config object, so this should work automatically as long as OpentabsConfig includes the field."
+    },
+    {
+      "id": "US-002",
+      "title": "Add unit tests for updateCheckIntervalMinutes config parsing and interval scheduling",
+      "description": "Add tests verifying the config parsing (default, custom, zero, invalid values) and that the interval is correctly applied.",
+      "acceptanceCriteria": [
+        "Test: parseConfigRecord with no updateCheckIntervalMinutes returns default 30",
+        "Test: parseConfigRecord with updateCheckIntervalMinutes: 60 returns 60",
+        "Test: parseConfigRecord with updateCheckIntervalMinutes: 0 returns 0",
+        "Test: parseConfigRecord with negative or non-integer values returns default 30",
+        "Test: 'updateCheckIntervalMinutes' is in KNOWN_CONFIG_KEYS"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/config.test.ts (add tests for the new config key)\n\nContext:\nThe config.test.ts file already has tests for parseConfigRecord and KNOWN_CONFIG_KEYS. Add new test cases following the existing patterns.\n\nChanges:\nAdd a new describe block for updateCheckIntervalMinutes:\n```ts\ndescribe('updateCheckIntervalMinutes', () => {\n  test('defaults to 30 when not set', () => {\n    const config = parseConfigRecord({});\n    expect(config.updateCheckIntervalMinutes).toBe(30);\n  });\n  test('accepts a valid positive integer', () => {\n    const config = parseConfigRecord({ updateCheckIntervalMinutes: 60 });\n    expect(config.updateCheckIntervalMinutes).toBe(60);\n  });\n  test('accepts 0 to disable periodic checks', () => {\n    const config = parseConfigRecord({ updateCheckIntervalMinutes: 0 });\n    expect(config.updateCheckIntervalMinutes).toBe(0);\n  });\n  test('falls back to 30 for negative numbers', () => {\n    const config = parseConfigRecord({ updateCheckIntervalMinutes: -5 });\n    expect(config.updateCheckIntervalMinutes).toBe(30);\n  });\n  test('falls back to 30 for non-integer values', () => {\n    const config = parseConfigRecord({ updateCheckIntervalMinutes: 10.5 });\n    expect(config.updateCheckIntervalMinutes).toBe(30);\n  });\n  test('falls back to 30 for non-number values', () => {\n    const config = parseConfigRecord({ updateCheckIntervalMinutes: 'fast' });\n    expect(config.updateCheckIntervalMinutes).toBe(30);\n  });\n});\n```\n\nAlso verify KNOWN_CONFIG_KEYS contains the new key — there's likely an existing test that checks the set contents; update it to include 'updateCheckIntervalMinutes'.\n\nConstraints:\n- Follow existing test patterns in config.test.ts\n- Import parseConfigRecord and KNOWN_CONFIG_KEYS from the same path as existing tests"
+    }
+  ]
+}
