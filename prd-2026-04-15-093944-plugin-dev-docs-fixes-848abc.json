@@ -1,0 +1,52 @@
+{
+  "project": "OpenTabs Docs",
+  "description": "Fix three friction points discovered through live testing of the plugin development workflow: (1) configSchema example in plugin-class.mdx is missing 'override readonly' which is required by the scaffolded tsconfig's noImplicitOverride setting, causing TS4114 compilation errors; (2) getConfig() — the only way to read user-configured settings in tool handlers — is not documented in the utilities reference; (3) the streaming-progress.mdx example imports ToolHandlerContext but doesn't use it, failing biome lint with noUnusedImports.",
+  "workingDirectory": "docs",
+  "qualityChecks": "cd docs && npm run build && npm run type-check && npm run lint && npm run knip && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix configSchema example in plugin-class.mdx to use override readonly",
+      "description": "The configSchema property example in plugin-class.mdx shows 'readonly configSchema: ConfigSchema = {...}' without the 'override' modifier. Since the scaffolded tsconfig.json enables noImplicitOverride:true, following this example exactly produces TS4114: 'This member must have an override modifier because it overrides a member in the base class OpenTabsPlugin'. Add 'override' to both the example declaration and the surrounding explanation text.",
+      "acceptanceCriteria": [
+        "The configSchema code example in plugin-class.mdx uses 'override readonly configSchema: ConfigSchema' not 'readonly configSchema: ConfigSchema'",
+        "The surrounding text mentions that override is required because the scaffolded tsconfig enables noImplicitOverride"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- docs/content/docs/sdk/plugin-class.mdx (fix configSchema example)\n\nContext:\nThe configSchema example at docs/content/docs/sdk/plugin-class.mdx line 132-143:\n\n```typescript\n**Example — declaring a configSchema:**\n\n```typescript\nimport type { ConfigSchema } from '@opentabs-dev/plugin-sdk';\n\nclass MyPlugin extends OpenTabsPlugin {\n  readonly configSchema: ConfigSchema = {\n    instanceUrl: { type: 'url', label: 'Instance URL', required: true },\n  };\n  // ...\n}\n```\n\nThe base class OpenTabsPlugin declares configSchema as:\n```typescript\nreadonly configSchema?: ConfigSchema;\n```\n(in platform/plugin-sdk/src/index.ts line ~102)\n\nWith noImplicitOverride:true in the scaffolded tsconfig.json, TypeScript requires 'override' when a subclass declares a property that exists on the base class.\n\nChanges:\n1. Change `readonly configSchema: ConfigSchema = {` to `override readonly configSchema: ConfigSchema = {` in the code example\n2. Add a note near the example: something like 'The override modifier is required because the scaffolded tsconfig.json enables noImplicitOverride — omitting it causes TS4114.'\n\nConstraints:\n- lifecycle-hooks.mdx already explains noImplicitOverride for lifecycle hook methods — this fix adds the same clarification for configSchema\n- Do NOT change any other property examples (urlPatterns, homepage, etc.) — configSchema is the special case here because it's optional on the base class\n- The fix should be consistent with how lifecycle-hooks.mdx explains override"
+    },
+    {
+      "id": "US-002",
+      "title": "Add getConfig() documentation to utilities.mdx",
+      "description": "getConfig(key) is the only way to read user-configured settings (declared in configSchema) from inside tool handlers. It is documented in plugin-sdk/CLAUDE.md but does not appear anywhere in the docs site — not in utilities.mdx, not in plugin-class.mdx, not in plugin-development.mdx. A developer who declares configSchema will not know how to access the values without reading SDK source code. Add a 'Plugin Settings' or 'Config Utilities' section to utilities.mdx documenting getConfig.",
+      "acceptanceCriteria": [
+        "utilities.mdx contains a section documenting getConfig(key)",
+        "The section shows the function signature: function getConfig(key: string): string | number | boolean | undefined",
+        "The section includes a usage example showing import and usage in a tool handler",
+        "getConfig is added to the top-level import list at the start of utilities.mdx"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- docs/content/docs/sdk/utilities.mdx (add getConfig section and update import list)\n\nContext:\nThe utilities.mdx file has sections: DOM Utilities, Fetch Utilities, Storage Utilities, Page State Utilities, Timing Utilities, Logging, Readiness.\n\nThe file ends at line 1022 with the Readiness / notifyReadinessChanged section.\n\nThe top-level import list at lines 9-22:\n```typescript\nimport {\n  waitForSelector, waitForSelectorRemoval, querySelectorAll, getTextContent, getMetaContent, observeDOM,\n  fetchFromPage, fetchJSON, postJSON, postForm, postFormData, putJSON, patchJSON, deleteJSON,\n  fetchText, buildQueryString, httpStatusToToolError, parseRetryAfterMs, parseRateLimitHeader, stripUndefined,\n  getLocalStorage, setLocalStorage, removeLocalStorage,\n  getSessionStorage, setSessionStorage, removeSessionStorage,\n  getCookie,\n  getAuthCache, setAuthCache, clearAuthCache, findLocalStorageEntry,\n  getPageGlobal, getCurrentUrl, getPageTitle,\n  retry, sleep, waitUntil,\n  log,\n  notifyReadinessChanged,\n} from '@opentabs-dev/plugin-sdk';\n```\n\nThe actual getConfig implementation from platform/plugin-sdk/src/config.ts:\n```typescript\nexport const getConfig = (key: string): string | number | boolean | undefined => {\n  const config = (globalThis as Record<string, unknown>).__openTabs?.pluginConfig as\n    | Record<string, string | number | boolean>\n    | undefined;\n  return config?.[key];\n};\n```\n\nChanges:\n1. Add getConfig to the import list (after notifyReadinessChanged or as its own line)\n2. Add a new section before the Readiness section (or after Storage Utilities — place it wherever makes logical sense given it's about reading config, not DOM/fetch/storage/timing) titled '## Config Utilities' or '## Plugin Settings'\n3. Document getConfig(key):\n   - Signature: `function getConfig(key: string): string | number | boolean | undefined`\n   - Description: Reads a resolved setting value from the plugin's configuration. Values are injected into the page context before the adapter IIFE runs.\n   - Return value: The setting value as string, number, or boolean; undefined if the key is not configured.\n   - Usage example showing a tool handler reading instanceUrl:\n\n```typescript\nimport { getConfig } from '@opentabs-dev/plugin-sdk';\n\n// In a tool handler:\nconst instanceUrl = getConfig('instanceUrl') as string | undefined;\nif (!instanceUrl) {\n  throw ToolError.validation('Plugin not configured — set instanceUrl in OpenTabs settings');\n}\nconst data = await fetchJSON(`${instanceUrl}/api/items`);\n```\n\nConstraints:\n- This section should cross-reference plugin-class.mdx for how to declare configSchema\n- Do NOT add getConfig to the main plugin-development.mdx guide — that guide is already long enough\n- The section placement should be after the Storage Utilities section since reading config is conceptually related to reading settings/storage"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix unused ToolHandlerContext import in streaming-progress.mdx example",
+      "description": "The primary code example in streaming-progress.mdx imports 'import type { ToolHandlerContext } from @opentabs-dev/plugin-sdk' but does not use it in a type annotation. The handle function's context parameter gets its type inferred from defineTool's generic signature — no explicit annotation is needed. This unused import fails biome lint with noUnusedImports. Remove the import, or add an explicit context type annotation to make the import used.",
+      "acceptanceCriteria": [
+        "The streaming-progress.mdx code example does not have an unused ToolHandlerContext import",
+        "If ToolHandlerContext import is kept, it must be used as an explicit type annotation on the context parameter"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- docs/content/docs/guides/streaming-progress.mdx\n\nContext:\nThe code example at lines 1-2 of the example block:\n```typescript\nimport { defineTool, fetchJSON, ToolError } from '@opentabs-dev/plugin-sdk';\nimport type { ToolHandlerContext } from '@opentabs-dev/plugin-sdk';\nimport { z } from 'zod';\n```\n\nThe handle function at line 40:\n```typescript\nhandle: async (params, context) => {\n```\n\nThe defineTool type signature provides `context?: ToolHandlerContext` through generics, so the import is unused for inference purposes. biome lint/correctness/noUnusedImports flags this.\n\nChanges (two options — pick whichever reads more clearly for the docs):\nOption A (simpler): Remove the unused import. The context parameter is still typed through inference.\nOption B (more explicit/educational): Keep the import but add it as an explicit type annotation:\n```typescript\nhandle: async (params, context?: ToolHandlerContext) => {\n```\n\nRecommend Option A (remove the import) because:\n1. It's the minimal fix\n2. The inferred type is correct and sufficient\n3. Having the import creates confusion about whether it's needed\n\nConstraints:\n- Only change the ToolHandlerContext import line in the code example — do not change any other part of the example\n- The context?.reportProgress() calls throughout the handle function must remain unchanged"
+    }
+  ]
+}

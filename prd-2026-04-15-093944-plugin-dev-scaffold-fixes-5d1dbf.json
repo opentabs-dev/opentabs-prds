@@ -1,0 +1,68 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix four friction points in the plugin developer scaffold and CLI: (1) the non-interactive error message hardcodes the wrong invocation command for npx @opentabs-dev/create-plugin users, (2) jiti is listed as an unused devDependency in every scaffolded plugin, (3) the dev watch script uses bash-only & syntax that silently breaks on Windows, and (4) opentabs plugin configure crashes with an unhandled top-level await error when run in non-TTY/piped mode.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix scaffold non-interactive error message to reference correct invocation command",
+      "description": "The promptForMissingArgs function in scaffold.ts hardcodes 'Usage: opentabs plugin create <name> --domain <domain>' in the non-interactive error message. When the user invokes the scaffold via 'npx @opentabs-dev/create-plugin --domain example.com' (omitting name), they see usage instructions for the wrong command. Fix by making the usage/example line configurable so create-plugin passes its own binary name.",
+      "acceptanceCriteria": [
+        "promptForMissingArgs accepts an optional invocationName parameter (defaults to 'opentabs plugin create') used in the error message",
+        "create-plugin/src/index.ts passes 'npx @opentabs-dev/create-plugin' as invocationName to promptForMissingArgs",
+        "cli/src/commands/plugin.ts passes no invocationName (uses default 'opentabs plugin create')",
+        "Error message for missing name when invoked via create-plugin shows 'npx @opentabs-dev/create-plugin' not 'opentabs plugin create'"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/scaffold.ts (add optional invocationName param to promptForMissingArgs signature and error message)\n- platform/create-plugin/src/index.ts (pass invocationName)\n- platform/cli/src/commands/plugin.ts (no change needed since default matches)\n\nContext:\nThe error is thrown in promptForMissingArgs when process.stdin.isTTY is falsy and name or domain is missing. Current code at platform/cli/src/scaffold.ts lines 436-441:\n\n```typescript\nif (!process.stdin.isTTY) {\n  const missing = [!name && 'name', !domain && '--domain'].filter(Boolean);\n  throw new ScaffoldError(\n    `Missing required arguments: ${missing.join(', ')}.\\n\\nUsage: opentabs plugin create <name> --domain <domain>\\nExample: opentabs plugin create my-app --domain .example.com --display \"My App\"`,\n  );\n}\n```\n\nThe `promptForMissingArgs` function signature is:\n```typescript\nconst promptForMissingArgs = async (partial: PartialScaffoldArgs): Promise<ScaffoldArgs>\n```\n\ncreate-plugin/src/index.ts calls it as:\n```typescript\nconst args = await promptForMissingArgs({ name, domain: options.domain, ... });\n```\n\nChanges:\n1. Add `invocationName?: string` to PartialScaffoldArgs interface (or add a separate param)\n2. Update the error message to use `invocationName ?? 'opentabs plugin create'`\n3. In create-plugin/src/index.ts, pass `invocationName: 'npx @opentabs-dev/create-plugin'`\n\nConstraints:\n- Do NOT change the PartialScaffoldArgs type exported from scaffold.ts — this type is re-exported. Add invocationName as a separate optional param to the function instead of adding it to PartialScaffoldArgs if that causes issues.\n- The export of promptForMissingArgs stays the same."
+    },
+    {
+      "id": "US-002",
+      "title": "Remove unused jiti devDependency from scaffolded plugin package.json",
+      "description": "The generatePackageJson function in scaffold.ts includes 'jiti: \"^2.6.1\"' in devDependencies of every scaffolded plugin. jiti is never referenced in any plugin script, build tool, or source file — it was likely left over from an earlier build approach. Remove it from the scaffold template.",
+      "acceptanceCriteria": [
+        "jiti no longer appears in the devDependencies section of generatePackageJson in scaffold.ts",
+        "Scaffolded plugin package.json does not include jiti as a dependency",
+        "No other scaffold file references jiti"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/scaffold.ts (remove jiti from devDependencies object)\n\nContext:\nThe devDependencies object in generatePackageJson at platform/cli/src/scaffold.ts lines 185-191:\n\n```typescript\ndevDependencies: {\n  '@biomejs/biome': '2.4.5',\n  '@opentabs-dev/plugin-tools': openTabsVersion,\n  jiti: '^2.6.1',\n  typescript: '^5.9.3',\n  zod: zodVersion,\n},\n```\n\nChanges:\nDelete the `jiti: '^2.6.1',` line. No other changes needed.\n\nConstraints:\n- Do NOT remove any other devDependency — only jiti. Every other entry is used."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix dev watch script Windows incompatibility by replacing & with concurrently",
+      "description": "The scaffolded plugin's dev npm script uses 'tsc --watch --preserveWatchOutput & opentabs-plugin build --watch'. The & operator is bash-specific — on Windows, npm scripts run in cmd.exe where & is a sequential operator, not background. As a result, on Windows tsc --watch blocks and opentabs-plugin build --watch never starts. Fix by replacing & with concurrently, adding it as a devDependency in the scaffold.",
+      "acceptanceCriteria": [
+        "generatePackageJson in scaffold.ts includes 'concurrently: \"^9.0.0\"' in devDependencies",
+        "The dev script in generatePackageJson uses 'concurrently \"tsc --watch --preserveWatchOutput\" \"opentabs-plugin build --watch\"'",
+        "The dev script does not use the & operator"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/scaffold.ts (change dev script and add concurrently devDependency)\n\nContext:\nCurrent dev script in generatePackageJson at platform/cli/src/scaffold.ts line 171:\n```typescript\ndev: 'tsc --watch --preserveWatchOutput & opentabs-plugin build --watch',\n```\n\nCurrent devDependencies (after US-002 removes jiti) at lines 185-191:\n```typescript\ndevDependencies: {\n  '@biomejs/biome': '2.4.5',\n  '@opentabs-dev/plugin-tools': openTabsVersion,\n  typescript: '^5.9.3',\n  zod: zodVersion,\n},\n```\n\nChanges:\n1. Change dev script to: 'concurrently \"tsc --watch --preserveWatchOutput\" \"opentabs-plugin build --watch\"'\n2. Add 'concurrently: \"^9.0.0\"' to devDependencies\n\nConstraints:\n- Use concurrently version ^9.0.0 (current stable)\n- Do NOT add --kill-others or other concurrently flags — keep the script minimal\n- Do NOT change the build, type-check, lint, format:check, or check scripts"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix plugin configure crash on non-TTY stdin",
+      "description": "handlePluginConfigure in plugin.ts does not check process.stdin.isTTY before entering interactive readline prompts. When stdin is piped (non-interactive, e.g. CI, scripted usage), rl.question() hits EOF, and the required-field loop keeps spinning until Node.js crashes with 'Detected unsettled top-level await'. Add a non-TTY guard at the start of handlePluginConfigure that exits with a helpful error directing the user to 'opentabs config set setting.<plugin>.<key> <value>'.",
+      "acceptanceCriteria": [
+        "handlePluginConfigure checks !process.stdin.isTTY at the start",
+        "When stdin is non-TTY, the command exits with code 1 and prints an error message",
+        "The error message includes the alternative command: 'opentabs config set setting.<plugin>.<key> <value>'",
+        "When stdin is a TTY, the configure flow works as before"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/cli/src/commands/plugin.ts (add TTY check to handlePluginConfigure)\n\nContext:\nhandlePluginConfigure starts at platform/cli/src/commands/plugin.ts line 953. The function:\n1. Finds the plugin dir\n2. Reads configSchema\n3. Reads current settings\n4. Creates readline interface: `const rl = createInterface({ input: process.stdin, output: process.stdout });`\n5. Loops calling promptField for each setting\n\nprompField has inner while(true) loops for url-type fields that call rl.question() repeatedly. When stdin is EOF, rl.question() rejects/returns empty and the loop spins until the process crashes.\n\nBy contrast, promptForMissingArgs in scaffold.ts correctly handles this at lines 436-441:\n```typescript\nif (!process.stdin.isTTY) {\n  const missing = [!name && 'name', !domain && '--domain'].filter(Boolean);\n  throw new ScaffoldError(`Missing required arguments: ...`);\n}\n```\n\nChanges:\nAdd this block AFTER the configSchema null check (line ~963) and BEFORE the readline interface creation (line ~975):\n\n```typescript\nif (!process.stdin.isTTY) {\n  console.error(pc.red(`opentabs plugin configure requires an interactive terminal.`));\n  console.error(`Use the non-interactive command instead:`);\n  console.error(`  ${pc.cyan(`opentabs config set setting.${found.shortName}.<key> <value>`)}`);\n  console.error(`  ${pc.dim(`Example: opentabs config set setting.${found.shortName}.instanceUrl https://example.com`)}`);\n  process.exit(1);\n}\n```\n\nConstraints:\n- The check must occur AFTER the configSchema is loaded (so we have found.shortName available)\n- Do NOT change the TTY flow (readline handling, promptField, settings save logic) — only add the guard\n- Use pc.red/cyan/dim from the already-imported picocolors (pc)"
+    }
+  ]
+}
