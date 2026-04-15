@@ -1,0 +1,64 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix four concrete bugs in the perfect audit infrastructure (.ralph/): (1) perfect.sh silently ignores script failures because $! tracks the wrong PID; (2) run-prompt.sh silences all claude stderr including error messages, and displays raw JSON for Agent tool calls; (3) perfect-cli-platform-contributor.sh prompt has no stale container cleanup so second run fails; (4) perfect-perfect.sh omits itself from audit scope and perfect-plugins.sh gives unrealistic instructions for 100+ plugins.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix perfect.sh FAILED counter: wrap pipeline in subshell so $! tracks correct exit code",
+      "description": "In perfect.sh, the background pipeline `bash \"$f\" 2>&1 | ts_prefix \"$short\" &` stores $! as the PID of the ts_prefix subshell (last pipeline command), not bash \"$f\". When bash \"$f\" exits, ts_prefix reads EOF and exits 0. So `wait $pid` always returns 0, FAILED is never incremented, and perfect.sh always reports 'All N scripts completed successfully' even when audit scripts fail. Fix by wrapping the pipeline in a subshell so $! is the outer subshell's PID and its exit code reflects the pipeline's failure.",
+      "acceptanceCriteria": [
+        "Line 77 of .ralph/perfect.sh reads `(bash \"$f\" 2>&1 | ts_prefix \"$short\") &` (pipeline wrapped in subshell)",
+        "If an audit script exits non-zero, FAILED is incremented and perfect.sh exits 1 with the 'N of M scripts failed' message",
+        "No change to the streaming behavior: ts_prefix still prefixes every output line with timestamp and script name"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- .ralph/perfect.sh (lines 76-78: change pipeline to use subshell wrapper)\n\nContext:\nThe bug is in the launch loop (lines 66-79). The current code:\n  # Launch script, pipe stdout+stderr through ts_prefix for live streaming.\n  bash \"$f\" 2>&1 | ts_prefix \"$short\" &\n  PIDS+=($!)\n\nIn non-interactive bash (scripts, no -m flag), $! after a background pipeline is the PID of the last command in the pipeline. ts_prefix is a shell function that runs in a subshell on the right side of the pipe. So PIDS gets the ts_prefix subshell PID, not bash \"$f\"'s PID.\n\nWhen bash \"$f\" exits (any status), ts_prefix receives EOF on stdin, the while-read loop exits normally, and ts_prefix exits 0. So `wait \"$pid\"` at line 106 always returns 0. FAILED is never incremented.\n\nThe failure tracking loop (lines 102-112):\n  FAILED=0\n  for i in \"${!PIDS[@]}\"; do\n    pid=${PIDS[$i]}\n    short=\"${NAMES[$i]}\"\n    if wait \"$pid\"; then\n      echo -e \"$(ts) ${GREEN}[${short}] completed successfully.${RESET}\"\n    else\n      echo -e \"$(ts) ${RED}[${short}] failed (exit $?).${RESET}\"\n      FAILED=$((FAILED + 1))\n    fi\n  done\n\nThis always takes the success branch.\n\nChanges:\nChange line 77 from:\n  bash \"$f\" 2>&1 | ts_prefix \"$short\" &\nTo:\n  (bash \"$f\" 2>&1 | ts_prefix \"$short\") &\n\nThe outer subshell inherits set -eo pipefail from the parent (line 15: `set -eo pipefail`). With pipefail, if bash \"$f\" exits non-zero, the pipeline exits non-zero, and with -e, the subshell exits non-zero. Now $! = outer subshell PID, and `wait $pid` returns the subshell's exit code, which reflects bash \"$f\"'s failure.\n\nConstraints:\n- Do NOT change the ts_prefix function or how it formats output\n- Do NOT change the PIDS array structure or the failure tracking loop (lines 102-112) — the fix is only at line 77\n- Do NOT add set -o pipefail to the subshell explicitly — it's already inherited from the parent\n- The cleanup handler (lines 85-98) kills by PID and process group — this still works correctly because the outer subshell's process group includes both bash \"$f\" and ts_prefix"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix run-prompt.sh: restore claude stderr visibility and fix Agent tool display",
+      "description": "run-prompt.sh has two bugs: (1) `claude ... 2>/dev/null` silences ALL claude stderr including auth errors, rate limits, and 'command not found' — users see no diagnostic when claude fails; (2) stream_filter checks `.name == \"Task\"` but Claude Code's subagent tool is named \"Agent\", so Agent tool invocations fall through to the else branch and display 60 chars of raw JSON instead of the readable description.",
+      "acceptanceCriteria": [
+        "Line 128 of .ralph/run-prompt.sh does NOT contain `2>/dev/null` — claude's stderr flows through to the caller",
+        "The stream_filter jq expression checks `.name == \"Agent\"` (not `\"Task\"`) and extracts `.input.description` for Agent tool calls",
+        "Agent tool invocations display as `▸ Agent    <description text>` in the output"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- .ralph/run-prompt.sh (line 128: remove 2>/dev/null; line 92: change Task to Agent)\n\nChange 1 — Restore stderr visibility:\nCurrent line 128:\n  claude \"${CLAUDE_ARGS[@]}\" < <(echo \"$PROMPT\") 2>/dev/null | stream_filter\nChange to:\n  claude \"${CLAUDE_ARGS[@]}\" < <(echo \"$PROMPT\") | stream_filter\n\nJust remove `2>/dev/null`. Claude's stderr will flow to run-prompt.sh's stderr. When called from perfect.sh via `bash \"$f\" 2>&1 | ts_prefix`, that stderr flows through the pipeline and gets prefixed like any other output line. When run standalone, stderr appears on the terminal directly. This restores visibility of auth errors, rate limit messages, and 'claude: command not found' errors.\n\nDo NOT change to `2>&1` (redirecting stderr into stream_filter's stdin) — stream_filter would try to parse it as JSON and silently discard it, which is the same problem as 2>/dev/null.\n\nChange 2 — Fix Agent tool name:\nCurrent line 92 in the jq expression inside stream_filter:\n  elif .name == \"Task\" then (.input.description // \"\")\nChange to:\n  elif .name == \"Agent\" then (.input.description // \"\")\n\nClaude Code's tool for spawning subagents is named \"Agent\" (see system prompt tool list). The \"Task\" name was incorrect. With this fix, Agent tool invocations show the description field instead of falling through to the else branch which outputs raw JSON.\n\nConstraints:\n- No other changes to stream_filter\n- No changes to CLAUDE_ARGS or any other line in the file"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix perfect-cli-platform-contributor.sh: add stale container cleanup at Docker setup start",
+      "description": "The prompt for perfect-cli-platform-contributor.sh creates a Docker container named `opentabs-platform-contributor-test` but has no stale container cleanup step at the beginning. If Claude is interrupted before Phase 12 cleanup (`docker stop opentabs-platform-contributor-test`), the container stays running. On the next run, `docker run --name opentabs-platform-contributor-test` fails with 'container name already in use'. The other two CLI scripts (perfect-cli-user.sh and perfect-cli-plugin-developer.sh) both handle this correctly — add the same pattern here.",
+      "acceptanceCriteria": [
+        "The prompt in .ralph/perfect-cli-platform-contributor.sh begins the Docker setup section with a command to kill and remove any stale container named `opentabs-platform-contributor-test`",
+        "The stale cleanup command uses `2>/dev/null` and a truthy fallback so it does not fail when no stale container exists"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- .ralph/perfect-cli-platform-contributor.sh (add stale container cleanup before docker run)\n\nContext:\nThe prompt's Step 2 Docker setup (inside the PROMPT heredoc, lines 29-43) currently reads:\n  ```bash\n  docker run --rm -d \\\n    --name opentabs-platform-contributor-test \\\n    --network host --ipc=host --shm-size=2g \\\n    -v \"$HOME/.npmrc:/root/.npmrc:ro\" \\\n    -v \"$(pwd):/repo:ro\" \\\n    mcr.microsoft.com/playwright:v1.58.2-noble \\\n    tail -f /dev/null\n  ```\n\nFor comparison, perfect-cli-user.sh Step 1 starts with:\n  ```bash\n  docker kill opentabs-ux-test 2>/dev/null; docker rm opentabs-ux-test 2>/dev/null; true\n  ```\nAnd perfect-cli-plugin-developer.sh starts with:\n  ```bash\n  docker rm -f opentabs-plugin-dev-test 2>/dev/null || true\n  ```\n\nChange:\nInsert a stale container kill/remove command BEFORE the `docker run` command in the Step 2 Docker setup section of the PROMPT heredoc. Add:\n  ```bash\n  docker kill opentabs-platform-contributor-test 2>/dev/null; docker rm opentabs-platform-contributor-test 2>/dev/null; true\n  ```\n\nConstraints:\n- Change is inside the PROMPT heredoc (between `<<'PROMPT_EOF'` and `PROMPT_EOF`) — the shell does NOT expand variables or commands in this section, it's literal text passed to Claude\n- Do NOT change the docker run command itself\n- Do NOT change the container name or any other part of the setup"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix perfect-perfect.sh and perfect-plugins.sh prompt gaps",
+      "description": "Two prompt quality issues: (1) perfect-perfect.sh's prompt lists 12 files to audit but omits perfect-perfect.sh itself — the meta-audit has a blind spot for its own bugs; (2) perfect-plugins.sh instructs Claude to 'read EVERY source file' for all 100+ plugins in a single session, which hits context limits and produces a silently incomplete audit with no indication of which plugins were skipped.",
+      "acceptanceCriteria": [
+        "perfect-perfect.sh's prompt includes `perfect-perfect.sh` in the numbered list of files to read",
+        "perfect-plugins.sh's Step 3 includes guidance acknowledging the 100+ plugin scale and directing the agent to prioritize by complexity/risk rather than attempt to read every file in every plugin"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- .ralph/perfect-perfect.sh (add perfect-perfect.sh to the file list in the prompt)\n- .ralph/perfect-plugins.sh (add scale/prioritization guidance to Step 3)\n\nChange 1 — perfect-perfect.sh:\nThe PROMPT heredoc has a numbered list of 12 files (lines ~20-33). Currently ends with:\n  11. **perfect-cli-plugin-developer.sh** — audits CLI from plugin dev perspective\n  12. **perfect-cli-platform-contributor.sh** — audits CLI from contributor perspective\n\nAdd after item 12:\n  13. **perfect-perfect.sh** — the meta-audit script itself (this file)\n\nThe Step 1 instruction says \"Read ALL of the above files. Every line.\" — perfect-perfect.sh will then be included in the audit scope.\n\nChange 2 — perfect-plugins.sh:\nCurrent Step 3 header reads:\n  ## Step 3: Audit each plugin thoroughly (Phase 1 — Collect)\n  For each plugin, read EVERY source file.\n\nReplace that opening paragraph with:\n  ## Step 3: Audit each plugin thoroughly (Phase 1 — Collect)\n\n  **Scale note:** There are 100+ plugins. Reading every source file for every plugin in a single session will exceed context limits and produce a silently incomplete audit. Instead, prioritize by risk: (1) plugins with the most tools or most complex logic first, (2) plugins that have not been recently audited, (3) plugins with large src/ directories. Audit as many as context allows, and note which plugins you audited vs skipped in your PRD description. A thorough audit of 20-30 high-complexity plugins is more valuable than a shallow pass over all 100+.\n\nConstraints:\n- Changes are inside PROMPT heredocs — they are literal text, not shell code\n- Do NOT change any other part of either script\n- In perfect-plugins.sh, do NOT change Steps 1, 2, 4, 5, or 6"
+    }
+  ]
+}
