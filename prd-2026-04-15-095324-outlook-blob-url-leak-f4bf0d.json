@@ -1,0 +1,24 @@
+{
+  "project": "OpenTabs Plugin — outlook",
+  "description": "Fix blob URL and DOM element leak in download-attachment.ts where a 1-second setTimeout cleanup is skipped if the page navigates before the timer fires.",
+  "workingDirectory": "plugins/outlook",
+  "qualityChecks": "cd plugins/outlook && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Revoke blob URL synchronously after click in triggerBrowserDownload",
+      "description": "In plugins/outlook/src/tools/download-attachment.ts, triggerBrowserDownload() appends an <a> element and calls URL.revokeObjectURL() inside a setTimeout(..., 1000) callback. If the page navigates within that 1-second window, the setTimeout is cancelled and the blob URL is never revoked, leaking memory proportional to attachment size. Modern browsers support calling URL.revokeObjectURL() immediately after a.click() since the download is already initiated. Revoke synchronously after the click and remove the DOM element immediately.",
+      "acceptanceCriteria": [
+        "URL.revokeObjectURL(url) is called synchronously after a.click(), not inside setTimeout",
+        "document.body.removeChild(a) is called synchronously after a.click(), not inside setTimeout",
+        "No setTimeout remains in triggerBrowserDownload",
+        "The download still triggers correctly (a.click() still initiates the download before cleanup)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- plugins/outlook/src/tools/download-attachment.ts (triggerBrowserDownload function, lines 22-38)\n\nContext:\nCurrent triggerBrowserDownload (lines 22-38):\n  function triggerBrowserDownload(bytes: Uint8Array, filename: string, mimeType: string): void {\n    const buffer = new ArrayBuffer(bytes.byteLength);\n    new Uint8Array(buffer).set(bytes);\n    const blob = new Blob([buffer], { type: mimeType });\n    const url = URL.createObjectURL(blob);\n    const a = document.createElement('a');\n    a.href = url;\n    a.download = filename;\n    a.style.display = 'none';\n    document.body.appendChild(a);\n    a.click();\n    // Cleanup after a short delay to ensure the download starts\n    setTimeout(() => {\n      document.body.removeChild(a);\n      URL.revokeObjectURL(url);\n    }, 1000);\n  }\n\nFix:\n  function triggerBrowserDownload(bytes: Uint8Array, filename: string, mimeType: string): void {\n    const buffer = new ArrayBuffer(bytes.byteLength);\n    new Uint8Array(buffer).set(bytes);\n    const blob = new Blob([buffer], { type: mimeType });\n    const url = URL.createObjectURL(blob);\n    const a = document.createElement('a');\n    a.href = url;\n    a.download = filename;\n    a.style.display = 'none';\n    document.body.appendChild(a);\n    a.click();\n    document.body.removeChild(a);\n    URL.revokeObjectURL(url);\n  }\n\nModern browsers (Chrome 60+) start the download when click() is called and do not need the blob URL to remain valid after that point. The 1-second delay was a historical workaround for older browsers.\n\nConstraints:\n- Do NOT change the Blob construction or ArrayBuffer setup\n- Do NOT add a requestAnimationFrame or any async delay — synchronous cleanup is correct"
+    }
+  ]
+}

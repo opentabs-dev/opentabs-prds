@@ -1,0 +1,24 @@
+{
+  "project": "OpenTabs Plugin — tumblr",
+  "description": "Fix api() calling refreshCsrf() before every non-GET request, which makes an extra /user/info API call that can fail independently (e.g., if rate-limited), causing the write operation to fail even though the cached CSRF token may still be valid.",
+  "workingDirectory": "plugins/tumblr",
+  "qualityChecks": "cd plugins/tumblr && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Use cached CSRF token for writes; only refresh on 403 CSRF failure",
+      "description": "In plugins/tumblr/src/tumblr-api.ts, api() calls `await refreshCsrf(auth.apiToken)` before every non-GET request, requiring a successful GET /api/v2/user/info just to get a CSRF token. If the user/info endpoint is rate-limited, the write fails even though the cached CSRF token from a previous response header is still valid. Change the logic to use the cached CSRF token from auth and only call refreshCsrf() when no cached token is available. The CSRF token is already updated from response headers after each request (lines 143-147), so the cache stays fresh without proactive refreshing.",
+      "acceptanceCriteria": [
+        "Non-GET requests use auth.csrfToken if it is non-empty, without calling refreshCsrf()",
+        "refreshCsrf() is only called when auth.csrfToken is empty/falsy",
+        "The response-header CSRF update (lines 143-147) still runs after every request to keep the cache fresh",
+        "The X-Csrf header is still set on all non-GET requests"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/tumblr/src/tumblr-api.ts (change CSRF logic around lines 121-123)\n\nContext:\nCurrent code (lines 118-125 approximately):\n  if (method !== 'GET') {\n    const freshCsrf = await refreshCsrf(auth.apiToken);\n    headers['X-Csrf'] = freshCsrf;\n  }\n\nThe TumblrAuth object (from getAuthCache) includes a csrfToken field. After each request, updateCsrf() is called with the response X-Csrf header (lines 143-147), keeping it current. So the cached token is already kept up-to-date.\n\nFix:\n  if (method !== 'GET') {\n    // Use cached CSRF token; refresh only if empty\n    const csrf = auth.csrfToken || await refreshCsrf(auth.apiToken);\n    headers['X-Csrf'] = csrf;\n  }\n\nOr even simpler — since every response updates the cached CSRF via updateCsrf(), and getAuth() reads from the auth cache, after the first successful request the cache always has a fresh CSRF. Just use auth.csrfToken directly:\n  if (method !== 'GET') {\n    const csrf = auth.csrfToken;\n    if (csrf) {\n      headers['X-Csrf'] = csrf;\n    } else {\n      // First write with no cached CSRF — fetch it\n      headers['X-Csrf'] = await refreshCsrf(auth.apiToken);\n    }\n  }\n\nMake sure to read the full TumblrAuth interface and updateCsrf() implementation to understand how the cached csrfToken is stored and retrieved. The auth object must be updated (re-set in auth cache) when updateCsrf() runs, or the fix needs to directly access the cached auth and update it.\n\nConstraints:\n- Do NOT remove refreshCsrf() — it is still needed as a fallback when no cached CSRF exists\n- Do NOT change the response header CSRF update logic (lines 143-147)\n- The fix must handle the case where the csrfToken field is initially empty (first write in a session)"
+    }
+  ]
+}

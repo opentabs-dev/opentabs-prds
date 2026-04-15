@@ -1,0 +1,23 @@
+{
+  "project": "OpenTabs Plugin — teams",
+  "description": "Fix cachedEnterpriseChatServiceBase being cached permanently with no invalidation path, causing all Teams API calls to hit a stale chat service URL after tenant or account switches within the same tab.",
+  "workingDirectory": "plugins/teams",
+  "qualityChecks": "cd plugins/teams && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Clear cachedEnterpriseChatServiceBase in teardown() or on auth state change",
+      "description": "In plugins/teams/src/teams-api.ts, cachedEnterpriseChatServiceBase (line 85) is a module-level let variable that is set once by discoverEnterpriseChatServiceBase() and never invalidated. If a user switches tenant or account within the same Teams tab (which is common in enterprise environments), the stale chat service URL continues to be used for all subsequent API calls, causing them to fail silently. Add a clearChatServiceCache() export and call it from the plugin's teardown() or onNavigate() when detecting an account change.",
+      "acceptanceCriteria": [
+        "cachedEnterpriseChatServiceBase is reset to null in the plugin's teardown() method",
+        "Subsequent tool calls after teardown and re-activation re-discover the correct chat service URL",
+        "The cached Skype JWT (cachedSkypeJwt) is also cleared in teardown() since it is tenant-specific"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/teams/src/teams-api.ts (add clearCaches() export function)\n- plugins/teams/src/index.ts (add teardown() method that calls clearCaches())\n\nContext:\nIn teams-api.ts:\n  let cachedEnterpriseChatServiceBase: string | null = null; // line 85 — never reset\n  let cachedSkypeJwt: { token: string; expiresAt: number } | null = null; // line 129 — has expiry check\n\ncachedSkypeJwt has expiry logic (line 137: `if (cachedSkypeJwt && Date.now() < cachedSkypeJwt.expiresAt - 60_000)`), so it naturally becomes stale and is re-fetched. But cachedEnterpriseChatServiceBase has NO expiry or invalidation path.\n\nFix:\n1. In teams-api.ts, add:\n   export const clearCaches = (): void => {\n     cachedEnterpriseChatServiceBase = null;\n     cachedSkypeJwt = null;  // also clear for good measure (re-fetched next call)\n   };\n2. In index.ts, add teardown() that calls clearCaches()\n\nConstraints:\n- Do NOT change discoverEnterpriseChatServiceBase() logic — it reads from localStorage correctly each time it runs\n- Do NOT clear the MSAL tokens or auth cache (those are managed by the platform)\n- cachedSkypeJwt clearing is secondary — the expiry handles it naturally — but clearing in teardown is belt-and-suspenders"
+    }
+  ]
+}

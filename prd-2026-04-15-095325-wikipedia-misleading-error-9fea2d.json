@@ -1,0 +1,23 @@
+{
+  "project": "OpenTabs Plugin — wikipedia",
+  "description": "Fix the catch block in get-page-views.ts incorrectly converting JSON parse errors (SyntaxError) to ToolError.notFound, giving a misleading 'page not found' error when the Wikimedia API returns malformed JSON.",
+  "workingDirectory": "plugins/wikipedia",
+  "qualityChecks": "cd plugins/wikipedia && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Distinguish JSON parse errors from notFound in get-page-views.ts catch block",
+      "description": "In plugins/wikipedia/src/tools/get-page-views.ts, the catch block at lines 44-47 converts any non-ToolError exception to ToolError.notFound, including SyntaxError from response.json() on malformed responses. When the Wikimedia API returns a malformed JSON body, the AI receives 'Page view data not found' which is incorrect — the article exists but the API returned bad data. Map SyntaxError to ToolError.internal and keep the notFound mapping only for the genuine not-found case.",
+      "acceptanceCriteria": [
+        "SyntaxError from response.json() is caught and thrown as ToolError.internal (not notFound)",
+        "ToolError instances are still re-thrown as-is (ToolError.notFound from fetchFromPage on 404 propagates correctly)",
+        "Network errors that are not ToolError are thrown as ToolError.internal"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- plugins/wikipedia/src/tools/get-page-views.ts (fix catch block, lines 41-47)\n\nContext:\nCurrent code (lines 40-47):\n  try {\n    const response = await fetchFromPage(url, { credentials: 'omit' });\n    data = (await response.json()) as PageViewResponse;\n  } catch (e) {\n    if (e instanceof ToolError) throw e;\n    throw ToolError.notFound(`Page view data not found for \"${params.title}\" in the given date range`);\n  }\n\nThe issue: `response.json()` can throw SyntaxError if the Wikimedia API returns malformed JSON. This is caught and converted to notFound (wrong — the data failed to parse, not that it was not found).\n\nFix:\n  } catch (e) {\n    if (e instanceof ToolError) throw e;\n    if (e instanceof SyntaxError) {\n      throw ToolError.internal(`Failed to parse Wikimedia API response for \"${params.title}\"`);\n    }\n    throw ToolError.notFound(`Page view data not found for \"${params.title}\" in the given date range`);\n  }\n\nNote: fetchFromPage throws a ToolError on 404 (not a plain Error), so `e instanceof ToolError` at line 45 correctly handles real 404 notFound cases — they propagate as ToolError.notFound. The remaining non-ToolError exceptions are SyntaxError (bad JSON) or other network errors. Mapping SyntaxError to internal and keeping network errors as notFound (or also mapping to internal) is the correct fix.\n\nConstraints:\n- Do NOT change the URL construction or fetchFromPage call\n- The ToolError re-throw at line 45 must remain\n- credentials: 'omit' is correct for the cross-origin Wikimedia API — do not change it"
+    }
+  ]
+}

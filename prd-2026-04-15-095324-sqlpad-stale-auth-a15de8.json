@@ -1,0 +1,23 @@
+{
+  "project": "OpenTabs Plugin — sqlpad",
+  "description": "Fix module-level cachedAuth never being cleared: once populated by waitForAuth(), it persists indefinitely so session expiry is not detected and subsequent tool calls use stale auth.",
+  "workingDirectory": "plugins/sqlpad",
+  "qualityChecks": "cd plugins/sqlpad && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Clear cachedAuth on 401 errors and in teardown()",
+      "description": "In plugins/sqlpad/src/sqlpad-api.ts, `let cachedAuth: { userId: string } | null = null` (line 11) is set by waitForAuth() and never cleared. When a SQLPad session expires, all tool calls still pass the `cachedAuth !== null` check in ensureAuth() and proceed with stale auth until the API returns 401. But there is no 401 handler that clears the cache — the 401 is surfaced as a ToolError.auth but cachedAuth remains set, so future calls also skip the re-auth check. Add cache invalidation on 401 errors and in teardown().",
+      "acceptanceCriteria": [
+        "cachedAuth is set to null when a 401 or 403 ToolError.auth is thrown by API calls",
+        "cachedAuth is set to null in the plugin's teardown() method",
+        "After clearAuthCache, the next tool call re-runs waitForAuth() to re-establish the session"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/sqlpad/src/sqlpad-api.ts (add clearAuth() export, handle 401 responses)\n- plugins/sqlpad/src/index.ts (add teardown() that calls clearAuth())\n\nContext:\nIn sqlpad-api.ts (line 11):\n  let cachedAuth: { userId: string } | null = null;\n\nwaitForAuth() sets this at line ~25 when /api/app returns currentUser.id. ensureAuth() at lines ~41-45 throws ToolError.auth if cachedAuth is null, but if cachedAuth is SET (even stale), it returns the stale userId.\n\nThe SQLPad api() function makes fetch() calls. When SQLPad returns 401 (session expired), the code throws ToolError.auth. But cachedAuth is never cleared, so the next tool call re-enters with the same stale auth.\n\nFix approach:\n1. Add `export const clearAuth = (): void => { cachedAuth = null; };` in sqlpad-api.ts\n2. In the api() function error handler, if the error is ToolError with category 'auth', call clearAuth() before re-throwing\n3. In index.ts, add teardown() that calls clearAuth()\n\nRead the full sqlpad-api.ts to understand how api() handles errors before implementing the 401 handler.\n\nConstraints:\n- Do NOT change the waitForAuth() polling logic — it should be called again naturally the next time ensureAuth() runs and finds cachedAuth === null\n- Only clear cachedAuth on auth errors (401/403), not on other error types\n- The userId in cachedAuth is only used to identify the current user, not for authentication headers — verify how it's used before deciding what 'stale' means"
+    }
+  ]
+}

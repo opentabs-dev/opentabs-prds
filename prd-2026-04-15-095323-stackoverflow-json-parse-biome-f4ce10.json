@@ -1,0 +1,38 @@
+{
+  "project": "OpenTabs Plugin — stackoverflow",
+  "description": "Fix two bugs in stackoverflow-api.ts: (1) response.json() called before response.ok check, causing SyntaxError crash on non-JSON 5xx error pages; (2) biome-ignore lint suppression comments that violate project conventions.",
+  "workingDirectory": "plugins/stackoverflow",
+  "qualityChecks": "cd plugins/stackoverflow && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Move response.json() call after response.ok check in stackoverflow-api.ts",
+      "description": "In plugins/stackoverflow/src/stackoverflow-api.ts, the api() function calls response.json() at line 70 unconditionally, BEFORE checking response.ok at line 81. When the Stack Exchange CDN returns a 502/504 error with an HTML body, response.json() throws a SyntaxError that propagates uncategorized. Move the response.json() call after response.ok is checked, so HTTP errors get classified before JSON parsing.",
+      "acceptanceCriteria": [
+        "In stackoverflow-api.ts, response.json() is only called after confirming response.ok is true",
+        "Non-ok responses with non-JSON bodies are handled gracefully (e.g., throw ToolError.internal with the response status)",
+        "The existing SE API error_id handling (lines 72-79) still works for SE-format JSON error responses on ok responses"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/stackoverflow/src/stackoverflow-api.ts (restructure response handling)\n\nContext:\nCurrent flow (lines 56-89):\n  response = await fetch(url, ...) // raw fetch, correct for public unauthenticated SE API\n  const body = await response.json() // line 70 — PROBLEM: unconditional\n  if (body.error_id) { throw ... }  // SE-specific errors\n  if (!response.ok) { throw ... }   // HTTP errors — but body.json() already threw if non-JSON\n\nThe SE API uses application-layer error codes (error_id) on 200 responses. The response.ok check was intended as a fallback for transport-level errors. But if the CDN returns a 502 with HTML, response.json() throws SyntaxError before the !response.ok check runs.\n\nRequired new flow:\n1. Check response.ok first\n2. If !response.ok, throw ToolError.internal with the status (no JSON parsing)\n3. Only if response.ok, parse JSON and check body.error_id\n\nBUT there is a subtlety: The Stack Exchange API returns 200 with body.error_id for most errors, but may also use non-200 status codes. The existing code checks body.error_id BEFORE !response.ok, suggesting the API sometimes returns non-200 with SE-format error bodies. The safe approach:\n  - If !response.ok AND body cannot be parsed as JSON → throw ToolError.internal with status\n  - If !response.ok AND body is valid SE-format JSON with error_id → still classify via error_id\n  - If response.ok → parse body and check error_id, backoff\n\nSimplest correct fix:\n  const text = await response.text();\n  let body: unknown;\n  try { body = JSON.parse(text); } catch { body = null; }\n  \n  if (body && typeof body === 'object' && (body as any).error_id) {\n    // SE error handling\n  }\n  if (!response.ok) {\n    throw ToolError.internal(`HTTP ${response.status}: ${endpoint}`);\n  }\n  // Now body is guaranteed to be valid SE response\n\nConstraints:\n- Do NOT change the function signature or caller interface\n- The existing body.backoff check must still run after error_id and ok checks\n- This is a raw fetch() to the public Stack Exchange API — do NOT change to fetchFromPage (which would add credentials; the SE API is cross-origin and does not need session cookies)"
+    },
+    {
+      "id": "US-002",
+      "title": "Remove biome-ignore lint suppression comments in stackoverflow plugin",
+      "description": "plugins/stackoverflow/src/stackoverflow-api.ts and plugins/stackoverflow/src/tools/schemas.ts contain biome-ignore lint comments suppressing noExplicitAny, which violates the project's convention (CLAUDE.md: 'NEVER use biome-ignore comments'). Replace the any types with unknown and add proper type-narrowing in the mapper functions.",
+      "acceptanceCriteria": [
+        "No biome-ignore comments remain in stackoverflow-api.ts or tools/schemas.ts",
+        "The SEResponse.items type uses unknown (or a properly typed interface) instead of Record<string, any>[]",
+        "The biome lint rule for noExplicitAny passes without suppression"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/stackoverflow/src/stackoverflow-api.ts (SEResponse interface, line ~93)\n- plugins/stackoverflow/src/tools/schemas.ts (RawData type, line ~91)\n\nContext:\nThe SEResponse interface has:\n  // biome-ignore lint/suspicious/noExplicitAny: SE API returns untyped JSON\n  items: Record<string, any>[];\n\nAnd schemas.ts has a similar RawData type using any.\n\nChanges:\n1. Change `Record<string, any>[]` to `Record<string, unknown>[]` in SEResponse.items\n2. In schemas.ts, change RawData from `Record<string, any>` to `Record<string, unknown>`\n3. Update any code that accesses items properties to use type assertions (e.g., `item.title as string` or optional chaining with type narrowing)\n4. Remove the biome-ignore comments\n\nConstraints:\n- Do NOT change the API call logic\n- The mapper functions in tool files may need to add explicit type assertions when accessing item fields — that is acceptable and correct\n- Do NOT add type assertions using 'as any' (that would just move the any elsewhere)"
+    }
+  ]
+}

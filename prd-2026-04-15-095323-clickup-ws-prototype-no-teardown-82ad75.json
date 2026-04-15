@@ -1,0 +1,23 @@
+{
+  "project": "OpenTabs Plugin — clickup",
+  "description": "Fix WebSocket.prototype.send being permanently patched with no teardown: the ClickUp plugin intercepts WebSocket.prototype.send to capture session tokens but never restores the original method.",
+  "workingDirectory": "plugins/clickup",
+  "qualityChecks": "cd plugins/clickup && npm run build && npm run type-check && npm run lint && npm run format:check",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Restore WebSocket.prototype.send in teardown() when the ClickUp adapter is deactivated",
+      "description": "In plugins/clickup/src/clickup-api.ts, installWsInterceptor() overwrites WebSocket.prototype.send at module load (line 66 calls it immediately), but the OrigSend reference is scoped inside the function and there is no teardown(). The global WebSocket prototype stays patched for the tab's lifetime. Save OrigSend at module level and add a teardown() method to the plugin class that restores it.",
+      "acceptanceCriteria": [
+        "After teardown(), WebSocket.prototype.send is the original browser method",
+        "The __cu_ws_interceptor_installed flag is reset to false in teardown() so re-injection works correctly",
+        "The ClickUpPlugin class in index.ts implements a teardown() method that restores the original send"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- plugins/clickup/src/clickup-api.ts (save OrigSend at module level, export resetWsInterceptor)\n- plugins/clickup/src/index.ts (add teardown() method)\n\nContext:\nCurrent installWsInterceptor() (lines 40-66):\n  const installWsInterceptor = (): void => {\n    const g = globalThis as Record<string, unknown>;\n    if (g.__cu_ws_interceptor_installed) return;\n    g.__cu_ws_interceptor_installed = true;\n\n    const OrigSend = WebSocket.prototype.send; // LOCAL variable — not accessible from outside\n    WebSocket.prototype.send = function (data) {\n      // intercepts JSON auth frames to capture JWT and teamId\n      return OrigSend.call(this, data);\n    };\n  };\n  installWsInterceptor(); // called at module load\n\nThe OrigSend is a local variable inside the function closure. It needs to be elevated to module level.\n\nFix:\n1. In clickup-api.ts, add a module-level variable: `let origWsSend: typeof WebSocket.prototype.send | null = null;`\n2. In installWsInterceptor(), save the original: `origWsSend = WebSocket.prototype.send;` BEFORE overwriting\n3. Export a new function `resetWsInterceptor()` that:\n   - Restores WebSocket.prototype.send from origWsSend (if set)\n   - Sets (globalThis as any).__cu_ws_interceptor_installed = false\n   - Sets origWsSend = null\n4. In index.ts, add teardown() that calls resetWsInterceptor()\n\nConstraints:\n- Do NOT change the JWT/teamId capture logic in the interceptor\n- resetWsInterceptor() must be a no-op if origWsSend is null (interceptor was never installed)\n- The __cu_ws_interceptor_installed guard must be reset so re-injection after teardown correctly re-installs the interceptor"
+    }
+  ]
+}
