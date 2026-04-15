@@ -14,7 +14,7 @@
         "The function still returns null if the webpack chunk is unavailable on first call"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- plugins/minimax-agent/src/minimax-api.ts (add module-level cache for the require function)\n\nContext:\nCurrent getWebpackRequire() (lines 29-50):\n  const getWebpackRequire = (): ((id: string | number) => unknown) | null => {\n    const cached = getAuthCache<{ hasAxios: true }>(CACHE_NS);  // only checks hasAxios, not req\n    const chunk = (globalThis as any).webpackChunk_N_E as ...;\n    if (!chunk) return null;\n    const probeId = `__ot_mx_${Date.now()}`;\n    let req: ... = null;\n    chunk.push([ [probeId], {}, r => { req = r; } ]);\n    if (!req && cached) clearAuthCache(CACHE_NS);\n    return req;\n  };\n\nEvery call to getWebpackRequire() appends to chunk, even when the require function was already obtained.\n\nFix: Add a module-level variable `let cachedRequire: ((id: string | number) => unknown) | null = null;` and return it early if set:\n  if (cachedRequire) return cachedRequire;\n  ...\n  if (req) cachedRequire = req;\n  return req;\n\nConstraints:\n- Do NOT remove the existing CACHE_NS auth cache logic (it tracks whether Axios was obtained, used by waitForAuth)\n- The module-level cachedRequire variable should be reset if the adapter is torn down (add `cachedRequire = null` in teardown if one exists in index.ts, or add a teardown method)\n- The probeId must still use Date.now() or a unique value to avoid webpack cache collisions on the one-time probe"
@@ -29,7 +29,7 @@
         "getAxios() still returns null if no matching module is found"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- plugins/minimax-agent/src/minimax-api.ts (replace getAxios() ID lookup with module scan)\n\nContext:\nCurrent getAxios() (lines 53-62):\n  const getAxios = (): AxiosInstance | null => {\n    const req = getWebpackRequire();\n    if (!req) return null;\n    try {\n      const mod = req(33993) as { ZP?: AxiosInstance } | undefined;\n      return mod?.ZP ?? null;\n    } catch {\n      return null;\n    }\n  };\n\nThe fix: iterate over webpack module IDs and look for a module whose export (or ZP export) has the characteristic Axios interface (`.get` and `.post` functions that return Promises). Use a range-bounded scan to avoid iterating over thousands of modules.\n\nApproach:\n1. Try req(33993) first as the known-good ID (fast path, still works until next deploy)\n2. If that fails, scan module IDs in a reasonable range (e.g., 30000-40000) looking for a module with mod.ZP?.get and mod.ZP?.post functions\n3. Cache the found ID in the module-level cache (from US-001) so the scan only runs once\n\nAlternatively, use the webpack module's string ID if available. Some webpack bundles expose modules by string IDs — check if webpackChunk_N_E entries use string keys.\n\nConstraints:\n- Do NOT make this synchronous-blocking — scanning must be bounded (try at most a few hundred IDs, not all webpack modules)\n- Do NOT add network requests to find the module ID\n- If no Axios-like module is found, return null gracefully (do not throw)\n- The cached module-level variable from US-001 should also cache the found Axios instance to avoid rescanning"
