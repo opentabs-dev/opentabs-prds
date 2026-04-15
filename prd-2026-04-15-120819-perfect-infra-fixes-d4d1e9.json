@@ -1,0 +1,55 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three concrete bugs in the perfect audit infrastructure: (1) perfect.sh never detects script failures because it waits on the wrong PID, silently reporting success even when audits fail; (2) run-prompt.sh suppresses all claude error output and parallel agents all write to the same /tmp/perfect-findings.md file causing data loss; (3) Docker containers launched by CLI audit scripts leak for 24 hours when perfect.sh is interrupted.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix FAILED counter in perfect.sh — it always shows 0 because wait uses the wrong PID",
+      "description": "perfect.sh launches each audit script as a pipeline `bash \"$f\" 2>&1 | ts_prefix \"$short\" &` and stores `$!` (the PID of ts_prefix, the last command in the pipeline) in PIDS[]. The wait loop then does `wait \"$pid\"` on ts_prefix, which always exits 0 (it just reads stdin until EOF). The exit code of `bash \"$f\"` is never observed, so FAILED is never incremented and perfect.sh always prints 'All N scripts completed successfully' even when every audit script fails. Fix by wrapping the pipeline in a subshell that exits with `bash \"$f\"`'s exit code, so `wait \"$pid\"` returns the correct status.",
+      "acceptanceCriteria": [
+        "When one or more perfect-*.sh scripts exit non-zero, perfect.sh exits non-zero and prints the failure count",
+        "When all scripts exit 0, perfect.sh exits 0 and prints success",
+        "`bash -n .ralph/perfect.sh` passes (valid bash syntax)",
+        "The PIDS array stores the PID of a subshell whose exit code equals the exit code of the wrapped `bash \"$f\"` invocation"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- .ralph/perfect.sh (wrap pipeline in subshell that exits with bash \"$f\"'s exit code)\n\nContext:\nThe bug is in the script launch loop (lines 66-79) and the wait loop (lines 103-113).\n\nCurrent broken launch code:\n```bash\nbash \"$f\" 2>&1 | ts_prefix \"$short\" &\nPIDS+=($!)\n```\n`$!` here is the PID of `ts_prefix`, not `bash \"$f\"`. `wait \"$pid\"` returns ts_prefix's exit code, which is always 0 (while loop that exits when stdin closes).\n\nFix: wrap in a subshell that propagates the pipeline's first-command exit code:\n```bash\n(bash \"$f\" 2>&1 | ts_prefix \"$short\"; exit \"${PIPESTATUS[0]}\") &\nPIDS+=($!)\n```\nNow `$!` is the PID of the subshell. `wait \"$pid\"` returns the subshell's exit code, which is `${PIPESTATUS[0]}` = the exit code of `bash \"$f\"`.\n\nThe wait loop (lines 103-113) does not need changes — it already does `if wait \"$pid\"; then ... else FAILED=((FAILED + 1)); fi` which is correct once the PID captures the right process.\n\nConstraints:\n- Do NOT change the ts_prefix function or how output is formatted\n- Do NOT change the NAMES array or cleanup logic\n- Do NOT change the signal trap\n- `${PIPESTATUS[0]}` is bash-specific and correct here; do not use `$?` (that would capture ts_prefix's exit code)"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix run-prompt.sh: remove stderr suppression and use per-invocation unique findings file",
+      "description": "run-prompt.sh has two independent bugs: (1) `claude ... 2>/dev/null` silently discards all error output from claude — if claude is not installed, has an invalid API key, or crashes, the user sees zero output and (combined with the FAILED counter bug in US-001) a false success. (2) All parallel audit agents are instructed to write to the same hardcoded path `/tmp/perfect-findings.md`. Since perfect.sh launches 8+ agents in parallel, concurrent file writes corrupt each other's findings. Fix both: remove `2>/dev/null` so claude errors are visible, and substitute a per-invocation unique path (using `$$`, the shell's PID) for every occurrence of `/tmp/perfect-findings.md` in the assembled prompt before passing it to claude.",
+      "acceptanceCriteria": [
+        "The claude invocation in run-prompt.sh no longer has `2>/dev/null` — claude errors appear on stderr",
+        "After `PROMPT` is fully assembled (perfect-prompt.md prepended + per-script prompt), all occurrences of the string `/tmp/perfect-findings.md` in `$PROMPT` are replaced with `/tmp/perfect-findings-$$.md` before passing to claude",
+        "Each concurrent run-prompt.sh invocation uses a different findings file path (one per shell PID)",
+        "`bash -n .ralph/run-prompt.sh` passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- .ralph/run-prompt.sh (two changes: remove 2>/dev/null, add path substitution)\n\nContext:\nTwo independent bugs in the same file.\n\nBug 1 — stderr suppression:\nLine 128 (current):\n```bash\nclaude \"${CLAUDE_ARGS[@]}\" < <(echo \"$PROMPT\") 2>/dev/null | stream_filter\n```\nFix: remove `2>/dev/null`:\n```bash\nclaude \"${CLAUDE_ARGS[@]}\" < <(echo \"$PROMPT\") | stream_filter\n```\nclaude's stderr will flow to run-prompt.sh's stderr, which is visible through the calling script's `2>&1` redirect in perfect.sh.\n\nBug 2 — findings file race condition:\nThe prompt building block (around lines 61-68) assembles the full prompt by prepending perfect-prompt.md. After this, ALL occurrences of `/tmp/perfect-findings.md` in both perfect-prompt.md and the per-script prompt need to be replaced with a unique per-invocation path.\n\nAdd this block AFTER the prompt is fully assembled (after the if block that prepends perfect-prompt.md), BEFORE the claude invocation:\n```bash\n# Use a per-invocation unique findings file to prevent race conditions when\n# multiple audit scripts run in parallel and write to the same file.\nFINDINGS_FILE=\"/tmp/perfect-findings-$$.md\"\nPROMPT=\"${PROMPT//\\/tmp\\/perfect-findings.md/$FINDINGS_FILE}\"\n```\n`$$` is the PID of the current run-prompt.sh shell — unique per invocation.\nThe bash `${var//pattern/replacement}` substitution replaces ALL occurrences.\nForward slashes in the pattern must be escaped as `\\/` in this context.\nForward slashes in `$FINDINGS_FILE` (the replacement) do NOT need escaping.\n\nConstraints:\n- Do NOT add a `--print` flag or change how prompts are constructed otherwise\n- Do NOT change the stream_filter function\n- Do NOT change the argument parsing section\n- The substitution must happen AFTER perfect-prompt.md is prepended (so references in the shared guidelines are also substituted) but BEFORE the claude invocation"
+    },
+    {
+      "id": "US-003",
+      "title": "Add Docker cleanup traps in perfect-cli-*.sh scripts to prevent container leaks on interrupt",
+      "description": "perfect-cli-user.sh, perfect-cli-plugin-developer.sh, and perfect-cli-platform-contributor.sh each instruct the Claude agent to `docker run --rm -d` a named container (opentabs-ux-test, opentabs-plugin-dev-test, opentabs-platform-contributor-test respectively). These containers run with `sleep 86400` and stay alive for 24 hours if not explicitly stopped. When perfect.sh is interrupted (Ctrl+C), it kills the claude processes but Docker containers are not children of claude and are unaffected — they leak. Add shell-level EXIT/SIGTERM/SIGINT traps in each script to stop the container on any exit path.",
+      "acceptanceCriteria": [
+        "perfect-cli-user.sh defines a trap that runs `docker kill opentabs-ux-test 2>/dev/null || true` on EXIT, SIGTERM, and SIGINT",
+        "perfect-cli-plugin-developer.sh defines a trap that kills `opentabs-plugin-dev-test` on EXIT, SIGTERM, and SIGINT",
+        "perfect-cli-platform-contributor.sh defines a trap that kills `opentabs-platform-contributor-test` on EXIT, SIGTERM, and SIGINT",
+        "`bash -n .ralph/perfect-cli-user.sh` passes (and same for the other two scripts)",
+        "The cleanup trap uses `|| true` so it doesn't fail if the container is already stopped or was never started"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- .ralph/perfect-cli-user.sh (add trap for opentabs-ux-test)\n- .ralph/perfect-cli-plugin-developer.sh (add trap for opentabs-plugin-dev-test)\n- .ralph/perfect-cli-platform-contributor.sh (add trap for opentabs-platform-contributor-test)\n\nContext:\nEach script has this structure:\n```bash\n#!/bin/bash\n# perfect-cli-XXX.sh — ...\nset -euo pipefail\n\nSCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n\nread -r -d '' PROMPT <<'PROMPT_EOF' || true\n...\nPROMPT_EOF\n\necho \"=== perfect-cli-XXX.sh ===\"\n...\necho \"$PROMPT\" | bash \"$SCRIPT_DIR/run-prompt.sh\"\n```\n\nThe Docker container names in the embedded prompts:\n- perfect-cli-user.sh: `opentabs-ux-test` (see `docker run ... --name opentabs-ux-test ...` in the heredoc)\n- perfect-cli-plugin-developer.sh: `opentabs-plugin-dev-test`\n- perfect-cli-platform-contributor.sh: `opentabs-platform-contributor-test`\n\nAdd the trap AFTER the SCRIPT_DIR assignment and BEFORE the heredoc, so it's active for the entire script lifetime:\n```bash\n# Kill the Docker test container on any exit (normal, error, or signal).\n# This prevents container leaks when perfect.sh is interrupted (Ctrl+C).\ncleanup_docker() {\n  docker kill opentabs-ux-test 2>/dev/null || true\n}\ntrap cleanup_docker EXIT SIGTERM SIGINT\n```\n\nUse the correct container name for each file (see above).\n\nConstraints:\n- The trap must be shell-level code OUTSIDE the heredoc (NOT inside the PROMPT heredoc)\n- Use both `EXIT` and signal traps: EXIT fires on normal exit, but signals (from perfect.sh's kill 0) require explicit SIGTERM/SIGINT traps\n- `docker rm` is not needed since containers use `--rm` flag (auto-removed on stop)\n- Do not change the PROMPT content (the heredoc) — only add the trap before it\n- Do not change the `echo | bash run-prompt.sh` invocation at the end"
+    }
+  ]
+}
