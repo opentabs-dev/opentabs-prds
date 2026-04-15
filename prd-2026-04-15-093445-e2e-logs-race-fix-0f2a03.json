@@ -1,0 +1,65 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix the server.logs.length = 0 race condition that causes spurious E2E test timeouts. The pattern `server.logs.length = 0; triggerHotReload(); waitForLog(server, 'X')` is racy: if the server already emitted message 'X' before the clear (due to async timing), the clear destroys the evidence and waitForLog then times out waiting for a second occurrence that may never arrive. Replace every instance with a count-snapshot approach: capture the count of existing 'X' occurrences before the action, trigger the action, then poll until the count increases.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix server.logs race in side-panel-realtime-state.e2e.ts and side-panel-instant-startup.e2e.ts",
+      "description": "Replace all `server.logs.length = 0` occurrences with the count-snapshot pattern to eliminate spurious waitForLog timeouts.",
+      "acceptanceCriteria": [
+        "No `server.logs.length = 0` remains in side-panel-realtime-state.e2e.ts or side-panel-instant-startup.e2e.ts",
+        "Each former clear site uses a pattern like: `const countBefore = server.logs.filter(l => l.includes(TARGET)).length; triggerAction(); await waitFor(() => server.logs.filter(l => l.includes(TARGET)).length > countBefore, timeout, 200, label)`",
+        "The existing `waitFor` helper from e2e/helpers.ts is used (not a new helper)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/side-panel-realtime-state.e2e.ts (3 occurrences to fix)\n- e2e/side-panel-instant-startup.e2e.ts (2 occurrences to fix)\n\nContext:\nThe pattern `server.logs.length = 0` is used to prevent waitForLog from finding a stale match when the same log message appears multiple times (e.g., 'Hot reload complete' or 'Config reload complete'). But clearing the array races with the server appending new logs: if the target log was already emitted before the clear, the clear removes it and waitForLog times out.\n\nThe correct fix is a count-snapshot approach: capture how many times the target message already appears, trigger the action, then wait until the count grows.\n\nThe `waitFor` helper in e2e/helpers.ts (signature: `waitFor(predicate, timeoutMs, intervalMs, label)`) can replace each occurrence.\n\nChanges for side-panel-realtime-state.e2e.ts:\n\nOccurrence 1 (~line 109):\n  BEFORE:\n    server.logs.length = 0;\n    await waitForLog(server, 'Config reload complete', 10_000);\n  AFTER:\n    const reloadCountBefore1 = server.logs.filter(l => l.includes('Config reload complete')).length;\n    await waitFor(() => server.logs.filter(l => l.includes('Config reload complete')).length > reloadCountBefore1, 10_000, 200, 'Config reload complete');\n  NOTE: The writeTestConfig call that precedes the clear triggers the reload — do NOT add a separate trigger.\n\nOccurrence 2 (~line 300):\n  Same pattern with 'Config reload complete'.\n\nOccurrence 3 (~line 351):\n  BEFORE:\n    server.logs.length = 0;\n    server.triggerHotReload();\n    (followed by waitForLog for hot reload)\n  AFTER:\n    const hotReloadBefore = server.logs.filter(l => l.includes('Hot reload complete')).length;\n    server.triggerHotReload();\n    await waitFor(() => server.logs.filter(l => l.includes('Hot reload complete')).length > hotReloadBefore, 20_000, 200, 'Hot reload complete');\n\nChanges for side-panel-instant-startup.e2e.ts:\n\nOccurrence 1 (~line 115):\n  BEFORE:\n    server.logs.length = 0;\n    server.triggerHotReload();\n    await waitForLog(server, 'Hot reload complete', 20_000);\n  AFTER:\n    const hotReloadBefore1 = server.logs.filter(l => l.includes('Hot reload complete')).length;\n    server.triggerHotReload();\n    await waitFor(() => server.logs.filter(l => l.includes('Hot reload complete')).length > hotReloadBefore1, 20_000, 200, 'Hot reload complete');\n\nOccurrence 2 (~line 199): Same pattern.\n\nConstraints:\n- Do NOT add a new helper function to helpers.ts — use the existing `waitFor` helper inline.\n- Do NOT remove the `server.triggerHotReload()` calls or change the surrounding test logic.\n- Do NOT change any assertions or test structure beyond replacing the log-clear pattern.\n- Import `waitFor` from './helpers.js' if not already imported in the file."
+    },
+    {
+      "id": "US-002",
+      "title": "Fix server.logs race in plugin-review.e2e.ts",
+      "description": "Replace all four `mcpServer.logs.length = 0` occurrences in plugin-review.e2e.ts with the count-snapshot approach.",
+      "acceptanceCriteria": [
+        "No `mcpServer.logs.length = 0` or `server.logs.length = 0` remains in plugin-review.e2e.ts",
+        "Each former clear site uses the count-snapshot pattern with waitFor",
+        "All four occurrences are fixed"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/plugin-review.e2e.ts (4 occurrences)\n\nContext:\nAll 4 occurrences follow the same pattern:\n  mcpServer.logs.length = 0;\n  mcpServer.triggerHotReload();\n  await waitForLog(mcpServer, 'Hot reload complete', 20_000);\n\nLocations:\n- ~line 357-359\n- ~line 383-385\n- ~line 445-447\n- ~line 599-601\n\nChanges (apply to all 4 occurrences):\n  BEFORE:\n    mcpServer.logs.length = 0;\n    mcpServer.triggerHotReload();\n    await waitForLog(mcpServer, 'Hot reload complete', 20_000);\n  AFTER:\n    const hotReloadBefore = mcpServer.logs.filter(l => l.includes('Hot reload complete')).length;\n    mcpServer.triggerHotReload();\n    await waitFor(() => mcpServer.logs.filter(l => l.includes('Hot reload complete')).length > hotReloadBefore, 20_000, 200, 'Hot reload complete');\n\nConstraints:\n- Use the existing `waitFor` helper from e2e/helpers.ts (already imported in this file as it uses other helpers).\n- Do NOT change any test logic, assertions, or surrounding code.\n- Each occurrence needs a uniquely-named counter variable (e.g., hotReloadBefore1, hotReloadBefore2, etc.) since they may appear in the same function scope."
+    },
+    {
+      "id": "US-003",
+      "title": "Fix server.logs race in adapter-files-eager.e2e.ts and adapter-hash.e2e.ts",
+      "description": "Replace all server.logs.length = 0 occurrences in adapter-files-eager.e2e.ts (3 occurrences) and adapter-hash.e2e.ts (4 occurrences). For adapter-hash.e2e.ts, also ensure sequential hot reload waiting in the loop.",
+      "acceptanceCriteria": [
+        "No `server.logs.length = 0` or `mcpServer.logs.length = 0` remains in either file",
+        "All 3 occurrences in adapter-files-eager.e2e.ts and all 4 in adapter-hash.e2e.ts use count-snapshot pattern",
+        "The hot reload loop in adapter-hash.e2e.ts correctly waits for each reload to complete before triggering the next"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/adapter-files-eager.e2e.ts (3 occurrences at ~lines 76, 120, 136)\n- e2e/adapter-hash.e2e.ts (4 occurrences — 2 standalone + 2 inside loops)\n\nFor adapter-files-eager.e2e.ts:\nAll 3 follow the same pattern:\n  BEFORE:\n    server.logs.length = 0;\n    server.triggerHotReload();\n    await waitForLog(server, 'Hot reload complete', 20_000);\n  AFTER:\n    const hotReloadBefore = server.logs.filter(l => l.includes('Hot reload complete')).length;\n    server.triggerHotReload();\n    await waitFor(() => server.logs.filter(l => l.includes('Hot reload complete')).length > hotReloadBefore, 20_000, 200, 'Hot reload complete');\n\nFor adapter-hash.e2e.ts:\nOccurrence 1 (~line 54) — standalone, waits for 'plugin(s) mapped':\n  BEFORE:\n    mcpServer.logs.length = 0;\n    mcpServer.triggerHotReload();\n    await waitForLog(mcpServer, 'plugin(s) mapped', 20_000);\n  AFTER:\n    const mappedBefore1 = mcpServer.logs.filter(l => l.includes('plugin(s) mapped')).length;\n    mcpServer.triggerHotReload();\n    await waitFor(() => mcpServer.logs.filter(l => l.includes('plugin(s) mapped')).length > mappedBefore1, 20_000, 200, 'plugin(s) mapped');\n\nOccurrences 2 and 4 — inside loops (~lines 104-109 and ~228-232):\n  The loop triggers 3 hot reloads. Each iteration must complete before the next trigger. The current code does this by awaiting waitForLog each iteration. With the fix:\n  BEFORE (per iteration):\n    mcpServer.logs.length = 0;\n    mcpServer.triggerHotReload();\n    await waitForLog(mcpServer, 'plugin(s) mapped', 20_000);\n  AFTER (per iteration):\n    const mappedBefore = mcpServer.logs.filter(l => l.includes('plugin(s) mapped')).length;\n    mcpServer.triggerHotReload();\n    await waitFor(() => mcpServer.logs.filter(l => l.includes('plugin(s) mapped')).length > mappedBefore, 20_000, 200, 'plugin(s) mapped');\n  The count-snapshot approach inherently ensures sequential waiting since each iteration captures the current count.\n\nOccurrence 3 (~line 186) — standalone:\n  Same pattern as occurrence 1.\n\nConstraints:\n- Use the existing `waitFor` helper from e2e/helpers.ts.\n- Each occurrence needs a unique counter variable name within its scope.\n- Do NOT change loop structure, assertions, or surrounding test logic.\n- In loop contexts, the counter variable can be declared inside the loop body (it's a new scope each iteration)."
+    },
+    {
+      "id": "US-004",
+      "title": "Fix server.logs race in multi-profile-diagnostics.e2e.ts and stress-config-reload Promise.all race",
+      "description": "Replace server.logs.length = 0 in multi-profile-diagnostics.e2e.ts (2 occurrences) and fix the concurrent config-write + POST-reload race in stress-config-reload.e2e.ts.",
+      "acceptanceCriteria": [
+        "No `mcpServer.logs.length = 0` remains in multi-profile-diagnostics.e2e.ts",
+        "In stress-config-reload.e2e.ts, the config write completes before POST /reload is sent (sequential, not concurrent via Promise.all)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/multi-profile-diagnostics.e2e.ts (2 occurrences)\n- e2e/stress-config-reload.e2e.ts (Promise.all race fix)\n\nFor multi-profile-diagnostics.e2e.ts:\n\nOccurrence 1 (~line 66):\n  BEFORE:\n    await waitForLog(mcpServer, 'plugin(s) mapped', 5_000);\n    mcpServer.logs.length = 0;\n    sendJsonRpc(wsBeta, 'tab.syncAll', { tabs: { 'e2e-test': { ... } } });\n    await waitForLog(mcpServer, 'plugin(s) mapped', 5_000);\n  AFTER:\n    await waitForLog(mcpServer, 'plugin(s) mapped', 5_000);\n    const mappedBefore1 = mcpServer.logs.filter(l => l.includes('plugin(s) mapped')).length;\n    sendJsonRpc(wsBeta, 'tab.syncAll', { tabs: { 'e2e-test': { ... } } });\n    await waitFor(() => mcpServer.logs.filter(l => l.includes('plugin(s) mapped')).length > mappedBefore1, 5_000, 200, 'new plugin(s) mapped from wsBeta');\n\nOccurrence 2 (~line 280): Same pattern.\n\nFor stress-config-reload.e2e.ts Promise.all race:\n\nThe current code fires config write and POST /reload concurrently:\n  BEFORE (~lines 77-84):\n    await Promise.all([\n      Promise.resolve().then(() => {\n        writeTestConfig(configDirRef, { localPlugins: [absPluginPath] });\n      }),\n      postReload(server.port, headers),\n    ]);\n  AFTER: Run sequentially so config write completes before reload reads disk:\n    writeTestConfig(configDir, { localPlugins: [absPluginPath] });\n    await postReload(server.port, headers);\n\n  The `postReload` call must be awaited. The `writeTestConfig` is synchronous (fs.writeFileSync). Running them sequentially is correct: disk write must complete before the server reads the config.\n\nConstraints:\n- Do NOT change test logic beyond these specific patterns.\n- For multi-profile-diagnostics, preserve the test's intent of detecting when wsBeta's tab sync triggers a new plugin mapping.\n- For stress-config-reload, do NOT restructure the test — only fix the ordering of the config write and the reload POST.\n- Check if `configDir` vs `configDirRef` variable is used after the fix to ensure the correct variable is passed."
+    }
+  ]
+}
