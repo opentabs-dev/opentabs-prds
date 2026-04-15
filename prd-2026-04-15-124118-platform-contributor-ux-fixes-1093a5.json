@@ -1,0 +1,66 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Fix three contributor experience issues found during platform audit: (1) DEP0190 deprecation warnings in dev mode and unit tests from unconditional shell:true child process spawning, (2) incorrect npm run check description in CONTRIBUTING.md that omits build:plugins and storybook:build steps, (3) misleading error message in opentabs-plugin build when tsc exits 0 but emits no files due to stale tsbuildinfo.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Fix DEP0190 deprecation warning in dev.ts from unconditional shell:true",
+      "description": "Fix the Node.js DEP0190 deprecation warning in scripts/dev.ts by replacing the unconditional shell:true on execFileSync with an execSync call using a string command. The warning fires on every npm run dev on Linux/Mac and will become a fatal error in a future Node.js version.",
+      "acceptanceCriteria": [
+        "scripts/dev.ts no longer uses execFileSync with both args array and shell:true",
+        "Running npm run dev on Linux does not print DEP0190 warning during lefthook install step",
+        "lefthook install is still executed at dev startup (non-fatal if fails)"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- scripts/dev.ts (replace execFileSync call with execSync string command)\n\nContext:\nNode.js 24 introduced DEP0190: 'Passing args to a child process with shell option true can lead to security vulnerabilities, as the arguments are not escaped, only concatenated.' This fires when spawn/execFileSync is called with both an args array AND shell:true. The dev.ts file runs lefthook install at startup to keep git hooks up-to-date after lefthook version bumps.\n\nCurrent code (scripts/dev.ts, lines 383-390):\n```\nconst { execFileSync } = await import('node:child_process');\ntry {\n  execFileSync('npx', ['lefthook', 'install'], { cwd: ROOT, stdio: 'ignore', shell: true });\n} catch {\n  // Non-fatal — lefthook may not be installed yet (first clone before npm install)\n}\n```\n\nChanges:\nReplace execFileSync with execSync using a single string command (no args array, so no DEP0190):\n```\nconst { execSync } = await import('node:child_process');\ntry {\n  execSync('npx lefthook install', { cwd: ROOT, stdio: 'ignore' });\n} catch {\n  // Non-fatal — lefthook may not be installed yet (first clone before npm install)\n}\n```\nThis is safe on all platforms: on Windows, npx resolves .cmd shims via PATH regardless of shell:true; execSync with a string command uses sh on Unix, cmd.exe on Windows — both resolve npx correctly.\n\nConstraints:\n- Do NOT change the surrounding block structure (the IIFE-style block with braces, lines 383-390)\n- Do NOT change any other spawn/exec calls in the file\n- The catch block must remain as-is (non-fatal fallback)"
+    },
+    {
+      "id": "US-002",
+      "title": "Fix DEP0190 deprecation warning in create-plugin test from unconditional shell:true",
+      "description": "Fix the Node.js DEP0190 deprecation warning in platform/create-plugin/src/index.test.ts by making shell:true conditional on Windows only. The test unconditionally applies shell:true on all platforms even though the comment says it's only needed on Windows.",
+      "acceptanceCriteria": [
+        "platform/create-plugin/src/index.test.ts uses shell:true only on process.platform === 'win32'",
+        "Running npm run test on Linux/Mac does not print DEP0190 warning from index.test.ts",
+        "The scaffolded plugin build test still passes on all platforms"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/create-plugin/src/index.test.ts (make shell:true conditional on Windows)\n\nContext:\nThe test uses spawnSync with shell:true unconditionally. The comment explains it's for Windows .cmd scripts, but it fires DEP0190 on Linux/Mac too.\n\nCurrent code (index.test.ts, lines 266-267):\n```\n// shell: true is required on Windows where npm is a .cmd script\nconst spawnOpts = { cwd: projectDir, env: buildEnv, shell: true } as const;\n```\nThis spawnOpts object is used at lines 270, 278, 286, 291 (install, build, lint, format:check runs).\n\nChanges:\nMake shell:true conditional:\n```\n// shell: true is required on Windows where npm is a .cmd script\nconst spawnOpts = { cwd: projectDir, env: buildEnv, shell: process.platform === 'win32' } as const;\n```\nThe `as const` still applies. Since `process.platform === 'win32'` evaluates to a boolean, this is type-safe.\n\nConstraints:\n- Only change line 267 — do NOT change any of the four spawnSync call sites (they just use spawnOpts)\n- Do NOT change the comment on line 266\n- Do NOT add any new import"
+    },
+    {
+      "id": "US-003",
+      "title": "Fix misleading error message in plugin-tools build when tsc emits no files",
+      "description": "Improve the error message in platform/plugin-tools/src/commands/build.ts when tsc exits 0 but the expected entry point file is not created. The current message says 'Check your tsconfig.json outDir setting' but the most common actual cause is a stale tsconfig.tsbuildinfo file.",
+      "acceptanceCriteria": [
+        "Error message at build.ts line 1084 mentions tsconfig.tsbuildinfo as the likely cause",
+        "Error message instructs the user to delete tsconfig.tsbuildinfo and retry",
+        "Error message still mentions tsconfig.json as a secondary check"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- platform/plugin-tools/src/commands/build.ts (update error message at line 1084)\n\nContext:\nWhen a stale tsconfig.tsbuildinfo exists alongside a deleted dist/ directory, tsc considers everything up-to-date (incremental mode) and exits 0 without emitting any files. The build.ts error handler then throws a misleading message pointing to tsconfig.json. This is a known pain point: delete dist/, keep tsbuildinfo, run opentabs-plugin build — get 'Check your tsconfig.json outDir setting' which points to the wrong thing.\n\nCurrent code (build.ts, line 1084):\n```\nthrow new Error(`tsc succeeded but ${entryPoint} was not created. Check your tsconfig.json outDir setting.`);\n```\n\nChanges:\nUpdate the error message to name the actual most common cause:\n```\nthrow new Error(`tsc succeeded but ${entryPoint} was not created. If you deleted dist/ manually, delete tsconfig.tsbuildinfo and retry. Otherwise, check your tsconfig.json outDir setting.`);\n```\n\nConstraints:\n- Only change this one string literal at line 1084 inside the if-block checking `!(await access(entryPoint)...)`\n- Do NOT change surrounding code — the check, the try/catch, or any other error messages in this function\n- The variable `entryPoint` must remain interpolated (it's the actual path, not a hardcoded string)"
+    },
+    {
+      "id": "US-004",
+      "title": "Fix npm run check description in CONTRIBUTING.md to include build:plugins and storybook:build",
+      "description": "Update CONTRIBUTING.md to accurately describe what npm run check actually runs. The current description omits build:plugins (builds all 114 plugins, takes minutes, modifies plugin lockfiles) and storybook:build, causing contributor confusion about why check takes much longer than expected.",
+      "acceptanceCriteria": [
+        "CONTRIBUTING.md inline comment for npm run check mentions build:plugins and storybook:build",
+        "CONTRIBUTING.md table row for npm run check accurately describes all steps",
+        "No other text in CONTRIBUTING.md is changed"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "sonnet",
+      "notes": "Files:\n- CONTRIBUTING.md (update two places that describe npm run check)\n\nContext:\nThe actual npm run check script (package.json) is:\nnpm run build && npm run build:plugins && npm run storybook:build && npm run lint && npm run format:check && npm run knip && npm run test\n\nTwo places in CONTRIBUTING.md describe this incorrectly:\n\n1. Inline comment (line 105):\n```\nnpm run check       # build + lint + format:check + knip + unit tests\n```\nMissing: build:plugins and storybook:build\n\n2. Table row (line 121):\n```\n| `npm run check`            | All root checks (build + lint + format:check + knip + unit tests) |\n```\nMissing: build:plugins and storybook:build\n\nChanges:\n\n1. Update line 105:\n```\nnpm run check       # build + build:plugins + storybook:build + lint + format:check + knip + unit tests\n```\n\n2. Update line 121 table row:\n```\n| `npm run check`            | All root checks (build + build:plugins + storybook:build + lint + format:check + knip + unit tests) |\n```\n\nConstraints:\n- Only change these two lines — do NOT restructure or reformat the surrounding table\n- Do NOT add new rows or sections\n- Preserve the exact column alignment style of the surrounding table rows (pad with spaces if needed to maintain the pipe-aligned format)"
+    }
+  ]
+}
