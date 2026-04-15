@@ -11,7 +11,7 @@
         "`ws.close()` is called even when any assertion between the WebSocket creation and the end of the try body throws"
       ],
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "Files:\n- e2e/security.e2e.ts (move ws.close() into finally block)\n\nContext:\nThe test `concurrent setToolPermission calls with WebSocket` (around line 670 in security.e2e.ts) creates a raw WebSocket:\n```ts\nconst { wsUrl, wsSecret } = await fetchWsInfo(server.port, server.secret);\nconst ws = new WebSocket(wsUrl, [...]);\n```\nAt the end of the test body:\n```ts\n      ws.close();        // <-- line ~773, outside finally\n    } finally {\n      await server.kill();\n      cleanupTestConfigDir(configDir);\n    }\n```\nThe fix is:\n```ts\n    } finally {\n      ws.close();        // <-- moved here\n      await server.kill();\n      cleanupTestConfigDir(configDir);\n    }\n```\n\nConstraints:\n- Do NOT change anything else in the test logic\n- `ws.close()` should be the FIRST statement in the finally block so it runs before the server is killed (closing the WS client before the server is cleaner)"
@@ -25,7 +25,7 @@
         "The reset is in a finally block so it runs even if the test throws"
       ],
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "sonnet",
       "notes": "Files:\n- e2e/strict-csp.e2e.ts (add try/finally with connect-src reset for the connect-src:'none' test)\n\nContext:\nLocate the test that calls `set-connect-src` with `connectSrcNone: true`. The pattern to fix:\n```ts\nawait strictCspServer.control('set-connect-src', { connectSrcNone: true });\n\nconst page = await openTestAppTab(extensionContext, strictCspServer.url, mcpServer);\n// ... assertions ...\nawait page.close();\n// no reset!\n```\nThe fix:\n```ts\nawait strictCspServer.control('set-connect-src', { connectSrcNone: true });\ntry {\n  const page = await openTestAppTab(extensionContext, strictCspServer.url, mcpServer);\n  try {\n    // ... assertions ...\n  } finally {\n    await page.close();\n  }\n} finally {\n  await strictCspServer.control('set-connect-src', { connectSrcNone: false }).catch(() => {});\n}\n```\nNote: `.catch(() => {})` is a best-effort since the test server might be in a bad state.\n\nConstraints:\n- Do NOT change the test's assertions\n- Only add the cleanup guarantee"
@@ -40,7 +40,7 @@
         "The URL assertion checks the ACTUAL port the homepageServer bound to, not a hardcoded 9876"
       ],
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "e2eCheckpoint": false,
       "model": "opus",
       "notes": "Files:\n- e2e/side-panel-open-tab.e2e.ts (fix homepageServer port and close)\n\nContext:\nThe test creates an http.Server and listens on port 9876:\n```ts\nhomepageServer.listen(9876, resolve);  // hardcoded port\n```\nWith an EADDRINUSE fallback:\n```ts\nhomepageServer.once('error', (err) => {\n  if (err.code === 'EADDRINUSE') {\n    homepageServer.listen(0, resolve);  // fallback to random port\n  }\n});\n```\nBut then the URL assertion uses the hardcoded port:\n```ts\nexpect(newPage.url()).toContain('localhost:9876');\n```\nAnd cleanup:\n```ts\nhomepageServer.close();  // fire and forget\n```\n\nFix:\n1. Always use port 0 (dynamic) from the start:\n```ts\nhomepageServer.listen(0, () => {\n  const homepagePort = (homepageServer.address() as net.AddressInfo).port;\n  resolve();\n});\n```\n2. Store the actual port and use it in the URL assertion:\n```ts\nexpect(newPage.url()).toContain(`localhost:${String(homepagePort)}`);\n```\n3. Wrap close() in a Promise:\n```ts\nawait new Promise<void>(resolve => homepageServer.close(() => resolve()));\n```\n\nThe test needs to import `import net from 'node:net'` if not already imported, or read the port via `(homepageServer.address() as net.AddressInfo).port`.\n\nConstraints:\n- Do NOT change the test's assertion about the page URL behavior — just fix what port it checks\n- The server still needs to serve the same 'homepage-test' content at the root path"
