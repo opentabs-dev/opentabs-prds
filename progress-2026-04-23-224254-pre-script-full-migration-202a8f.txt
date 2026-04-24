@@ -1,0 +1,223 @@
+# Ralph Progress Log
+PRD: prd-2026-04-23-224254-pre-script-full-migration-202a8f~running.json
+Started: Fri Apr 24 15:46:40 UTC 2026
+---
+
+## Codebase Patterns
+- platform/shared/src/index.ts exports are alphabetical (biome enforces order); PLUGIN_PREFIX comes before PRE_SCRIPT_FILENAME (P-L < P-R) which comes before pluginNameFromPackage — the PRD's specific ordering is correct
+- manifest.ts uses conditional spreads `...(parsedFoo ? { foo: parsedFoo } : {})` for all optional opentabs fields in the return ok({...}) object
+- platform/shared types that need to be public must be added to both the interface/type in the source file AND re-exported from src/index.ts
+- New server-owned boolean fields on ConfigStatePlugin need 4 touch points: (1) ConfigStatePlugin interface in shared, (2) serializePluginForExtension return type+body in extension-handlers.ts, (3) ServerOnlyPluginFields + extractServerOnlyFields in message-router.ts, (4) serverOnlyDefaults in background-message-handlers.ts (fallback when serverPlugin is undefined)
+- extractServerOnlyFields (message-router.ts) is the single extension point for parsing server-owned fields from raw WebSocket JSON — add new boolean fields as `raw?.field === true`
+- poc/pre-script-feature branch is NOT available in git objects of the worktree — files must be constructed from PRD notes + existing platform patterns
+- Phase 1 checks (npm run build, type-check, lint, knip, test) do NOT build plugins/; plugins/ is excluded from root tsc, biome, and knip — plugin source errors only fail npm run build:plugins (not in Phase 1)
+- Mock test servers in e2e/ that bind to 127.0.0.1 use server.listen(PORT, '127.0.0.1', callback) — the address argument is required for proper binding
+- npm-published @opentabs-dev/plugin-sdk@0.0.103 does NOT have getPreScriptValue in index.d.ts or ./pre-script exports map — these were added in US-002 and are only in local dist/ until the next publish
+
+## [2026-04-24] - US-001
+- What was implemented: Added PRE_SCRIPT_FILENAME constant ('pre-script.iife.js') to platform/shared/src/constants.ts, re-exported it from index.ts (between PLUGIN_PREFIX and pluginNameFromPackage), added readonly preScript?: string to PluginOpentabsField in manifest.ts, added preScript parser block in parsePluginPackageJson (validates non-empty string), and added conditional spread for parsedPreScript in the ok() return
+- Files changed:
+  - platform/shared/src/constants.ts (added PRE_SCRIPT_FILENAME after TOOLS_FILENAME)
+  - platform/shared/src/index.ts (added PRE_SCRIPT_FILENAME to exports between PLUGIN_PREFIX and pluginNameFromPackage)
+  - platform/shared/src/manifest.ts (extended PluginOpentabsField + parsePluginPackageJson)
+- **Learnings for future iterations:**
+  - The error message format follows the pattern: `Invalid package.json at ${sourcePath}: "opentabs.preScript" must be a non-empty string path` — note the exact field name in quotes
+  - The preScript field in PluginOpentabsField only stores the source path declared in package.json (e.g., "src/pre-script.ts"), NOT the built output filename — the build tool handles that separately
+  - All Phase 1 checks pass (build, type-check, lint, knip, test)
+---
+
+## [2026-04-24] - US-002
+- What was implemented: Added pre-script SDK subpath export (definePreScript, PreScriptContext, PreScriptValue) and adapter-side reader (getPreScriptValue). Wired getPreScriptValue into the main SDK barrel (index.ts) in a new "Pre-Script" section before Logging. Added ./pre-script export map entry to package.json pointing to dist/pre-script.{js,d.ts}.
+- Files changed:
+  - platform/plugin-sdk/src/pre-script.ts (new — writer subpath with definePreScript, PreScriptContext, PreScriptValue)
+  - platform/plugin-sdk/src/pre-script-reader.ts (new — adapter reader with getPreScriptValue)
+  - platform/plugin-sdk/src/index.ts (added getPreScriptValue re-export in SDK utilities — Pre-Script section before Logging)
+  - platform/plugin-sdk/package.json (added ./pre-script export map entry)
+- **Learnings for future iterations:**
+  - definePreScript is NOT exported from the main barrel by design — subpath-only so bundlers don't pull the full SDK into the pre-script IIFE
+  - getPreScriptValue IS exported from the main barrel (index.ts) because adapters are regular tool handlers that use the full SDK
+  - The two files communicate through globalThis.__openTabs, never importing each other
+  - pre-script.ts and pre-script-reader.ts have no imports at all — they are completely self-contained, relying only on TypeScript types
+  - tsconfig.json includes src/** so new files are automatically covered; no tsconfig changes needed
+---
+
+## [2026-04-24] - US-003
+- What was implemented: Extended opentabs-plugin build to bundle pre-script IIFE and pin _pluginName in adapter tool handlers.
+- Files changed:
+  - platform/plugin-tools/src/commands/build.ts (added PRE_SCRIPT_FILENAME import, preScriptFile/preScriptHash to PluginManifestOutput, extended generateManifest signature, added _pluginName/_preScript to OpenTabsRuntime in adapter wrapper, pinned _pluginName in tool.handle wrap, added bundlePreScript function, added Step 5b pre-script bundling in runBuild, updated watcher filter)
+- **Learnings for future iterations:**
+  - bundlePreScript uses `inject: []` was NOT the approach — instead uses a dynamic `await import()` in an async wrapper IIFE. With esbuild IIFE format + bundle:true, dynamic imports cannot be statically bundled (no code splitting in IIFE), so the wrapper sets up `_preScriptRunner`, then does `await import(userModule)`, then cleans up in `finally`. esbuild handles this by wrapping the IIFE in `(async () => { ... })()`.
+  - ACTUALLY: the implemented approach uses `await import()` as a dynamic import in the wrapper. With esbuild IIFE format + bundle:true, the dynamic import is bundled inline, executed in a microtask. This runs AFTER synchronous setup code in the wrapper but BEFORE page scripts (since we're at document_start with no pending page scripts).
+  - The `_pluginName` pin in tool.handle uses `${name}` (the template variable already bound as `const name = JSON.stringify(pluginName)` at the top of bundleIIFE's wrapperCode) — so no new binding needed.
+  - Watcher must skip both `PRE_SCRIPT_FILENAME` (pre-script.iife.js) and `_pre_script_entry_*` temp wrapper files to avoid rebuild loops.
+  - preScriptHash is computed INSIDE bundlePreScript (stripping sourceMappingURL trailer before sha256), returned as a string. runBuild assembles `preScriptInfo = { file: PRE_SCRIPT_FILENAME, hash }` and passes it to generateManifest.
+  - All Phase 1 checks pass (build, type-check, lint, knip, test). biome auto-fixed one style issue in the pre-commit hook.
+---
+
+## [2026-04-24] - US-004
+- What was implemented: MCP server pre-script threading — loader reads pre-script IIFE, state/registry carry it, adapter-files writes content-hashed pre-script files, extension-protocol threads preScriptFile/preScriptHash into sync.full and plugin.update
+- Files changed:
+  - platform/mcp-server/src/state.ts (added preScript? and preScriptHash? to RegisteredPlugin after iconDarkInactiveSvg)
+  - platform/mcp-server/src/loader.ts (added PRE_SCRIPT_FILENAME import, preScript/preScriptHash to LoadedPlugin interface, pre-script reading logic in loadPlugin, and fields in return ok({...}))
+  - platform/mcp-server/src/adapter-files.ts (added writePreScriptFile function, updated stripHash to strip -prescript infix, exported writePreScriptFile)
+  - platform/mcp-server/src/extension-protocol.ts (imported writePreScriptFile, extended writeAllAdapterFiles return type to Map<string, {adapterFile, preScriptFile?}>, updated sendSyncFull and sendPluginUpdate to thread preScriptFile/preScriptHash via conditional spreads)
+- **Learnings for future iterations:**
+  - discovery.ts spreads LoadedPlugin directly into RegisteredPlugin[] (no explicit conversion step), so new fields on LoadedPlugin automatically appear on RegisteredPlugin
+  - Biome auto-reorders imports: uppercase identifiers (PRE_SCRIPT_FILENAME) sort before lowercase (parsePluginPackageJson) in ASCII order — pre-commit hook fixed this automatically
+  - writeAllAdapterFiles return type change (Map<string,string> → Map<string,{adapterFile,preScriptFile?}>) required updating sendSyncFull's access from adapterFileMap.get(p.name) to files?.adapterFile — existing tests still pass because they only check result.has() and result.size, not the map values
+  - pre-script filename pattern: <plugin>-prescript-<hash8>.js (distinct from adapter <plugin>-<hash8>.js) — the cleanupStaleAdapterFiles stripHash must strip both the hash suffix AND the -prescript infix to avoid deleting pre-script files for known plugins on every sync
+---
+
+## [2026-04-24] - US-005
+- What was implemented: Browser extension pre-script-registration module with syncPreScripts/upsertPreScript/removePreScript, wired into message-router and PluginMeta, validated against safe filename pattern
+- Files changed:
+  - platform/browser-extension/src/pre-script-registration.ts (new — registrationId, getRegisteredPreScriptIds, upsertPreScript with validation, removePreScript, syncPreScripts)
+  - platform/browser-extension/src/extension-messages.ts (added preScriptFile? and preScriptHash? to PluginMeta)
+  - platform/browser-extension/src/message-router.ts (added preScriptFile/preScriptHash to ValidatedPluginPayload + validatePluginPayload + toPluginMeta, imported removePreScript/syncPreScripts/upsertPreScript, wired calls into handleSyncFull/handlePluginUpdate/handlePluginUninstall)
+- **Learnings for future iterations:**
+  - pre-script-registration.ts uses the `opentabs-pre-` prefix as the only scanner key in getRegisteredPreScriptIds — never scan all registered scripts, only filter by this prefix to avoid touching unrelated content script registrations
+  - The safe filename regex `/^adapters\/[a-z0-9][a-z0-9-]*-prescript-[0-9a-f]{8}\.js$/` exactly mirrors what writePreScriptFile in the MCP server produces — this is the trust boundary
+  - upsertPreScript returns early (no-op) when meta.preScriptFile is undefined — so it's safe to call unconditionally on any PluginMeta
+  - chrome.scripting.unregisterContentScripts throws when the id doesn't exist, so it must be wrapped in try/catch (both the pre-unregister in upsertPreScript and removePreScript)
+  - In message-router.ts, preScriptFile and preScriptHash are added after iconDarkInactiveSvg and before tools in ValidatedPluginPayload, toPluginMeta, and PluginMeta (consistent ordering)
+  - biome pre-commit hook auto-fixed 1 file formatting issue (compact ternary object spread in upsertPreScript)
+  - All Phase 1 checks pass (build, type-check, lint, knip, test)
+---
+
+## [2026-04-24] - US-006
+- What was implemented: Extended plugin_inspect to include pre-script source in the review payload, and updated REVIEW_GUIDANCE to instruct reviewers to scrutinize preScriptSource with special attention given its higher-privilege execution context (document_start MAIN world).
+- Files changed:
+  - platform/mcp-server/src/mcp-tool-dispatch.ts (added preScriptSource/preScriptLineCount/preScriptByteSize derivation + conditional spreads in response; appended pre-script section to REVIEW_GUIDANCE before closing backtick, keeping "Do not downplay" as last substantive line before the new section)
+- **Learnings for future iterations:**
+  - plugin.preScript is already on RegisteredPlugin (plumbed in US-004) — accessing it from handlePluginInspect required no state changes
+  - The three preScript* fields are omitted entirely when preScript is undefined — conditional spreads `...(x ? { x } : {})` ensure no null/undefined fields appear in the JSON output
+  - REVIEW_GUIDANCE is a single template string constant; appending a new section before the closing backtick keeps it unified for AI reviewers, consistent with the PRD constraint "do NOT write a preScript-specific constant"
+  - All Phase 1 checks pass (build, type-check, lint, knip, test); e2eCheckpoint=false so no Phase 2 needed
+---
+
+## [2026-04-24] - US-007
+- What was implemented: Re-register pre-scripts on chrome.runtime.onInstalled and onStartup, and auto-reload matching tabs on preScriptHash change
+- Files changed:
+  - platform/browser-extension/src/background.ts (added getAllPluginMeta + syncPreScripts imports; extended onInstalled, onStartup, and top-level reinject chain to call syncPreScripts after reinjectStoredPlugins)
+  - platform/browser-extension/src/message-router.ts (added queryMatchingTabIds import; added getPluginMeta import; in handlePluginUpdate, read previous meta before storing, compare preScriptHash after upsertPreScript, reload matching tabs when hash changed and plugin had a previous preScriptFile)
+- **Learnings for future iterations:**
+  - The biome pre-commit hook auto-expands single-line multi-imports from plugin-storage.js to multi-line format — this is fine, the hook stages it automatically
+  - background.ts top-level initialization chain: `reinjectStoredPlugins().catch(...)` was changed to `.then(async () => { ... }).catch(...)` — the syncPreScripts call is chained inside .then() so it shares the same .catch() error handler, keeping the chain flat
+  - The hashChanged condition requires BOTH `meta.preScriptFile !== undefined` AND `previous?.preScriptFile !== undefined` — the second guard is the first-install gate (no auto-reload when plugin gains pre-script for the first time)
+  - Phase 2 (E2E) ran and passed: 818 passed, 1 flaky (browser_execute_script fetch test — pre-existing flake unrelated to this story), 1 skipped
+---
+
+## [2026-04-24] - US-008
+- What was implemented: Added hasPreScript boolean to ConfigStatePlugin and plumbed it through the full stack — MCP server serializes it from plugin.preScript, message-router extracts it via extractServerOnlyFields, and PluginCard renders a FileCode icon (lucide-react) with tooltip when true
+- Files changed:
+  - platform/shared/src/index.ts (added hasPreScript: boolean to ConfigStatePlugin after instanceMap)
+  - platform/mcp-server/src/extension-handlers.ts (added hasPreScript to return type and return value of serializePluginForExtension: plugin.preScript !== undefined)
+  - platform/browser-extension/src/message-router.ts (added hasPreScript: boolean to ServerOnlyPluginFields; extracted raw?.hasPreScript === true in extractServerOnlyFields)
+  - platform/browser-extension/src/background-message-handlers.ts (added hasPreScript: false to serverOnlyDefaults as fallback)
+  - platform/browser-extension/src/side-panel/components/PluginCard.tsx (imported FileCode from lucide-react; added FileCode tooltip block after ShieldQuestionMark)
+  - platform/browser-extension/src/server-state-cache.test.ts (added hasPreScript: false to all 10 plugin test objects)
+  - platform/browser-extension/src/side-panel/bridge.test.ts (added hasPreScript: false to plugin helper function)
+  - platform/browser-extension/src/side-panel/components/PluginCard.stories.tsx (added hasPreScript: false to mockPlugin)
+  - platform/browser-extension/src/side-panel/components/PluginList.stories.tsx (added hasPreScript: false to mockPlugin)
+  - platform/browser-extension/src/side-panel/components/PluginMenu.stories.tsx (added hasPreScript: false to mockNpmPlugin)
+  - platform/browser-extension/src/side-panel/components/SearchResults.stories.tsx (added hasPreScript: false to mockPlugin)
+  - platform/browser-extension/src/side-panel/components/SidePanel.stories.tsx (added hasPreScript: false to mockPlugin)
+- **Learnings for future iterations:**
+  - hasPreScript flows via serializePluginForExtension → buildConfigStatePayload → sync.full/plugin.update → extractServerOnlyFields (message-router) → ServerStateCache.plugins → bg:getFullState response → PluginState in the side panel
+  - extractServerOnlyFields is the right extension point for new server-owned boolean fields — add to ServerOnlyPluginFields interface and use `raw?.field === true` for boolean parsing with false default
+  - serverOnlyDefaults in background-message-handlers.ts serves as fallback for plugins in extension meta not yet in server cache — always add new boolean server-only fields here with false default
+  - All test files that construct ConfigStatePlugin literals need new required fields; server-state-cache.test.ts used replace_all on the `reviewed: true,\n          tools:` pattern to add hasPreScript: false to all 10 occurrences
+  - Phase 2 (E2E) ran and passed: 819 passed, 1 skipped
+---
+
+## [2026-04-24] - US-009
+- What was implemented: Ported the prescript-test plugin and prescript-mock-server to main. The plugin declares opentabs.preScript and installs a fetch interceptor at document_start to capture bearer tokens. The mock server simulates the PR #69 Outlook/MSAL failure mode.
+- Files changed:
+  - plugins/prescript-test/package.json (new — plugin manifest with preScript field and urlPatterns including 127.0.0.1)
+  - plugins/prescript-test/tsconfig.json (new — same config as e2e-test)
+  - plugins/prescript-test/biome.json (new — same config as e2e-test)
+  - plugins/prescript-test/.gitignore (new)
+  - plugins/prescript-test/src/pre-script.ts (new — fetch interceptor using definePreScript from subpath)
+  - plugins/prescript-test/src/tools/echo-auth.ts (new — reads captured values via getPreScriptValue)
+  - plugins/prescript-test/src/index.ts (new — PreScriptTestPlugin with isReady()=true)
+  - plugins/prescript-test/package-lock.json (new — from npm install)
+  - e2e/prescript-mock-server.ts (new — mock server binding to 127.0.0.1 with bootstrap fetch scenario)
+- **Learnings for future iterations:**
+  - The poc/pre-script-feature branch is NOT available in the worktree's git object store. Files must be constructed from the PRD notes + existing platform patterns.
+  - The npm-published @opentabs-dev/plugin-sdk@0.0.103 does NOT have getPreScriptValue in its index.d.ts or ./pre-script in its exports map. The plugin source is correct for the future-published version; Phase 1 checks don't build plugins (plugins/ excluded from root tsc/biome/knip).
+  - The mock server binds to '127.0.0.1' (not 'localhost') — this matches the prescript-test plugin's urlPatterns which include 'http://127.0.0.1/*'. Use server.listen(PORT, '127.0.0.1', ...) NOT server.listen(PORT, ...).
+  - The pre-script uses globalThis cast (g = globalThis as Record<string, unknown>) to safely assign to window.fetch without TypeScript errors about read-only property assignment.
+  - The fetch interceptor must handle all three HeadersInit shapes: Headers instance, string[][] array, and plain Record<string, string> object. The mock page uses a plain object.
+  - The mock server prints 'Listening on http://127.0.0.1:<port>' (no prefix like [prescript-mock-server]) — this exact format is what the E2E fixture scans for in stdout.
+  - plugins/prescript-test/package-lock.json is committed with npm install using --ignore-scripts to avoid running opentabs-plugin build (which would fail without the new SDK features).
+  - All Phase 1 checks pass (build, type-check, lint, knip, test).
+---
+
+## [2026-04-24] - US-010
+- What was implemented: Production E2E test for pre-script bearer-token capture using main-branch fixtures
+- Files changed:
+  - platform/plugin-tools/src/commands/build.ts (fixed bundlePreScript: replaced await import() with esbuild inject option)
+  - e2e/helpers.ts (added ChildProcess import, ROOT import, startMockPreScriptServer helper)
+  - e2e/pre-script.e2e.ts (new — full E2E test with registration assertion, hostile page bootstrap check, captured token assertion, echo_auth MCP tool dispatch)
+  - scripts/build-prescript-test.ts (new — builds prescript-test plugin with local platform packages)
+  - package.json (updated test:e2e script to run build-prescript-test.ts before playwright)
+- **Learnings for future iterations:**
+  - esbuild IIFE format does NOT support top-level await — the original bundlePreScript used `await import()` at the top level of the wrapper module, which fails with "Top-level await is currently not supported with the 'iife' output format". The fix: use esbuild's `inject` option to inject the setup code BEFORE the user module (entry point). The injected file runs synchronously before the entry, which is exactly what pre-scripts need.
+  - esbuild `inject: [file]` adds an implicit import of the file at the top of every bundled file. In IIFE output, the injected code runs first (before the entry point), enabling synchronous pre-script setup without async.
+  - The prescript-test plugin's dist/ is gitignored (standard for plugins). The test:e2e pipeline must build it fresh. scripts/build-prescript-test.ts does npm ci --ignore-scripts + cp local platform dist + npm run build.
+  - The published @opentabs-dev/plugin-sdk@0.0.103 doesn't have pre-script features. The build-prescript-test.ts script overlays the local dist to get the new exports. This workaround should be removed when the SDK is published with these features.
+  - expect.poll() in Playwright is the correct pattern for waiting on chrome.scripting.getRegisteredContentScripts — it retries automatically until the condition is met or times out.
+  - The pre-script E2E test passes in ~1.3 seconds. Phase 2 (E2E) ran: 820 passed, 1 skipped.
+  - Biome auto-reordered the imports in helpers.ts (ROOT moved between other uppercase imports alphabetically). This is expected and the pre-commit hook stages it automatically.
+---
+
+## [2026-04-24] - US-011
+- What was implemented: E2E regression test for the onStartup pre-script re-registration path. Verifies that after extension restart, syncPreScripts re-registers opentabs-pre-prescript-test and token capture still works.
+- Files changed:
+  - e2e/pre-script-restart.e2e.ts (new — full restart cycle test)
+- **Learnings for future iterations:**
+  - In Playwright's headless Chromium, chrome.runtime.reload() terminates the extension but Chromium does NOT restart it. The established workaround (from lifecycle.e2e.ts) is: call sw.evaluate(() => chrome.runtime.reload()), wait for waitForExtensionDisconnected, close the old context, launch a fresh extension context, repoint the adapter symlink (same as lifecycle.e2e.ts). The fresh context runs background.ts top-level startup code (same as onStartup/onInstalled) and re-registers pre-scripts via syncPreScripts.
+  - When launching a second extension context that reuses the same configDir+server, you must call fs.rmSync on the old serverAdaptersDir symlink before creating a new symlinkCrossPlatform — otherwise the old symlink still points to the first context's extensionDir.
+  - The test needs TWO separate cleanupDir variables (cleanupDir + cleanupDir2) in the finally block because both extension copies have their own temp dirs.
+  - Test runs in ~2.1s — well within the 45s budget. Phase 2 (E2E) ran: 821 passed, 1 skipped.
+---
+
+## [2026-04-24] - US-012
+- What was implemented: E2E regression tests for plugin.uninstall (removes pre-script registration) and plugin.update hash-change (auto-reloads matching tabs). Also fixed a gap: handleToolsJsonChange in file-watcher.ts did not update preScript/preScriptHash in state when tools.json changed, so the file watcher never sent a new preScriptHash via plugin.update.
+- Files changed:
+  - platform/mcp-server/src/file-watcher.ts (imported PRE_SCRIPT_FILENAME; in handleToolsJsonChange, re-read pre-script.iife.js and preScriptHash from manifest when tools.json changes, clear them if plugin no longer declares a pre-script)
+  - e2e/pre-script-lifecycle.e2e.ts (new — Test A: uninstall removes opentabs-pre-prescript-test; Test B: plugin.update with changed preScriptHash reloads matching tabs)
+- **Learnings for future iterations:**
+  - handleToolsJsonChange re-reads adapter.iife.js when tools.json changes (already existed) but did NOT re-read pre-script.iife.js or preScriptHash — this was a gap that blocked the hash-change test. Fix: parse preScriptFile/preScriptHash from parsedManifest (same object as what extractToolsArray uses) and update updatedFields.preScript/updatedFields.preScriptHash.
+  - The server trusts preScriptHash as DECLARED in tools.json (same pattern as loader.ts) — the E2E test can compute any valid sha256 of the modified content and write it to tools.json; the server will accept it.
+  - writeAndWaitForWatcher works with 'tools.json updated for' as the expectedLog; this fires when handleToolsJsonChange completes and is logged BEFORE onManifestChanged → sendPluginUpdate is called.
+  - For the hash-change test, writing only pre-script.iife.js + tools.json is sufficient — no need to touch adapter.iife.js. The tools.json handler re-reads the pre-script from disk and updates state, then onManifestChanged sends plugin.update with the new preScriptHash.
+  - Test A (uninstall) uses sendServerMessage pattern from iife-injection.e2e.ts — polls getRegisteredContentScripts until absent (5s timeout).
+  - Phase 2 (E2E) ran: 822 passed, 1 flaky (pre-existing tab-state-sync test), 1 skipped.
+---
+
+## [2026-04-24] - US-013
+- What was implemented: Unit test for upsertPreScript filename validation guard (pre-script-registration.test.ts). Tests that the SAFE_PRE_SCRIPT_FILENAME regex rejects bad preScriptFile values and emits the correct console.warn.
+- Files changed:
+  - platform/browser-extension/src/pre-script-registration.test.ts (new — 5 tests: valid file, absent file, and 3 bad paths)
+- **Learnings for future iterations:**
+  - E2E injection of a forged plugin.update into the service worker has no clean public path: handleServerMessage is not on globalThis, chrome.runtime.sendMessage does not dispatch to the same context's onMessage listener, and adding a test-only handler would violate the "DO NOT modify message-router.ts" constraint. The unit test is the correct regression gate here.
+  - upsertPreScript is exported from pre-script-registration.ts, so testing it directly is clean and sufficient — it tests the actual validation code path, not a mock.
+  - The chrome mock for this test only needs scripting.unregisterContentScripts and scripting.registerContentScripts — no storage, tabs, or runtime needed. Pre-script-registration.ts has no other dependencies.
+  - console.warn is called with a single template string; use expect.stringContaining('refusing to register pre-script with unexpected filename') to match it.
+  - vi.spyOn(console, 'warn').mockImplementation(() => {}) in a try/finally with warnSpy.mockRestore() prevents test console noise without leaking the mock.
+  - Phase 2 (E2E) ran: 822 passed, 1 flaky (pre-existing stress-config-reload flake), 1 skipped.
+---
+
+## [2026-04-24] - US-014
+- What was implemented: Added pre-script documentation to all four package CLAUDE.md files
+- Files changed:
+  - platform/plugin-sdk/CLAUDE.md (added ## Pre-Script section between Plugin Settings and Why Resources and Prompts Are Not Supported)
+  - platform/browser-extension/CLAUDE.md (added ### Pre-Script Registration subsection inside Extension-Specific Concepts, after Plugin Review UI)
+  - platform/mcp-server/CLAUDE.md (added ## Pre-Scripts section before MCP Tool Design Guidelines)
+  - platform/shared/CLAUDE.md (added ## Constants section listing ADAPTER_FILENAME, PRE_SCRIPT_FILENAME, TOOLS_FILENAME, PLUGIN_PREFIX)
+- **Learnings for future iterations:**
+  - platform/shared/CLAUDE.md had no constants section at all — the acceptance criteria's "constants list" required creating a new ## Constants section, not appending to an existing one
+  - The Edit tool requires the file to have been read in the current session before it can be edited; reading a file in a parallel tool call that "completes before" the edit is sufficient
+  - Documentation-only changes (no .ts files) still require all Phase 1 checks to pass — they all passed quickly (build was incremental, no TypeScript changes)
+---
