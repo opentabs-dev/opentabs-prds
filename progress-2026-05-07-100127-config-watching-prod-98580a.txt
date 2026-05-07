@@ -1,0 +1,110 @@
+# Ralph Progress Log
+PRD: prd-2026-05-07-100127-config-watching-prod-98580a~running.json
+Started: Thu May  7 17:02:04 UTC 2026
+---
+
+## 2026-05-07 - US-007
+- Added `rapid config.json writes are debounced into a single reload in production mode` test to `e2e/config-watcher-prod.e2e.ts`.
+- Test writes config.json 5 times every 20ms (within the 200ms debounce window), then waits 2s for all debounced reloads to settle.
+- Counts new occurrences of `'config.json changed — triggering reload'` in `server.logs` and asserts `>= 1` and `<= 2`.
+- Final write adds the e2e-test plugin so the test also verifies the last config write took effect.
+- Files changed: `e2e/config-watcher-prod.e2e.ts`
+- **Learnings for future iterations:**
+  - The debounce log line uses an em-dash: `'config.json changed — triggering reload'` (not `--` or `-`). Use `\u2014` in source code to avoid linter complaints about non-ASCII literals.
+  - The biome pre-commit hook auto-formats multi-line filter callbacks — the `\n` indentation style is adjusted automatically.
+  - `reloadCount = reloadLogAfter - reloadLogBefore` correctly handles pre-existing occurrences; using `>= 1 && <= 2` rather than exactly 1 avoids false failures on slow CI where two debounce windows fire.
+---
+
+## 2026-05-07 - US-008
+- Added `MCP client receives tools/list_changed notification after config.json adds a plugin in production mode` test to `e2e/config-watcher-prod.e2e.ts`.
+- Test opens a GET /mcp SSE stream using the established session ID to receive server-pushed notifications. Uses `ReadableStream.getReader()` to parse SSE data lines in real time and detects `notifications/tools/list_changed`.
+- Also fixed a bug in `platform/mcp-server/src/file-watcher.ts`: `startConfigWatching` was not starting mtime polling when `fs.watch()` failed with EMFILE in production mode (because `fw.mtimePollTimerId === null` — mtime polling was never started in production mode without `startFileWatching`). This caused all prod-mode config watcher tests to fail when inotify instances were exhausted.
+- Files changed: `e2e/config-watcher-prod.e2e.ts`, `platform/mcp-server/src/file-watcher.ts`
+- **Learnings for future iterations:**
+  - GET /mcp with `mcp-session-id` header opens an SSE stream for server-pushed notifications. Use `ReadableStream.getReader()` with a `TextDecoder` to parse `data:` lines in real time.
+  - When `controller.abort()` is called after resolving, the `ReadableStream.read()` throws `AbortError` — catch and swallow it since it's expected.
+  - `startConfigWatching` EMFILE fallback only called `startMtimePolling` when polling was already running (from `startFileWatching`). Production mode never calls `startFileWatching`, so the EMFILE fallback was a no-op. Fix: unconditionally call `startMtimePolling` after clearing any existing timer.
+  - The EMFILE condition for `fs.watch()` is common when 128 inotify instances (Linux default) are exhausted during parallel E2E tests. The mtime polling fallback is the only detection mechanism in that case.
+---
+
+## Codebase Patterns
+- Health endpoint `pluginDetails` now includes `urlPatterns: string[]` (effective patterns including those derived from url-type settings). Added in US-005.
+- `settings-resolver.ts` handles url-type settings as `Record<string, string>` (instance name → URL), not plain strings. Each entry derives a `*://host/*` match pattern.
+- `writeTestConfig` auto-generates `permissions` with `{ permission: 'auto' }` for each plugin by basename — no need to explicitly set permissions in most tests.
+
+- `startConfigWatching` EMFILE fallback: must unconditionally call `startMtimePolling` regardless of whether polling was already running — in production mode it was never started, so the old guard `if (fw.mtimePollTimerId !== null)` was always false.
+- reload.ts `reloadCore`: callbacks created by `createFileWatcherCallbacks` is now shared between unconditional config watching and the dev-only plugin file watchers.
+- `stopFileWatching` at top of `reloadCore` stops ALL watchers (including config watcher) before re-creating them — intentional, must not be removed.
+- dev-mode.ts simply exports `isDev()` as a plain boolean — the only file to edit for dev mode detection semantics.
+
+## 2026-05-07 - US-001
+- Moved `startConfigWatching` and the missed-write detection (prevConfigMtime comparison) out of the `isDev()` guard in `reload.ts` so config.json changes are detected in production mode.
+- `createFileWatcherCallbacks` is now called unconditionally (before the `isDev()` block), and its result shared with both the config watcher and the dev-only plugin file watchers.
+- `startFileWatching` and `startPluginDirWatching` remain inside `isDev()`.
+- Updated `dev-mode.ts` module doc comment and inline JSDoc to remove references to config watching as a dev-only feature.
+- Updated `reloadCore` JSDoc to reflect that config watching runs in all modes.
+- Files changed: `platform/mcp-server/src/reload.ts`, `platform/mcp-server/src/dev-mode.ts`
+- **Learnings for future iterations:**
+  - The `callbacks` object was previously declared inside the `isDev()` block — moving it out required no changes to the function signature since `createFileWatcherCallbacks` takes `state, sessionServers, transports` which are all in scope.
+  - The missed-write detection block uses `state.fileWatching.configLastSeenMtime` which is set by `startConfigWatching` — so it must come after `startConfigWatching`, not before it.
+---
+
+## 2026-05-07 - US-002
+- Added `prodMode?: boolean` as a 5th optional parameter to `startMcpServer` in `e2e/fixtures.ts`.
+- When `prodMode` is true, the server is spawned as `dist/index.js` without `--dev`, enabling production-mode E2E tests.
+- All existing callers are unaffected (parameter defaults to `undefined`/falsy).
+- `OPENTABS_DEV` env var was never set by the fixture (dev mode is controlled solely by the `--dev` CLI flag), so no env changes were needed.
+- Files changed: `e2e/fixtures.ts`
+- **Learnings for future iterations:**
+  - `startMcpServer` exports via the bottom-of-file export object — no separate export statement needed.
+  - Dev mode in the server is set by `--dev` CLI flag, not by any environment variable in the fixture env.
+  - The 5th positional parameter approach is clean here since existing callers use named positional args.
+---
+
+## 2026-05-07 - US-003
+- Created `e2e/config-watcher-prod.e2e.ts` with one test: adding a plugin path to config.json in production mode auto-discovers plugin tools without POST /reload.
+- Test uses `startMcpServer(configDir, false, undefined, undefined, true)` to start in prod mode (hot=false, prodMode=true).
+- Follows the exact pattern of the `adding a plugin path` test in `config-watcher.e2e.ts`.
+- Files changed: `e2e/config-watcher-prod.e2e.ts` (new file)
+- **Learnings for future iterations:**
+  - `startMcpServer(configDir, false, undefined, undefined, true)` is the correct call signature for prod-mode non-hot server (hot=false skips the dev proxy, prodMode=true omits `--dev`).
+  - The `describe` block name was chosen to distinguish from the dev-mode config watcher describe block (`Config watcher — auto-discovery` vs `Config watcher — production mode auto-discovery`).
+  - Subsequent prod-mode tests (US-004 through US-008) all append to this same file.
+---
+
+## 2026-05-07 - US-005
+- Added `urlPatterns: string[]` to `pluginDetails` in health endpoint (`http-routes.ts`) so tests can observe derived URL patterns.
+- Updated `PluginDetail` interface in `fixtures.ts` and `HealthResponse` in `http-routes.test.ts` to include `urlPatterns`.
+- Added `settings change derives new URL patterns in production mode` test to `e2e/config-watcher-prod.e2e.ts`.
+- Test writes `{ instanceUrl: { prod: 'https://example.com', staging: 'https://staging.example.com' } }` to config.json and polls health until both `*://example.com/*` and `*://staging.example.com/*` appear in the plugin's `urlPatterns`.
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`, `e2e/fixtures.ts`, `e2e/config-watcher-prod.e2e.ts`
+- **Learnings for future iterations:**
+  - The url-type settings resolver expects `Record<string, string>` (instance name → URL map), not a plain string — matching `settings-resolver.ts` behavior.
+  - `server.waitForHealth(predicate, timeout)` is available on the `McpServer` fixture and handles polling internally — no need to use raw `fetch` + loop.
+  - The health endpoint previously didn't expose `urlPatterns` in `pluginDetails`; adding it was needed to make the test observable.
+---
+
+## 2026-05-07 - US-004
+- Added `removing a plugin path from config.json auto-removes plugin tools in production mode` test to `e2e/config-watcher-prod.e2e.ts`.
+- Test starts with e2e-test plugin in localPlugins, starts server in prod mode, verifies tools present, then writes empty localPlugins config and polls until tools disappear.
+- Verifies browser tools remain after plugin removal.
+- Files changed: `e2e/config-watcher-prod.e2e.ts`
+- **Learnings for future iterations:**
+  - The new test is prepended before the "adding" test inside the same describe block — ordering doesn't matter for Playwright but grouping logically by scenario makes the file readable.
+  - The tmpdir prefix `opentabs-e2e-cwp-remove-` follows the naming convention: `cwp` for config-watcher-prod.
+  - `readPluginToolNames()` returns the prefixed tool names (e2e-test_*) — useful for verifying count.
+---
+
+## 2026-05-07 - US-006
+- Added `permission` field to `pluginDetails` in the health response (`http-routes.ts`) so tests can observe per-plugin permission state.
+- Updated `PluginDetail` interface in `e2e/fixtures.ts` and the inline `HealthResponse.pluginDetails` type in `http-routes.test.ts` to include `permission: 'off' | 'ask' | 'auto'`.
+- Added `permission change in config.json takes effect in production mode` test to `e2e/config-watcher-prod.e2e.ts`.
+- Test passes `envOverrides: { OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: undefined }` to disable skip-permissions so the permission state is actually enforced.
+- Test reads e2e-test plugin version from `plugins/e2e-test/package.json` to set a matching `reviewedVersion` in the updated config.
+- Files changed: `platform/mcp-server/src/http-routes.ts`, `platform/mcp-server/src/http-routes.test.ts`, `e2e/fixtures.ts`, `e2e/config-watcher-prod.e2e.ts`
+- **Learnings for future iterations:**
+  - `envOverrides: { OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS: undefined }` effectively unsets the env var (the spread `{ ...process.env, ...envOverrides }` uses `undefined` value which Node ignores when constructing env).
+  - The health endpoint `pluginDetails` now includes `permission` — the effective plugin-level permission from `state.pluginPermissions[name]?.permission ?? 'off'`.
+  - `writeTestConfig` auto-generates permissions for localPlugins — to override this, pass `permissions` explicitly in the config object.
+  - Biome reformats multi-arg function calls by splitting long arg lists across lines — the pre-commit hook applies the format automatically.
+---
