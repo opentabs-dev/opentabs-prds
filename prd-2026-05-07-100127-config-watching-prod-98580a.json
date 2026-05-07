@@ -1,0 +1,135 @@
+{
+  "project": "OpenTabs Platform",
+  "description": "Enable config.json file watching in production mode so that settings, permissions, and plugin path changes are automatically detected and trigger rediscovery \u2014 without requiring a manual POST /reload or server restart. Currently, config watching is gated behind isDev(), meaning production users who edit config.json (e.g., adding a new instance URL) don't see their changes reflected until they manually reload. This change moves config watching out of the dev-only guard while keeping plugin file watchers (dist/ directory watchers) dev-only. Includes extensive E2E tests verifying production-mode config watching across multiple scenarios.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Enable config watching in production mode",
+      "description": "Move startConfigWatching (and its mtime polling fallback) out of the isDev() guard in reload.ts so config.json changes are detected in both dev and production modes. Plugin file watchers (startFileWatching, startPluginDirWatching) remain dev-only.",
+      "acceptanceCriteria": [
+        "startConfigWatching is called in both isDev() and non-isDev() branches of reloadCore",
+        "startFileWatching and startPluginDirWatching remain gated behind isDev()",
+        "The dev-mode.ts module doc comment no longer lists 'config.json watching' as dev-only",
+        "The reload.ts comment 'Production mode: static plugin discovery at startup; restart to reload' is updated to reflect config watching",
+        "The missed-config-write detection (prevConfigMtime comparison) also runs outside isDev()"
+      ],
+      "priority": 1,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- platform/mcp-server/src/reload.ts (restructure isDev block)\n- platform/mcp-server/src/dev-mode.ts (update module doc comment)\n\nContext:\nIn reload.ts, lines 377-404 gate ALL file watching behind `if (isDev())`. The fix is to extract `startConfigWatching` (and its supporting missed-write detection at lines 396-403) out of that block so it runs unconditionally. The callbacks object from `createFileWatcherCallbacks` is needed for both branches \u2014 declare it before the `if (isDev())` block.\n\nCurrent code in reload.ts (the dev-only block):\n```\n  // File watchers, config watching, and mtime polling are dev-only features.\n  // Production mode discovers plugins once at startup; restart to reload.\n  if (isDev()) {\n    const callbacks = createFileWatcherCallbacks(state, sessionServers, transports);\n    const failedPaths = state.registry.failures.map(f => f.path);\n    startFileWatching(state, callbacks, failedPaths);\n    startConfigWatching(state, callbacks);\n\n    // Watch localPluginDirs parent directories for new plugin subdirectories\n    const resolvedPluginDirs = state.localPluginDirs.map(d => resolveLocalPath(d, getConfigDir()));\n    startPluginDirWatching(state, resolvedPluginDirs, callbacks);\n\n    // Detect config.json writes that occurred during the async reload above.\n    if (\n      prevConfigMtime !== null &&\n      state.fileWatching.configLastSeenMtime !== null &&\n      state.fileWatching.configLastSeenMtime > prevConfigMtime\n    ) {\n      log.info('Config changed during reload \u2014 triggering follow-up reload to apply latest changes');\n      callbacks.onConfigChanged();\n    }\n  }\n```\n\nAfter the change, the structure should be:\n```\n  // Config watching runs in all modes \u2014 users expect config.json edits to take effect without restart.\n  const callbacks = createFileWatcherCallbacks(state, sessionServers, transports);\n  startConfigWatching(state, callbacks);\n\n  // Detect config.json writes that occurred during the async reload above.\n  if (...) {\n    callbacks.onConfigChanged();\n  }\n\n  // Plugin file watchers and plugin dir watchers are dev-only (for active plugin development).\n  if (isDev()) {\n    const failedPaths = state.registry.failures.map(f => f.path);\n    startFileWatching(state, callbacks, failedPaths);\n    const resolvedPluginDirs = ...;\n    startPluginDirWatching(state, resolvedPluginDirs, callbacks);\n  }\n```\n\nIn dev-mode.ts, update the doc comment from:\n  `Dev mode enables: file watchers for local plugins, config.json watching, mtime polling fallback, and the POST /reload HTTP endpoint.`\nto:\n  `Dev mode enables: file watchers for local plugins, plugin directory watching, and the POST /reload HTTP endpoint.`\n\nAnd update the inline comment from:\n  `/** Whether the server is running in dev mode (file watchers, hot reload, config watching) */`\nto:\n  `/** Whether the server is running in dev mode (plugin file watchers, hot reload, plugin dir watching) */`\n\nConstraints:\n- Do NOT move startFileWatching or startPluginDirWatching out of the isDev() block \u2014 those are specifically for plugin development hot reload.\n- Do NOT change the stopFileWatching call at the top of reloadCore \u2014 it must still stop ALL watchers (including config) before re-creating them.\n- The `createFileWatcherCallbacks` function signature and behavior must not change.\n- The reload.ts comment at line 254 ('In dev mode, file watchers and config watching are started after discovery.') should be updated."
+    },
+    {
+      "id": "US-002",
+      "title": "Add production-mode server fixture to E2E tests",
+      "description": "Add support for starting the MCP server in production mode (without --dev flag) in the E2E test fixtures, enabling tests that verify config watching works outside dev mode.",
+      "acceptanceCriteria": [
+        "startMcpServer accepts a new option or parameter to start without --dev flag",
+        "When started without --dev, the server process does NOT receive --dev in its argv",
+        "When started without --dev, the server process does NOT have OPENTABS_DEV=1 in env",
+        "The existing tests that use startMcpServer(configDir, true) continue to work unchanged"
+      ],
+      "priority": 2,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/fixtures.ts (modify startMcpServer)\n\nContext:\nCurrently `startMcpServer` has signature `(configDir, hot?, explicitPort?, envOverrides?)`. In non-hot mode (hot=false), it spawns `dist/index.js --dev`. There is no way to omit `--dev`.\n\nAdd a new optional parameter or options object. The simplest approach is to add a `prodMode?: boolean` parameter. When `prodMode` is true:\n1. Spawn `dist/index.js` without `--dev` in nodeArgs\n2. Do NOT set `OPENTABS_DEV` in the env\n\nCurrent code (line 531-533):\n```\n    const nodeArgs = hot\n      ? [path.join(SERVER_DIST_DIR, 'dev-proxy.js')]\n      : [path.join(SERVER_DIST_DIR, 'index.js'), '--dev'];\n```\n\nAfter change:\n```\n    const nodeArgs = hot\n      ? [path.join(SERVER_DIST_DIR, 'dev-proxy.js')]\n      : prodMode\n        ? [path.join(SERVER_DIST_DIR, 'index.js')]\n        : [path.join(SERVER_DIST_DIR, 'index.js'), '--dev'];\n```\n\nAnd in the env object, conditionally exclude OPENTABS_DEV when prodMode is true (or just don't set it \u2014 it's not currently set anyway, since --dev comes from the CLI flag).\n\nAlso export the new option signature.\n\nConstraints:\n- Do NOT break existing callers \u2014 the parameter must be optional with a backward-compatible default.\n- The `hot: true` mode (dev proxy) is not affected by this change.\n- Keep the function signature clean \u2014 consider using an options object if adding a 5th positional param feels unwieldy. Check what existing callers look like."
+    },
+    {
+      "id": "US-003",
+      "title": "E2E test: config change adds plugin in production mode",
+      "description": "Write an E2E test verifying that adding a plugin path to config.json in production mode (no --dev) automatically discovers the plugin without POST /reload.",
+      "acceptanceCriteria": [
+        "Test starts MCP server in production mode (no --dev flag)",
+        "Test writes config.json with a new plugin path after startup",
+        "Test verifies plugin tools appear in tools/list within 15 seconds without calling POST /reload",
+        "Test cleans up resources in a finally block"
+      ],
+      "priority": 3,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/config-watcher-prod.e2e.ts (new file)\n\nContext:\nFollow the exact pattern from e2e/config-watcher.e2e.ts (the 'adding a plugin path' test at line 38) but start the server in production mode using the new fixture option from US-002.\n\nThe test should:\n1. Create temp config dir with empty localPlugins\n2. Start server in production mode\n3. Connect MCP client\n4. Wait for 'Config watcher: Watching' log line (confirms watcher started)\n5. Write config.json with E2E_TEST_PLUGIN_DIR in localPlugins\n6. Poll tools/list until e2e-test_ tools appear (waitForToolList)\n7. Verify all expected tools are present\n\nImport from fixtures.ts: `startMcpServer`, `createMcpClient`, `E2E_TEST_PLUGIN_DIR`, `readPluginToolNames`, `writeTestConfig`, `cleanupTestConfigDir`, `expect`, `test`\nImport from helpers.ts: `BROWSER_TOOL_NAMES`, `waitForLog`, `waitForToolList`\n\nConstraints:\n- Do NOT call POST /reload \u2014 the whole point is that config watching handles it.\n- Use the same 15-second timeout as the existing dev-mode config watcher tests.\n- Follow the try/finally cleanup pattern from the existing config-watcher.e2e.ts tests."
+    },
+    {
+      "id": "US-004",
+      "title": "E2E test: removing a plugin via config change in production mode",
+      "description": "Write an E2E test verifying that removing a plugin path from config.json in production mode automatically removes its tools.",
+      "acceptanceCriteria": [
+        "Test starts with a plugin registered, then removes it from config.json",
+        "Plugin tools disappear from tools/list without POST /reload",
+        "Browser tools remain present after the plugin is removed",
+        "Server is in production mode (no --dev)"
+      ],
+      "priority": 4,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/config-watcher-prod.e2e.ts (append to existing file from US-003)\n\nContext:\nFollow the pattern from config-watcher.e2e.ts line 103 ('removing a plugin path' test) but in production mode.\n\nThe test should:\n1. Create temp config dir with e2e-test plugin in localPlugins\n2. Start server in production mode\n3. Connect MCP client, verify e2e-test tools present\n4. Wait for 'Config watcher: Watching' log\n5. Write config.json with empty localPlugins\n6. Poll tools/list until e2e-test_ tools disappear\n7. Verify browser tools still present\n\nConstraints:\n- Same file as US-003 (config-watcher-prod.e2e.ts), add under same describe block or a new describe.\n- Use try/finally cleanup."
+    },
+    {
+      "id": "US-005",
+      "title": "E2E test: settings change derives new URL patterns in production mode",
+      "description": "Write an E2E test verifying that adding url-type settings to config.json in production mode causes new URL patterns to be derived and reported in the health endpoint.",
+      "acceptanceCriteria": [
+        "Test starts server in production mode with a plugin that has a url configSchema field",
+        "Test writes settings to config.json after startup",
+        "Health endpoint shows the derived URL pattern within 15 seconds without POST /reload",
+        "Multiple instances (e.g., prod + staging) both derive their own patterns"
+      ],
+      "priority": 5,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/config-watcher-prod.e2e.ts (append to existing file)\n\nContext:\nThe e2e-test plugin already has configSchema with `instanceUrl` of type 'url'. See e2e/plugin-settings.e2e.ts line 69 for how the existing settings derivation test works (it uses POST /reload). This new test must NOT use POST /reload.\n\nThe test should:\n1. Create temp config dir with e2e-test plugin in localPlugins, empty settings\n2. Start server in production mode\n3. Connect MCP client\n4. Wait for config watcher log\n5. Write config.json adding `settings: { 'e2e-test': { instanceUrl: { prod: 'https://example.com', staging: 'https://staging.example.com' } } }`\n6. Poll the health endpoint (GET /health with auth) until the e2e-test plugin shows both derived URL patterns (`*://example.com/*`, `*://staging.example.com/*`)\n7. Verify both patterns are present\n\nTo read health: use `fetch(`http://localhost:${server.port}/health`, { headers: { Authorization: `Bearer ${server.secret}` } })` and parse JSON.\n\nConstraints:\n- Do NOT call POST /reload.\n- The E2E test plugin's configSchema has `instanceUrl` with `type: 'url'` \u2014 verify this by reading e2e/fixtures/ plugin package.json if needed."
+    },
+    {
+      "id": "US-006",
+      "title": "E2E test: permission change takes effect in production mode",
+      "description": "Write an E2E test verifying that changing a plugin's permission in config.json in production mode is reflected in the server state without restart.",
+      "acceptanceCriteria": [
+        "Test starts with a plugin at permission 'off'",
+        "Test updates config.json to set permission to 'auto'",
+        "Health endpoint or tool dispatch reflects the new permission without POST /reload",
+        "Server is in production mode"
+      ],
+      "priority": 6,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/config-watcher-prod.e2e.ts (append to existing file)\n\nContext:\nPermissions are stored in config.json under the `permissions` key. When config.json changes, the config watcher triggers reloadCore which re-reads permissions into state.pluginPermissions.\n\nThe test should:\n1. Create temp config dir with e2e-test plugin, permission set to 'off' (not auto-approved)\n2. Start server in production mode\n3. Connect MCP client\n4. Call a tool \u2014 verify it fails with permission error (or check health shows permission 'off')\n5. Wait for config watcher log\n6. Write config.json changing the permission to 'auto' with reviewedVersion matching plugin version\n7. Poll until health endpoint shows the plugin with permission 'auto'\n8. Verify tool call now succeeds (or health shows 'auto')\n\nCheck how permissions are structured in config: `{ permissions: { 'e2e-test': { permission: 'auto', reviewedVersion: '...' } } }`\n\nThe server version for the e2e-test plugin can be read from the plugin's package.json.\n\nConstraints:\n- Do NOT call POST /reload.\n- Since OPENTABS_DANGEROUSLY_SKIP_PERMISSIONS=1 is set by the fixture, you may need to NOT set it for this specific test (override via envOverrides). Or instead of testing dispatch behavior, just verify the health endpoint reports the correct permission state."
+    },
+    {
+      "id": "US-007",
+      "title": "E2E test: rapid config writes are debounced in production mode",
+      "description": "Write an E2E test verifying that rapid successive writes to config.json are debounced into a single reload in production mode.",
+      "acceptanceCriteria": [
+        "Test writes config.json 5+ times in rapid succession (< 50ms apart)",
+        "Only 1-2 reload log lines appear (not 5+), proving debounce works",
+        "Final state reflects the last written config",
+        "Server is in production mode"
+      ],
+      "priority": 7,
+      "passes": false,
+      "e2eCheckpoint": false,
+      "model": "opus",
+      "notes": "Files:\n- e2e/config-watcher-prod.e2e.ts (append to existing file)\n\nContext:\nThe config watcher uses a 200ms debounce timer (see file-watcher.ts line 637-647). Rapid writes within 200ms should only trigger one reload. The reload log line to look for is: 'Config watcher: config.json changed \u2014 triggering reload' (logged at line 642 of file-watcher.ts).\n\nThe test should:\n1. Create temp config dir with empty localPlugins\n2. Start server in production mode\n3. Wait for config watcher to start\n4. Write config.json 5 times rapidly (every 20ms) with different localPlugin paths (can use the same plugin path each time \u2014 the content change is what triggers the watcher)\n5. Wait 2 seconds for all debounced reloads to complete\n6. Count occurrences of 'config.json changed \u2014 triggering reload' in server logs\n7. Assert count is <= 2 (debounce consolidated most writes)\n8. Verify final state matches the last write (plugin tools present)\n\nConstraints:\n- The debounce interval is 200ms, so writes every 20ms should be well within the debounce window.\n- Do NOT assert exactly 1 reload \u2014 timing can vary. Assert <= 2 is safe.\n- Use server.logs (the captured stdout lines) to count occurrences."
+    },
+    {
+      "id": "US-008",
+      "title": "E2E test: tools/list_changed notification sent to MCP clients after config change",
+      "description": "Write an E2E test verifying that MCP clients receive a tools/list_changed notification after a config.json change adds or removes plugins in production mode.",
+      "acceptanceCriteria": [
+        "Test connects an MCP client and listens for tools/list_changed notifications",
+        "After config.json is modified to add a plugin, client receives the notification",
+        "After receiving notification, client can list tools and see the new plugin's tools",
+        "Server is in production mode"
+      ],
+      "priority": 8,
+      "passes": false,
+      "e2eCheckpoint": true,
+      "model": "opus",
+      "notes": "Files:\n- e2e/config-watcher-prod.e2e.ts (append to existing file)\n\nContext:\nWhen reloadCore completes, the caller (performConfigReload or the startup flow) calls notifyToolListChanged on all session servers. The MCP SDK emits this as a `notifications/tools/list_changed` JSON-RPC notification to connected clients.\n\nThe MCP client fixture (createMcpClient) likely has a way to subscribe to notifications or the client object may accumulate them. Check e2e/fixtures.ts for how McpClient is implemented \u2014 look for `onNotification` or a notifications array.\n\nThe test should:\n1. Start server in production mode with empty localPlugins\n2. Connect MCP client\n3. Set up a notification listener (or check if the fixture has one)\n4. Wait for config watcher log\n5. Write config.json adding the e2e-test plugin\n6. Wait for tools/list_changed notification (with timeout)\n7. After receiving it, call listTools and verify new tools present\n\nIf the MCP client fixture doesn't expose notifications directly, check how other tests verify notifications \u2014 grep for 'list_changed' or 'notification' in e2e/*.ts files.\n\nConstraints:\n- This test verifies the notification mechanism, not just polling. If the client fixture doesn't support notification listening, the test should use a polling approach but assert that `tools/list_changed` appeared in some observable way."
+    }
+  ]
+}
