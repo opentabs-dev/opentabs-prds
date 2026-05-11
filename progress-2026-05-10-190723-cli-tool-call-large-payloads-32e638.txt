@@ -1,0 +1,51 @@
+# Ralph Progress Log
+PRD: prd-2026-05-10-190723-cli-tool-call-large-payloads-32e638~running.json
+Started: Mon May 11 02:07:53 UTC 2026
+---
+
+## Codebase Patterns
+- platform/cli/src/commands/tool.ts: command entry point for `opentabs tool`. Use `command.optsWithGlobals()` to read options in action handlers.
+- commander camelCases kebab-case option names: `--params-file` becomes `options.paramsFile`.
+- `toErrorMessage` from `@opentabs-dev/shared` is the standard way to convert unknown errors to strings.
+- CLI functions call `process.exit(2)` for user-input errors (bad args), `process.exit(1)` for server/auth errors.
+- readFile from `node:fs/promises` is already used in platform/cli/src/commands/audit.ts — use it for async file I/O.
+
+---
+
+## 2026-05-11 - US-001
+- Added `--params-file <path>` option to `opentabs tool call` in platform/cli/src/commands/tool.ts
+- Added `readParamsSource` exported async helper that reads JSON from file path, stdin (`-`), `--params`, or positional arg
+- Added mutual exclusion: errors with "Specify only one of:" when multiple sources given
+- Path-qualified error messages for missing files ("Failed to read params file <path>:") and invalid JSON ("Invalid JSON in <path>:" or "Invalid JSON on stdin:")
+- Removed raw blob echo from invalid JSON errors (was `Invalid JSON: ${rawJson}`) — replaced with just the parse error message
+- Updated `addHelpText` examples to include `--params-file payload.json` and `--params-file -` (stdin) examples
+- **Learnings for future iterations:**
+  - `readParamsSource` is exported so unit tests in US-002 can import it directly
+  - The stdin path uses `for await (const chunk of process.stdin)` — accumulates Buffer chunks and concatenates; works because process.stdin is async iterable
+  - TypeScript type inference: `process.exit(2)` after a try/catch in an async function means TypeScript knows we never fall through — no need to add `as unknown` on the return type
+  - All Phase 1 checks (build, type-check, lint, knip, test) passed on first run
+---
+
+## 2026-05-11 - US-002
+- Created platform/cli/src/commands/tool.test.ts with 9 unit tests for `readParamsSource`
+- Tests cover: undefined inputs, --params flag, positional jsonArg, --params-file path, stdin via `-`, mutual exclusion (2 tests), missing file error, and 2 MB round-trip
+- Exported `readParamsSource` was already done in US-001 — no changes needed to tool.ts
+- **Learnings for future iterations:**
+  - `process.stdin` is read-only (getter-only property) on Node.js — cannot assign directly. Use `Object.defineProperty(process, 'stdin', { value: mockStream, configurable: true })` and restore with the original descriptor in a finally block
+  - `@ts-expect-error` comments cause TS2578 errors when TypeScript doesn't actually see an error on the next line — don't add them speculatively; only add when the error actually fires
+  - Biome auto-formats on pre-commit; the formatted result is auto-staged by the hook — the commit captures the formatted version automatically
+---
+
+## 2026-05-11 - US-003
+- Created e2e/tool-call-large-payload.e2e.ts with 3 Playwright E2E tests for CLI large payload bypass
+- Test structure: spawn real CLI subprocess, pass 1.5 MB payload via --params-file <path>, --params-file - (stdin), and --params inline
+- Uses `setupToolTest` from helpers.ts to bring up full stack (MCP server + extension + test server + MCP client)
+- Uses `mcpServer.configDir` for OPENTABS_CONFIG_DIR env var, `mcpServer.port` for --port flag
+- CLI binary resolved via `fileURLToPath(new URL('../platform/cli/dist/cli.js', import.meta.url))`
+- **Learnings for future iterations:**
+  - The E2E tests failed in this container due to pre-existing Docker image mismatch: Playwright 1.59.1 installed but Docker image only has chromium-1208 (needs chromium-1217). This caused 578 pre-existing test failures in ALL tests using extensionContext (tool-dispatch, audit-logging, side-panel, etc.). NOT caused by this PR's changes.
+  - Phase 1 checks (build, type-check, lint, knip, test) all passed cleanly
+  - For tests that need the full extension stack: they use mcpServer + testServer + extensionContext + mcpClient fixtures from fixtures.ts. Without extensionContext, plugin tools return "tab closed" because no browser is connected.
+  - The regression guard test (--params inline) asserts `code !== 0 || spawnError === 'E2BIG' || /E2BIG|too long/i.test(stderr)` — accepts either OS-level spawn failure OR non-zero exit since behavior varies by platform
+  - stdin piping: use `child.stdin.end(buffer)` after spawning with `stdio: ['pipe', 'pipe', 'pipe']`
+---
